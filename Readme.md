@@ -32,6 +32,7 @@ sproxy node 1 run # enter that container from another shell
 - Portmaster does not handle the use case this tool is concerning. 
     - I find it dishonest because its per-app-vpn feature only works with *their* VPNs
 - Opensnitch does not have the `redirect/restrict programs to certain net interfaces, addresses (of socks5)` feature.
+- Easider debugging of the network due to netns seperating traffic. You have create one netns for each process you want to debug.
 
 ## The usecase
 
@@ -40,6 +41,13 @@ sproxy node 1 run # enter that container from another shell
 - You have a diverse need for proxied routing, and you don't want to read a ton of docs.
 - You don't want to mess with other parts of your system. 
 - You want to proxy Flatpak apps.
+
+Examples
+
+- Librewolf/Firefox/MullvadBrowser with multiple profiles, one per container. 
+- Monerod
+- Zcash
+- Vscode
 
 ## We've got you covered
 
@@ -91,3 +99,15 @@ Currently it's not recommended (bad for anonymity) to have multiple instances of
 - Rangemap based IP allocation (or suitable object) library
 - Forked PidFd with `impl AsFd for PidFd`
 - Mounting network namespaces, preparing them for use, everything, in Rust.
+
+## Why doesn't my IPV6 work ?
+
+I've been using nsproxy with Geph. For some reason I had to use IPV6, which didn't work in nsproxy. I found out an ipv6 address of `exmaple.com` and put it in the browser, which surprisingly loaded.
+
+The source code of geph shows it doesn't support ipv6. After some wireshark-ing, apparently the browser (librewolf) treated the ipv6 address as a domain, passed it to geph's socks server.
+
+Librewolf is not complying with socks5 protocol, and concidentally sidestepped the code in Geph that throws errors upon ipv6.
+
+After more debugging, it turned out the traffic was sent directly without proxying, because the addr was being labelled as a domain by librewolf, and then catogorized as "should not proxied" by geph.
+
+If I were to keep anonymity, that would be a total disaster.
