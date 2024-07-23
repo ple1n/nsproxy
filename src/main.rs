@@ -866,6 +866,32 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 cwd,
             )?;
         }
+        Commands::Librewolf => {
+            let cli = Cli {
+                log: None,
+                command: Commands::Node {
+                    id: Some(NodeAddr::Ix(0.into())),
+                    op: Some(NodeOps::Run {
+                        cmd: Some("librewolf".into()),
+                        uid: None,
+                    }),
+                },
+            };
+            cmd(cli, cwd)?;
+        }
+        Commands::Fractal => {
+            let cli = Cli {
+                log: None,
+                command: Commands::Node {
+                    id: Some(NodeAddr::Ix(0.into())),
+                    op: Some(NodeOps::Run {
+                        cmd: Some("fractal".into()),
+                        uid: None,
+                    }),
+                },
+            };
+            cmd(cli, cwd)?;
+        }
         _ => todo!(),
     })
 }

@@ -4,9 +4,24 @@ Kernel-namespaces-based alternative to proxychains.
 
 > Part of Accessible OPSEC series (if there even is).
 
-## Usage 
+## quick start
 
-It's recommended to use the veth + tun2proxy method. 
+```bash
+# download or compile
+sudo ./nsproxy install
+# geph is a well known tool with good opsec
+# this command sets up a namespace and enters it giving you a shell
+sproxy geph
+# now open another terminal
+sproxy librewolf # lauches a librewolf with a prompt for choosing a profile
+# you can use different profiles for different namespaces
+sproxy fractal  # lauches `fractal` by directing running the command ie not using flatpak
+# fractal is a matrix client written in Rust
+```
+
+## Usage
+
+It's recommended to use the veth + tun2proxy method.
 
 ```bash
 ./nsproxy install -s # installs nsproxy and sproxy to your /usr/local (requires root) and makes sproxy suid
@@ -28,8 +43,8 @@ sproxy node 1 run # enter that container from another shell
     - because it avoids the roundtrip of TUN and make the app connect to SOCKS5 endpoint directly
 - Nsproxy creates containers which better suits the OPSEC use case than [sing-box](https://github.com/SagerNet/sing-box)
 - [Tun2socks](https://github.com/xjasonlyu/tun2socks) does not have virtual DNS
-- VPNs (in the sense the binaries VPN vendors distribute) do not care about the OPSEC usecase. 
-- Portmaster does not handle the use case this tool is concerning. 
+- VPNs (in the sense the binaries VPN vendors distribute) do not care about the OPSEC usecase.
+- Portmaster does not handle the use case this tool is concerning.
     - I find it dishonest because its per-app-vpn feature only works with *their* VPNs
 - Opensnitch does not have the `redirect/restrict programs to certain net interfaces, addresses (of socks5)` feature.
 - Easider debugging of the network due to netns seperating traffic. You have create one netns for each process you want to debug.
@@ -39,12 +54,12 @@ sproxy node 1 run # enter that container from another shell
 - You use non-conventional protocols. You need userspace TUNs.
 - You want to have some apps proxied, and others not.
 - You have a diverse need for proxied routing, and you don't want to read a ton of docs.
-- You don't want to mess with other parts of your system. 
+- You don't want to mess with other parts of your system.
 - You want to proxy Flatpak apps.
 
 Examples
 
-- Librewolf/Firefox/MullvadBrowser with multiple profiles, one per container. 
+- Librewolf/Firefox/MullvadBrowser with multiple profiles, one per container.
 - Monerod
 - Zcash
 - Vscode
@@ -62,7 +77,7 @@ Root or not
 - `nsproxy socks2tun --new-userns`
     - requires no root, throughout the whole process.
 
-The proxy 
+The proxy
 
 - The current recommended usage is `sproxy veth -t <config>`
     - Provides a TUN for non-socks5-capable programs
