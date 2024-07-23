@@ -28,6 +28,7 @@ use netlink_ops::{
     state::{Existence, ExpCollection},
 };
 use tracing::info;
+use uzers::os::unix::UserExt;
 use zbus::Connection;
 
 use super::*;
@@ -449,15 +450,18 @@ pub fn check_capsys() -> Result<()> {
     Ok(())
 }
 
-pub fn your_shell(specify: Option<String>) -> Result<Option<String>> {
+pub fn your_shell(specify: Option<String>, mut uid: Option<u32>) -> Result<Option<String>> {
     Ok(match specify {
         Some(k) => Some(k),
         None => {
-            let d = var("SHELL");
-            if d.is_err() {
-                Some("fish".to_owned())
+            if uid.is_none() {
+                uid = Some(what_uid(uid, false)?);
+            }
+            let user = uzers::get_user_by_uid(uid.unwrap());
+            if let Some(user) = user {
+                Some(user.shell().to_string_lossy().into_owned())
             } else {
-                Some(d.unwrap())
+                None
             }
         }
     })

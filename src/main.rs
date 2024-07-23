@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::{exit, Command, Stdio};
 use std::{fs::File, io::Read, os::fd::AsFd, path::PathBuf};
 
+use crate::PidPath::Selfproc;
 use anyhow::{anyhow, bail, ensure};
 use capctl::prctl;
 use clap::{Parser, Subcommand};
@@ -63,7 +64,6 @@ use tracing::{info, warn, Level};
 use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
-use crate::PidPath::Selfproc;
 
 #[derive(Parser)]
 #[command(
@@ -130,7 +130,7 @@ enum Commands {
         deinit: bool,
     },
     Node {
-        #[arg(value_parser=parse_node)]
+        #[arg(value_parser=parse_node, default_value="0")]
         id: Option<NodeAddr>,
         #[command(subcommand)]
         op: Option<NodeOps>,
@@ -150,6 +150,10 @@ enum Commands {
         dstdir: Option<PathBuf>,
     },
     Noop,
+    /// First line support for certain softwares
+    Librewolf,
+    Fractal,
+    Geph,
 }
 
 fn parse_node(addr: &str) -> Result<NodeAddr> {
@@ -197,7 +201,12 @@ fn main() -> Result<()> {
     info!("SHA1: {}", env!("VERGEN_GIT_SHA"));
     let cwd = std::env::current_dir()?;
 
-    match cli.command {
+    cmd(cli, cwd)?;
+    Ok(())
+}
+
+fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
+    Ok(match cli.command {
         Commands::New {
             pid,
             mut tun2proxy,
@@ -327,7 +336,7 @@ fn main() -> Result<()> {
                             sc.send_fd(nl.as_raw_fd())?;
                         }
                         sc.read_exact(&mut buf)?;
-                        let mut cmd = Command::new(your_shell(cmd)?.ok_or(anyhow!(
+                        let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
                             "--cmd must be specified when --pid is not provided"
                         ))?);
                         // We don't change uid of this process.
@@ -617,8 +626,9 @@ fn main() -> Result<()> {
                         setresuid(u, u, u)?;
                     }
 
-                    let mut cmd =
-                        Command::new(your_shell(None)?.ok_or(anyhow!("specify env var SHELL"))?);
+                    let mut cmd = Command::new(
+                        your_shell(None, uid)?.ok_or(anyhow!("specify env var SHELL"))?,
+                    );
                     cmd.spawn()?.wait()?;
                 }
             } else {
@@ -658,8 +668,9 @@ fn main() -> Result<()> {
                         nss.validated_enter()?;
                         drop(graphs);
                         cmd_uid(uid, true, true)?;
-                        let mut cmd =
-                            Command::new(your_shell(cmd)?.ok_or(anyhow!("specify env var SHELL"))?);
+                        let mut cmd = Command::new(
+                            your_shell(cmd, uid)?.ok_or(anyhow!("specify env var SHELL"))?,
+                        );
                         cmd.current_dir(cwd);
                         cmd.spawn()?.wait()?;
                     }
@@ -776,7 +787,8 @@ fn main() -> Result<()> {
             let f = unsafe { pidfd::PidFd::open(pid.try_into().unwrap(), 0) }?;
             setns(f, CloneFlags::CLONE_NEWNET)?;
             cmd_uid(uid, true, true)?;
-            let mut cmd = Command::new(your_shell(cmd)?.ok_or(anyhow!("specify env var SHELL"))?);
+            let mut cmd =
+                Command::new(your_shell(cmd, uid)?.ok_or(anyhow!("specify env var SHELL"))?);
             cmd.current_dir(cwd);
             cmd.spawn()?.wait()?;
         }
@@ -818,9 +830,44 @@ fn main() -> Result<()> {
                 f.set_permissions(perms)?;
             }
         }
+        Commands::Geph => {
+            // generate config first
+            use std::fs::File;
+            use tun2socks5::*;
+            let path = "./geph.json";
+            let f = File::create(path)?;
+            use serde_json::to_writer_pretty;
+            let conf = IArgs {
+                proxy: ArgProxy::from_url("socks5://127.0.0.1:9909")?,
+                ipv6_enabled: true,
+                dns: ArgDns::Handled,
+                dns_addr: "127.0.0.1".parse()?,
+                bypass: Default::default(),
+                state: None,
+            };
+            let uid = what_uid(None, false)?;
+            info!("uid determined to be {}", uid);
+            to_writer_pretty(f, &conf);
+            info!("config written to {}", path);
+            cmd(
+                Cli {
+                    log: None,
+                    command: Commands::New {
+                        pid: None,
+                        tun2proxy: Some(path.into()),
+                        cmd: your_shell(None, Some(uid))?,
+                        uid: Some(uid),
+                        name: Some("geph".into()),
+                        mount: true,
+                        out: None,
+                        veth: true,
+                    },
+                },
+                cwd,
+            )?;
+        }
         _ => todo!(),
-    }
-    Ok(())
+    })
 }
 
 fn summarize_graph(graphs: &Graphs) -> Result<()> {

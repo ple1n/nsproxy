@@ -1,6 +1,7 @@
 use std::{
     fs::File,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd}, process::Command,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    process::Command,
 };
 
 use anyhow::Result;
@@ -17,7 +18,7 @@ fn main() -> Result<()> {
     setns(&f2, CloneFlags::CLONE_NEWUSER)?;
     setns(&f, CloneFlags::CLONE_NEWNET)?;
     // Okay, this works for a flatpak process
-    let mut cmd = Command::new(your_shell(Some("fish".to_owned()))?.unwrap());
+    let mut cmd = Command::new(your_shell(Some("fish".to_owned()), None)?.unwrap());
     cmd.spawn()?.wait()?;
     Ok(())
 }
