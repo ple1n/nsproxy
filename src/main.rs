@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::env::var;
+use std::fmt::format;
 use std::fs::{OpenOptions, Permissions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -57,6 +58,7 @@ use nsproxy_common::{ExactNS, NSFrom, PidPath, VaCache};
 use owo_colors::OwoColorize;
 use passfd::FdPassingExt;
 use petgraph::visit::IntoNodeReferences;
+use procfs::sys::kernel::random::uuid;
 use std::os::unix::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument::WithSubscriber;
@@ -64,6 +66,7 @@ use tracing::{info, warn, Level};
 use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
+use tun2socks5::IArgs;
 
 #[derive(Parser)]
 #[command(
@@ -150,6 +153,11 @@ enum Commands {
         dstdir: Option<PathBuf>,
     },
     Noop,
+    /// Quick command to get a container
+    Socks {
+        #[command(flatten)]
+        args: IArgs,
+    },
     /// First line support for certain softwares
     Librewolf,
     Fractal,
@@ -858,6 +866,35 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         cmd: your_shell(None, Some(uid))?,
                         uid: Some(uid),
                         name: Some("geph".into()),
+                        mount: true,
+                        out: None,
+                        veth: true,
+                    },
+                },
+                cwd,
+            )?;
+        }
+        Commands::Socks { args } => {
+            // generate config first
+            use std::fs::File;
+            use tun2socks5::*;
+            let path = format!("/tmp/proxy_{}.json", uuid()?);
+            info!("write config to {}", &path);
+            let f = File::create(&path)?;
+            use serde_json::to_writer_pretty;
+            let conf = args;
+            let uid = what_uid(None, false)?;
+            info!("uid determined to be {}", uid);
+            to_writer_pretty(f, &conf);
+            cmd(
+                Cli {
+                    log: None,
+                    command: Commands::New {
+                        pid: None,
+                        tun2proxy: Some(path.into()),
+                        cmd: your_shell(None, Some(uid))?,
+                        uid: Some(uid),
+                        name: None,
                         mount: true,
                         out: None,
                         veth: true,

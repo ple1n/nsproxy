@@ -13,11 +13,26 @@ sudo ./nsproxy install
 # this command sets up a namespace and enters it giving you a shell
 sproxy geph
 # now open another terminal
-sproxy librewolf # lauches a librewolf with a prompt for choosing a profile
+sproxy librewolf # lauches librewolf with a prompt for choosing a profile
 # you can use different profiles for different namespaces
 sproxy fractal  # lauches `fractal` by directing running the command ie not using flatpak
 # fractal is a matrix client written in Rust
 ```
+
+apart from biased shortcuts, the standard commands are....
+
+here is the case where you connect to a proxy from another computer in a local network
+
+```bash
+## get the binary to the device you want to proxy by whatever way, like kde-connect
+kdeconnect-cli --share ./target/debug/nsproxy -d _a82d921a_aaa3_495f_978e_433a17395f3e_
+## now run this one liner to install it to /usr/bin/ of course this doesnt work with nixos
+sudo ./nsproxy install
+## make the container
+sproxy socks --proxy socks5://192.167.1.2:9909
+```
+
+and it enters a shell which is proxied as instructed.
 
 ## Usage
 
