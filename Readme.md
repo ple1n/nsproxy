@@ -6,7 +6,7 @@ Kernel-namespaces-based alternative to proxychains.
 
 ## quick start
 
-```bash
+```sh
 # download or compile
 sudo ./nsproxy install -s
 # geph is a well known tool with good opsec
@@ -23,7 +23,7 @@ apart from biased shortcuts, the standard commands are....
 
 here is the case where you connect to a proxy from another computer in a local network
 
-```bash
+```sh
 ## get the binary to the device you want to proxy by whatever way, like kde-connect
 kdeconnect-cli --share ./target/debug/nsproxy -d _a82d921a_aaa3_495f_978e_433a17395f3e_
 ## now run this one liner to install it to /usr/bin/ of course this doesnt work with nixos
