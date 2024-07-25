@@ -34,7 +34,7 @@ sproxy socks --proxy socks5://192.167.1.2:9909
 
 and it enters a shell which is proxied as instructed.
 
-for **flatpak** apps you can always run "flatpak run <name>" inside a shell like above. at least by the time I'm writing this, flatpak does not run the app through another process outside the namespace.....
+for **flatpak** apps you can always run "flatpak run com.someapp" inside a shell like above. at least by the time I'm writing this, flatpak does not run the app through another process outside the namespace.....
 
 ## more
 
