@@ -14,6 +14,7 @@
 #![feature(async_closure)]
 
 pub mod data;
+pub mod etc_resolv;
 pub mod flatpak;
 pub mod graph;
 pub mod managed;

@@ -158,6 +158,8 @@ enum Commands {
         #[command(flatten)]
         args: IArgs,
     },
+    /// Override DNS configuration for the mount namespace you are in. It performs a bind mount
+    SetDNS,
     /// First line support for certain softwares
     Librewolf,
     Fractal,
@@ -608,6 +610,9 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
 
                 aok!()
             })?;
+        }
+        Commands::SetDNS => {
+            etc_resolv::mount_conf()?;
         }
         Commands::Userns {
             rmall,
