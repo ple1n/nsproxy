@@ -20,6 +20,7 @@ use crate::PidPath::Selfproc;
 use anyhow::{anyhow, bail, ensure};
 use capctl::prctl;
 use clap::{Parser, Subcommand};
+use etc_resolv::cleanup_resolvconf;
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
@@ -308,8 +309,16 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
                     priv_ns.as_ref().unwrap().enter(&ctx)?;
                     log::info!("Entered user, mnt NS");
+
                     if set_dns {
-                        info!("bind mounting resolv.conf");
+                        info!(
+                            "bind mounting resolv.conf {}",
+                            if userns {
+                                "in userns"
+                            } else {
+                                "outside userns"
+                            }
+                        );
                         etc_resolv::mount_conf()?;
                     }
                 } else {
@@ -317,8 +326,22 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw())?);
                     depriv_userns = true;
                 }
+
                 check_capsys()?;
             } else {
+                let eu = geteuid();
+                if set_dns {
+                    info!(
+                        "bind mounting resolv.conf {}. euid = {:}",
+                        if userns {
+                            "in userns"
+                        } else {
+                            "outside userns"
+                        },
+                        eu
+                    );
+                    etc_resolv::mount_conf()?;
+                }
                 // The user is using SUID or sudo, or we are alredy in a userns, or user did setcap.
                 // Probably intentional
                 priv_ns = Some(NSGroup::proc_path(
@@ -326,6 +349,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     Some(NSSource::Unavail(false)),
                 )?);
             }
+
             let ns_add = if mount {
                 NSAdd::RecordMountedPaths
             } else {
@@ -918,7 +942,11 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             if euid.is_root() && !root {
                 error!(
                     "use nsproxy socks ..... instead of sproxy socks ....
-                    note you must create userns with `sproxy userns` first"
+                    note you must create userns with `sproxy userns` first.
+                    run sproxy socks .... --root to force the use of root user
+                    warning, this temporarily changes global DNS configuration to make your container work
+                    which may break some of softwares
+                    that you do not run in the container"
                 );
                 return Ok(());
             }
@@ -933,7 +961,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             to_writer_pretty(f, &conf)?;
             if euid.is_root() {
                 if root {
-                    warn!("attempting to create a netns in root mode. bind mount will not be performed");
+                    warn!("attempting to create a netns in root mode");
                 }
             } else {
                 if root {
@@ -958,6 +986,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 },
                 cwd,
             )?;
+            cleanup_resolvconf()?;
         }
         Commands::Librewolf => {
             let cli = Cli {
