@@ -1,20 +1,22 @@
-use std::io::Write;
+use std::{fs, io::Write};
 
 use anyhow::Result;
 use log::warn;
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount, MsFlags};
 use tracing::info;
 
 /// run this in a mount namespace; otherwise it applies globally which is probably undesirable
 pub fn mount_conf() -> Result<()> {
-    let path = "./resolv.conf";
     let copy = include_str!("../resolv.conf");
-    if !std::fs::exists(path)? {
-        warn!("./resolv.conf not found. writing the default config to it...");
-        let mut fd = std::fs::File::create(path)?;
-        fd.write_all(copy.as_bytes())?;
-    }
+    let path = "/tmp/resolv.conf";
+    let mut fd = std::fs::File::create(path)?;
+    fd.write_all(copy.as_bytes())?;
     let target = "/etc/resolv.conf";
+    info!("try umount first");
+    let rx = umount(target);
+    if rx.is_ok() {
+        info!("umount suceeded");
+    }
     info!("bind mount {} onto {}", path, target);
     mount(
         // CAP_SYS_ADMIN

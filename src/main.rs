@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
+use log::error;
 use log::LevelFilter::{self, Debug};
 use netlink_ops::netlink::{nl_ctx, NLDriver, NLHandle, VPairKey, VethConn};
 use netlink_ops::rtnetlink::netlink_proto::{new_connection_from_socket, NetlinkCodec};
@@ -102,6 +103,10 @@ enum Commands {
         out: Option<NodeAddr>,
         #[arg(long, short)]
         veth: bool,
+        #[arg(long)]
+        userns: Option<bool>,
+        #[arg(long, short, default_value = "true")]
+        set_dns: bool,
     },
     /// Start as watcher daemon. This uses the socks2tun method.
     Watch {
@@ -131,6 +136,8 @@ enum Commands {
         node: Option<NodeAddr>,
         #[arg(long, short)]
         deinit: bool,
+        #[arg(long, short)]
+        exit: bool,
     },
     Node {
         #[arg(value_parser=parse_node, default_value="0")]
@@ -157,6 +164,8 @@ enum Commands {
     Socks {
         #[command(flatten)]
         args: IArgs,
+        #[arg(long, short)]
+        root: bool,
     },
     /// Override DNS configuration for the mount namespace you are in. It performs a bind mount
     SetDNS,
@@ -226,6 +235,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             mount,
             out,
             veth,
+            mut userns,
+            mut set_dns,
         } => {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
@@ -264,37 +275,56 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
 
             let gid = getgid();
             let mut depriv_userns = false;
-            match capsys {
+
+            let userns = match capsys {
                 Ok(_) => {
-                    // The user is using SUID or sudo, or we are alredy in a userns, or user did setcap.
-                    // Probably intentional
-                    priv_ns = Some(NSGroup::proc_path(
-                        PidPath::Selfproc,
-                        Some(NSSource::Unavail(false)),
-                    )?);
+                    if userns.is_none() {
+                        false
+                    } else {
+                        userns.unwrap()
+                    }
                 }
                 _ => {
-                    log::warn!("CAP_SYS_ADMIN not available, entering user NS (I assume you want to use UserNS)");
-                    if mount {
-                        // It only makes sense when we have a persistent userns to mount
-                        priv_ns = Some(paths.userns().procns()?);
-                        if !paths.userns().exist()? {
-                            println!(
-                                "User NS does not exist. Create it as root with command {}",
-                                "sproxy userns".bright_yellow()
-                            );
-                            exit(-1);
-                        }
-                        let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
-                        priv_ns.as_ref().unwrap().enter(&ctx)?;
-                        log::info!("Entered user, mnt NS");
+                    if userns.is_none() {
+                        log::warn!("CAP_SYS_ADMIN not available, entering user NS (I assume you want to use UserNS)");
+                        true
                     } else {
-                        // Not mounting defaults to use a new userns
-                        priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw())?);
-                        depriv_userns = true;
+                        userns.unwrap()
                     }
-                    check_capsys()?;
                 }
+            };
+
+            if userns {
+                if mount {
+                    // It only makes sense when we have a persistent userns to mount
+                    priv_ns = Some(paths.userns().procns()?);
+                    if !paths.userns().exist()? {
+                        println!(
+                            "User NS does not exist. Create it as root with command {}",
+                            "sproxy userns".bright_yellow()
+                        );
+                        exit(-1);
+                    }
+                    let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
+                    priv_ns.as_ref().unwrap().enter(&ctx)?;
+                    log::info!("Entered user, mnt NS");
+                    if set_dns {
+                        info!("bind mounting resolv.conf");
+                        etc_resolv::mount_conf()?;
+                    }
+                } else {
+                    // Not mounting defaults to use a new userns
+                    priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw())?);
+                    depriv_userns = true;
+                }
+                check_capsys()?;
+            } else {
+                // The user is using SUID or sudo, or we are alredy in a userns, or user did setcap.
+                // Probably intentional
+                priv_ns = Some(NSGroup::proc_path(
+                    PidPath::Selfproc,
+                    Some(NSSource::Unavail(false)),
+                )?);
             }
             let ns_add = if mount {
                 NSAdd::RecordMountedPaths
@@ -617,6 +647,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
         Commands::Userns {
             rmall,
             uid,
+            exit,
             node,
             deinit,
         } => {
@@ -638,11 +669,12 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         let u = Uid::from_raw(uid);
                         setresuid(u, u, u)?;
                     }
-
-                    let mut cmd = Command::new(
-                        your_shell(None, uid)?.ok_or(anyhow!("specify env var SHELL"))?,
-                    );
-                    cmd.spawn()?.wait()?;
+                    if !exit {
+                        let mut cmd = Command::new(
+                            your_shell(None, uid)?.ok_or(anyhow!("specify env var SHELL"))?,
+                        );
+                        cmd.spawn()?.wait()?;
+                    }
                 }
             } else {
                 log::warn!("UserNS does not exist");
@@ -860,7 +892,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             };
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);
-            to_writer_pretty(f, &conf);
+            to_writer_pretty(f, &conf)?;
             info!("config written to {}", path);
             cmd(
                 Cli {
@@ -874,15 +906,20 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         mount: true,
                         out: None,
                         veth: true,
+                        set_dns: false,
+                        userns: None,
                     },
                 },
                 cwd,
             )?;
         }
-        Commands::Socks { args } => {
-            // generate config first
+        Commands::Socks { args, root } => {
+            let euid = geteuid();
+            if euid.is_root() && !root {
+                error!("use nsproxy socks ..... instead of sproxy socks ....");
+                return Ok(());
+            }
             use std::fs::File;
-            use tun2socks5::*;
             let path = format!("/tmp/proxy_{}.json", uuid()?);
             info!("write config to {}", &path);
             let f = File::create(&path)?;
@@ -890,23 +927,46 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             let conf = args;
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);
-            to_writer_pretty(f, &conf);
-            cmd(
-                Cli {
-                    log: None,
-                    command: Commands::New {
-                        pid: None,
-                        tun2proxy: Some(path.into()),
-                        cmd: your_shell(None, Some(uid))?,
-                        uid: Some(uid),
-                        name: None,
-                        mount: true,
-                        out: None,
-                        veth: true,
-                    },
-                },
-                cwd,
-            )?;
+            to_writer_pretty(f, &conf)?;
+            match unsafe { nix::unistd::fork().unwrap() } {
+                ForkResult::Parent { child } => {
+                    waitpid(Some(child), None)?;
+                    info!("userns crearted. ");
+                    cmd(
+                        Cli {
+                            log: None,
+                            command: Commands::New {
+                                pid: None,
+                                tun2proxy: Some(path.into()),
+                                cmd: your_shell(None, Some(uid))?,
+                                uid: Some(uid),
+                                name: None,
+                                mount: true,
+                                out: None,
+                                veth: false,
+                                userns: Some(true),
+                                set_dns: true,
+                            },
+                        },
+                        cwd,
+                    )?;
+                }
+                ForkResult::Child => {
+                    cmd(
+                        Cli {
+                            log: None,
+                            command: Commands::Userns {
+                                rmall: false,
+                                uid: None,
+                                node: None,
+                                deinit: false,
+                                exit: true,
+                            },
+                        },
+                        cwd.clone(),
+                    )?;
+                }
+            }
         }
         Commands::Librewolf => {
             let cli = Cli {
