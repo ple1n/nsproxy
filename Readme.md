@@ -24,12 +24,18 @@ apart from biased shortcuts, the standard commands are....
 here is the case where you connect to a proxy from another computer in a local network
 
 ```sh
-## get the binary to the device you want to proxy by whatever way, like kde-connect
+# get the binary to the device you want to proxy by whatever way, like kde-connect
 kdeconnect-cli --share ./target/debug/nsproxy -d _a82d921a_aaa3_495f_978e_433a17395f3e_
-## now run this one liner to install it to /usr/bin/ of course this doesnt work with nixos
+# now run this one liner to install it to /usr/bin/ of course this doesnt work with nixos
 sudo ./nsproxy install -s
-## make the container
-sproxy socks --proxy socks5://192.167.1.2:9909
+# must use sproxy (which has SUID flag set) to initialize userns
+sproxy userns
+# subsequent operations do not need the SUID binary
+# make the container
+nsproxy socks --proxy socks5://192.167.1.2:9909
+# you may also not use userns, which has better compatibility especially for system softwares, such as distribution's package managers
+sproxy socks --proxy socks5://192.167.1.2:9909 --root
+# this affects system wide DNS configuration temporarily though
 ```
 
 and it enters a shell which is proxied as instructed.
