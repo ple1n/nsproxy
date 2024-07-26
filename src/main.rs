@@ -916,7 +916,10 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
         Commands::Socks { args, root } => {
             let euid = geteuid();
             if euid.is_root() && !root {
-                error!("use nsproxy socks ..... instead of sproxy socks ....");
+                error!(
+                    "use nsproxy socks ..... instead of sproxy socks ....
+                    note you must create userns with `sproxy userns` first"
+                );
                 return Ok(());
             }
             use std::fs::File;
@@ -928,45 +931,33 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);
             to_writer_pretty(f, &conf)?;
-            match unsafe { nix::unistd::fork().unwrap() } {
-                ForkResult::Parent { child } => {
-                    waitpid(Some(child), None)?;
-                    info!("userns crearted. ");
-                    cmd(
-                        Cli {
-                            log: None,
-                            command: Commands::New {
-                                pid: None,
-                                tun2proxy: Some(path.into()),
-                                cmd: your_shell(None, Some(uid))?,
-                                uid: Some(uid),
-                                name: None,
-                                mount: true,
-                                out: None,
-                                veth: false,
-                                userns: Some(true),
-                                set_dns: true,
-                            },
-                        },
-                        cwd,
-                    )?;
+            if euid.is_root() {
+                if root {
+                    warn!("attempting to create a netns in root mode. bind mount will not be performed");
                 }
-                ForkResult::Child => {
-                    cmd(
-                        Cli {
-                            log: None,
-                            command: Commands::Userns {
-                                rmall: false,
-                                uid: None,
-                                node: None,
-                                deinit: false,
-                                exit: true,
-                            },
-                        },
-                        cwd.clone(),
-                    )?;
+            } else {
+                if root {
+                    warn!("euid is not root but root mode is specified");
                 }
             }
+            cmd(
+                Cli {
+                    log: None,
+                    command: Commands::New {
+                        pid: None,
+                        tun2proxy: Some(path.into()),
+                        cmd: your_shell(None, Some(uid))?,
+                        uid: Some(uid),
+                        name: None,
+                        mount: true,
+                        out: None,
+                        veth: false,
+                        userns: Some(!root),
+                        set_dns: true,
+                    },
+                },
+                cwd,
+            )?;
         }
         Commands::Librewolf => {
             let cli = Cli {
