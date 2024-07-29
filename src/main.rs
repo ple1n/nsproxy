@@ -36,7 +36,7 @@ use netlink_ops::state::{Existence, ExpCollection};
 use nix::fcntl::{open, OFlag};
 use nix::sched::{setns, unshare, CloneFlags};
 use nix::sys::stat::Mode;
-use nix::sys::wait::waitpid;
+use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
     close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, ForkResult, Pid,
     Uid,
@@ -61,7 +61,6 @@ use nsproxy::*;
 use nsproxy::{data::Ix, systemd};
 use nsproxy_common::NSSource::{self, Unavail};
 use nsproxy_common::{ExactNS, NSFrom, PidPath, VaCache};
-use owo_colors::OwoColorize;
 use passfd::FdPassingExt;
 use petgraph::visit::IntoNodeReferences;
 use procfs::sys::kernel::random::uuid;
@@ -74,7 +73,6 @@ use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
 use tun2socks5::IArgs;
-use zbus::zvariant::OwnedFd;
 
 #[derive(Parser)]
 #[command(
@@ -314,6 +312,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
 
             if userns {
                 if mount {
+                    use owo_colors::OwoColorize;
                     // It only makes sense when we have a persistent userns to mount
                     priv_ns = Some(paths.userns().procns()?);
                     if !paths.userns().exist()? {
@@ -484,7 +483,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         .await?;
                     graphs.data[edge].replace(rel);
                 }
-                let nl = NLHandle::new_self_proc_tokio()?;
+                let root = NLHandle::new_self_proc_tokio()?;
 
                 if let Some(nl_fd) = nl_fd {
                     let (nl_ch_conn, handle_ch, _) =
@@ -493,21 +492,28 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         });
                     tokio::spawn(nl_ch_conn);
 
-                    let nlh_ch = NLHandle::new(Handle::new(handle_ch), chid.clone());
+                    let sub = NLHandle::new(Handle::new(handle_ch), chid.clone());
 
                     if let Some(interface) = associated {
-                        if !interface.starts_with("nsp") {
-                            warn!("interface name is not started with nsp. it might not be recovered when the namespace is manually destroyed");
-                        }
-                        let link = nl.get_link(interface.parse()?).await?;
+                        let link = root.get_link(interface.parse()?).await?;
                         let id = link.header.index;
                         let fd = chid.open()?;
                         info!("moving {} into the new netns", interface);
-                        nl.ip_setns(&fd, id).await?;
-                        if let Some(ip ) = assoc_ip {
+                        root.ip_setns(&fd, id).await?;
+                        if let Some(ip) = assoc_ip {
+                            let renamed = format!("nsp_{}", src.index());
+                            info!("rename {} to {}", interface, renamed);
+                            let link = sub.get_link(interface.parse()?).await?;
+                            let id = link.header.index;
+                            sub.rawh
+                                .link()
+                                .set(id)
+                                .name(renamed.clone())
+                                .execute()
+                                .await?;
                             info!("add ip to moved interface");
-                            nlh_ch.add_addr_dev(ip, id).await?;
-                            nlh_ch.set_link_up(id).await?;
+                            sub.add_addr_dev(ip, id).await?;
+                            sub.set_link_up(id).await?;
                         } else {
                             warn!("no ip supplied");
                         }
@@ -516,11 +522,10 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     if veth {
                         let veth_key: Option<VPairKey>;
                         veth_key = Some(format!("v{}to{}", src.index(), out.index()).try_into()?);
-                        let vc = connect_ns_veth(nlh_ch, nl.clone(), veth_key).await?;
+                        let vc = connect_ns_veth(sub, root.clone(), veth_key).await?;
                         let edge = graphs.data.add_edge(src, out, None);
                         graphs.data[edge].replace(Relation::Veth(vc));
                     }
-
                 }
 
                 let ctx = serv.ctx().await?;
@@ -530,7 +535,6 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 serv.reload(&ctx).await?;
                 nw.1.restart(&serv, &ctx).await?;
                 nw.0.restart(&serv, &ctx).await?;
-
 
                 aok!()
             })?;
@@ -858,13 +862,34 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         })?;
                     }
                     NodeOps::Restore { fd } => {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-                        let ns = PidOrFd::Fd(Box::new(fd));
-                        rt.block_on(async {
+                        let task = async move {
+                            let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+                            let ns = PidOrFd::Fd(Box::new(fd));
+                            let graphs = Graphs::load_file(&paths)?;
+                            let require_id = || {
+                                if let Some(id) = id {
+                                    graphs.resolve(&id)
+                                } else {
+                                    bail!("Node operation requires a node address (name/id)")
+                                }
+                            };
+                            let ix = require_id()?;
+                            let node = graphs
+                                .data
+                                .node_weight(ix)
+                                .ok_or(anyhow!("Specified node does not exist"))?
+                                .as_ref() // Second one is an invariant
+                                .unwrap();
+                            let mut va = VaCache::default();
+                            let mut nss = NSState {
+                                target: &node.main,
+                                va: &mut va,
+                            };
+                            nss.validated_enter()?;
+                            drop(graphs);
+
                             let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+
                             nl.fill().await?;
                             info!("{:?}", &nl);
                             for (k, dev) in &nl.links {
@@ -877,7 +902,12 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                 }
                             }
                             aok!()
-                        })?;
+                        };
+
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(task)?;
                     }
                     NodeOps::RM { ids } => {
                         let ids: Vec<_> = ids.into_iter().map(NodeI::from).collect();
@@ -888,11 +918,15 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         let rootful = geteuid().is_root();
                         let mut serv = systemd::Systemd::new(&paths, None, rootful)?;
                         let mut rmnode = Default::default();
-                        let graphs = rt.block_on(async {
-                            let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
-                            nl.fill().await?;
+                        let graphs = {
+                            let mut nl = rt.block_on(async {
+                                let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                                nl.fill().await?;
+                                Ok::<_, anyhow::Error>(nl)
+                            })?;
                             let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
                             let fd = open("/proc/self/ns/net", OFlag::empty(), Mode::empty())?;
+
                             for id in &ids {
                                 match unsafe { fork()? } {
                                     ForkResult::Child => {
@@ -907,15 +941,23 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                             },
                                             cwd.clone(),
                                         )?;
-                                        return Ok(None);
+                                        return Ok(());
                                     }
                                     ForkResult::Parent { child } => {
-                                        waitpid(child, None)?;
+                                        let exit = waitpid(child, None)?;
+                                        match exit {
+                                            WaitStatus::Exited(p, c) => {
+                                                if c != 0 {
+                                                    panic!("removal cancelled");
+                                                }
+                                            }
+                                            _ => {
+                                                panic!("removal cancelled");
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            close(fd)?;
-
                             let mut graphs = Graphs::load_file(&paths)?;
                             let require_id = || {
                                 if let Some(id) = id {
@@ -924,15 +966,19 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                     bail!("Node operation requires a node address (name/id)")
                                 }
                             };
-                            graphs
-                                .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
-                                .await?;
-                            graphs
-                                .node_rm(&ctx, &ids[..], &mut va, &mut rmnode, &mut nl)
-                                .await?;
-                            graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
+                            rt.block_on(async {
+                                graphs
+                                    .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
+                                    .await?;
+                                graphs
+                                    .node_rm(&ctx, &ids[..], &mut va, &mut rmnode, &mut nl)
+                                    .await?;
+                                graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
+                                Ok::<_, anyhow::Error>(())
+                            })?;
+
                             Ok::<_, anyhow::Error>(Some(graphs))
-                        })?;
+                        }?;
                         if let Some(graphs) = graphs {
                             graphs.dump_file(&paths, what_uid(None, true)?)?;
                         } else {
@@ -1143,6 +1189,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
 }
 
 fn summarize_graph(graphs: &Graphs) -> Result<()> {
+    use owo_colors::OwoColorize;
     Ok(for ni in graphs.data.node_indices() {
         let nwdeps = graphs.nodewdeps(ni)?;
         print!("{}", nwdeps.0);
