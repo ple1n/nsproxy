@@ -110,8 +110,8 @@ enum Commands {
         veth: bool,
         #[arg(long)]
         userns: Option<bool>,
-        #[arg(long, short, default_value = "true")]
-        set_dns: bool,
+        #[arg(long, short)]
+        set_dns: Option<bool>,
         #[arg(long, short)]
         associated: Option<String>,
         #[arg(long, default_value = "192.168.2.1/24")]
@@ -310,6 +310,18 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 }
             };
 
+            let set_dns = if userns {
+                let set_dns = set_dns.unwrap_or(true);
+                set_dns
+            } else {
+                if let Some(set_dns) = set_dns {
+                    set_dns
+                } else {
+                    warn!("set_dns not specified. by default bind mount is not performed. if you experience DNS issues check /etc/resolv.conf");
+                    false
+                }
+            };
+
             if userns {
                 if mount {
                     use owo_colors::OwoColorize;
@@ -325,18 +337,6 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
                     priv_ns.as_ref().unwrap().enter(&ctx)?;
                     log::info!("Entered user, mnt NS");
-
-                    if set_dns {
-                        info!(
-                            "bind mounting resolv.conf {}",
-                            if userns {
-                                "in userns"
-                            } else {
-                                "outside userns"
-                            }
-                        );
-                        etc_resolv::mount_conf()?;
-                    }
                 } else {
                     // Not mounting defaults to use a new userns
                     priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw())?);
@@ -346,18 +346,6 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 check_capsys()?;
             } else {
                 let eu = geteuid();
-                if set_dns {
-                    info!(
-                        "bind mounting resolv.conf {}. euid = {:}",
-                        if userns {
-                            "in userns"
-                        } else {
-                            "outside userns"
-                        },
-                        eu
-                    );
-                    etc_resolv::mount_conf()?;
-                }
                 // The user is using SUID or sudo, or we are alredy in a userns, or user did setcap.
                 // Probably intentional
                 priv_ns = Some(NSGroup::proc_path(
@@ -365,7 +353,9 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     Some(NSSource::Unavail(false)),
                 )?);
             }
-
+            if set_dns {
+                etc_resolv::mount_conf()?;
+            }
             let ns_add = if mount {
                 NSAdd::RecordMountedPaths
             } else {
@@ -1096,7 +1086,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         mount: true,
                         out: None,
                         veth: true,
-                        set_dns: false,
+                        set_dns: None,
                         userns: None,
                         associated: None,
                         assoc_ip: None,
@@ -1149,7 +1139,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         out: None,
                         veth: false,
                         userns: Some(!root),
-                        set_dns: true,
+                        set_dns: None,
                         associated: None,
                         assoc_ip: None,
                     },
