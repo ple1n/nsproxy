@@ -16,6 +16,7 @@ use daggy::NodeIndex;
 use netlink_ops::netlink::{nl_ctx, LinkAB, NLDriver};
 use nsproxy_common::ExactNS;
 use systemd_zbus::{ManagerProxy, Mode::Replace};
+use tracing::info;
 use tun::Layer;
 use zbus::Address;
 
@@ -67,6 +68,7 @@ impl<'k> ItemRM for NodeIndexed<'k> {
 }
 
 pub fn remove_file_lenient(path: impl AsRef<Path> + Debug) -> Result<()> {
+    info!("trying to remove file {:?}", &path);
     match remove_file(&path) {
         Err(err) => {
             if err.kind() == ErrorKind::NotFound {

@@ -9,7 +9,8 @@ use std::env::var;
 use std::fmt::format;
 use std::fs::{OpenOptions, Permissions};
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -24,18 +25,21 @@ use etc_resolv::cleanup_resolvconf;
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
-use log::error;
 use log::LevelFilter::{self, Debug};
-use netlink_ops::netlink::{nl_ctx, NLDriver, NLHandle, VPairKey, VethConn};
+use log::{debug, error};
+use netlink_ops::netlink::{nl_ctx, GetPidOrFd, NLDriver, NLHandle, PidOrFd, VPairKey, VethConn};
 use netlink_ops::rtnetlink::netlink_proto::{new_connection_from_socket, NetlinkCodec};
 use netlink_ops::rtnetlink::netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_ops::rtnetlink::netlink_sys::{Socket, TokioSocket};
 use netlink_ops::rtnetlink::Handle;
 use netlink_ops::state::{Existence, ExpCollection};
+use nix::fcntl::{open, OFlag};
 use nix::sched::{setns, unshare, CloneFlags};
+use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
 use nix::unistd::{
-    fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, ForkResult, Pid, Uid,
+    close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, ForkResult, Pid,
+    Uid,
 };
 use nsproxy::data::{
     FDRecver, Graphs, NSAdd, NSAddRes, NSGroup, NSSlot, NSState, NodeAddr, NodeI, ObjectNode,
@@ -62,6 +66,7 @@ use passfd::FdPassingExt;
 use petgraph::visit::IntoNodeReferences;
 use procfs::sys::kernel::random::uuid;
 use std::os::unix::net::{UnixListener, UnixStream};
+use sys::NSEnter;
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument::WithSubscriber;
 use tracing::{info, warn, Level};
@@ -69,6 +74,7 @@ use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
 use tun2socks5::IArgs;
+use zbus::zvariant::OwnedFd;
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +114,10 @@ enum Commands {
         userns: Option<bool>,
         #[arg(long, short, default_value = "true")]
         set_dns: bool,
+        #[arg(long, short)]
+        associated: Option<String>,
+        #[arg(long, default_value = "192.168.2.1/24")]
+        assoc_ip: Option<IpNetwork>,
     },
     /// Start as watcher daemon. This uses the socks2tun method.
     Watch {
@@ -202,6 +212,11 @@ enum NodeOps {
     RM {
         ids: Vec<Ix>,
     },
+    /// return moved interfaces
+    Restore {
+        #[arg(long, short)]
+        fd: i32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -238,6 +253,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             veth,
             mut userns,
             mut set_dns,
+            associated,
+            assoc_ip,
         } => {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
@@ -395,10 +412,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         } else {
                             enable_ping_all()?;
                         }
-                        if veth {
-                            let nl = Socket::new(NETLINK_ROUTE)?;
-                            sc.send_fd(nl.as_raw_fd())?;
-                        }
+                        let nl = Socket::new(NETLINK_ROUTE)?;
+                        sc.send_fd(nl.as_raw_fd())?;
                         sc.read_exact(&mut buf)?;
                         let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
                             "--cmd must be specified when --pid is not provided"
@@ -417,7 +432,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     ForkResult::Parent { child } => {
                         drop(sc);
                         sp.read_exact(&mut buf)?;
-                        nl_fd = if veth { Some(sp.recv_fd()?) } else { None };
+                        nl_fd = Some(sp.recv_fd()?);
                         let k = graphs.add_ns(
                             PidPath::N(child.as_raw()),
                             &paths,
@@ -432,6 +447,13 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     }
                 }
             }; // Source of TUNFD/SocketFD
+            let chid = graphs.data[src]
+                .as_ref()
+                .unwrap()
+                .main
+                .net
+                .must()?
+                .to_owned();
 
             rt.block_on(async move {
                 graphs.clear_ns(src, &serv).await?;
@@ -462,31 +484,43 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         .await?;
                     graphs.data[edge].replace(rel);
                 }
-
-                let mut nl = NLHandle::new_self_proc_tokio()?;
+                let nl = NLHandle::new_self_proc_tokio()?;
 
                 if let Some(nl_fd) = nl_fd {
-                    let veth_key: Option<VPairKey>;
-                    veth_key = Some(format!("v{}to{}", src.index(), out.index()).try_into()?);
                     let (nl_ch_conn, handle_ch, _) =
                         new_connection_from_socket::<_, _, NetlinkCodec>(unsafe {
                             TokioSocket::from_raw_fd(nl_fd)
                         });
                     tokio::spawn(nl_ch_conn);
-                    let mut nlh_ch = NLHandle::new(
-                        Handle::new(handle_ch),
-                        graphs.data[src]
-                            .as_ref()
-                            .unwrap()
-                            .main
-                            .net
-                            .must()?
-                            .to_owned(),
-                    );
 
-                    let vc = connect_ns_veth(nlh_ch, nl.clone(), veth_key).await?;
-                    let edge = graphs.data.add_edge(src, out, None);
-                    graphs.data[edge].replace(Relation::Veth(vc));
+                    let nlh_ch = NLHandle::new(Handle::new(handle_ch), chid.clone());
+
+                    if let Some(interface) = associated {
+                        if !interface.starts_with("nsp") {
+                            warn!("interface name is not started with nsp. it might not be recovered when the namespace is manually destroyed");
+                        }
+                        let link = nl.get_link(interface.parse()?).await?;
+                        let id = link.header.index;
+                        let fd = chid.open()?;
+                        info!("moving {} into the new netns", interface);
+                        nl.ip_setns(&fd, id).await?;
+                        if let Some(ip ) = assoc_ip {
+                            info!("add ip to moved interface");
+                            nlh_ch.add_addr_dev(ip, id).await?;
+                            nlh_ch.set_link_up(id).await?;
+                        } else {
+                            warn!("no ip supplied");
+                        }
+                    }
+
+                    if veth {
+                        let veth_key: Option<VPairKey>;
+                        veth_key = Some(format!("v{}to{}", src.index(), out.index()).try_into()?);
+                        let vc = connect_ns_veth(nlh_ch, nl.clone(), veth_key).await?;
+                        let edge = graphs.data.add_edge(src, out, None);
+                        graphs.data[edge].replace(Relation::Veth(vc));
+                    }
+
                 }
 
                 let ctx = serv.ctx().await?;
@@ -496,9 +530,12 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 serv.reload(&ctx).await?;
                 nw.1.restart(&serv, &ctx).await?;
                 nw.0.restart(&serv, &ctx).await?;
+
+
                 aok!()
             })?;
             sp.write_all(&[2])?;
+
             // Wait for the child, or it gets orphaned.
             waitpid(Some(Pid::from_raw(-1)), None)?;
         }
@@ -709,18 +746,19 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
         Commands::Node { id, op } => {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
-            let mut graphs = Graphs::load_file(&paths)?;
-            let require_id = || {
-                if let Some(id) = id {
-                    graphs.resolve(&id)
-                } else {
-                    bail!("Node operation requires a node address (name/id)")
-                }
-            };
+
             // We gain full caps after setns
             if let Some(op) = op {
                 match op {
                     NodeOps::Run { cmd, uid } => {
+                        let mut graphs = Graphs::load_file(&paths)?;
+                        let require_id = || {
+                            if let Some(id) = id {
+                                graphs.resolve(&id)
+                            } else {
+                                bail!("Node operation requires a node address (name/id)")
+                            }
+                        };
                         let ix = require_id()?;
                         let node = graphs
                             .data
@@ -744,6 +782,14 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         cmd.spawn()?.wait()?;
                     }
                     NodeOps::Deps { lines, index } => {
+                        let mut graphs = Graphs::load_file(&paths)?;
+                        let require_id = || {
+                            if let Some(id) = id {
+                                graphs.resolve(&id)
+                            } else {
+                                bail!("Node operation requires a node address (name/id)")
+                            }
+                        };
                         let ix = require_id()?;
                         let mut cmd = Command::new("journalctl");
                         let (node, deps) = graphs.nodewdeps(ix)?;
@@ -786,6 +832,14 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         }
                     }
                     NodeOps::Reboot => {
+                        let graphs = Graphs::load_file(&paths)?;
+                        let require_id = || {
+                            if let Some(id) = id {
+                                graphs.resolve(&id)
+                            } else {
+                                bail!("Node operation requires a node address (name/id)")
+                            }
+                        };
                         let ix = require_id()?;
                         let (node, deps) = graphs.nodewdeps(ix)?;
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -803,6 +857,28 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                             aok!()
                         })?;
                     }
+                    NodeOps::Restore { fd } => {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+                        let ns = PidOrFd::Fd(Box::new(fd));
+                        rt.block_on(async {
+                            let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                            nl.fill().await?;
+                            info!("{:?}", &nl);
+                            for (k, dev) in &nl.links {
+                                let name = &k.0;
+                                if let Ok(dev) = dev.exist_ref() {
+                                    if name.starts_with("nsp") {
+                                        warn!("moved {} back", name);
+                                        nl.conn.ip_setns(&ns, dev.index).await?;
+                                    }
+                                }
+                            }
+                            aok!()
+                        })?;
+                    }
                     NodeOps::RM { ids } => {
                         let ids: Vec<_> = ids.into_iter().map(NodeI::from).collect();
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -812,10 +888,42 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         let rootful = geteuid().is_root();
                         let mut serv = systemd::Systemd::new(&paths, None, rootful)?;
                         let mut rmnode = Default::default();
-                        rt.block_on(async {
+                        let graphs = rt.block_on(async {
                             let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                             nl.fill().await?;
                             let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
+                            let fd = open("/proc/self/ns/net", OFlag::empty(), Mode::empty())?;
+                            for id in &ids {
+                                match unsafe { fork()? } {
+                                    ForkResult::Child => {
+                                        info!("forking for {:?}", id);
+                                        cmd(
+                                            Cli {
+                                                log: None,
+                                                command: Commands::Node {
+                                                    id: Some(NodeAddr::Ix(*id)),
+                                                    op: NodeOps::Restore { fd }.into(),
+                                                },
+                                            },
+                                            cwd.clone(),
+                                        )?;
+                                        return Ok(None);
+                                    }
+                                    ForkResult::Parent { child } => {
+                                        waitpid(child, None)?;
+                                    }
+                                }
+                            }
+                            close(fd)?;
+
+                            let mut graphs = Graphs::load_file(&paths)?;
+                            let require_id = || {
+                                if let Some(id) = id {
+                                    graphs.resolve(&id)
+                                } else {
+                                    bail!("Node operation requires a node address (name/id)")
+                                }
+                            };
                             graphs
                                 .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
                                 .await?;
@@ -823,15 +931,27 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                 .node_rm(&ctx, &ids[..], &mut va, &mut rmnode, &mut nl)
                                 .await?;
                             graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
-                            aok!()
+                            Ok::<_, anyhow::Error>(Some(graphs))
                         })?;
-                        graphs.dump_file(&paths, what_uid(None, true)?)?;
+                        if let Some(graphs) = graphs {
+                            graphs.dump_file(&paths, what_uid(None, true)?)?;
+                        } else {
+                            return Ok(());
+                        }
                     }
                 }
             } else {
                 match op {
                     Some(op) => unimplemented!(),
                     None => {
+                        let mut graphs = Graphs::load_file(&paths)?;
+                        let require_id = || {
+                            if let Some(id) = id {
+                                graphs.resolve(&id)
+                            } else {
+                                bail!("Node operation requires a node address (name/id)")
+                            }
+                        };
                         summarize_graph(&graphs)?;
                     }
                 }
@@ -932,6 +1052,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         veth: true,
                         set_dns: false,
                         userns: None,
+                        associated: None,
+                        assoc_ip: None,
                     },
                 },
                 cwd,
@@ -982,6 +1104,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         veth: false,
                         userns: Some(!root),
                         set_dns: true,
+                        associated: None,
+                        assoc_ip: None,
                     },
                 },
                 cwd,
