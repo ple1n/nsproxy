@@ -105,7 +105,7 @@ impl Display for SocketC {
 }
 
 #[public]
-#[derive(Serialize, Deserialize, Debug, Parser)]
+#[derive(Serialize, Deserialize, Debug, Parser, Clone)]
 struct TUNC {
     #[arg(long, short)]
     #[arg(default_value = "l3")]

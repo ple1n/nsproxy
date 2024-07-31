@@ -24,7 +24,7 @@ use crate::PidPath::Selfproc;
 use anyhow::{anyhow, bail, ensure};
 use atomic::Atomic;
 use capctl::prctl;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use daggy::NodeIndex;
 use etc_resolv::cleanup_resolvconf;
 use fork::Fork;
@@ -152,6 +152,12 @@ enum Commands {
         #[command(flatten)]
         iargs: IArgs,
     },
+    Enter {
+        name: WellKnown,
+        cmd: Option<String>,
+        #[arg(long, short)]
+        uid: Option<u32>,
+    },
     /// Run TUN2Proxy daemon.
     TUN2proxy {
         conf: Option<PathBuf>,
@@ -214,6 +220,11 @@ enum Commands {
     Geph,
 }
 
+#[derive(ValueEnum, Clone)]
+enum WellKnown {
+    Local,
+}
+
 fn parse_node(addr: &str) -> Result<NodeAddr> {
     if let Ok(ix) = addr.parse::<Ix>() {
         Ok(NodeAddr::Ix(ix.into()))
@@ -244,6 +255,15 @@ enum NodeOps {
     Restore {
         #[arg(long, short)]
         fd: i32,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum LocalOps {
+    Enter {
+        cmd: Option<String>,
+        #[arg(long, short)]
+        uid: Option<u32>,
     },
 }
 
@@ -339,6 +359,14 @@ fn main() -> Result<()> {
 
 static mut SOCK_CHILD: Option<UnixStream> = None;
 
+impl WellKnown {
+    pub fn resolve(&self) -> &str {
+        match self {
+            Self::Local => "local",
+        }
+    }
+}
+
 use blockon::*;
 
 fn cmd(
@@ -352,7 +380,20 @@ fn cmd(
         SIGINT_GOAL.store(cli.sigint, SeqCst);
     }
 
+    let node_name = "local";
+
     Ok(match cli.command {
+        Commands::Enter { name, cmd: op, uid } => {
+            let cl = Cli {
+                log: cli.log,
+                command: Commands::Node {
+                    id: Some(NodeAddr::Name(name.resolve().to_owned())),
+                    op: NodeOps::Run { cmd: op, uid }.into(),
+                },
+                sigint: cli.sigint,
+            };
+            cmd(cl, cwd, nonecb)?;
+        }
         Commands::Local {
             interface,
             alt: role,
@@ -377,7 +418,7 @@ fn cmd(
                                 tun2proxy: None,
                                 cmd: None,
                                 uid: None,
-                                name: "local".to_owned().into(),
+                                name: node_name.to_owned().into(),
                                 mount: true,
                                 out: None,
                                 veth: true,
@@ -1007,7 +1048,6 @@ fn cmd(
         Commands::Node { id, op } => {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
-
             // We gain full caps after setns
             if let Some(op) = op {
                 match op {
