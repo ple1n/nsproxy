@@ -38,7 +38,7 @@ use crate::{
 };
 
 use nix::{
-    mount::{mount, umount, MsFlags},
+    mount::{mount, umount, umount2, MntFlags, MsFlags},
     sched::{setns, unshare, CloneFlags},
     sys::{signal::kill, stat::fstat, wait::waitpid},
     unistd::{
@@ -134,7 +134,8 @@ impl NSGroup<ExactNS> {
         for e in std::fs::read_dir(&binds)? {
             let e = e?;
             let p = e.path();
-            let rx = umount(&p);
+            info!("umount {:?}", &p);
+            let rx = umount2(&p, MntFlags::MNT_DETACH | MntFlags::MNT_FORCE);
             match rx {
                 Err(no) => {
                     match no {

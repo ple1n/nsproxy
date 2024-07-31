@@ -358,7 +358,7 @@ fn cmd(
             alt: role,
             iargs,
         } => {
-            let (mut sp, mut sc) = UnixStream::pair()?;
+            let (mut sp, sc) = UnixStream::pair()?;
             // fork before tokio runtime init
             match unsafe { fork() }? {
                 ForkResult::Child => {
@@ -380,7 +380,7 @@ fn cmd(
                                 name: "local".to_owned().into(),
                                 mount: true,
                                 out: None,
-                                veth: false,
+                                veth: true,
                                 userns: None,
                                 set_dns: None,
                                 associated: Some(interface),
@@ -819,8 +819,11 @@ fn cmd(
                     config.apply_settings(false);
                 });
                 conf.layer(args.layer);
+                let default_name = "tun0";
                 if let Some(na) = args.name {
                     conf.name(na);
+                } else {
+                    conf.name(default_name);
                 }
                 let mut dev = tun::create(&conf)?;
                 if let Some(mtu) = args.mtu.or(Some(DEFAULT_MTU)) {
@@ -829,6 +832,26 @@ fn cmd(
                 dev.enabled(true)?;
                 dev.set_nonblock()?;
                 dev.persist()?;
+
+                info!("configuring TUN and network routing");
+                block_on(async {
+                    let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                    let li = wh.conn.get_link(default_name.parse()?).await?;
+                    wh.conn
+                        .ip_add_route(li.header.index, None, Some(true))
+                        .await?;
+                    wh.conn
+                        .ip_add_route(li.header.index, None, Some(false))
+                        .await?;
+                    wh.conn
+                        .add_addr_dev(IpNetwork::new("100.64.0.2".parse()?, 16)?, li.header.index)
+                        .await?;
+                    // It must have a source addr so the TUN driver can send packets back.
+                    // It shows as 0.0.0.0 if there isn't an ddress
+                    let li = wh.conn.get_link("lo".parse()?).await?;
+                    wh.conn.set_link_up(li.header.index).await?;
+                    aok!()
+                })??;
 
                 assert!(dev.has_packet_information());
                 dev
