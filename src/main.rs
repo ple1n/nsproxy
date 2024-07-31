@@ -5,9 +5,10 @@
 #![feature(ip_bits)]
 
 use std::collections::HashSet;
-use std::env::var;
+use std::env::{current_exe, var};
 use std::fmt::format;
 use std::fs::{OpenOptions, Permissions};
+use std::future::Future;
 use std::io::Write;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
@@ -15,19 +16,27 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{exit, Command, Stdio};
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize};
 use std::{fs::File, io::Read, os::fd::AsFd, path::PathBuf};
 
 use crate::PidPath::Selfproc;
 use anyhow::{anyhow, bail, ensure};
+use atomic::Atomic;
 use capctl::prctl;
 use clap::{Parser, Subcommand};
+use daggy::NodeIndex;
 use etc_resolv::cleanup_resolvconf;
+use fork::Fork;
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
 use log::LevelFilter::{self, Debug};
 use log::{debug, error};
 use netlink_ops::netlink::{nl_ctx, GetPidOrFd, NLDriver, NLHandle, PidOrFd, VPairKey, VethConn};
+use netlink_ops::rtnetlink::netlink_packet_utils::byteorder::{
+    BigEndian, ReadBytesExt, WriteBytesExt,
+};
 use netlink_ops::rtnetlink::netlink_proto::{new_connection_from_socket, NetlinkCodec};
 use netlink_ops::rtnetlink::netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_ops::rtnetlink::netlink_sys::{Socket, TokioSocket};
@@ -35,11 +44,12 @@ use netlink_ops::rtnetlink::Handle;
 use netlink_ops::state::{Existence, ExpCollection};
 use nix::fcntl::{open, OFlag};
 use nix::sched::{setns, unshare, CloneFlags};
+use nix::sys::signal::{signal, SigHandler};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, ForkResult, Pid,
-    Uid,
+    close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, setsid,
+    ForkResult, Pid, Uid,
 };
 use nsproxy::data::{
     FDRecver, Graphs, NSAdd, NSAddRes, NSGroup, NSSlot, NSState, NodeAddr, NodeI, ObjectNode,
@@ -66,6 +76,7 @@ use petgraph::visit::IntoNodeReferences;
 use procfs::sys::kernel::random::uuid;
 use std::os::unix::net::{UnixListener, UnixStream};
 use sys::NSEnter;
+use tokio::net::unix::pipe::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument::WithSubscriber;
 use tracing::{info, warn, Level};
@@ -73,6 +84,7 @@ use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
 use tun2socks5::IArgs;
+use zbus::zvariant::NoneValue;
 
 #[derive(Parser)]
 #[command(
@@ -85,6 +97,9 @@ struct Cli {
     log: Option<Level>,
     #[command(subcommand)]
     command: Commands,
+    /// Require repeated signals to exit
+    #[arg(long, short, default_value = "1")]
+    sigint: u8,
 }
 
 #[derive(Subcommand)]
@@ -128,10 +143,25 @@ enum Commands {
     Probe {
         id: Ix,
     },
+    /// Preset for a container having a local interface
+    Local {
+        interface: String,
+        /// Two ends of an ethernet link
+        #[arg(long, short)]
+        alt: bool,
+        #[command(flatten)]
+        iargs: IArgs,
+    },
     /// Run TUN2Proxy daemon.
-    /// This must be run as a systemd service
     TUN2proxy {
-        conf: PathBuf,
+        conf: Option<PathBuf>,
+        /// Run as a systemd service
+        #[arg(long, short)]
+        systemd: bool,
+        #[command(flatten)]
+        args: TUNC,
+        #[command(flatten)]
+        iargs: IArgs,
     },
     Info,
     /// Enter the initialized user&mnt ns
@@ -217,7 +247,86 @@ enum NodeOps {
     },
 }
 
+static SIGINT_RES: Atomic<SigintResponse> = Atomic::new(SigintResponse::Ignore);
+static CURR_NODE: AtomicI32 = AtomicI32::new(-1);
+static SIGINT_COUNTER: AtomicU8 = AtomicU8::new(0);
+static SIGINT_GOAL: AtomicU8 = AtomicU8::new(1);
+static TEARDOWN: Atomic<TeardownState> = Atomic::new(TeardownState::Disabled);
+static FORK_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+use bytemuck::NoUninit;
+
+#[derive(NoUninit, Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum SigintResponse {
+    TeardownCurrNode,
+    Ignore,
+    Exit,
+}
+
+#[derive(NoUninit, Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum TeardownState {
+    Disabled,
+    Await,
+    Doing,
+}
+
+extern "C" fn handle_sigint(signal: libc::c_int) {
+    let sig: nix::sys::signal::Signal = signal.try_into().unwrap();
+    let p = SIGINT_RES.load(SeqCst);
+    dbg!(&p);
+    match p {
+        SigintResponse::Exit => {
+            let (c, g) = (SIGINT_COUNTER.load(SeqCst), SIGINT_GOAL.load(SeqCst));
+            if c >= g {
+                info!("exiting");
+                exit(0);
+            } else {
+                SIGINT_COUNTER.fetch_add(1, SeqCst);
+            }
+        }
+        SigintResponse::Ignore => {}
+        SigintResponse::TeardownCurrNode => {
+            TEARDOWN.store(TeardownState::Doing, SeqCst);
+            warn!("tear down container, {}", sig);
+            let cwd = std::env::current_dir().unwrap();
+            let node = CURR_NODE.load(SeqCst);
+            if node < 0 {
+                error!("CURR_NODE < 0");
+            } else {
+                let ni: Ix = node as u32;
+                let mut nonecb = Some(Box::new(|| aok!()) as Box<dyn FnOnce() -> Result<()>>);
+                nonecb.take();
+                cmd(
+                    Cli {
+                        log: None,
+                        command: Commands::Node {
+                            id: None,
+                            op: NodeOps::RM { ids: vec![ni] }.into(),
+                        },
+                        sigint: 2,
+                    },
+                    cwd,
+                    nonecb,
+                )
+                .unwrap();
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    unsafe {
+        signal(
+            nix::sys::signal::Signal::SIGINT,
+            SigHandler::Handler(handle_sigint),
+        )
+        .unwrap()
+    };
+    let mut nonecb = Some(Box::new(|| aok!()) as Box<dyn FnOnce() -> Result<()>>);
+    nonecb.take();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Noop => exit(0),
@@ -234,12 +343,100 @@ fn main() -> Result<()> {
     info!("SHA1: {}", env!("VERGEN_GIT_SHA"));
     let cwd = std::env::current_dir()?;
 
-    cmd(cli, cwd)?;
+    cmd(cli, cwd, nonecb)?;
     Ok(())
 }
 
-fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
+use blockon::*;
+
+fn cmd(
+    cli: Cli,
+    cwd: PathBuf,
+    cb: Option<Box<dyn FnOnce() -> Result<()>>>,
+) -> Result<(), anyhow::Error> {
+    let mut nonecb = Some(Box::new(|| aok!()) as Box<dyn FnOnce() -> Result<()>>);
+    nonecb.take();
+    let fc = FORK_DEPTH.load(SeqCst);
+    info!("fc {}", fc);
+    let v;
+    if fc == 0 {
+        let td = TEARDOWN.load(SeqCst);
+        if matches!(td, TeardownState::Await) {
+            v = None;
+        } else {
+            v = match cli.command {
+                Commands::Local { .. } => {
+                    TEARDOWN.store(TeardownState::Await, SeqCst);
+                    Some(SigintResponse::TeardownCurrNode)
+                }
+                _ => Some(SigintResponse::Exit),
+            };
+        }
+    } else {
+        v = Some(SigintResponse::Exit)
+    }
+    if let Some(v) = v {
+        SIGINT_RES.store(v, SeqCst);
+    }
+    if cli.sigint > 1 {
+        SIGINT_GOAL.store(cli.sigint, SeqCst);
+    }
+
     Ok(match cli.command {
+        Commands::Local {
+            interface,
+            alt: role,
+            iargs,
+        } => {
+            cmd(
+                Cli {
+                    log: cli.log,
+                    sigint: 1,
+                    command: Commands::New {
+                        pid: None,
+                        tun2proxy: None,
+                        cmd: None,
+                        uid: None,
+                        name: "local".to_owned().into(),
+                        mount: true,
+                        out: None,
+                        veth: false,
+                        userns: None,
+                        set_dns: None,
+                        associated: Some(interface),
+                        assoc_ip: Some(if role {
+                            "192.168.2.1/24".parse()?
+                        } else {
+                            "192.168.2.2/24".parse()?
+                        }),
+                    },
+                },
+                cwd.clone(),
+                Some(Box::new(move || {
+                    warn!("netns created. now start tun2proxy right here");
+                    cmd(
+                        Cli {
+                            log: cli.log,
+                            sigint: 1,
+                            command: Commands::TUN2proxy {
+                                conf: None,
+                                systemd: false,
+                                args: TUNC {
+                                    layer: Layer::L3,
+                                    name: None,
+                                    mtu: None,
+                                },
+                                iargs,
+                            },
+                        },
+                        cwd,
+                        nonecb,
+                    )?;
+
+                    aok!()
+                })),
+            )?;
+        }
         Commands::New {
             pid,
             mut tun2proxy,
@@ -249,8 +446,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             mount,
             out,
             veth,
-            mut userns,
-            mut set_dns,
+            userns,
+            set_dns,
             associated,
             assoc_ip,
         } => {
@@ -258,9 +455,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             let paths: Paths = paths.into();
 
             let mut graphs = Graphs::load_file(&paths)?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+
             let capsys = check_capsys();
 
             let wuid = what_uid(uid, true)?;
@@ -272,13 +467,13 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             }
             // Connect and authenticate to systemd before entering userns
             let rootful = geteuid().is_root();
-            let pre = rt.block_on(async { systemd_connection(rootful).await })?;
+            let pre = block_on(async { systemd_connection(rootful).await })??;
             let priv_ns;
             let mut va = VaCache::default();
             let mut serv = systemd::Systemd::new(&paths, Some(pre), rootful)?;
             let mut rmnode = Default::default();
 
-            rt.block_on(async {
+            block_on(async {
                 let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                 let ctx = NSGroup::proc_path(Selfproc, None)?;
                 nl.fill().await?;
@@ -287,7 +482,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     .await?;
                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
                 aok!()
-            })?;
+            })??;
 
             let gid = getgid();
             let mut depriv_userns = false;
@@ -362,7 +557,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 NSAdd::RecordProcfsPaths
             };
             let mut rmnode = Default::default();
-            rt.block_on(async {
+            block_on(async {
                 let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                 let ctx = NSGroup::proc_path(Selfproc, None)?;
                 nl.fill().await?;
@@ -371,7 +566,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     .await?;
                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
                 aok!()
-            })?;
+            })??;
             // Prune is called twice because some NSes are visible only in userns
             let (mut sp, mut sc) = UnixStream::pair()?;
             let mut buf = [0; 1];
@@ -389,13 +584,14 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             } else {
                 match unsafe { fork() }? {
                     ForkResult::Child => {
+                        FORK_DEPTH.fetch_add(1, SeqCst);
                         drop(sp);
                         prctl::set_pdeathsig(Some(SIGTERM))?;
                         unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUTS)?;
-                        sc.write_all(&[0])?;
-                        // sethostname("proxied")?;
-                        // The line above caused XWayland to malfunction for me.
-                        // Librewolf and vscode launched in nsproxy had intermittent full-system lags.
+                        sc.write_all(&[0])?; // #1
+                                             // sethostname("proxied")?;
+                                             // The line above caused XWayland to malfunction for me.
+                                             // Librewolf and vscode launched in nsproxy had intermittent full-system lags.
                         if depriv_userns {
                             enable_ping_gid(gid)?
                         } else {
@@ -403,24 +599,31 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         }
                         let nl = Socket::new(NETLINK_ROUTE)?;
                         sc.send_fd(nl.as_raw_fd())?;
-                        sc.read_exact(&mut buf)?;
-                        let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
-                            "--cmd must be specified when --pid is not provided"
-                        ))?);
-                        // We don't change uid of this process.
-                        // Otherwise probe might fail due to perms
-                        cmd.current_dir(cwd);
-                        cmd_uid(Some(wuid), true, false)?;
-                        cmd.uid(wuid);
+                        let currnode = sc.read_i32::<BigEndian>()?; // 2
+                        CURR_NODE.store(currnode as i32, SeqCst);
+                        info!("curr node = {}", currnode);
+                        if let Some(cb) = cb {
+                            cb()?;
+                        } else {
+                            let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
+                                "--cmd must be specified when --pid is not provided"
+                            ))?);
+                            // We don't change uid of this process.
+                            // Otherwise probe might fail due to perms
+                            cmd.current_dir(cwd);
+                            cmd_uid(Some(wuid), true, false)?;
+                            cmd.uid(wuid);
 
-                        sc.read_exact(&mut buf)?;
-                        let mut ch = cmd.spawn()?;
-                        ch.wait()?;
+                            sc.read_exact(&mut buf)?; // 3
+                            let mut ch = cmd.spawn()?;
+                            ch.wait()?;
+                        }
+
                         exit(0);
                     }
                     ForkResult::Parent { child } => {
                         drop(sc);
-                        sp.read_exact(&mut buf)?;
+                        sp.read_exact(&mut buf)?; // 1
                         nl_fd = Some(sp.recv_fd()?);
                         let k = graphs.add_ns(
                             PidPath::N(child.as_raw()),
@@ -431,7 +634,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                             name,
                             rootful,
                         )?;
-                        sp.write_all(&[1])?;
+                        CURR_NODE.store(k.1.index() as i32, SeqCst);
+                        sp.write_i32::<BigEndian>(k.1.index() as i32)?; // 2
                         k
                     }
                 }
@@ -444,7 +648,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 .must()?
                 .to_owned();
 
-            rt.block_on(async move {
+            block_on(async move {
                 graphs.clear_ns(src, &serv).await?;
 
                 let out = if let Some(out) = &out {
@@ -461,7 +665,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     out
                 };
 
-                if let Some(tun2proxy) = tun2proxy {
+                if let Some(ref tun2proxy) = tun2proxy {
                     let edge = graphs.data.add_edge(src, out, None);
                     log::info!(
                         "Src/Probe {src:?} {}, OutNode(This process), Src --TUN--> Out {edge:?}",
@@ -491,8 +695,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         info!("moving {} into the new netns", interface);
                         root.ip_setns(&fd, id).await?;
                         if let Some(ip) = assoc_ip {
-                            let renamed = format!("nsp_{}", src.index());
-                            info!("rename {} to {}", interface, renamed);
+                            let renamed = format!("{}_", interface);
                             let link = sub.get_link(interface.parse()?).await?;
                             let id = link.header.index;
                             sub.rawh
@@ -520,15 +723,17 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
 
                 let ctx = serv.ctx().await?;
                 graphs.dump_file(&paths, wuid)?;
-                let nw = graphs.nodewdeps(src)?;
-                nw.write(Some(pspath.clone()), &serv).await?;
-                serv.reload(&ctx).await?;
-                nw.1.restart(&serv, &ctx).await?;
-                nw.0.restart(&serv, &ctx).await?;
+                if tun2proxy.is_some() {
+                    let nw = graphs.nodewdeps(src)?;
+                    nw.write(Some(pspath.clone()), &serv).await?;
+                    serv.reload(&ctx).await?;
+                    nw.1.restart(&serv, &ctx).await?;
+                    nw.0.restart(&serv, &ctx).await?;
+                }
 
                 aok!()
-            })?;
-            sp.write_all(&[2])?;
+            })??;
+            sp.write_all(&[2])?; // 3
 
             // Wait for the child, or it gets orphaned.
             waitpid(Some(Pid::from_raw(-1)), None)?;
@@ -555,10 +760,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     _ => (),
                 }
             }
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+            block_on(async {
                 let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                 // let mut nl = NLStateful::new(&wh);
                 // nl.fill().await?;
@@ -577,42 +779,77 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 let li = wh.conn.get_link("lo".parse()?).await?;
                 wh.conn.set_link_up(li.header.index).await?;
                 aok!()
-            })?;
+            })??;
         }
-        Commands::TUN2proxy { conf } => {
-            // Setns, recv FD, start daemon
-            // Recv a TUN FD, and/or a upstream socket FD
-            // Socket activation
-            let mut fds = libsystemd::activation::receive_descriptors(true)?;
-            let fdx = fds.pop().unwrap();
-            let fdx = unsafe { UnixListener::from_raw_fd(fdx.into_raw_fd()) };
-            log::info!("Waiting for device FD");
-            let (conn, _addr) = fdx.accept()?;
-            let devfd = conn.recv_fd()?;
-            log::info!("Got FD");
-            let mut cf = File::open(&conf)?;
-            let mut args: tun2socks5::IArgs = serde_json::from_reader(&mut cf)?;
-            let devconf = Configuration::default();
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+        Commands::TUN2proxy {
+            conf,
+            systemd,
+            args,
+            iargs,
+        } => {
+            let dev = if systemd {
+                // Setns, recv FD, start daemon
+                // Recv a TUN FD, and/or a upstream socket FD
+                // Socket activation
+                let mut fds = libsystemd::activation::receive_descriptors(true)?;
+                let fdx = fds.pop().unwrap();
+                let fdx = unsafe { UnixListener::from_raw_fd(fdx.into_raw_fd()) };
+                log::info!("Waiting for device FD");
+                let (conn, _addr) = fdx.accept()?;
+                let devfd = conn.recv_fd()?;
+                log::info!("Got FD");
+                let devconf = Default::default();
                 let dev = tun::platform::linux::Device::from_raw_fd(devfd.as_raw_fd(), &devconf)?;
-                if let Some(ref mut p) = args.state {
-                    let mut f = p.file_name().unwrap().to_owned();
-                    let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?;
-                    f.push(format!("_ns_{}", netns.unique));
-                    // WARN This will cause problems when you have multiple TUNs in one NS, and use one config
-                    p.set_file_name(f);
+                dev
+            } else {
+                let mut conf: Configuration = Default::default();
+                #[cfg(target_os = "linux")]
+                conf.platform(|config| {
+                    config.packet_information(true);
+                    config.apply_settings(false);
+                });
+                conf.layer(args.layer);
+                if let Some(na) = args.name {
+                    conf.name(na);
                 }
-                log::info!("{:?}", args);
-                let dev = AsyncDevice::new(dev)?;
+                let mut dev = tun::create(&conf)?;
+                if let Some(mtu) = args.mtu.or(Some(DEFAULT_MTU)) {
+                    dev.set_mtu((mtu).try_into().unwrap())?;
+                }
+                dev.enabled(true)?;
+                dev.set_nonblock()?;
+                dev.persist()?;
 
-                let (sx, rx) = mpsc::channel(1);
-                tun2socks5::main_entry(dev, DEFAULT_MTU.try_into()?, true, args, rx, sx).await?;
+                assert!(dev.has_packet_information());
+                dev
+            };
+            let mut args: tun2socks5::IArgs = if let Some(conf) = conf {
+                let mut cf = File::open(&conf)?;
+                serde_json::from_reader(&mut cf)?
+            } else {
+                iargs
+            };
 
-                aok!()
-            })?;
+            block_on_2(
+                async {
+                    if let Some(ref mut p) = args.state {
+                        let mut f = p.file_name().unwrap().to_owned();
+                        let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?;
+                        f.push(format!("_ns_{}", netns.unique));
+                        // WARN This will cause problems when you have multiple TUNs in one NS, and use one config
+                        p.set_file_name(f);
+                    }
+                    log::info!("{:?}", args);
+                    let dev = AsyncDevice::new(dev)?;
+
+                    let (sx, rx) = mpsc::channel(1);
+                    tun2socks5::main_entry(dev, DEFAULT_MTU.try_into()?, true, args, rx, sx)
+                        .await?;
+
+                    aok!()
+                },
+                true,
+            )??;
         }
         Commands::Watch { mut path, dryrun } => {
             // I think there is no root flatpak /run/ dir. therefore false.
@@ -632,10 +869,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             let list_apps: Vec<FlatpakID> = serde_json::from_reader(&mut fapps)?;
             let brred: Vec<_> = list_apps.iter().map(|k| k).collect();
             crate::flatpak::adapt_flatpak(brred, dryrun)?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+            block_on(async {
                 let (sx, mut rx) = mpsc::channel(5);
                 let rootful = geteuid().is_root();
                 let pre = systemd_connection(rootful).await?;
@@ -694,7 +928,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                 tokio::select! { h = dae => h??, h = looper => h?};
 
                 aok!()
-            })?;
+            })??;
         }
         Commands::SetDNS => {
             etc_resolv::mount_conf()?;
@@ -745,7 +979,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             if let Some(op) = op {
                 match op {
                     NodeOps::Run { cmd, uid } => {
-                        let mut graphs = Graphs::load_file(&paths)?;
+                        let graphs = Graphs::load_file(&paths)?;
                         let require_id = || {
                             if let Some(id) = id {
                                 graphs.resolve(&id)
@@ -776,7 +1010,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         cmd.spawn()?.wait()?;
                     }
                     NodeOps::Deps { lines, index } => {
-                        let mut graphs = Graphs::load_file(&paths)?;
+                        let graphs = Graphs::load_file(&paths)?;
                         let require_id = || {
                             if let Some(id) = id {
                                 graphs.resolve(&id)
@@ -836,10 +1070,8 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                         };
                         let ix = require_id()?;
                         let (node, deps) = graphs.nodewdeps(ix)?;
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        rt.block_on(async {
+
+                        block_on(async {
                             let rootful = geteuid().is_root();
                             let pre = systemd_connection(rootful).await?;
                             let serv = systemd::Systemd::new(&paths, Some(pre), rootful)?;
@@ -849,7 +1081,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                             deps.restart(&serv, &ctx).await?;
                             node.restart(&serv, &ctx).await?;
                             aok!()
-                        })?;
+                        })??;
                     }
                     NodeOps::Restore { fd } => {
                         let task = async move {
@@ -885,7 +1117,16 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                             for (k, dev) in &nl.links {
                                 let name = &k.0;
                                 if let Ok(dev) = dev.exist_ref() {
-                                    if name.starts_with("nsp") {
+                                    if name.ends_with("_") {
+                                        let strip = name[..(name.len() - 1)].to_owned();
+                                        warn!("rename interface back to {}", strip);
+                                        nl.conn
+                                            .rawh
+                                            .link()
+                                            .set(dev.index)
+                                            .name(strip)
+                                            .execute()
+                                            .await?;
                                         warn!("moved {} back", name);
                                         nl.conn.ip_setns(&ns, dev.index).await?;
                                     }
@@ -894,42 +1135,39 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                             aok!()
                         };
 
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        rt.block_on(task)?;
+                        block_on(task)??;
                     }
                     NodeOps::RM { ids } => {
                         let ids: Vec<_> = ids.into_iter().map(NodeI::from).collect();
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
                         let mut va = VaCache::default();
                         let rootful = geteuid().is_root();
                         let mut serv = systemd::Systemd::new(&paths, None, rootful)?;
                         let mut rmnode = Default::default();
                         let graphs = {
-                            let mut nl = rt.block_on(async {
+                            let mut nl = block_on(async {
                                 let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                                 nl.fill().await?;
                                 Ok::<_, anyhow::Error>(nl)
-                            })?;
+                            })??;
                             let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
                             let fd = open("/proc/self/ns/net", OFlag::empty(), Mode::empty())?;
 
                             for id in &ids {
                                 match unsafe { fork()? } {
                                     ForkResult::Child => {
+                                        FORK_DEPTH.fetch_add(1, SeqCst);
                                         info!("forking for {:?}", id);
                                         cmd(
                                             Cli {
                                                 log: None,
+                                                sigint: 1,
                                                 command: Commands::Node {
                                                     id: Some(NodeAddr::Ix(*id)),
                                                     op: NodeOps::Restore { fd }.into(),
                                                 },
                                             },
                                             cwd.clone(),
+                                            nonecb,
                                         )?;
                                         return Ok(());
                                     }
@@ -956,7 +1194,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                     bail!("Node operation requires a node address (name/id)")
                                 }
                             };
-                            rt.block_on(async {
+                            block_on(async {
                                 graphs
                                     .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
                                     .await?;
@@ -965,7 +1203,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                                     .await?;
                                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
                                 Ok::<_, anyhow::Error>(())
-                            })?;
+                            })??;
 
                             Ok::<_, anyhow::Error>(Some(graphs))
                         }?;
@@ -1021,17 +1259,15 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
             let graphs = Graphs::load_file(&paths)?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+
+            block_on(async {
                 let rootful = geteuid().is_root();
                 let pre = systemd_connection(rootful).await?;
                 let serv = systemd::Systemd::new(&paths, Some(pre), rootful)?;
                 // let ctx = serv.ctx().await?;
                 graphs.write_probes(&serv, Some(pspath), rootful).await?;
                 aok!()
-            })?;
+            })??;
         }
         Commands::Install { sproxy, dstdir } => {
             let selfprog = std::env::current_exe()?;
@@ -1077,6 +1313,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             cmd(
                 Cli {
                     log: None,
+                    sigint: 1,
                     command: Commands::New {
                         pid: None,
                         tun2proxy: Some(path.into()),
@@ -1093,6 +1330,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     },
                 },
                 cwd,
+                nonecb,
             )?;
         }
         Commands::Socks { args, root } => {
@@ -1129,6 +1367,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
             cmd(
                 Cli {
                     log: None,
+                    sigint: 1,
                     command: Commands::New {
                         pid: None,
                         tun2proxy: Some(path.into()),
@@ -1145,12 +1384,14 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     },
                 },
                 cwd,
+                nonecb,
             )?;
             cleanup_resolvconf()?;
         }
         Commands::Librewolf => {
             let cli = Cli {
                 log: None,
+                sigint: 1,
                 command: Commands::Node {
                     id: Some(NodeAddr::Ix(0.into())),
                     op: Some(NodeOps::Run {
@@ -1159,11 +1400,12 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     }),
                 },
             };
-            cmd(cli, cwd)?;
+            cmd(cli, cwd, nonecb)?;
         }
         Commands::Fractal => {
             let cli = Cli {
                 log: None,
+                sigint: 1,
                 command: Commands::Node {
                     id: Some(NodeAddr::Ix(0.into())),
                     op: Some(NodeOps::Run {
@@ -1172,7 +1414,7 @@ fn cmd(cli: Cli, cwd: PathBuf) -> Result<(), anyhow::Error> {
                     }),
                 },
             };
-            cmd(cli, cwd)?;
+            cmd(cli, cwd, nonecb)?;
         }
         _ => todo!(),
     })

@@ -269,7 +269,10 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
         let sec = servsec
             .set(
                 "ExecStart",
-                format!("{:?} tun2proxy {:?}", &serv.self_path, &self.confpath),
+                format!(
+                    "{:?} tun2proxy --systemd {:?}",
+                    &serv.self_path, &self.confpath
+                ),
             )
             .set("Environment", "RUST_LOG=trace")
             .set("Environment", "RUST_BACKTRACE=1");

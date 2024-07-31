@@ -83,6 +83,9 @@ fs4 = "0.7.0"
 linux-raw-sys = { version = "0.6.3", features = ["ioctl"] }
 passfd = { version = "*" }
 derive-new = "0.6.0"
+atomic = "0.6.0"
+fork = "0.2.0"
+bytemuck = { version = "1.16.1", features = ["derive"] }
 # daemonize-me = "2.0.1"
 
 [build-dependencies]

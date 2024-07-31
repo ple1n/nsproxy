@@ -18,7 +18,7 @@ use crate::{
 use super::*;
 use anyhow::{anyhow, bail};
 use bimap::BiMap;
-use clap::ValueEnum;
+use clap::{Parser, ValueEnum};
 use derivative::Derivative;
 
 use linux_raw_sys::ioctl::NS_GET_USERNS;
@@ -105,10 +105,14 @@ impl Display for SocketC {
 }
 
 #[public]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Parser)]
 struct TUNC {
+    #[arg(long, short)]
+    #[arg(default_value = "l3")]
     layer: Layer,
+    #[arg(long, short)]
     name: Option<String>,
+    #[arg(long, short)]
     mtu: Option<u32>,
 }
 

@@ -13,6 +13,7 @@
 #![feature(impl_trait_in_fn_trait_return)]
 #![feature(async_closure)]
 
+pub mod blockon;
 pub mod data;
 pub mod etc_resolv;
 pub mod flatpak;
