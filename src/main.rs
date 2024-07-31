@@ -270,48 +270,38 @@ pub enum TeardownState {
     Disabled,
     Await,
     Doing,
+    ChildAwait,
 }
 
 extern "C" fn handle_sigint(signal: libc::c_int) {
     let sig: nix::sys::signal::Signal = signal.try_into().unwrap();
     let p = SIGINT_RES.load(SeqCst);
-    dbg!(&p);
+    let ts = TEARDOWN.load(SeqCst);
+    match ts {
+        TeardownState::ChildAwait => unsafe {
+            SOCK_CHILD
+                .as_mut()
+                .unwrap()
+                .write_i32::<BigEndian>(CURR_NODE.load(SeqCst))
+                .unwrap();
+        },
+        _ => {}
+    };
     match p {
         SigintResponse::Exit => {
+            SIGINT_COUNTER.fetch_add(1, SeqCst);
             let (c, g) = (SIGINT_COUNTER.load(SeqCst), SIGINT_GOAL.load(SeqCst));
             if c >= g {
                 info!("exiting");
                 exit(0);
-            } else {
-                SIGINT_COUNTER.fetch_add(1, SeqCst);
             }
         }
-        SigintResponse::Ignore => {}
+        SigintResponse::Ignore => {
+            info!("ignored");
+        }
         SigintResponse::TeardownCurrNode => {
             TEARDOWN.store(TeardownState::Doing, SeqCst);
-            warn!("tear down container, {}", sig);
-            let cwd = std::env::current_dir().unwrap();
-            let node = CURR_NODE.load(SeqCst);
-            if node < 0 {
-                error!("CURR_NODE < 0");
-            } else {
-                let ni: Ix = node as u32;
-                let mut nonecb = Some(Box::new(|| aok!()) as Box<dyn FnOnce() -> Result<()>>);
-                nonecb.take();
-                cmd(
-                    Cli {
-                        log: None,
-                        command: Commands::Node {
-                            id: None,
-                            op: NodeOps::RM { ids: vec![ni] }.into(),
-                        },
-                        sigint: 2,
-                    },
-                    cwd,
-                    nonecb,
-                )
-                .unwrap();
-            }
+            SIGINT_RES.store(SigintResponse::Exit, SeqCst);
         }
     }
 }
@@ -347,6 +337,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+static mut SOCK_CHILD: Option<UnixStream> = None;
+
 use blockon::*;
 
 fn cmd(
@@ -356,28 +348,6 @@ fn cmd(
 ) -> Result<(), anyhow::Error> {
     let mut nonecb = Some(Box::new(|| aok!()) as Box<dyn FnOnce() -> Result<()>>);
     nonecb.take();
-    let fc = FORK_DEPTH.load(SeqCst);
-    info!("fc {}", fc);
-    let v;
-    if fc == 0 {
-        let td = TEARDOWN.load(SeqCst);
-        if matches!(td, TeardownState::Await) {
-            v = None;
-        } else {
-            v = match cli.command {
-                Commands::Local { .. } => {
-                    TEARDOWN.store(TeardownState::Await, SeqCst);
-                    Some(SigintResponse::TeardownCurrNode)
-                }
-                _ => Some(SigintResponse::Exit),
-            };
-        }
-    } else {
-        v = Some(SigintResponse::Exit)
-    }
-    if let Some(v) = v {
-        SIGINT_RES.store(v, SeqCst);
-    }
     if cli.sigint > 1 {
         SIGINT_GOAL.store(cli.sigint, SeqCst);
     }
@@ -388,54 +358,94 @@ fn cmd(
             alt: role,
             iargs,
         } => {
-            cmd(
-                Cli {
-                    log: cli.log,
-                    sigint: 1,
-                    command: Commands::New {
-                        pid: None,
-                        tun2proxy: None,
-                        cmd: None,
-                        uid: None,
-                        name: "local".to_owned().into(),
-                        mount: true,
-                        out: None,
-                        veth: false,
-                        userns: None,
-                        set_dns: None,
-                        associated: Some(interface),
-                        assoc_ip: Some(if role {
-                            "192.168.2.1/24".parse()?
-                        } else {
-                            "192.168.2.2/24".parse()?
-                        }),
-                    },
-                },
-                cwd.clone(),
-                Some(Box::new(move || {
-                    warn!("netns created. now start tun2proxy right here");
+            let (mut sp, mut sc) = UnixStream::pair()?;
+            // fork before tokio runtime init
+            match unsafe { fork() }? {
+                ForkResult::Child => {
+                    FORK_DEPTH.fetch_add(1, SeqCst);
+                    SIGINT_RES.store(SigintResponse::Exit, SeqCst);
+                    unsafe {
+                        SOCK_CHILD = Some(sc);
+                    }
+                    TEARDOWN.store(TeardownState::ChildAwait, SeqCst);
                     cmd(
                         Cli {
                             log: cli.log,
                             sigint: 1,
-                            command: Commands::TUN2proxy {
-                                conf: None,
-                                systemd: false,
-                                args: TUNC {
-                                    layer: Layer::L3,
-                                    name: None,
-                                    mtu: None,
-                                },
-                                iargs,
+                            command: Commands::New {
+                                pid: None,
+                                tun2proxy: None,
+                                cmd: None,
+                                uid: None,
+                                name: "local".to_owned().into(),
+                                mount: true,
+                                out: None,
+                                veth: false,
+                                userns: None,
+                                set_dns: None,
+                                associated: Some(interface),
+                                assoc_ip: Some(if role {
+                                    "192.168.2.1/24".parse()?
+                                } else {
+                                    "192.168.2.2/24".parse()?
+                                }),
                             },
                         },
-                        cwd,
-                        nonecb,
-                    )?;
+                        cwd.clone(),
+                        Some(Box::new(move || {
+                            warn!("netns created. now start tun2proxy right here");
+                            cmd(
+                                Cli {
+                                    log: cli.log,
+                                    sigint: 1,
+                                    command: Commands::TUN2proxy {
+                                        conf: None,
+                                        systemd: false,
+                                        args: TUNC {
+                                            layer: Layer::L3,
+                                            name: None,
+                                            mtu: None,
+                                        },
+                                        iargs,
+                                    },
+                                },
+                                cwd,
+                                nonecb,
+                            )?;
 
-                    aok!()
-                })),
-            )?;
+                            aok!()
+                        })),
+                    )?;
+                }
+                ForkResult::Parent { child } => {
+                    // wait
+                    TEARDOWN.store(TeardownState::Await, SeqCst);
+                    SIGINT_RES.store(SigintResponse::TeardownCurrNode, SeqCst);
+                    let node = sp.read_i32::<BigEndian>()?;
+                    info!("wait for child to stop");
+                    waitpid(child, None)?;
+                    info!("child stopped");
+                    if node < 0 {
+                        error!("node < 0");
+                        return aok!();
+                    }
+                    cmd(
+                        Cli {
+                            log: cli.log,
+                            command: Commands::Node {
+                                id: None,
+                                op: NodeOps::RM {
+                                    ids: vec![node as u32],
+                                }
+                                .into(),
+                            },
+                            sigint: 1,
+                        },
+                        cwd,
+                        cb,
+                    )?;
+                }
+            }
         }
         Commands::New {
             pid,
@@ -601,8 +611,8 @@ fn cmd(
                         sc.send_fd(nl.as_raw_fd())?;
                         let currnode = sc.read_i32::<BigEndian>()?; // 2
                         CURR_NODE.store(currnode as i32, SeqCst);
-                        info!("curr node = {}", currnode);
                         if let Some(cb) = cb {
+                            sc.read_exact(&mut buf)?; // 3
                             cb()?;
                         } else {
                             let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
@@ -1113,7 +1123,7 @@ fn cmd(
                             let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
 
                             nl.fill().await?;
-                            info!("{:?}", &nl);
+                            debug!("{:?}", &nl);
                             for (k, dev) in &nl.links {
                                 let name = &k.0;
                                 if let Ok(dev) = dev.exist_ref() {

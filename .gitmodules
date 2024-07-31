@@ -41,3 +41,6 @@
 	path = ipstack
 	url = https://github.com/planetoryd/ipstack
 	branch = main
+[submodule "clone3"]
+	path = clone3
+	url = https://github.com/planetoryd/clone3
