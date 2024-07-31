@@ -3367,6 +3367,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "base64",
+ "bimap",
  "bincode",
  "bytes",
  "clap",

@@ -1378,6 +1378,7 @@ fn cmd(
                 dns_addr: "127.0.0.1".parse()?,
                 bypass: Default::default(),
                 state: None,
+                designated: Default::default(),
             };
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);
