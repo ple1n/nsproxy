@@ -1379,6 +1379,8 @@ fn cmd(
                 bypass: Default::default(),
                 state: None,
                 designated: Default::default(),
+                id: None,
+                name: Some("geph".to_owned()),
             };
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);

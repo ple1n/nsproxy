@@ -8,6 +8,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::str::FromStr;
 use std::{borrow::Cow, os::fd::AsRawFd, path::PathBuf};
 
 use anyhow::ensure;
@@ -20,6 +21,8 @@ use nix::errno::Errno;
 use nix::{libc::pid_t, unistd::getpid};
 use owo_colors::OwoColorize;
 use serde::{de::Visitor, Deserialize, Serialize};
+
+pub mod rpc;
 
 /// Represents an NS anchored to a process, or a file
 /// Equality iff .unique equals
@@ -83,6 +86,13 @@ impl<'de> Deserialize<'de> for UniqueFile {
         D: serde::Deserializer<'de>,
     {
         deserializer.deserialize_str(UFVisitor)
+    }
+}
+
+impl FromStr for UniqueFile {
+    type Err = serde::de::value::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        UFVisitor.visit_str(s)
     }
 }
 

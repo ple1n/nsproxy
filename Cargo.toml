@@ -11,6 +11,7 @@ workspace = { members = [
     "id_alloc",
     "tun2socks5",
     "ipstack",
+    "nsproxy-ui/ui",
 ] }
 
 [package]

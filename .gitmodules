@@ -44,3 +44,6 @@
 [submodule "clone3"]
 	path = clone3
 	url = https://github.com/planetoryd/clone3
+[submodule "nsproxy-ui"]
+    path = nsproxy-ui
+    url = https://github.com/planetoryd/nsproxy_egui

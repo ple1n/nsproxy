@@ -270,8 +270,10 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
             .set(
                 "ExecStart",
                 format!(
-                    "{:?} tun2proxy --systemd {:?}",
-                    &serv.self_path, &self.confpath
+                    "{:?} tun2proxy --systemd {:?} --id {}",
+                    &serv.self_path,
+                    &self.confpath,
+                    self.ix.index()
                 ),
             )
             .set("Environment", "RUST_LOG=trace")
