@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::{exit, Command, Stdio};
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize};
+use std::time::Duration;
 use std::{fs::File, io::Read, os::fd::AsFd, path::PathBuf};
 
 use crate::PidPath::Selfproc;
@@ -26,8 +27,10 @@ use atomic::Atomic;
 use capctl::prctl;
 use clap::{Parser, Subcommand, ValueEnum};
 use daggy::NodeIndex;
+use data::forever;
 use etc_resolv::cleanup_resolvconf;
 use fork::Fork;
+use futures::SinkExt;
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
@@ -74,10 +77,14 @@ use nsproxy_common::{ExactNS, NSFrom, PidPath, VaCache};
 use passfd::FdPassingExt;
 use petgraph::visit::IntoNodeReferences;
 use procfs::sys::kernel::random::uuid;
+use rand::thread_rng;
+use rand_distr::{Distribution, Normal};
 use std::os::unix::net::{UnixListener, UnixStream};
 use sys::NSEnter;
+use tarpc::serde_transport::Transport;
 use tokio::net::unix::pipe::Sender;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::sleep;
 use tracing::instrument::WithSubscriber;
 use tracing::{info, warn, Level};
 use tracing_log::LogTracer;
@@ -168,6 +175,9 @@ enum Commands {
         args: TUNC,
         #[command(flatten)]
         iargs: IArgs,
+        /// configure network routing
+        #[arg(long)]
+        setup: bool,
     },
     Info,
     /// Enter the initialized user&mnt ns
@@ -212,6 +222,7 @@ enum Commands {
         #[arg(long, short)]
         root: bool,
     },
+    TestGUI {},
     /// Override DNS configuration for the mount namespace you are in. It performs a bind mount
     SetDNS,
     /// First line support for certain softwares
@@ -383,6 +394,65 @@ fn cmd(
     let node_name = "local";
 
     Ok(match cli.command {
+        Commands::TestGUI {} => {
+            SIGINT_RES.store(SigintResponse::Exit, SeqCst);
+            block_on(async {
+                use tarpc::serde_transport::unix;
+                let p: PathBuf = rpc_path_singleton();
+                use futures::channel::mpsc::unbounded;
+                use futures::StreamExt;
+                use nsproxy_common::rpc::*;
+                use tarpc::tokio_serde::formats::*;
+
+                let reconn = async move || loop {
+                    let rx = unix::connect(&p, Bincode::<FromServer, FromClient>::default).await;
+                    if rx.is_ok() {
+                        break rx.unwrap();
+                    } else {
+                        sleep(Duration::from_millis(800)).await;
+                    }
+                };
+                let mut rpc = reconn().await;
+
+                let (mut sx, mut rx) = unbounded::<FromClient>();
+                tokio::spawn(
+                    #[allow(unreachable_code)]
+                    async move {
+                        loop {
+                            if let Some(d) = rx.next().await {
+                                let r = rpc.send(d).await;
+                                if r.is_err() {
+                                    rpc = reconn().await;
+                                }
+                            }
+                        }
+                        aok!()
+                    },
+                );
+
+                let hd = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    let ls = tokio::task::LocalSet::new();
+                    ls.spawn_local(async move {
+                        let nm = Normal::new(500., 300.).unwrap();
+                        let mut rng = thread_rng();
+                        loop {
+                            let v = nm.sample(&mut rng);
+                            sx.send(FromClient::Data(Data::LoopTime(Duration::from_millis(
+                                v as u64,
+                            ))))
+                            .await
+                            .unwrap();
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                    });
+                    hd.block_on(ls);
+                });
+
+                forever!().await;
+                aok!()
+            })??;
+        }
         Commands::Enter { name, cmd: op, uid } => {
             let cl = Cli {
                 log: cli.log,
@@ -444,10 +514,11 @@ fn cmd(
                                         systemd: false,
                                         args: TUNC {
                                             layer: Layer::L3,
-                                            name: None,
+                                            tun_name: None,
                                             mtu: None,
                                         },
                                         iargs,
+                                        setup: true,
                                     },
                                 },
                                 cwd,
@@ -837,6 +908,7 @@ fn cmd(
             systemd,
             args,
             iargs,
+            setup,
         } => {
             let dev = if systemd {
                 // Setns, recv FD, start daemon
@@ -861,7 +933,7 @@ fn cmd(
                 });
                 conf.layer(args.layer);
                 let default_name = "tun0";
-                if let Some(na) = args.name {
+                if let Some(na) = args.tun_name {
                     conf.name(na);
                 } else {
                     conf.name(default_name);
@@ -874,25 +946,30 @@ fn cmd(
                 dev.set_nonblock()?;
                 dev.persist()?;
 
-                info!("configuring TUN and network routing");
-                block_on(async {
-                    let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
-                    let li = wh.conn.get_link(default_name.parse()?).await?;
-                    wh.conn
-                        .ip_add_route(li.header.index, None, Some(true))
-                        .await?;
-                    wh.conn
-                        .ip_add_route(li.header.index, None, Some(false))
-                        .await?;
-                    wh.conn
-                        .add_addr_dev(IpNetwork::new("100.64.0.2".parse()?, 16)?, li.header.index)
-                        .await?;
-                    // It must have a source addr so the TUN driver can send packets back.
-                    // It shows as 0.0.0.0 if there isn't an ddress
-                    let li = wh.conn.get_link("lo".parse()?).await?;
-                    wh.conn.set_link_up(li.header.index).await?;
-                    aok!()
-                })??;
+                if setup {
+                    info!("configuring TUN and network routing");
+                    block_on(async {
+                        let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                        let li = wh.conn.get_link(default_name.parse()?).await?;
+                        wh.conn
+                            .ip_add_route(li.header.index, None, Some(true))
+                            .await?;
+                        wh.conn
+                            .ip_add_route(li.header.index, None, Some(false))
+                            .await?;
+                        wh.conn
+                            .add_addr_dev(
+                                IpNetwork::new("100.64.0.2".parse()?, 16)?,
+                                li.header.index,
+                            )
+                            .await?;
+                        // It must have a source addr so the TUN driver can send packets back.
+                        // It shows as 0.0.0.0 if there isn't an ddress
+                        let li = wh.conn.get_link("lo".parse()?).await?;
+                        wh.conn.set_link_up(li.header.index).await?;
+                        aok!()
+                    })??;
+                }
 
                 assert!(dev.has_packet_information());
                 dev
@@ -1381,6 +1458,7 @@ fn cmd(
                 designated: Default::default(),
                 id: None,
                 name: Some("geph".to_owned()),
+                test_stats: false,
             };
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);

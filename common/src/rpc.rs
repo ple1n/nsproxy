@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,3 +20,7 @@ pub enum Data {
 }
 
 pub const TMP_RPC_PATH: &str = "nsproxy";
+
+pub fn rpc_path_singleton() -> PathBuf {
+    ["/tmp", TMP_RPC_PATH].iter().collect()
+}

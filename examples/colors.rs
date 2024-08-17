@@ -13,7 +13,7 @@ fn main() {
         "{}",
         TUNC {
             layer: tun::Layer::L2,
-            name: Some("tun0".to_owned())
+            tun_name: Some("tun0".to_owned())
         }
     );
     println!(
@@ -21,7 +21,7 @@ fn main() {
         PassFD {
             creation: TUNC {
                 layer: tun::Layer::L2,
-                name: Some("tun0".to_owned())
+                tun_name: Some("tun0".to_owned())
             },
             listener: "/run/sock".parse().unwrap(),
             receiver: nsproxy::data::FDRecver::Systemd("randomservice".to_owned())

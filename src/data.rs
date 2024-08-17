@@ -111,7 +111,7 @@ struct TUNC {
     #[arg(default_value = "l3")]
     layer: Layer,
     #[arg(long, short)]
-    name: Option<String>,
+    tun_name: Option<String>,
     #[arg(long, short)]
     mtu: Option<u32>,
 }
@@ -121,7 +121,7 @@ impl Display for TUNC {
         f.write_fmt(format_args!(
             "{:?}TUN {:?}",
             self.layer.bright_blue(),
-            self.name.bold()
+            self.tun_name.bold()
         ))
     }
 }

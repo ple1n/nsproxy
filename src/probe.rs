@@ -1,11 +1,12 @@
 //! Pass TUNTAP / TCP socket FDs to proxies, and the creation thereof
 
 use std::{
+    borrow::Borrow,
     io::Write,
     os::{
-        fd::{AsRawFd, RawFd, BorrowedFd, AsFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
         unix::net::UnixStream,
-    }, borrow::Borrow,
+    },
 };
 
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockProtocol, SockType};
@@ -40,7 +41,7 @@ impl PassFD<TUNC> {
         });
 
         conf.layer(self.creation.layer);
-        if let Some(na) = &self.creation.name {
+        if let Some(na) = &self.creation.tun_name {
             conf.name(na);
         }
         let mut dev = tun::create(&conf)?;

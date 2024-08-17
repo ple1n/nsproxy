@@ -290,7 +290,7 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
         Ok(Relation::SendTUN(PassFD {
             creation: data::TUNC {
                 layer: param.0,
-                name: Some(PROBE_TUN.to_owned()),
+                tun_name: Some(PROBE_TUN.to_owned()),
                 mtu: None,
             },
             receiver: data::FDRecver::TUN2Proxy(self.confpath.to_owned()),

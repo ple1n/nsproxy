@@ -87,6 +87,16 @@ derive-new = "0.6.0"
 atomic = "0.6.0"
 fork = "0.2.0"
 bytemuck = { version = "1.16.1", features = ["derive"] }
+tarpc = { version = "0.34.0", features = [
+    "serde",
+    "serde-transport",
+    "serde-transport-bincode",
+    "tokio-serde",
+    "unix",
+] }
+rand = "0.8.5"
+rand_distr = "0.4.3"
+
 # daemonize-me = "2.0.1"
 
 [build-dependencies]

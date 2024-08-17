@@ -1,4 +1,5 @@
 #![feature(associated_type_defaults)]
+#![feature(decl_macro)]
 
 use std::borrow::Borrow;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -343,4 +344,8 @@ fn test_f() {
     let rx = unsafe { pidfd::PidFd::open(65532, 0) };
     let ox = rx.err().unwrap();
     let _ = dbg!(ox.raw_os_error());
+}
+
+pub macro forever() {
+    ::std::future::pending::<()>()
 }
