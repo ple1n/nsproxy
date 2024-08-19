@@ -526,9 +526,15 @@ pub fn what_uid(uid: Option<u32>, allow_root: bool) -> Result<u32> {
 
 /// Unshare the process into a separate userns, rootless
 /// Map one single uid, and gid.
-pub fn unshare_user_standalone(uid: u32, gid: u32) -> Result<NSGroup<ExactNS>> {
+pub fn unshare_user_standalone(uid: u32, gid: u32, mnt: bool) -> Result<NSGroup<ExactNS>> {
     log::warn!("Unsharing into a new UserNS. This method currently has limitations.");
-    unshare(CloneFlags::CLONE_NEWUSER)?;
+    let flg = if mnt {
+        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS
+    } else {
+        CloneFlags::CLONE_NEWUSER
+    };
+
+    unshare(flg)?;
     let mut f = OpenOptions::new()
         .write(true)
         .open(format!("/proc/self/uid_map"))?;

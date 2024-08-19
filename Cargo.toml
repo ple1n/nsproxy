@@ -11,7 +11,6 @@ workspace = { members = [
     "id_alloc",
     "tun2socks5",
     "ipstack",
-    "nsproxy-ui/ui",
 ] }
 
 [package]
@@ -48,6 +47,7 @@ nix = { version = "0.27.1", features = [
     "hostname",
     "user",
     "ioctl",
+    "signal",
 ] }
 rust-ini = "0.20.0"
 serde = { version = "1.0.190", features = ["derive"] }
@@ -56,7 +56,7 @@ thiserror = "1.0.50"
 xdg = "2.5.2"
 nsproxy-derive = { path = "./derive" }
 nsproxy-common = { path = "./common" }
-zbus = { version = "3.14.1", features = ["tokio"] }
+zbus = { version = "3.14", features = ["tokio"] }
 systemd-zbus = "0.1.1"
 libsystemd = "0.7.0"
 pidfd = { path = "./pidfd" }

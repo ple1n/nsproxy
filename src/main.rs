@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::env::{current_exe, var};
 use std::fmt::format;
 use std::fs::{OpenOptions, Permissions};
-use std::future::Future;
+use std::future::{ready, Future, IntoFuture, Ready};
 use std::io::Write;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
@@ -27,7 +27,7 @@ use atomic::Atomic;
 use capctl::prctl;
 use clap::{Parser, Subcommand, ValueEnum};
 use daggy::NodeIndex;
-use data::forever;
+use data::{forever, EdgeI};
 use etc_resolv::cleanup_resolvconf;
 use fork::Fork;
 use futures::SinkExt;
@@ -75,6 +75,7 @@ use nsproxy::{data::Ix, systemd};
 use nsproxy_common::NSSource::{self, Unavail};
 use nsproxy_common::{ExactNS, NSFrom, PidPath, VaCache};
 use passfd::FdPassingExt;
+use paths::PerIx;
 use petgraph::visit::IntoNodeReferences;
 use procfs::sys::kernel::random::uuid;
 use rand::thread_rng;
@@ -131,9 +132,9 @@ enum Commands {
         #[arg(long, short)]
         veth: bool,
         #[arg(long)]
-        userns: Option<bool>,
+        userns: bool,
         #[arg(long, short)]
-        set_dns: Option<bool>,
+        set_dns: bool,
         #[arg(long, short)]
         associated: Option<String>,
         #[arg(long, default_value = "192.168.2.1/24")]
@@ -492,8 +493,8 @@ fn cmd(
                                 mount: true,
                                 out: None,
                                 veth: true,
-                                userns: None,
-                                set_dns: None,
+                                userns: false,
+                                set_dns: false,
                                 associated: Some(interface),
                                 assoc_ip: Some(if role {
                                     "192.168.2.1/24".parse()?
@@ -609,36 +610,6 @@ fn cmd(
             let gid = getgid();
             let mut depriv_userns = false;
 
-            let userns = match capsys {
-                Ok(_) => {
-                    if userns.is_none() {
-                        false
-                    } else {
-                        userns.unwrap()
-                    }
-                }
-                _ => {
-                    if userns.is_none() {
-                        log::warn!("CAP_SYS_ADMIN not available, entering user NS (I assume you want to use UserNS)");
-                        true
-                    } else {
-                        userns.unwrap()
-                    }
-                }
-            };
-
-            let set_dns = if userns {
-                let set_dns = set_dns.unwrap_or(true);
-                set_dns
-            } else {
-                if let Some(set_dns) = set_dns {
-                    set_dns
-                } else {
-                    warn!("set_dns not specified. by default bind mount is not performed. if you experience DNS issues check /etc/resolv.conf");
-                    false
-                }
-            };
-
             if userns {
                 if mount {
                     use owo_colors::OwoColorize;
@@ -656,7 +627,7 @@ fn cmd(
                     log::info!("Entered user, mnt NS");
                 } else {
                     // Not mounting defaults to use a new userns
-                    priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw())?);
+                    priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw(), true)?);
                     depriv_userns = true;
                 }
 
@@ -910,6 +881,10 @@ fn cmd(
             iargs,
             setup,
         } => {
+            SIGINT_RES.store(SigintResponse::Exit, SeqCst);
+            let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
+            let paths: Paths = paths.into();
+
             let dev = if systemd {
                 // Setns, recv FD, start daemon
                 // Recv a TUN FD, and/or a upstream socket FD
@@ -983,6 +958,12 @@ fn cmd(
 
             block_on_2(
                 async {
+                    use futures::StreamExt;
+                    use nsproxy_common::rpc::*;
+                    use tarpc::serde_transport::unix;
+                    use tarpc::tokio_serde::formats::*;
+                    use tokio::sync::mpsc::channel;
+
                     if let Some(ref mut p) = args.state {
                         let mut f = p.file_name().unwrap().to_owned();
                         let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?;
@@ -993,9 +974,56 @@ fn cmd(
                     log::info!("{:?}", args);
                     let dev = AsyncDevice::new(dev)?;
 
+                    let sock = paths.sock("rpc")?;
+                    let sx_report = if let Some(ei) = args.id {
+                        let sp = sock.for_ix(EdgeI::from(ei as u32));
+                        if sp.exists() {
+                            std::fs::remove_file(&sp)?;
+                        }
+                        info!("rpc on {:?} mode 777", &sp);
+                        let mut rpc =
+                            unix::listen(&sp, Bincode::<FromServer, FromClient>::default).await?;
+                        std::fs::set_permissions(&sp, Permissions::from_mode(0o777)).unwrap();
+                        let (sx, mut rx) = channel::<FromClient>(5);
+
+                        tokio::spawn(
+                            #[allow(unreachable_code)]
+                            async move {
+                                loop {
+                                    if let Some(d) = rpc.next().await {
+                                        let mut c = d?;
+                                        loop {
+                                            if let Some(x) = rx.recv().await {
+                                                let rx = c.send(x).await;
+                                                if rx.is_err() {
+                                                    break;
+                                                }
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                aok!()
+                            },
+                        );
+                        Some(sx)
+                    } else {
+                        None
+                    };
                     let (sx, rx) = mpsc::channel(1);
-                    tun2socks5::main_entry(dev, DEFAULT_MTU.try_into()?, true, args, rx, sx)
-                        .await?;
+                    tun2socks5::main_entry(
+                        dev,
+                        DEFAULT_MTU.try_into()?,
+                        true,
+                        args,
+                        rx,
+                        sx,
+                        sx_report,
+                    )
+                    .await?;
 
                     aok!()
                 },
@@ -1477,8 +1505,8 @@ fn cmd(
                         mount: true,
                         out: None,
                         veth: true,
-                        set_dns: None,
-                        userns: None,
+                        set_dns: false,
+                        userns: false,
                         associated: None,
                         assoc_ip: None,
                     },
@@ -1531,8 +1559,8 @@ fn cmd(
                         mount: true,
                         out: None,
                         veth: false,
-                        userns: Some(!root),
-                        set_dns: None,
+                        userns: !root,
+                        set_dns: false,
                         associated: None,
                         assoc_ip: None,
                     },

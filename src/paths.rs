@@ -14,6 +14,7 @@ use crate::{
 use super::*;
 use anyhow::anyhow;
 use daggy::NodeIndex;
+use data::EdgeI;
 use fs4::FileExt;
 use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,6 @@ pub type Paths = Arc<PathState>;
 
 // We want a feature to list all possible paths used by this program
 // Otherwise it would suck, really hard.
-
 
 fn create_dirs_chown(path: &Path, uid: u32) -> Result<()> {
     create_dir_all(path)?;
@@ -112,7 +112,7 @@ impl PathState {
         k.create_dirs(wuid)?;
         Ok(k)
     }
- 
+
     fn binds(&self) -> Result<&PathBuf> {
         self.binds
             .as_ref()
@@ -162,9 +162,46 @@ impl PathState {
     fn dump_paths(&self) -> Result<()> {
         self.dump_file(&self.pathspath())
     }
+    fn sock(&self, name: &str) -> Result<Sock<'_>> {
+        let prefix: PathBuf = format!("{}_sock", name).into();
+        let prefix = self.state.join(prefix);
+        let prefix = checked_path(prefix)?;
+        Ok(Sock(&self, prefix))
+    }
 }
 
+pub struct Sock<'a>(&'a PathState, PathBuf);
+
 pub struct Binds(pub PathBuf);
+
+pub trait PerIx<Ix: IxPrefix = EdgeI> {
+    fn for_ix(&self, ix: Ix) -> PathBuf;
+}
+
+impl IxPrefix for EdgeI {
+    fn ix_str(&self) -> String {
+        format!("edge{}", self.index())
+    }
+}
+
+impl IxPrefix for &str {
+    fn ix_str(&self) -> String {
+        self.to_string()
+    }
+}
+
+pub trait IxPrefix {
+    fn ix_str(&self) -> String;
+}
+
+impl<'a, X: IxPrefix> PerIx<X> for Sock<'a> {
+    fn for_ix(&self, ix: X) -> PathBuf {
+        let mut pb: PathBuf = self.0.state.clone();
+        pb.push(&self.1);
+        pb.push(ix.ix_str());
+        pb
+    }
+}
 
 // pass it through
 pub fn checked_path(p: PathBuf) -> Result<PathBuf> {
