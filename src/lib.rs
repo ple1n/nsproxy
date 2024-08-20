@@ -47,4 +47,5 @@ pub macro aok() {
 
 pub const PROBE_TUN: &str = "tunp";
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
+pub const PATH_VAR: &str = "NSPROXY_PATHS";
 pub const DEFAULT_MTU: u32 = 9000;

@@ -29,14 +29,14 @@ fn main() -> Result<()> {
             unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)?;
             sa.write_all(&[0])?;
             sa.read_exact(&mut b)?;
-            
+
             let caps = capctl::CapState::get_current().unwrap();
             dbg!(caps);
             let u = Uid::from_raw(0);
             setresuid(u, u, u)?;
             let caps = capctl::CapState::get_current().unwrap();
             dbg!(caps);
-            
+
             bash()?;
         }
         ForkResult::Parent { child } => {

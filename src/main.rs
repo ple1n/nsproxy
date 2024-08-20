@@ -131,6 +131,7 @@ enum Commands {
         out: Option<NodeAddr>,
         #[arg(long, short)]
         veth: bool,
+        /// Use a persistent, or a temporary userns
         #[arg(long)]
         userns: bool,
         #[arg(long, short)]
@@ -168,14 +169,8 @@ enum Commands {
     },
     /// Run TUN2Proxy daemon.
     TUN2proxy {
-        conf: Option<PathBuf>,
-        /// Run as a systemd service
-        #[arg(long, short)]
-        systemd: bool,
-        #[command(flatten)]
-        args: TUNC,
-        #[command(flatten)]
-        iargs: IArgs,
+        #[command(subcommand)]
+        cmd: TUN2ProxyCmd,
         /// configure network routing
         #[arg(long)]
         setup: bool,
@@ -230,6 +225,21 @@ enum Commands {
     Librewolf,
     Fractal,
     Geph,
+}
+
+#[derive(Subcommand)]
+enum TUN2ProxyCmd {
+    Systemd {
+        path: PathBuf,
+        #[arg(long)]
+        id: Option<usize>,
+    },
+    FromArgs {
+        #[command(flatten)]
+        args: TUNC,
+        #[command(flatten)]
+        iargs: IArgs,
+    },
 }
 
 #[derive(ValueEnum, Clone)]
@@ -511,14 +521,14 @@ fn cmd(
                                     log: cli.log,
                                     sigint: 1,
                                     command: Commands::TUN2proxy {
-                                        conf: None,
-                                        systemd: false,
-                                        args: TUNC {
-                                            layer: Layer::L3,
-                                            tun_name: None,
-                                            mtu: None,
+                                        cmd: TUN2ProxyCmd::FromArgs {
+                                            args: TUNC {
+                                                layer: Layer::L3,
+                                                tun_name: None,
+                                                mtu: None,
+                                            },
+                                            iargs,
                                         },
-                                        iargs,
                                         setup: true,
                                     },
                                 },
@@ -574,16 +584,13 @@ fn cmd(
             associated,
             assoc_ip,
         } => {
-            let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
+            let current_uid = what_uid(None, true)?;
+
+            let (pspath, paths): (PathBuf, PathState) = PathState::load(current_uid)?;
             let paths: Paths = paths.into();
 
             let mut graphs = Graphs::load_file(&paths)?;
-
-            let capsys = check_capsys();
-
-            let wuid = what_uid(uid, true)?;
-            let (pspath, paths): (PathBuf, PathState) = PathState::load(wuid)?;
-            let paths: Paths = paths.into();
+            let target_uid = what_uid(uid, true)?;
 
             if let Some(ref mut tun2proxy) = tun2proxy {
                 *tun2proxy = tun2proxy.canonicalize()?;
@@ -607,14 +614,17 @@ fn cmd(
                 aok!()
             })??;
 
-            let gid = getgid();
+            let gid_out = getgid();
             let mut depriv_userns = false;
+            let gid_in = {
+                let user = uzers::get_user_by_uid(target_uid).unwrap();
+                user.primary_group_id()
+            };
 
             if userns {
                 if mount {
                     use owo_colors::OwoColorize;
                     // It only makes sense when we have a persistent userns to mount
-                    priv_ns = Some(paths.userns().procns()?);
                     if !paths.userns().exist()? {
                         println!(
                             "User NS does not exist. Create it as root with command {}",
@@ -622,12 +632,20 @@ fn cmd(
                         );
                         exit(-1);
                     }
+                    priv_ns = Some(paths.userns().procns()?);
+
                     let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
                     priv_ns.as_ref().unwrap().enter(&ctx)?;
                     log::info!("Entered user, mnt NS");
                 } else {
                     // Not mounting defaults to use a new userns
-                    priv_ns = Some(unshare_user_standalone(wuid, gid.as_raw(), true)?);
+                    priv_ns = Some(unshare_user_standalone(
+                        target_uid,
+                        Some(gid_in),
+                        true,
+                        current_uid,
+                        Some(gid_out.as_raw()),
+                    )?);
                     depriv_userns = true;
                 }
 
@@ -686,7 +704,7 @@ fn cmd(
                                              // The line above caused XWayland to malfunction for me.
                                              // Librewolf and vscode launched in nsproxy had intermittent full-system lags.
                         if depriv_userns {
-                            enable_ping_gid(gid)?
+                            enable_ping_gid(gid_in.into())?
                         } else {
                             enable_ping_all()?;
                         }
@@ -704,8 +722,9 @@ fn cmd(
                             // We don't change uid of this process.
                             // Otherwise probe might fail due to perms
                             cmd.current_dir(cwd);
-                            cmd_uid(Some(wuid), true, false)?;
-                            cmd.uid(wuid);
+                            cmd_uid(Some(target_uid), true, false)?;
+                            cmd.uid(target_uid);
+                            cmd.env(PATH_VAR, &pspath);
 
                             sc.read_exact(&mut buf)?; // 3
                             let mut ch = cmd.spawn()?;
@@ -815,7 +834,7 @@ fn cmd(
                 }
 
                 let ctx = serv.ctx().await?;
-                graphs.dump_file(&paths, wuid)?;
+                graphs.dump_file(&paths, target_uid)?;
                 if tun2proxy.is_some() {
                     let nw = graphs.nodewdeps(src)?;
                     nw.write(Some(pspath.clone()), &serv).await?;
@@ -874,18 +893,17 @@ fn cmd(
                 aok!()
             })??;
         }
-        Commands::TUN2proxy {
-            conf,
-            systemd,
-            args,
-            iargs,
-            setup,
-        } => {
+        Commands::TUN2proxy { cmd, setup } => {
             SIGINT_RES.store(SigintResponse::Exit, SeqCst);
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
             let paths: Paths = paths.into();
+            let getfd_systemd = match &cmd {
+                TUN2ProxyCmd::FromArgs { args, iargs } => false,
+                TUN2ProxyCmd::Systemd { path, id } => true,
+            };
+            let default_tun_name = "tun0";
 
-            let dev = if systemd {
+            let dev = if getfd_systemd {
                 // Setns, recv FD, start daemon
                 // Recv a TUN FD, and/or a upstream socket FD
                 // Socket activation
@@ -900,6 +918,13 @@ fn cmd(
                 let dev = tun::platform::linux::Device::from_raw_fd(devfd.as_raw_fd(), &devconf)?;
                 dev
             } else {
+                let args = match &cmd {
+                    TUN2ProxyCmd::Systemd { path, id } => {
+                        bail!("creaeting tun device in systemd mode not supported");
+                    }
+                    TUN2ProxyCmd::FromArgs { args, iargs } => args,
+                }
+                .clone();
                 let mut conf: Configuration = Default::default();
                 #[cfg(target_os = "linux")]
                 conf.platform(|config| {
@@ -907,11 +932,10 @@ fn cmd(
                     config.apply_settings(false);
                 });
                 conf.layer(args.layer);
-                let default_name = "tun0";
                 if let Some(na) = args.tun_name {
                     conf.name(na);
                 } else {
-                    conf.name(default_name);
+                    conf.name(default_tun_name);
                 }
                 let mut dev = tun::create(&conf)?;
                 if let Some(mtu) = args.mtu.or(Some(DEFAULT_MTU)) {
@@ -920,40 +944,41 @@ fn cmd(
                 dev.enabled(true)?;
                 dev.set_nonblock()?;
                 dev.persist()?;
-
-                if setup {
-                    info!("configuring TUN and network routing");
-                    block_on(async {
-                        let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
-                        let li = wh.conn.get_link(default_name.parse()?).await?;
-                        wh.conn
-                            .ip_add_route(li.header.index, None, Some(true))
-                            .await?;
-                        wh.conn
-                            .ip_add_route(li.header.index, None, Some(false))
-                            .await?;
-                        wh.conn
-                            .add_addr_dev(
-                                IpNetwork::new("100.64.0.2".parse()?, 16)?,
-                                li.header.index,
-                            )
-                            .await?;
-                        // It must have a source addr so the TUN driver can send packets back.
-                        // It shows as 0.0.0.0 if there isn't an ddress
-                        let li = wh.conn.get_link("lo".parse()?).await?;
-                        wh.conn.set_link_up(li.header.index).await?;
-                        aok!()
-                    })??;
-                }
-
                 assert!(dev.has_packet_information());
                 dev
             };
-            let mut args: tun2socks5::IArgs = if let Some(conf) = conf {
-                let mut cf = File::open(&conf)?;
-                serde_json::from_reader(&mut cf)?
-            } else {
-                iargs
+            if setup {
+                info!("configuring TUN and network routing");
+                block_on(async {
+                    let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                    let li = wh.conn.get_link(default_tun_name.parse()?).await?;
+                    wh.conn
+                        .ip_add_route(li.header.index, None, Some(true))
+                        .await?;
+                    wh.conn
+                        .ip_add_route(li.header.index, None, Some(false))
+                        .await?;
+                    wh.conn
+                        .add_addr_dev(IpNetwork::new("100.64.0.2".parse()?, 16)?, li.header.index)
+                        .await?;
+                    // It must have a source addr so the TUN driver can send packets back.
+                    // It shows as 0.0.0.0 if there isn't an ddress
+                    let li = wh.conn.get_link("lo".parse()?).await?;
+                    wh.conn.set_link_up(li.header.index).await?;
+                    aok!()
+                })??;
+            }
+
+            let mut iargs = match cmd {
+                TUN2ProxyCmd::FromArgs { iargs, .. } => iargs,
+                TUN2ProxyCmd::Systemd { path, id } => {
+                    let mut cf = File::open(&path)?;
+                    let mut k: IArgs = serde_json::from_reader(&mut cf)?;
+                    if id.is_some() {
+                        k.id = id;
+                    }
+                    k
+                }
             };
 
             block_on_2(
@@ -964,23 +989,26 @@ fn cmd(
                     use tarpc::tokio_serde::formats::*;
                     use tokio::sync::mpsc::channel;
 
-                    if let Some(ref mut p) = args.state {
+                    if let Some(ref mut p) = iargs.state {
                         let mut f = p.file_name().unwrap().to_owned();
                         let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?;
                         f.push(format!("_ns_{}", netns.unique));
                         // WARN This will cause problems when you have multiple TUNs in one NS, and use one config
                         p.set_file_name(f);
                     }
-                    log::info!("{:?}", args);
+                    log::info!("{:?}", iargs);
                     let dev = AsyncDevice::new(dev)?;
 
                     let sock = paths.sock("rpc")?;
-                    let sx_report = if let Some(ei) = args.id {
+
+                    let sx_report = if let Some(ei) = iargs.id {
                         let sp = sock.for_ix(EdgeI::from(ei as u32));
                         if sp.exists() {
                             std::fs::remove_file(&sp)?;
                         }
                         info!("rpc on {:?} mode 777", &sp);
+                        drop(paths);
+
                         let mut rpc =
                             unix::listen(&sp, Bincode::<FromServer, FromClient>::default).await?;
                         std::fs::set_permissions(&sp, Permissions::from_mode(0o777)).unwrap();
@@ -1011,6 +1039,7 @@ fn cmd(
                         );
                         Some(sx)
                     } else {
+                        warn!("supply --id to enable RPC");
                         None
                     };
                     let (sx, rx) = mpsc::channel(1);
@@ -1018,7 +1047,7 @@ fn cmd(
                         dev,
                         DEFAULT_MTU.try_into()?,
                         true,
-                        args,
+                        iargs,
                         rx,
                         sx,
                         sx_report,
@@ -1030,6 +1059,7 @@ fn cmd(
                 true,
             )??;
         }
+
         Commands::Watch { mut path, dryrun } => {
             // I think there is no root flatpak /run/ dir. therefore false.
             let uid = what_uid(None, false)?;
@@ -1486,7 +1516,6 @@ fn cmd(
                 designated: Default::default(),
                 id: None,
                 name: Some("geph".to_owned()),
-                test_stats: false,
             };
             let uid = what_uid(None, false)?;
             info!("uid determined to be {}", uid);

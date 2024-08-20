@@ -80,7 +80,8 @@ impl PathState {
         }
     }
     fn load(whatuid: u32) -> Result<(PathBuf, Self)> {
-        let pa = if let Ok(p) = std::env::var("PathState") {
+        info!("Loading pathstate for uid {}", whatuid);
+        let pa = if let Ok(p) = std::env::var(PATH_VAR) {
             p.parse()?
         } else {
             let dpaths = PathState::default(whatuid)?;
@@ -109,6 +110,7 @@ impl PathState {
                 priv_binds: "/run/nsproxy/".into(),
             }
         };
+        info!("{:?}", &k);
         k.create_dirs(wuid)?;
         Ok(k)
     }
@@ -166,6 +168,7 @@ impl PathState {
         let prefix: PathBuf = format!("{}_sock", name).into();
         let prefix = self.state.join(prefix);
         let prefix = checked_path(prefix)?;
+        std::fs::set_permissions(&prefix, Permissions::from_mode(0o777))?;
         Ok(Sock(&self, prefix))
     }
 }
