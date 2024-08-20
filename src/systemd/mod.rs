@@ -226,7 +226,10 @@ impl<'n, 'd> ItemCreate for NodeWDeps<'n, 'd> {
             .set("Environment", "RUST_BACKTRACE=1");
         if let Some(p) = param {
             let p = p.canonicalize()?;
-            sec.set("Environment", format!("RUST_BACKTRACE=1 PathState={:?}", p));
+            sec.set(
+                "Environment",
+                format!("RUST_BACKTRACE=1 {}={:?}", PATH_VAR, p),
+            );
         }
         let servpath = serv.systemd_unit.join(&servname);
         service.write_to_file(&servpath)?;
@@ -270,7 +273,7 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
             .set(
                 "ExecStart",
                 format!(
-                    "{:?} tun2proxy --systemd {:?} --id {}",
+                    "{:?} tun2proxy systemd {:?} --id {}",
                     &serv.self_path,
                     &self.confpath,
                     self.ix.index()
@@ -280,7 +283,10 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
             .set("Environment", "RUST_BACKTRACE=1");
         if let Some(p) = param.1 {
             let p = p.canonicalize()?;
-            sec.set("Environment", format!("RUST_BACKTRACE=1 PathState={:?}", p));
+            sec.set(
+                "Environment",
+                format!("RUST_BACKTRACE=1 {}={:?}", PATH_VAR, p),
+            );
         }
 
         let servname = self.service()?;

@@ -10,7 +10,9 @@ use nix::{
     mount::{mount, umount, MsFlags},
     sched::{setns, unshare, CloneFlags},
     sys::{signal::kill, stat::fstat},
-    unistd::{fork, getuid, seteuid, setresgid, setresuid, setuid, ForkResult, Gid, Uid, getresuid},
+    unistd::{
+        fork, getresuid, getuid, seteuid, setresgid, setresuid, setuid, ForkResult, Gid, Uid,
+    },
 };
 use nsproxy::{paths::PathState, sys::UserNS};
 
@@ -29,7 +31,7 @@ fn main() -> Result<()> {
         }
         "s" => {
             usern.procns()?.enter()?;
-        },
+        }
         "n" => {
             // Requires no root. This works.
             let u = Uid::from_raw(1000);
@@ -38,7 +40,7 @@ fn main() -> Result<()> {
             unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)?;
             let mut f = OpenOptions::new().write(true).open("/proc/self/uid_map")?;
             f.write_all(b"0 1000 1")?; // map 0 (in user ns) to uid 1000 (outside)
-            // It's only possible to map a single line with this approach
+                                       // It's only possible to map a single line with this approach
         }
         _ => (),
     }

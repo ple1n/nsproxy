@@ -45,7 +45,6 @@ fn f2() -> Result<()> {
     Ok(())
 }
 
-
 fn bash() -> Result<()> {
     let mut cmd = Command::new("/usr/bin/bash");
     let mut sp = cmd.spawn()?;

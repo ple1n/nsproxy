@@ -27,7 +27,7 @@ use netlink_ops::{
     netlink::{nl_ctx, NLDriver, NLHandle, VPairKey, VethConn},
     state::{Existence, ExpCollection},
 };
-use tracing::info;
+use tracing::{info, warn};
 use uzers::os::unix::UserExt;
 use zbus::Connection;
 
@@ -376,9 +376,16 @@ impl<'p> UserNS<'p> {
     /// Generate a [ProcNS]
     fn procns(&self) -> Result<NSGroup<ExactNS>> {
         let (user, mnt) = self.paths()?;
+        info!("expect userns={:?}, mntns={:?}", &user, &mnt);
         Ok(NSGroup {
-            user: NSSlot::Provided(ExactNS::from_source(user)?, Default::default()),
-            mnt: NSSlot::Provided(ExactNS::from_source(mnt)?, Default::default()),
+            user: NSSlot::Provided(
+                ExactNS::from_source(user).expect("cannot load user ns"),
+                Default::default(),
+            ),
+            mnt: NSSlot::Provided(
+                ExactNS::from_source(mnt).expect("cannot load mnt ns"),
+                Default::default(),
+            ),
             ..Default::default()
         })
     }
@@ -491,6 +498,7 @@ pub fn cmd_uid(uid: Option<u32>, allow_root: bool, change_uid: bool) -> Result<(
     info!("set initgroups");
     // This line failed for a flatpak ns
     let _ = initgroups(&CString::new(user.name().as_bytes())?, g);
+    info!("change gid and uid");
     setresgid(g, g, g)?;
     if change_uid {
         setresuid(u, u, u)?;
@@ -526,19 +534,41 @@ pub fn what_uid(uid: Option<u32>, allow_root: bool) -> Result<u32> {
 
 /// Unshare the process into a separate userns, rootless
 /// Map one single uid, and gid.
-pub fn unshare_user_standalone(uid: u32, gid: u32, mnt: bool) -> Result<NSGroup<ExactNS>> {
-    log::warn!("Unsharing into a new UserNS. This method currently has limitations.");
+pub fn unshare_user_standalone(
+    uid: u32,
+    gid: Option<u32>,
+    mnt: bool,
+    uid_out: u32,
+    gid_out: Option<u32>,
+) -> Result<NSGroup<ExactNS>> {
+    log::warn!("Unsharing into a new, temporary UserNS. This method currently has limitations.");
     let flg = if mnt {
         CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS
     } else {
         CloneFlags::CLONE_NEWUSER
     };
 
+    let gid_out = if let Some(g) = gid_out {
+        g
+    } else {
+        let user = uzers::get_user_by_uid(uid).unwrap();
+        user.primary_group_id()
+    };
+
+    let gid = if let Some(g) = gid {
+        g
+    } else {
+        let user = uzers::get_user_by_uid(uid).unwrap();
+        user.primary_group_id()
+    };
+
     unshare(flg)?;
     let mut f = OpenOptions::new()
         .write(true)
         .open(format!("/proc/self/uid_map"))?;
-    f.write_all(format!("{uid} {uid} 1").as_bytes())?;
+    let uidmap = format!("{uid} {uid_out} 1",);
+    info!("uidmap: {}", &uidmap);
+    f.write_all(uidmap.as_bytes())?;
     let mut f = OpenOptions::new()
         .write(true)
         .open(format!("/proc/self/setgroups"))?;
@@ -546,7 +576,9 @@ pub fn unshare_user_standalone(uid: u32, gid: u32, mnt: bool) -> Result<NSGroup<
     let mut f = OpenOptions::new()
         .write(true)
         .open(format!("/proc/self/gid_map"))?;
-    f.write_all(format!("{gid} {gid} 1",).as_bytes())?;
+    let gidmap = format!("{gid} {gid_out} 1");
+    info!("gidmap: {}", &gidmap);
+    f.write_all(gidmap.as_bytes())?;
     Ok(NSGroup {
         // we have unshared user ns
         user: NSSlot::from_source(PidPath::Selfproc)?,
