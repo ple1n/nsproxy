@@ -12,7 +12,7 @@ pub use ipnetwork::{IpNetwork, IpNetworkError, Ipv4Network, Ipv6Network};
 use rangemap::{RangeInclusiveSet, StepFns, StepLite};
 use thiserror::Error;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 /// ID allocator implemented with range set
 pub struct IDAlloc<T: Ord + Clone + StepLite>(pub RangeInclusiveSet<T>);
 

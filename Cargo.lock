@@ -24,6 +24,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
 dependencies = [
  "cfg-if",
+ "getrandom",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -1646,6 +1647,7 @@ name = "ipstack"
 version = "0.0.2"
 dependencies = [
  "etherparse",
+ "futures",
  "thiserror",
  "tokio",
  "tracing",
@@ -2645,6 +2647,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick_cache"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc1dd700847420feb1735b16f8d7ee8a8704f4caec7b1aa19f074ea4f7f25ae"
+dependencies = [
+ "ahash",
+ "equivalent",
+ "hashbrown 0.14.5",
+ "parking_lot",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3542,6 +3556,7 @@ dependencies = [
  "log",
  "lru",
  "nsproxy-common",
+ "quick_cache",
  "rand",
  "rand_distr",
  "regex",

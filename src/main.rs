@@ -30,7 +30,7 @@ use daggy::NodeIndex;
 use data::{forever, EdgeI};
 use etc_resolv::cleanup_resolvconf;
 use fork::Fork;
-use futures::SinkExt;
+use futures::{FutureExt, SinkExt};
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{uid_t, SIGTERM};
@@ -478,10 +478,11 @@ fn cmd(
         Commands::Local {
             interface,
             alt: role,
-            iargs,
+            mut iargs,
         } => {
             let (mut sp, sc) = UnixStream::pair()?;
             // fork before tokio runtime init
+            iargs.name = Some("nsproxy".to_owned());
             match unsafe { fork() }? {
                 ForkResult::Child => {
                     FORK_DEPTH.fetch_add(1, SeqCst);
@@ -1001,8 +1002,16 @@ fn cmd(
 
                     let sock = paths.sock("rpc")?;
 
-                    let sx_report = if let Some(ei) = iargs.id {
+                    let path = if let Some(ei) = iargs.id {
                         let sp = sock.for_ix(EdgeI::from(ei as u32));
+                        Some(sp)
+                    } else if let Some(ref name) = iargs.name {
+                        Some(std::env::current_dir()?.join(format!("{}.sock", name)))
+                    } else {
+                        None
+                    };
+
+                    let sx_report = if let Some(sp) = path {
                         if sp.exists() {
                             std::fs::remove_file(&sp)?;
                         }
@@ -1017,29 +1026,34 @@ fn cmd(
                         tokio::spawn(
                             #[allow(unreachable_code)]
                             async move {
+                                let mut t = None;
                                 loop {
-                                    if let Some(d) = rpc.next().await {
-                                        let mut c = d?;
-                                        loop {
-                                            if let Some(x) = rx.recv().await {
-                                                let rx = c.send(x).await;
-                                                if rx.is_err() {
-                                                    break;
-                                                }
+                                    futures::select! {
+                                        d = rpc.next().fuse() => {
+                                            if let Some(d) = d {
+                                                t = Some(d?);
                                             } else {
                                                 break;
                                             }
                                         }
-                                    } else {
-                                        break;
-                                    }
+                                        x = rx.recv().fuse() => {
+                                            if let Some(x) = x {
+                                                if let Some(c) = &mut t {
+                                                    let rx = c.send(x).await;
+                                                    if rx.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
                                 }
                                 aok!()
                             },
                         );
                         Some(sx)
                     } else {
-                        warn!("supply --id to enable RPC");
+                        warn!("supply --id or --name to enable RPC");
                         None
                     };
                     let (sx, rx) = mpsc::channel(1);
