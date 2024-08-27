@@ -205,6 +205,7 @@ enum Commands {
     Sync,
     /// Install nsproxy to your system.
     Install {
+        /// install sproxy binary too
         #[arg(long, short)]
         sproxy: bool,
         #[arg(long, short)]
@@ -374,6 +375,15 @@ fn main() -> Result<()> {
     LogTracer::init()?;
     info!("SHA1: {}", env!("VERGEN_GIT_SHA"));
     let cwd = std::env::current_dir()?;
+
+    // set limits
+    use rlimit as rl;
+    let (soft, hard) = rl::Resource::NOFILE.get()?;
+    info!(
+        "open file limits, soft={}, hard={}. trying to raise soft limit to max",
+        soft, hard
+    );
+    rl::Resource::NOFILE.set(hard, hard)?;
 
     cmd(cli, cwd, nonecb)?;
     Ok(())
@@ -1495,8 +1505,8 @@ fn cmd(
             let selfprog = std::env::current_exe()?;
             let mut sproxyf = selfprog.clone();
             let dstdir: PathBuf = dstdir.unwrap_or("/usr/local/bin".parse()?);
-            sproxyf.set_file_name("sproxy");
             let overwrite = |src: &Path, path: &Path| {
+                warn!("installing {:?} to {:?}", src, path);
                 if path.exists() {
                     std::fs::remove_file(path)?;
                 }
@@ -1506,11 +1516,14 @@ fn cmd(
             let selfprogdst = dstdir.join(selfprog.file_name().unwrap());
             overwrite(&selfprog, &selfprogdst)?;
             if sproxy {
+                sproxyf.set_file_name("sproxy");
                 let fd = dstdir.join(sproxyf.file_name().unwrap());
                 overwrite(&sproxyf, &fd)?;
                 let f = std::fs::File::open(&fd)?;
                 let perms = Permissions::from_mode(0o6755);
                 f.set_permissions(perms)?;
+            } else {
+                warn!("you might want to install sproxy binary too. use nsproxy install -s")
             }
         }
         Commands::Geph => {
