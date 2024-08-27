@@ -14,12 +14,15 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
+use log::info;
 use nix::unistd::execve;
 use nsproxy::{aok, UID_HINT_VAR};
+use tracing::warn;
 
 fn main() -> anyhow::Result<()> {
     let mut ce = std::env::current_exe()?;
     ce.set_file_name("nsproxy");
+    info!("exec {:?}", &ce);
     if !ce.exists() {
         println!("can not find nsproxy binary. It must exist in the same directory as sproxy.")
     }
