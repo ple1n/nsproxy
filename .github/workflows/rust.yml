@@ -14,7 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
     - name: Build
-      run: cargo build --verbose -r
+      run: cargo build -r
     # - name: Run tests
     #   run: cargo test --verbose
