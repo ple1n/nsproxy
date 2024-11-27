@@ -727,7 +727,6 @@ fn cmd(
                             sc.read_exact(&mut buf)?; // 3
                             cb()?;
                         } else {
-                            let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
                             let mut cmd : Command = match cmd {
                                 Some(c) => {
                                     let mut _cmd = Command::new("/bin/sh");
