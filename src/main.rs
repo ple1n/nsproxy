@@ -727,9 +727,20 @@ fn cmd(
                             sc.read_exact(&mut buf)?; // 3
                             cb()?;
                         } else {
-                            let mut cmd = Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
-                                "--cmd must be specified when --pid is not provided"
-                            ))?);
+                            let mut cmd : Command = match cmd {
+                                Some(c) => {
+                                    let mut _cmd = Command::new("/bin/sh");
+                                    _cmd.arg("-c");
+                                    _cmd.arg(c);
+                                    _cmd
+                            },
+    
+                                _ => Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
+                                    "--cmd must be specified when --pid is not provided"
+                                ))?),
+                            };
+
+
                             // We don't change uid of this process.
                             // Otherwise probe might fail due to perms
                             cmd.current_dir(cwd);
