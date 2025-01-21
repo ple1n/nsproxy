@@ -1,4 +1,4 @@
-use std::{fs, io::Write};
+use std::{fs, io::Write, path::Path};
 
 use anyhow::Result;
 use log::warn;
@@ -10,7 +10,8 @@ const ETCRESOLV: &str = "/etc/resolv.conf";
 pub fn mount_conf() -> Result<()> {
     let copy = include_str!("../resolv.conf");
     let path = "/tmp/resolv.conf";
-    if fs::exists(path)? {
+    
+    if Path::new(path).exists() {
         let _ = fs::remove_file(path);
     }
     let mut fd = std::fs::File::create(path)?;
