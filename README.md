@@ -18,7 +18,7 @@ The networking here is mostly targeted at censorship-ridden users, such as in Ch
 The recommended setup is to have both `nsproxy` and `sproxy` available. 
 
 ```bash
-./nsproxy -s
+./nsproxy install -s
 ```
 
 `sproxy` the wrapper is nessitated because in some cases the environment `sudo` creates breaks the apps, such as AppImages.
