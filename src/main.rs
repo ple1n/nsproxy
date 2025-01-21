@@ -74,6 +74,7 @@ use nsproxy::*;
 use nsproxy::{data::Ix, systemd};
 use nsproxy_common::NSSource::{self, Unavail};
 use nsproxy_common::{ExactNS, NSFrom, PidPath, VaCache};
+use owo_colors::OwoColorize;
 use passfd::FdPassingExt;
 use paths::PerIx;
 use petgraph::visit::IntoNodeReferences;
@@ -161,8 +162,11 @@ enum Commands {
         #[command(flatten)]
         iargs: IArgs,
     },
+    /// Shorthand for the node operation
     Enter {
-        name: WellKnown,
+        #[arg(value_parser=parse_node)]
+        id: NodeAddr,
+
         cmd: Option<String>,
         #[arg(long, short)]
         uid: Option<u32>,
@@ -222,10 +226,20 @@ enum Commands {
     TestGUI {},
     /// Override DNS configuration for the mount namespace you are in. It performs a bind mount
     SetDNS,
-    /// First line support for certain softwares
+    /// Launch it in Node 0
     Librewolf,
+    /// Launch it in Node 0
     Fractal,
+    /// Make a node for Geph and enter the netns
     Geph,
+    /// Generate typical config for Tun2proxy
+    /// Using this command comes with the benefit that it validates your input
+    Gen {
+        #[command(flatten)]
+        args: IArgs,
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,11 +255,6 @@ enum TUN2ProxyCmd {
         #[command(flatten)]
         iargs: IArgs,
     },
-}
-
-#[derive(ValueEnum, Clone)]
-enum WellKnown {
-    Local,
 }
 
 fn parse_node(addr: &str) -> Result<NodeAddr> {
@@ -391,14 +400,6 @@ fn main() -> Result<()> {
 
 static mut SOCK_CHILD: Option<UnixStream> = None;
 
-impl WellKnown {
-    pub fn resolve(&self) -> &str {
-        match self {
-            Self::Local => "local",
-        }
-    }
-}
-
 use blockon::*;
 
 fn cmd(
@@ -474,11 +475,11 @@ fn cmd(
                 aok!()
             })??;
         }
-        Commands::Enter { name, cmd: op, uid } => {
+        Commands::Enter { id, cmd: op, uid } => {
             let cl = Cli {
                 log: cli.log,
                 command: Commands::Node {
-                    id: Some(NodeAddr::Name(name.resolve().to_owned())),
+                    id: Some(id),
                     op: NodeOps::Run { cmd: op, uid }.into(),
                 },
                 sigint: cli.sigint,
@@ -586,7 +587,7 @@ fn cmd(
             mut tun2proxy,
             cmd,
             uid,
-            name,
+            mut name,
             mount,
             out,
             veth,
@@ -605,6 +606,18 @@ fn cmd(
 
             if let Some(ref mut tun2proxy) = tun2proxy {
                 *tun2proxy = tun2proxy.canonicalize()?;
+            }
+
+            // Find typical name designated in the tun2proxy file
+            if let Some(ref path) = tun2proxy {
+                log::info!("Reading from {:?}", &path);
+                let mut f = std::fs::File::open(path)?;
+                let iargs: IArgs = serde_json::from_reader(&mut f)?;
+                if let Some(inside) = iargs.name {
+                    if name.is_none() {
+                        let _ = name.insert(inside);
+                    }
+                }
             }
             // Connect and authenticate to systemd before entering userns
             let rootful = geteuid().is_root();
@@ -1653,6 +1666,12 @@ fn cmd(
                 },
             };
             cmd(cli, cwd, nonecb)?;
+        }
+        Commands::Gen { args, mut output } => {
+            let path = output.get_or_insert("./generated.json".into());
+            println!("Write file to {}", path.display().bright_purple());
+            let fd = std::fs::File::create(path)?;
+            serde_json::to_writer_pretty(fd, &args)?;
         }
         _ => todo!(),
     })
