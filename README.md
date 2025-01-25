@@ -25,6 +25,15 @@ The recommended setup is to have both `nsproxy` and `sproxy` available.
 
 Let's start from the simplest use case
 
+In most cases you just need a separate network namespace with a pair of veths. 
+
+```sh
+sproxy new --veth
+# have your proxy listen on the other end of veth
+```
+
+This is also more performant unlike the TUN-method which needs a roundtrip to userspace and a lot of copying... unless you have apps that are not compatible with SOCKS5. At that moment anything works is a life saver.......
+
 ## To use it with Tor 
 
 ```json
