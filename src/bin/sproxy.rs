@@ -38,13 +38,18 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn sudo_check(nsp: &Path) -> anyhow::Result<()> {
-    let mut cmd = Command::new("/usr/bin/sudo");
-    cmd.arg(nsp).arg("noop");
-    let mut ch = cmd.spawn()?;
-    let status = ch.wait()?;
-    if status.success() {
+    if cfg!(sudo_check) {
+        let mut cmd = Command::new("/usr/bin/sudo");
+        cmd.arg(nsp).arg("noop");
+        let mut ch = cmd.spawn()?;
+        let status = ch.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("Authentication failed")
+        }
+    }else{
+        println!("sudo check disabled");
         Ok(())
-    } else {
-        bail!("Authentication failed")
     }
 }

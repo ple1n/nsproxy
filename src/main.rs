@@ -160,6 +160,8 @@ enum Commands {
         alt: bool,
         #[command(flatten)]
         iargs: IArgs,
+        #[arg(long)]
+        wayvnc: bool,
     },
     Enter {
         name: WellKnown,
@@ -489,6 +491,7 @@ fn cmd(
             interface,
             alt: role,
             mut iargs,
+            wayvnc,
         } => {
             let (mut sp, sc) = UnixStream::pair()?;
             // fork before tokio runtime init
@@ -527,6 +530,13 @@ fn cmd(
                         cwd.clone(),
                         Some(Box::new(move || {
                             warn!("netns created. now start tun2proxy right here");
+                            if wayvnc {
+                                let mut subproc = Command::new("/usr/bin/wayvnc");
+                                subproc.arg("0");
+                                // inherit stdout
+                                subproc.spawn()?;
+                            }
+
                             cmd(
                                 Cli {
                                     log: cli.log,

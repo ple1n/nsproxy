@@ -32,7 +32,7 @@ use crate::{
 
 pub trait ServiceM: Sized {
     type Ctx<'p>;
-    /// Run this before any starts
+    /// Run this before any startsj 
     async fn reload(&self, ctx: &Self::Ctx<'_>) -> Result<()>;
     async fn ctx<'p>(&'p self) -> Result<Self::Ctx<'p>>;
 }
