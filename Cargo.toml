@@ -15,7 +15,7 @@ workspace = { members = [
 
 [package]
 name = "nsproxy"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 build = "build.rs"
 
@@ -30,6 +30,9 @@ linker = "/usr/bin/clang"
 rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+sudo_check = []
 
 [dependencies]
 anyhow = "1.0.75"
