@@ -2087,7 +2087,11 @@ dependencies = [
 
 [[package]]
 name = "nsproxy"
+<<<<<<< HEAD
 version = "1.0.0"
+=======
+version = "0.3.0"
+>>>>>>> refs/remotes/gh/tun2socks5
 dependencies = [
  "anyhow",
  "atomic",
