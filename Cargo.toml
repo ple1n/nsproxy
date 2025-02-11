@@ -15,11 +15,7 @@ workspace = { members = [
 
 [package]
 name = "nsproxy"
-<<<<<<< HEAD
 version = "1.0.0"
-=======
-version = "0.3.0"
->>>>>>> refs/remotes/gh/tun2socks5
 edition = "2021"
 build = "build.rs"
 
