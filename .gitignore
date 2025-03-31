@@ -3,3 +3,4 @@ target/
 *.paths
 generated.json
 geph.json
+nsproxy
