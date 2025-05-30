@@ -7,9 +7,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+concurrent-map = "5.0.37"
 derivative = "2.2.0"
 derive-new = "0.6.0"
 ipnetwork = "0.20.0"
+opool = "0.1.1"
 rangemap = { version = "1.4.0", features = ["serde1"] }
 serde = { version = "1.0.193", features = ["derive"] }
 thiserror = "1.0.50"
+
+[dev-dependencies]
+dialoguer = "0.11.0"
