@@ -5,12 +5,18 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::RangeInclusive,
+    process,
 };
 
 use anyhow::Result;
+use concurrent_map::{Maximum, Minimum};
 pub use ipnetwork::{IpNetwork, IpNetworkError, Ipv4Network, Ipv6Network};
+use opool::{Pool, PoolAllocator};
 use rangemap::{RangeInclusiveSet, StepFns, StepLite};
 use thiserror::Error;
+
+pub mod lock_alloc;
+pub use opool;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 /// ID allocator implemented with range set
@@ -82,11 +88,11 @@ use derivative::Derivative;
 
 use serde::{Deserialize, Serialize};
 
-wrapip!(Ipv4A, Ipv4Addr, addr, host, new);
-wrapip!(Ipv6A, Ipv6Addr, addr, host, new);
+wrapip!(Ipv4A, Ipv4Addr, addr, host, new, u32, u32);
+wrapip!(Ipv6A, Ipv6Addr, addr, host, new, u32, u128);
 
-pub macro wrapip($ty:ident, $inner:ty, $addr:ident, $host:ident, $fnew:ident) {
-    #[derive(Clone, Copy, Debug, Derivative, Serialize, Deserialize)]
+pub macro wrapip($ty:ident, $inner:ty, $addr:ident, $host:ident, $fnew:ident, $hostrep:ty, $rep: ident) {
+    #[derive(Clone, Copy, Debug, Derivative, Serialize, Deserialize, Hash)]
     #[derivative(PartialEq, PartialOrd, Ord, Eq)]
     pub struct $ty {
         pub $addr: $inner,
@@ -123,6 +129,40 @@ pub macro wrapip($ty:ident, $inner:ty, $addr:ident, $host:ident, $fnew:ident) {
             $ty { $addr, $host }
         }
     }
+    impl IPOps for $ty {
+        type Host = $hostrep;
+        type Rep = $rep;
+        fn known_host(&self) -> u8 {
+            self.$host
+        }
+        fn cast(&self, host: Self::Host) -> Self {
+            $ty {
+                $addr: <$inner>::from_bits(
+                    (self.$addr.to_bits() & !0 << self.$host) + (host as $rep),
+                ),
+                $host: self.$host,
+            }
+        }
+    }
+    impl Minimum for $ty {
+        const MIN: Self = $ty {
+            $addr: <$inner>::from_bits(0),
+            $host: 0,
+        };
+    }
+    impl Maximum for $ty {
+        const MAX: Self = $ty {
+            $addr: <$inner>::from_bits(!0),
+            $host: 0,
+        };
+    }
+}
+
+pub trait IPOps: Clone {
+    type Host: From<u32>;
+    type Rep;
+    fn known_host(&self) -> u8;
+    fn cast(&self, host: Self::Host) -> Self;
 }
 
 pub fn from_ipnet(
@@ -214,4 +254,30 @@ fn findip2() -> Result<()> {
     dbg!(v4.alloc(&dom));
     dbg!(v4.alloc(&dom));
     Ok(())
+}
+
+struct AllocStub<T: Default>(T);
+
+impl<T: Default> PoolAllocator<T> for AllocStub<T> {
+    fn allocate(&self) -> T {
+        T::default()
+    }
+}
+
+#[test]
+fn lockpool_size() {
+    type T = u64;
+    type P = Pool<AllocStub<T>, T>;
+    let p = P::new_prefilled(3000000, AllocStub(0));
+
+    dialoguer::Confirm::new()
+        .with_prompt(process::id().to_string())
+        .interact()
+        .unwrap();
+    p.get();
+}
+
+#[test]
+fn max() {
+    println!("{}", u16::MAX);
 }
