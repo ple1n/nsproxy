@@ -57,6 +57,10 @@ sproxy node 1 run # enter that container from another shell
 
 ![](./pic.png)
 
+## common problems
+
+NSProxy must be installed to paths that SELinux allows; otherwise you get 203/Exec systemd error, if you choose to use systemd.
+
 ## Rationale
 
 - Firefox and its derivatives, leak traffic even with SOCKS5 proxy configured

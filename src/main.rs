@@ -1027,7 +1027,7 @@ fn cmd(
             };
 
             block_on_2(
-                async {
+                async move {
                     use futures::StreamExt;
                     use nsproxy_common::rpc::*;
                     use tarpc::serde_transport::unix;
