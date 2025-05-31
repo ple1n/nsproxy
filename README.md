@@ -18,14 +18,16 @@ The networking here is mostly targeted at censorship-ridden users, such as in Ch
 The recommended setup is to have both `nsproxy` and `sproxy` available. 
 
 ```bash
-./nsproxy install -s
+./nsproxy install -s [--dstdir DSTDIR] 
 ```
 
-`sproxy` the wrapper is nessitated because in some cases the environment `sudo` creates breaks the apps, such as AppImages.
+`sproxy` the wrapper is nessitated because in some cases the environment `sudo` creates breaks the apps, such as AppImages
+
+> the initial use case that prompted me to make this tool is that Zcash desktop client didn't work with proxychains, and it was shipped in AppImage. Manually scripting with netns based off stackoverflow didn't work either due to SUDO perm issues.
 
 Let's start from the simplest use case
 
-In most cases you just need a separate network namespace with a pair of veths. 
+In most cases you just need a separate network namespace with a pair of veths. You can use the proxy through the veth as usual, provided that you listen the proxy on the veth.
 
 ```sh
 sproxy new --veth
@@ -33,6 +35,8 @@ sproxy new --veth
 ```
 
 This is also more performant unlike the TUN-method which needs a roundtrip to userspace and a lot of copying... unless you have apps that are not compatible with SOCKS5. At that moment anything works is a life saver.......
+
+> Direct use of socks5/http proxy is always more efficient, because otherwise this tool is used as a compatibility layer that translates Unix sockets with TUN to the proxy protocol, which involves several times of memory copying and costs of synchronization and syscalls.
 
 ## To use it with Tor 
 
@@ -90,6 +94,27 @@ Option `-m` mounts the namespace to a file. Otherwise the namespace gets garbage
 
 In any case, namespaces are cleared every reboot. 
 
+## Now I want to proxy with something other than Tor?
+
+Command `nsproxy gen --proxy socks5://someip -o output.json` should generate a config file, to serve as your starting point.
+
+```
+./target/debug/nsproxy gen --help
+Generate typical config for Tun2proxy
+
+Usage: nsproxy gen [OPTIONS] --proxy <URL> [STATE]
+
+Arguments:
+  [STATE]
+          
+
+Options:
+  -p, --proxy <URL>
+          Proxy URL in the form proto://[username[:password]@]host:port
+
+  -o, --output <OUTPUT>
+```
+
 ## Troubleshooting
 
 One common problem is about DNS 
@@ -112,30 +137,15 @@ Usage: nsproxy set-dns
 
 You have to enter the namespace, and do the command in the said shell.
 
+NSProxy must be installed to paths that SELinux allows; otherwise you get 203/Exec systemd error, if you choose to use systemd.
+
+## Changes
+
+- V2 fixed *major performance issues* with virtual dns implementation
+
 ## To check the state of namespaces
 
 `nsproxy info` should print a summary of all living nodes. 
-
-## Now I want to proxy with something other than Tor?
-
-Command `nsproxy gen --proxy socks5://someip -o output.json` should generate a config file, to serve as your starting point.
-
-```
-./target/debug/nsproxy gen --help
-Generate typical config for Tun2proxy
-
-Usage: nsproxy gen [OPTIONS] --proxy <URL> [STATE]
-
-Arguments:
-  [STATE]
-          
-
-Options:
-  -p, --proxy <URL>
-          Proxy URL in the form proto://[username[:password]@]host:port
-
-  -o, --output <OUTPUT>
-```
 
 ## Why even bother
 
