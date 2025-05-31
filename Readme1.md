@@ -61,6 +61,16 @@ sproxy node 1 run # enter that container from another shell
 
 NSProxy must be installed to paths that SELinux allows; otherwise you get 203/Exec systemd error, if you choose to use systemd.
 
+## direct use of socks5/http proxy is always more efficient
+
+because otherwise this tool is used as a compatibility layer that translates Unix sockets with TUN to the proxy protocol, which involves several times of memory copying and costs of synchronization and syscalls.
+
+you can do it by using `-v` which adds a pair of veth between the sandbox and host, and make the proxy listen at the veth address at the end in the host.
+
+## changes
+
+- v2 fixed *major performance issues* with virtual dns implementation
+
 ## Rationale
 
 - Firefox and its derivatives, leak traffic even with SOCKS5 proxy configured
