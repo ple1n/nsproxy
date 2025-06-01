@@ -160,3 +160,6 @@ Secondly, based on my past usage, it's really hard to configure everything right
 
 A: I already wrote this and it's based on the same primitives Docker uses. 
 
+## Dev
+
+a tool is available for ./tun2socks5 testing https://github.com/ple1n/dns_stress_test
