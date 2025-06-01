@@ -168,7 +168,6 @@ enum Commands {
     Enter {
         #[arg(value_parser=parse_node)]
         id: NodeAddr,
-
         cmd: Option<String>,
         #[arg(long, short)]
         uid: Option<u32>,
@@ -228,12 +227,6 @@ enum Commands {
     TestGUI {},
     /// Override DNS configuration for the mount namespace you are in. It performs a bind mount
     SetDNS,
-    /// Launch it in Node 0
-    Librewolf,
-    /// Launch it in Node 0
-    Fractal,
-    /// Make a node for Geph and enter the netns
-    Geph,
     /// Generate typical config for Tun2proxy
     /// Using this command comes with the benefit that it validates your input
     Gen {
@@ -1560,51 +1553,6 @@ fn cmd(
                 warn!("you might want to install sproxy binary too. use nsproxy install -s")
             }
         }
-        Commands::Geph => {
-            // generate config first
-            use std::fs::File;
-            use tun2socks5::*;
-            let path = "./geph.json";
-            let f = File::create(path)?;
-            use serde_json::to_writer_pretty;
-            let conf = IArgs {
-                proxy: ArgProxy::from_url("socks5://127.0.0.1:9909")?,
-                ipv6_enabled: true,
-                dns: ArgDns::Handled,
-                dns_addr: "127.0.0.1".parse()?,
-                bypass: Default::default(),
-                state: None,
-                designated: Default::default(),
-                id: None,
-                name: Some("geph".to_owned()),
-            };
-            let uid = what_uid(None, false)?;
-            info!("uid determined to be {}", uid);
-            to_writer_pretty(f, &conf)?;
-            info!("config written to {}", path);
-            cmd(
-                Cli {
-                    log: None,
-                    sigint: 1,
-                    command: Commands::New {
-                        pid: None,
-                        tun2proxy: Some(path.into()),
-                        cmd: your_shell(None, Some(uid))?,
-                        uid: Some(uid),
-                        name: Some("geph".into()),
-                        mount: true,
-                        out: None,
-                        veth: true,
-                        set_dns: false,
-                        userns: false,
-                        associated: None,
-                        assoc_ip: None,
-                    },
-                },
-                cwd,
-                nonecb,
-            )?;
-        }
         Commands::Socks { args, root } => {
             let euid = geteuid();
             if euid.is_root() && !root {
@@ -1659,34 +1607,6 @@ fn cmd(
                 nonecb,
             )?;
             cleanup_resolvconf()?;
-        }
-        Commands::Librewolf => {
-            let cli = Cli {
-                log: None,
-                sigint: 1,
-                command: Commands::Node {
-                    id: Some(NodeAddr::Ix(0.into())),
-                    op: Some(NodeOps::Run {
-                        cmd: Some("librewolf".into()),
-                        uid: None,
-                    }),
-                },
-            };
-            cmd(cli, cwd, nonecb)?;
-        }
-        Commands::Fractal => {
-            let cli = Cli {
-                log: None,
-                sigint: 1,
-                command: Commands::Node {
-                    id: Some(NodeAddr::Ix(0.into())),
-                    op: Some(NodeOps::Run {
-                        cmd: Some("fractal".into()),
-                        uid: None,
-                    }),
-                },
-            };
-            cmd(cli, cwd, nonecb)?;
         }
         Commands::Gen { args, mut output } => {
             let path = output.get_or_insert("./generated.json".into());
