@@ -193,7 +193,7 @@ With this setup, either the librewolf opens a new instance in the designated net
 1. If you set it to `/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- %u -p`, it asks you which profile to use, and _experimentally_ when a running instance of the profile already exists, it opens _a new window_ in the instance, which is in the same netns as the running instance.
 2. If you set it to `/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- %u -p profile1`. Also, experimentally, it opens a new tab in `profile1` when a running instance exists, and creates a new instance when it doesn't, which is _in_ the netns of `node 0`, as specified.
 
-I say experimentally because I did not check the code of librewolf. Who knows if it does "smart detection" and makes decisions for me.
+I say experimentally because I did not check the code of librewolf. Who knows if it does "smart detection" and makes unanticipated decisions for me.
 
 ## Changes
 
