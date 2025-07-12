@@ -195,13 +195,23 @@ struct NSState<'n> {
     va: &'n mut VaCache,
 }
 
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+
+pub enum NSEnterErr {
+    #[error("target ns is identical to current ns")]
+    SameNS,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 impl<'n> NSState<'n> {
-    pub fn validated_enter(&mut self) -> Result<()> {
+    pub fn validated_enter(&mut self) -> Result<(), NSEnterErr> {
         let cache = &mut self.va;
         let ctx = NSGroup::proc_path(PidPath::Selfproc, None)?;
         if ctx.net.must()?.unique == self.target.net.must()?.unique {
-            bail!("Target NetNS is identital to the current NetNS");
-            // Just error in this case, which should prevent a large number of mistakes.
+            return Err(NSEnterErr::SameNS);
         }
         let mut val = NSGroup::<[Option<ValidateR>; 2]>::default();
         let ctx = if ctx.pid.must()?.unique == self.target.pid.must()?.unique {
