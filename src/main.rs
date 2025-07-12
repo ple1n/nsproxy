@@ -171,6 +171,7 @@ enum Commands {
         cmd: Option<String>,
         #[arg(long, short)]
         uid: Option<u32>,
+        args: Vec<String>
     },
     /// Run TUN2Proxy daemon.
     TUN2proxy {
@@ -271,6 +272,7 @@ enum NodeOps {
     Run {
         /// Command to run
         cmd: Option<String>,
+        args: Vec<String>,
         #[arg(long, short)]
         uid: Option<u32>,
     },
@@ -470,12 +472,12 @@ fn cmd(
                 aok!()
             })??;
         }
-        Commands::Enter { id, cmd: op, uid } => {
+        Commands::Enter { id, cmd: op, uid, args } => {
             let cl = Cli {
                 log: cli.log,
                 command: Commands::Node {
                     id: Some(id),
-                    op: NodeOps::Run { cmd: op, uid }.into(),
+                    op: NodeOps::Run { cmd: op, uid, args }.into(),
                 },
                 sigint: cli.sigint,
             };
@@ -743,19 +745,18 @@ fn cmd(
                             sc.read_exact(&mut buf)?; // 3
                             cb()?;
                         } else {
-                            let mut cmd : Command = match cmd {
+                            let mut cmd: Command = match cmd {
                                 Some(c) => {
                                     let mut _cmd = Command::new("/bin/sh");
                                     _cmd.arg("-c");
                                     _cmd.arg(c);
                                     _cmd
-                            },
-    
+                                }
+
                                 _ => Command::new(your_shell(cmd, uid)?.ok_or(anyhow!(
                                     "--cmd must be specified when --pid is not provided"
                                 ))?),
                             };
-
 
                             // We don't change uid of this process.
                             // Otherwise probe might fail due to perms
@@ -1237,7 +1238,7 @@ fn cmd(
             // We gain full caps after setns
             if let Some(op) = op {
                 match op {
-                    NodeOps::Run { cmd, uid } => {
+                    NodeOps::Run { cmd, uid, args } => {
                         let graphs = Graphs::load_file(&paths)?;
                         let require_id = || {
                             if let Some(id) = id {
@@ -1259,12 +1260,21 @@ fn cmd(
                             va: &mut va,
                         };
                         let cwd = std::env::current_dir()?;
-                        nss.validated_enter()?;
+                        if let Result::Err(er) = nss.validated_enter() {
+                            match er {
+                                data::NSEnterErr::SameNS => {
+                                    log::warn!("{}", data::NSEnterErr::SameNS);
+                                }
+                                k => bail!(k),
+                            }
+                        }
+
                         drop(graphs);
                         cmd_uid(uid, true, true)?;
                         let mut cmd = Command::new(
                             your_shell(cmd, uid)?.ok_or(anyhow!("specify env var SHELL"))?,
                         );
+                        cmd.args(args);
                         cmd.current_dir(cwd);
                         cmd.spawn()?.wait()?;
                     }
