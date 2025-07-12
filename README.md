@@ -13,6 +13,12 @@ $ sproxy
 
 The networking here is mostly targeted at censorship-ridden users, such as in China, Russia, Iran. Hence it mainly uses userspace networking, rather than *wireguard* and such commonly used tooling. 
 
+## Security model
+
+This tool provides defense against accidental leaks of IP, through TCP, UDP or DNS, which is common for softwares not designed with net-proxying in mind.
+
+__*Not designed to contain malwares*__. Further, for convenience, the tool allows entering net-ns without _sudo_ UDO through the SUID binary. (This saves my time immensely)
+
 ## Setup
 
 The recommended setup is to have both `nsproxy` and `sproxy` available. 
@@ -138,6 +144,54 @@ Usage: nsproxy set-dns
 You have to enter the namespace, and do the command in the said shell.
 
 NSProxy must be installed to paths that SELinux allows; otherwise you get 203/Exec systemd error, if you choose to use systemd.
+
+## Handle system requests on opening links
+
+Many apps open links through `xdg-open` or the APIs thereof, or the like.
+
+If you have multiple instances of a browser in different net-ns, it's uncertain which browser will be used.
+
+For `xdg-open`, you can patch the `.desktop` file it uses, which is configured by `xdg-settings`.
+
+Example command line, `nsproxy enter 0 librewolf -- -p base_p`, which is
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=LibreWolf
+GenericName=Web Browser
+StartupNotify=true
+Terminal=false
+MimeType=application/json;application/pdf;application/rdf+xml;application/rss+xml;application/xhtml+xml;application/xhtml_xml;application/xml;image/gif;image/jpeg;image/png;image/webp;text/html;text/xml;x-scheme-handler/http;x-scheme-handler/https;
+Comment=Browse the World Wide Web
+Categories=Network;WebBrowser;Security;
+StartupWMClass=librewolf-default
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p %u
+Icon=librewolf
+
+Actions=new-window;new-private-window;safe-mode;preferences;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p %u
+[Desktop Action new-private-window]
+Name=New Private Window
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --private-window %u
+[Desktop Action safe-mode]
+Name=Start in Safe Mode
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --safe-mode
+[Desktop Action preferences]
+Name=Show Preferences
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --preferences
+
+```
+
+Replace `base_p` with your browser profile name.
+
+With this setup, either the librewolf opens a new instance in the designated net-ns, or it opens a new tab in the existing instance.
+
+1. If you set it to `/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- %u -p`, it asks you which profile to use, and _experimentally_ when a running instance of the profile already exists, it opens _a new window_ in the instance, which is in the same netns as the running instance.
+2. If you set it to `/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- %u -p profile1`. Also, experimentally, it opens a new tab in `profile1` when a running instance exists, and creates a new instance when it doesn't, which is _in_ the netns of `node 0`, as specified.
 
 ## Changes
 
