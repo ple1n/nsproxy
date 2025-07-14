@@ -176,13 +176,13 @@ Name=New Window
 Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p %u
 [Desktop Action new-private-window]
 Name=New Private Window
-Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --private-window %u
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p --private-window %u
 [Desktop Action safe-mode]
 Name=Start in Safe Mode
-Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --safe-mode
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p --safe-mode
 [Desktop Action preferences]
 Name=Show Preferences
-Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -p base_p --preferences
+Exec=/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- -p base_p --preferences
 
 ```
 
@@ -194,6 +194,12 @@ With this setup, either the librewolf opens a new instance in the designated net
 2. If you set it to `/usr/local/bin/sproxy enter 0 /usr/share/librewolf/librewolf -- %u -p profile1`. Also, experimentally, it opens a new tab in `profile1` when a running instance exists, and creates a new instance when it doesn't, which is _in_ the netns of `node 0`, as specified.
 
 I say experimentally because I did not check the code of librewolf. Who knows if it does "smart detection" and makes unanticipated decisions for me.
+
+You need to run xdg update after.
+
+```sh
+sudo update-desktop-database  /usr/share/applications # or the directory you use
+```
 
 ## Changes
 
