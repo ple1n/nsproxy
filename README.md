@@ -121,6 +121,30 @@ Options:
   -o, --output <OUTPUT>
 ```
 
+## Gudie on using Flatpak with Nsproxy
+
+Flatpak installs (as of the time of writing this, because they can change any time) packages with the process you run, which means you can run the flatpak-install inside an Nsproxy Netns, and keep downloads proxied.
+
+For reasons nobody knows flatpak-install is extremely dirty, it pings all the remotes even if you specify a remote to use with `flatpak install remote1 x.app`, and it hangs when any remote fails.
+
+As a workaround you can just disable it. 
+
+I just tested two terminals with `flatpak tun` inside a nsproxy ns. Both showed my root netns when `ip n`, which means the processes were probably run from a flatpak daemon. If I remember correcly It worked in the past.
+
+## On using Docker
+
+Docker installs things, by default, with a daemon, so you can not run a docker-install command in nsproxy and expect it work.
+
+## An attempt to run Ywallet on Fedora
+
+- The Appimage didn't work as it requires a different version Fedora has. 
+- I tried to run `flatpak run --unshare=network org.kde.konsole`. The sandboxing failed magificently. The process was _NOT_ sandboxed.
+- Last, I downloaded the binary `.gz` pack and `.so` from https://github.com/hhanh00/zwallet/releases/tag/v1.13.4
+
+which worked. 
+
+You need to run `ldconfig ./libwarp_api_ffi.so`
+
 ## Troubleshooting
 
 One common problem is about DNS 
