@@ -121,7 +121,7 @@ Options:
   -o, --output <OUTPUT>
 ```
 
-## Gudie on using Flatpak with Nsproxy
+## Guide on using Flatpak with Nsproxy
 
 Flatpak installs (as of the time of writing this, because they can change any time) packages with the process you run, which means you can run the flatpak-install inside an Nsproxy Netns, and keep downloads proxied.
 
@@ -223,6 +223,44 @@ You need to run xdg update after.
 
 ```sh
 sudo update-desktop-database  /usr/share/applications # or the directory you use
+```
+
+## What kind of softwares are compatible with nsproxy
+
+Nsproxy only 'sandboxes' a process tree, which means an app can not be _dirty_
+
+- No calling external processes through IPC
+- No communicating with systemd services
+- No 'one process only app' which detects existing instances, and easily leak your traffic unintended.
+- As little dependencies as possible because dependencies can go dirty.
+
+Browsers can be handled as guided above. 
+
+qBitorrent is a one-process-only app (by default). You can use transmission for your nsproxy-ed needs, while running qBittorrent for unproxied downloads, as a example solution.
+
+As a rule of thumb, if you _nsproxy_ enter into a shell, the process immediately exits the terminal, it's usually a _dirty_ program that esacpes net-ns.
+
+## Use nsproxy with Wireshark to isolate traffic
+
+Nsproxy can be a very handy to when it comes to _montioring traffic for select programs_. 
+
+As of the writing there are no other better ways of showing PIDs in wireshark and filtering with it.
+
+You can easily create a new netns, launch apps within, and start wireshark in the very same netns.
+
+```sh
+sproxy new -t geph.json # this creates a new netns. create it in any way you want.
+  ...
+  INFO nsproxy::data: Clear NS NodeIndex(8)    
+  INFO nsproxy::systemd: trying to remove file "/etc/systemd/system/probe8.service"
+  WARN nsproxy::systemd: File "/etc/systemd/system/probe8.service" not found    
+  INFO nsproxy::data: NS object Selfproc NodeIndex(1) exists    
+  INFO nsproxy::data: Updated NS node    
+  INFO nsproxy: Src/Probe NodeIndex(8) 
+  ....
+
+sproxy enter 8 -u 0 wireshark
+sproxy enter 8 transmission-qt
 ```
 
 ## Changes
