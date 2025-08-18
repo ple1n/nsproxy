@@ -1,7 +1,6 @@
-# strip before release
-strip ./target/release/sproxy
-# dont strip /nsproxy
-# otherwise no backtrace. sproxy is trivial
-mkdir release
+mkdir -p release
 cp ./target/release/sproxy ./release
 cp ./target/release/nsproxy ./release
+cp ./release/nsproxy ./release/nsproxy_debug
+strip ./release/sproxy
+strip ./release/nsproxy
