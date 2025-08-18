@@ -7,15 +7,16 @@ use std::{
     fmt::Debug,
     fs::{create_dir_all, remove_file},
     io::ErrorKind,
+    ops::Deref,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use daggy::NodeIndex;
-use netlink_ops::netlink::{nl_ctx, LinkAB, NLDriver};
+use netlink_ops::netlink::{LinkAB, NLDriver, nl_ctx};
 use nsproxy_common::ExactNS;
-use systemd_zbus::{ManagerProxy, Mode::Replace};
+use systemd_zbus::{ManagerProxy, ManagerProxyBlocking, Mode::Replace};
 use tracing::info;
 use tun::Layer;
 use zbus::Address;
@@ -33,12 +34,14 @@ use crate::{
 pub mod service;
 
 /// State data about the interfacing of service manager (process, task scheduler) and the proxy graph.
+#[derive(Clone)]
 pub struct Systemd {
     tun2proxy_socks: PathBuf,
     systemd_unit: PathBuf,
     self_path: PathBuf,
     pub conn: Option<zbus::Connection>,
     root: bool,
+    proxy: Option<ManagerProxy<'static>>,
 }
 
 impl<'b> MItem for Socks2TUN<'b> {
@@ -93,20 +96,16 @@ pub fn match_root(serv: &Systemd, root: bool) -> Result<()> {
 }
 
 impl<'k> ItemAction for NodeIndexed<'k> {
-    async fn restart(
-        &self,
-        serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
-    ) -> Result<()> {
+    async fn restart(&self, serv: &Self::Serv) -> Result<()> {
         let n = self.service()?;
         log::info!("(Re)start unit {n}");
-        ctx.restart_unit(&n, Replace).await?;
+        serv.ctx()?.restart_unit(&n, Replace).await?;
         Ok(())
     }
-    async fn stop(&self, serv: &Self::Serv, ctx: &<Self::Serv as ServiceM>::Ctx<'_>) -> Result<()> {
+    async fn stop(&self, serv: &Self::Serv) -> Result<()> {
         let n = self.service()?;
         log::info!("Stop unit {n}");
-        ctx.stop_unit(&n, Replace).await?;
+        serv.ctx()?.stop_unit(&n, Replace).await?;
         Ok(())
     }
 }
@@ -135,21 +134,17 @@ pub fn units(ve: &NDeps<'_>) -> Result<HashSet<String>> {
 }
 
 impl<'k> ItemAction for NDeps<'k> {
-    async fn restart(
-        &self,
-        serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
-    ) -> Result<()> {
+    async fn restart(&self, serv: &Self::Serv) -> Result<()> {
         let units = units(self)?;
         for s in units {
-            ctx.restart_unit(&s, Replace).await?;
+            serv.ctx()?.restart_unit(&s, Replace).await?;
         }
         Ok(())
     }
-    async fn stop(&self, serv: &Self::Serv, ctx: &<Self::Serv as ServiceM>::Ctx<'_>) -> Result<()> {
+    async fn stop(&self, serv: &Self::Serv) -> Result<()> {
         let units = units(self)?;
         for s in units {
-            ctx.stop_unit(&s, Replace).await?;
+            serv.ctx()?.stop_unit(&s, Replace).await?;
         }
         Ok(())
     }
@@ -184,7 +179,9 @@ impl<'n, 'd> ItemRM for NodeWDeps<'n, 'd> {
                     if let Some(fdr) = edge.fd_recver() {
                         match fdr {
                             FDRecver::TUN2Proxy(path) => {
+                                info!("removing tun2proxy systemd service over {:?}", &path);
                                 let socks2 = Socks2TUN::new(path, dep.edge.id)?;
+                                socks2.stop(serv).await?;
                                 socks2.remove(serv).await?;
                             }
                             _ => (),
@@ -306,18 +303,16 @@ impl<'b> ItemCreate for Socks2TUN<'b> {
 }
 
 impl<'b> ItemAction for Socks2TUN<'b> {
-    async fn restart(
-        &self,
-        serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
-    ) -> Result<()> {
+    async fn restart(&self, serv: &Self::Serv) -> Result<()> {
         let servname = self.service()?;
-        ctx.restart_unit(&servname, Replace).await?;
+        info!("restarting {}", &servname);
+        serv.ctx()?.restart_unit(&servname, Replace).await?;
         Ok(())
     }
-    async fn stop(&self, serv: &Self::Serv, ctx: &<Self::Serv as ServiceM>::Ctx<'_>) -> Result<()> {
+    async fn stop(&self, serv: &Self::Serv) -> Result<()> {
         let servname = self.service()?;
-        ctx.stop_unit(&servname, Replace).await?;
+        info!("stopping {}", &servname);
+        serv.ctx()?.stop_unit(&servname, Replace).await?;
         Ok(())
     }
 }
@@ -345,20 +340,27 @@ impl Systemd {
             systemd_unit,
             tun2proxy_socks: path,
             self_path: current_exe()?,
+            proxy: None,
             conn,
             root,
         })
     }
+    async fn init(&mut self) -> Result<()> {
+        if let Some(conn) = &self.conn {
+            self.proxy = Some(ManagerProxy::new(conn).await?);
+        }
+        Ok(())
+    }
 }
 
 impl ServiceM for Systemd {
-    type Ctx<'c> = ManagerProxy<'c>;
-    async fn ctx<'k>(&'k self) -> Result<Self::Ctx<'k>> {
-        Ok(ManagerProxy::new(self.conn.as_ref().unwrap()).await?)
-    }
-    async fn reload(&self, ctx: &Self::Ctx<'_>) -> Result<()> {
-        ctx.reload().await?;
+    type Ctx = ManagerProxy<'static>;
+    async fn reload(&self) -> Result<()> {
+        self.ctx()?.reload().await?;
         log::info!("Reloaded");
         Ok(())
+    }
+    fn ctx(&self) -> anyhow::Result<&Self::Ctx> {
+        anyhow::Ok(self.proxy.as_ref().ok_or(anyhow!("systemd.ctx None"))?)
     }
 }
