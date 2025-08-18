@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    managed::{ItemRM, NodeWDeps},
+    managed::{ItemRM, NodeWDeps, ServiceM},
     paths::PathState,
     sys::NSEnter,
 };
@@ -262,7 +262,7 @@ impl<const L: usize> NSGroup<[Option<ValidateR>; L]> {
         if *m == NSSlot::Absent {
             *m = NSSlot::Provided([None; L], Default::default());
         }
-        if let NSSlot::Provided(ref mut vec, _) = m {
+        if let NSSlot::Provided(vec, _) = m {
             assert!(vec[pos].is_none());
             vec[pos] = Some(match ns {
                 NSSlot::Absent => ValidateR::Impossible,
@@ -742,7 +742,7 @@ impl Graphs {
         }
     }
     /// It was supposed to be a new NS, but we find that it exists
-    async fn clear_ns<S>(&mut self, src: NodeI, serv: &S) -> Result<()>
+    async fn clear_ns<S: ServiceM>(&mut self, src: NodeI, serv: &S) -> Result<()>
     where
         for<'a, 'b> NodeWDeps<'a, 'b>: ItemRM<Serv = S>,
     {

@@ -3,21 +3,22 @@
 #![feature(iter_next_chunk)]
 #![feature(array_try_map)]
 #![feature(ip_bits)]
+#![allow(static_mut_refs)]
 
 use std::collections::HashSet;
 use std::env::{current_exe, var};
 use std::fmt::format;
 use std::fs::{OpenOptions, Permissions};
-use std::future::{ready, Future, IntoFuture, Ready};
+use std::future::{Future, IntoFuture, Ready, ready};
 use std::io::Write;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{exit, Command, Stdio};
+use std::process::{Command, Stdio, exit};
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize};
 use std::time::Duration;
 use std::{fs::File, io::Read, os::fd::AsFd, path::PathBuf};
 
@@ -27,48 +28,48 @@ use atomic::Atomic;
 use capctl::prctl;
 use clap::{Parser, Subcommand, ValueEnum};
 use daggy::NodeIndex;
-use data::{forever, EdgeI};
+use data::{EdgeI, forever};
 use etc_resolv::cleanup_resolvconf;
 use fork::Fork;
 use futures::{FutureExt, SinkExt};
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use libc::{uid_t, SIGTERM};
+use libc::{SIGTERM, uid_t};
 use log::LevelFilter::{self, Debug};
 use log::{debug, error};
-use netlink_ops::netlink::{nl_ctx, GetPidOrFd, NLDriver, NLHandle, PidOrFd, VPairKey, VethConn};
+use netlink_ops::netlink::{GetPidOrFd, NLDriver, NLHandle, PidOrFd, VPairKey, VethConn, nl_ctx};
+use netlink_ops::rtnetlink::Handle;
 use netlink_ops::rtnetlink::netlink_packet_utils::byteorder::{
     BigEndian, ReadBytesExt, WriteBytesExt,
 };
-use netlink_ops::rtnetlink::netlink_proto::{new_connection_from_socket, NetlinkCodec};
+use netlink_ops::rtnetlink::netlink_proto::{NetlinkCodec, new_connection_from_socket};
 use netlink_ops::rtnetlink::netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_ops::rtnetlink::netlink_sys::{Socket, TokioSocket};
-use netlink_ops::rtnetlink::Handle;
 use netlink_ops::state::{Existence, ExpCollection};
-use nix::fcntl::{open, OFlag};
-use nix::sched::{setns, unshare, CloneFlags};
-use nix::sys::signal::{signal, SigHandler};
+use nix::fcntl::{OFlag, open};
+use nix::sched::{CloneFlags, setns, unshare};
+use nix::sys::signal::{SigHandler, signal};
 use nix::sys::stat::Mode;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname, setresuid, setsid,
-    ForkResult, Pid, Uid,
+    ForkResult, Pid, Uid, close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname,
+    setresuid, setsid,
 };
 use nsproxy::data::{
     FDRecver, Graphs, NSAdd, NSAddRes, NSGroup, NSSlot, NSState, NodeAddr, NodeI, ObjectNode,
-    PassFD, Relation, Validate, ValidateR, TUNC,
+    PassFD, Relation, TUNC, Validate, ValidateR,
 };
 use nsproxy::flatpak::FlatpakID;
-use nsproxy::graph::{check_veths, FResult};
+use nsproxy::graph::{FResult, check_veths};
 use nsproxy::managed::{
     Indexed, ItemAction, ItemCreate, NodeIDPrint, NodeIndexed, NodeWDeps, ServiceM, Socks2TUN,
 };
 use nsproxy::paths::{PathState, Paths};
 use nsproxy::sys::{
-    check_capsys, cmd_uid, connect_ns_veth, enable_ping_all, enable_ping_gid, systemd_connection,
-    unshare_user_standalone, what_uid, your_shell, UserNS,
+    UserNS, check_capsys, cmd_uid, connect_ns_veth, enable_ping_all, enable_ping_gid,
+    systemd_connection, unshare_user_standalone, what_uid, your_shell,
 };
-use nsproxy::systemd::{match_root, UnitName};
+use nsproxy::systemd::{UnitName, match_root};
 use nsproxy::watcher::FlatpakWatcher;
 use nsproxy::*;
 use nsproxy::{data::Ix, systemd};
@@ -88,7 +89,7 @@ use tokio::net::unix::pipe::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::instrument::WithSubscriber;
-use tracing::{info, warn, Level};
+use tracing::{Level, info, warn};
 use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tun::{AsyncDevice, Configuration, Device, Layer};
@@ -141,6 +142,8 @@ enum Commands {
         associated: Option<String>,
         #[arg(long, default_value = "192.168.2.1/24")]
         assoc_ip: Option<IpNetwork>,
+        #[arg(value_parser=parse_node, long, short)]
+        replace: Option<NodeAddr>,
     },
     /// Start as watcher daemon. This uses the socks2tun method.
     Watch {
@@ -171,7 +174,7 @@ enum Commands {
         cmd: Option<String>,
         #[arg(long, short)]
         uid: Option<u32>,
-        args: Vec<String>
+        args: Vec<String>,
     },
     /// Run TUN2Proxy daemon.
     TUN2proxy {
@@ -418,8 +421,8 @@ fn cmd(
             block_on(async {
                 use tarpc::serde_transport::unix;
                 let p: PathBuf = rpc_path_singleton();
-                use futures::channel::mpsc::unbounded;
                 use futures::StreamExt;
+                use futures::channel::mpsc::unbounded;
                 use nsproxy_common::rpc::*;
                 use tarpc::tokio_serde::formats::*;
 
@@ -472,7 +475,12 @@ fn cmd(
                 aok!()
             })??;
         }
-        Commands::Enter { id, cmd: op, uid, args } => {
+        Commands::Enter {
+            id,
+            cmd: op,
+            uid,
+            args,
+        } => {
             let cl = Cli {
                 log: cli.log,
                 command: Commands::Node {
@@ -521,6 +529,7 @@ fn cmd(
                                 } else {
                                     "192.168.2.2/24".parse()?
                                 }),
+                                replace: None,
                             },
                         },
                         cwd.clone(),
@@ -600,6 +609,7 @@ fn cmd(
             set_dns,
             associated,
             assoc_ip,
+            replace,
         } => {
             let current_uid = what_uid(None, true)?;
 
@@ -635,10 +645,14 @@ fn cmd(
             block_on(async {
                 let mut nl = NLDriver::new(NLHandle::new_self_proc_tokio()?);
                 let ctx = NSGroup::proc_path(Selfproc, None)?;
+                serv.init().await?;
+
                 nl.fill().await?;
                 graphs
                     .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
                     .await?;
+
+                // let k = systemd_zbus::ManagerProxy::new(serv.conn.as_ref().unwrap()).await.unwrap_err();
                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
                 aok!()
             })??;
@@ -704,14 +718,18 @@ fn cmd(
                 graphs
                     .prune(&ctx, &mut va, &mut serv, &mut rmnode, &mut nl)
                     .await?;
+
                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
+                drop(ctx);
                 aok!()
             })??;
             // Prune is called twice because some NSes are visible only in userns
             let (mut sp, mut sc) = UnixStream::pair()?;
             let mut buf = [0; 1];
             let mut nl_fd = None;
+            let mut forked = false;
             // NS by Pid --send fd of TUN/socket--> NS of TUN2proxy
+            // src means the ns getting proxied.
             let (src_res, src) = if let Some(pid) = pid {
                 graphs.add_ns(
                     PidPath::N(pid),
@@ -721,7 +739,10 @@ fn cmd(
                     name,
                     rootful,
                 )?
+            } else if let Some(out) = &replace {
+                (NSAddRes::Found, graphs.resolve(out)?)
             } else {
+                forked = true;
                 match unsafe { fork() }? {
                     ForkResult::Child => {
                         FORK_DEPTH.fetch_add(1, SeqCst);
@@ -729,9 +750,9 @@ fn cmd(
                         prctl::set_pdeathsig(Some(SIGTERM))?;
                         unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUTS)?;
                         sc.write_all(&[0])?; // #1
-                                             // sethostname("proxied")?;
-                                             // The line above caused XWayland to malfunction for me.
-                                             // Librewolf and vscode launched in nsproxy had intermittent full-system lags.
+                        // sethostname("proxied")?;
+                        // The line above caused XWayland to malfunction for me.
+                        // Librewolf and vscode launched in nsproxy had intermittent full-system lags.
                         if depriv_userns {
                             enable_ping_gid(gid_in.into())?
                         } else {
@@ -769,6 +790,7 @@ fn cmd(
                             let mut ch = cmd.spawn()?;
                             ch.wait()?;
                         }
+                        log::info!("Child process exit");
 
                         exit(0);
                     }
@@ -798,7 +820,7 @@ fn cmd(
                 .net
                 .must()?
                 .to_owned();
-
+            
             block_on(async move {
                 graphs.clear_ns(src, &serv).await?;
 
@@ -815,6 +837,10 @@ fn cmd(
                     )?;
                     out
                 };
+
+                if src == out {
+                    warn!("src ns == target ns");
+                }
 
                 if let Some(ref tun2proxy) = tun2proxy {
                     let edge = graphs.data.add_edge(src, out, None);
@@ -872,14 +898,13 @@ fn cmd(
                     }
                 }
 
-                let ctx = serv.ctx().await?;
                 graphs.dump_file(&paths, target_uid)?;
                 if tun2proxy.is_some() {
                     let nw = graphs.nodewdeps(src)?;
                     nw.write(Some(pspath.clone()), &serv).await?;
-                    serv.reload(&ctx).await?;
-                    nw.1.restart(&serv, &ctx).await?;
-                    nw.0.restart(&serv, &ctx).await?;
+                    serv.reload().await?;
+                    nw.1.restart(&serv).await?;
+                    nw.0.restart(&serv).await?;
                 }
 
                 aok!()
@@ -887,7 +912,9 @@ fn cmd(
             sp.write_all(&[2])?; // 3
 
             // Wait for the child, or it gets orphaned.
-            waitpid(Some(Pid::from_raw(-1)), None)?;
+            if forked {
+                waitpid(Some(Pid::from_raw(-1)), None)?;
+            }
         }
         Commands::Probe { id } => {
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
@@ -1137,7 +1164,6 @@ fn cmd(
                 let dae = tokio::spawn(fpwatch.daemon(uid, sx));
                 let looper = async move {
                     let serv = systemd::Systemd::new(&paths, Some(pre), rootful)?;
-                    let ctx = serv.ctx().await?;
                     while let Some(fe) = rx.recv().await {
                         if dryrun {
                             continue;
@@ -1179,9 +1205,9 @@ fn cmd(
                         let nw = graphs.nodewdeps(src)?;
                         nw.write(Some(pspath.clone()), &serv).await?;
 
-                        serv.reload(&ctx).await?;
-                        nw.1.restart(&serv, &ctx).await?;
-                        nw.0.restart(&serv, &ctx).await?;
+                        serv.reload().await?;
+                        nw.1.restart(&serv).await?;
+                        nw.0.restart(&serv).await?;
                     }
 
                     aok!()
@@ -1297,7 +1323,7 @@ fn cmd(
                                 let fdrc = deps[index].edge.item.fd_recver();
                                 if let Some(recver) = fdrc {
                                     let serv = match recver {
-                                        FDRecver::TUN2Proxy(ref path) => {
+                                        FDRecver::TUN2Proxy(path) => {
                                             Socks2TUN::new(path, deps[0].edge.id)?.service()?
                                         }
                                         FDRecver::Systemd(serv) => serv.to_owned(),
@@ -1344,11 +1370,10 @@ fn cmd(
                             let rootful = geteuid().is_root();
                             let pre = systemd_connection(rootful).await?;
                             let serv = systemd::Systemd::new(&paths, Some(pre), rootful)?;
-                            let ctx = serv.ctx().await?;
                             match_root(&serv, node.item.root)?;
                             // A node is root implies deps are located in root systemd directories too
-                            deps.restart(&serv, &ctx).await?;
-                            node.restart(&serv, &ctx).await?;
+                            deps.restart(&serv).await?;
+                            node.restart(&serv).await?;
                             aok!()
                         })??;
                     }
@@ -1470,8 +1495,10 @@ fn cmd(
                                 graphs
                                     .node_rm(&ctx, &ids[..], &mut va, &mut rmnode, &mut nl)
                                     .await?;
+
                                 graphs.do_prune(&ctx, &serv, rmnode, &mut nl).await?;
-                                Ok::<_, anyhow::Error>(())
+
+                                aok!()
                             })??;
 
                             Ok::<_, anyhow::Error>(Some(graphs))
@@ -1611,6 +1638,7 @@ fn cmd(
                         set_dns: false,
                         associated: None,
                         assoc_ip: None,
+                        replace: None,
                     },
                 },
                 cwd,
@@ -1637,8 +1665,8 @@ fn summarize_graph(graphs: &Graphs) -> Result<()> {
             println!("      {}", rel.edge.item);
             let fdrc = rel.edge.item.fd_recver();
             if let Some(recver) = fdrc {
-                match recver {
-                    FDRecver::TUN2Proxy(ref path) => {
+                match &recver {
+                    FDRecver::TUN2Proxy(path) => {
                         let serv = Socks2TUN::new(path, rel.edge.id)?.service()?;
                         println!("      Tun2proxy {}", serv.bright_purple());
                     }

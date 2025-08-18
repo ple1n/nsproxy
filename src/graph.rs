@@ -5,8 +5,8 @@
 
 use std::{
     collections::{
-        hash_map::Entry::{Occupied, Vacant},
         HashMap, HashSet,
+        hash_map::Entry::{Occupied, Vacant},
     },
     ffi::OsStr,
     io::Read,
@@ -20,20 +20,19 @@ use crate::{
         ExactNS, Graphs, Ix, NSGraph, NSGroup, NSNet, NSSlot, NSTrait, NodeI, ObjectNode, Relation,
         Route, RouteNode, Validate,
     },
-    managed::{ItemCreate, ItemRM, NodeWDeps},
+    managed::{ItemCreate, ItemRM, NodeWDeps, ServiceM},
     paths::{PathState, Paths},
 };
 
 use anyhow::anyhow;
 use daggy::{
-    self,
+    self, Dag,
     petgraph::visit::{self, Reversed, Topo},
     stable_dag::StableDag,
-    Dag,
 };
 use fs4::FileExt;
 use futures::Future;
-use netlink_ops::netlink::{nl_ctx, LinkAB, LinkKey, NLDriver, NLHandle};
+use netlink_ops::netlink::{LinkAB, LinkKey, NLDriver, NLHandle, nl_ctx};
 use nsproxy_common::{NSSource, PidPath::Selfproc, UniqueFile, VaCache, ValidationErr};
 use petgraph::visit::IntoNodeReferences;
 use serde_json::{from_str, to_string_pretty};
@@ -257,15 +256,15 @@ impl Graphs {
         }
         Ok(())
     }
-    pub async fn do_prune<'f, S>(
-        &mut self,
-        ctx: &NSGroup<ExactNS>,
-        serv: &S,
+    pub async fn do_prune<'a, 'x, 'y, S: ServiceM>(
+        &'a mut self,
+        ctx: &'a NSGroup<ExactNS>,
+        serv: &'x S,
         remove: HashMap<NodeI, RM>,
-        nl: &mut NLDriver,
+        nl: &'a mut NLDriver,
     ) -> Result<()>
     where
-        for<'a, 'b> NodeWDeps<'a, 'b>: ItemRM<Serv = S>,
+        for<'b, 'c> NodeWDeps<'b, 'c>: ItemRM<Serv = S>,
     {
         for (ni, rm) in remove.iter() {
             let nodew = self.nodewdeps(*ni)?;

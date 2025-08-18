@@ -50,7 +50,9 @@ fn main() -> Result<()> {
         u.truncate(2);
         dbg!(u);
 
-        let mut u = p.clone().proxy.list_units().await?;
+        let k = p.clone();
+        drop(pre);
+        let mut u = k.proxy.list_units().await?;
         u.truncate(2);
         dbg!(u);
         anyhow::Ok(())

@@ -8,11 +8,11 @@ use std::{
 
 use anyhow::anyhow;
 use daggy::{
-    petgraph::{
-        visit::{EdgeRef, IntoEdgesDirected, IntoNodeReferences},
-        Direction,
-    },
     EdgeIndex, NodeIndex,
+    petgraph::{
+        Direction,
+        visit::{EdgeRef, IntoEdgesDirected, IntoNodeReferences},
+    },
 };
 use derive_new::new;
 use owo_colors::OwoColorize;
@@ -30,11 +30,11 @@ use crate::{
 // Higer level actions: create nodes, relations
 // Lower level actions: create, start, remove systemd services
 
-pub trait ServiceM: Sized {
-    type Ctx<'p>;
-    /// Run this before any startsj 
-    async fn reload(&self, ctx: &Self::Ctx<'_>) -> Result<()>;
-    async fn ctx<'p>(&'p self) -> Result<Self::Ctx<'p>>;
+pub trait ServiceM: Sized + Clone {
+    type Ctx;
+    /// Run this before any startsj
+    async fn reload(&self) -> Result<()>;
+    fn ctx(&self) -> anyhow::Result<&Self::Ctx>;
 }
 
 pub type NodeIndexed<'k> = Indexed<NodeI, &'k ObjectNode>;
@@ -79,22 +79,19 @@ pub trait ItemPersist: MItem {
     async fn enable(
         &self,
         serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
     ) -> Result<()>;
     async fn disable(
         &self,
         serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
     ) -> Result<()>;
 }
 
 /// Meaning as in systemd
 pub trait ItemAction: MItem {
-    async fn stop(&self, serv: &Self::Serv, ctx: &<Self::Serv as ServiceM>::Ctx<'_>) -> Result<()>;
+    async fn stop(&self, serv: &Self::Serv) -> Result<()>;
     async fn restart(
         &self,
         serv: &Self::Serv,
-        ctx: &<Self::Serv as ServiceM>::Ctx<'_>,
     ) -> Result<()>;
 }
 
@@ -106,7 +103,10 @@ pub trait ItemCreate: MItem {
 }
 
 pub trait ItemRM: MItem {
-    async fn remove(&self, serv: &Self::Serv) -> Result<()>;
+    async fn remove(
+        &self,
+        serv: &Self::Serv
+    ) -> Result<()>;
 }
 
 #[public]

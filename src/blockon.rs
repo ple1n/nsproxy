@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
 use crate::aok;
-pub fn block_on<F: Future + Send>(future: F) -> Result<F::Output>
+pub fn block_on<'f, F: Future + 'f + Send>(future: F) -> Result<F::Output>
 where
     F::Output: Send,
 {
@@ -15,7 +15,7 @@ where
 
 static ASYNCRT: Mutex<Option<Runtime>> = Mutex::new(None);
 
-pub fn block_on_2<K: Send, F: Future<Output = K> + Send>(
+pub fn block_on_2<'f, K: Send, F: Future<Output = K> + Send + 'f>(
     future: F,
     multi: bool,
 ) -> Result<F::Output> {

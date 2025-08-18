@@ -24,6 +24,7 @@ __*Not designed to contain malwares*__. Further, for convenience, the tool allow
 The recommended setup is to have both `nsproxy` and `sproxy` available. 
 
 ```bash
+cargo b -r # always use release build
 ./nsproxy install -s [--dstdir DSTDIR] 
 ```
 
@@ -67,6 +68,7 @@ Run
 
 ```bash
 sproxy new -t ./tor_browser.json
+# You must run sproxy in the same net namespace as Tor daemon process.
 ```
 
 Nsproxy then creates a node, which represents a network namespace.
@@ -121,6 +123,15 @@ Options:
   -o, --output <OUTPUT>
 ```
 
+## Changing the proxy of an existing Netns
+
+Say, you have opened browsers and vscode in a netns set up by _nsproxy_. You have to change the proxy of the ns.
+
+```sh
+sproxy new --replace <name or id of your ns> --tun2proxy <new config file>
+# only difference is the -r option. everything else is the same. 
+```
+
 ## Guide on using Flatpak with Nsproxy
 
 Flatpak installs (as of the time of writing this, because they can change any time) packages with the process you run, which means you can run the flatpak-install inside an Nsproxy Netns, and keep downloads proxied.
@@ -168,6 +179,21 @@ Usage: nsproxy set-dns
 You have to enter the namespace, and do the command in the said shell.
 
 NSProxy must be installed to paths that SELinux allows; otherwise you get 203/Exec systemd error, if you choose to use systemd.
+
+## Connecting Docker, but permission denied
+
+You found something like this?
+
+```
+Docker version 28.1.1, build 4eba377
+Cargo.lock not found in path /b/by_projects/zk_compile/compiler/host/Cargo.lock
+ERROR: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+Error: docker build failed
+```
+
+Re-enter your netns with root user, `sproxy enter -u 0 0` (assuming your ns has node id 0),
+
+Docker downloads files through a systemd service `dockerd`, which doesnt go through nsproxy.
 
 ## Handle system requests on opening links
 
@@ -287,3 +313,7 @@ A: I already wrote this and it's based on the same primitives Docker uses.
 ## Dev
 
 a tool is available for ./tun2socks5 testing https://github.com/ple1n/dns_stress_test
+
+TODO
++ Add nsproxy monitor, to show live logs. systemd sucks to use.
++ Integrate it with https://github.com/daeuniverse/dae 
