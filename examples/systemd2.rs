@@ -24,21 +24,36 @@ fn main() -> Result<()> {
 
     // })?;
 
-    let rt =  tokio::runtime::Builder::new_current_thread()
-    .enable_all()
-    .build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
-    let pre = rt.block_on(async {
-        zbus::Connection::session().await
-    })?;
+    let pre = rt.block_on(async { zbus::Connection::session().await })?;
 
     println!("conn");
 
-    rt.block_on(async {
-        let mg = ManagerProxy::new(&pre).await?;
+    let p = rt.block_on(async {
+        let mg: ManagerProxy<'static> = ManagerProxy::new(&pre).await?;
         mg.reload().await?;
+
+        let p = PackagedSystemd {
+            conn: pre.clone(), // this means conn can be cloned
+            proxy: mg,
+        };
         println!("reloaded");
-        aok!()
+
+        anyhow::Ok(p)
+    })?;
+
+    rt.block_on(async {
+        let mut u = p.proxy.list_units().await?;
+        u.truncate(2);
+        dbg!(u);
+
+        let mut u = p.clone().proxy.list_units().await?;
+        u.truncate(2);
+        dbg!(u);
+        anyhow::Ok(())
     })?;
 
     // asyncsingle(async {
@@ -50,6 +65,12 @@ fn main() -> Result<()> {
     //     aok!()
     // });
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct PackagedSystemd {
+    conn: zbus::Connection,
+    proxy: ManagerProxy<'static>,
 }
 
 fn asyncsingle<F>(fut: F) -> F::Output
