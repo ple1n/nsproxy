@@ -314,9 +314,11 @@ impl Graphs {
         k.file = Some(file);
         Ok(k)
     }
+    /// We should be particularly cautious about changing the config state
+    /// Invalid state can lead to a lot of inconvenience
     pub fn dump_file(&self, path: &PathState, wuid: u32) -> Result<()> {
         let pa = Self::path(path);
-        log::info!("Dump graphs to {:?}", &pa);
+        log::warn!("Dump graphs to {:?}", &pa);
         let file = std::fs::File::create(&pa)?;
         chown(&pa, Some(wuid), None)?;
         serde_json::to_writer_pretty(&file, self)?;
