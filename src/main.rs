@@ -105,8 +105,9 @@ use zbus::zvariant::NoneValue;
 struct Cli {
     #[arg(long, short)]
     log: Option<Level>,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
     /// Require repeated signals to exit
     #[arg(long, short, default_value = "1")]
     sigint: u8,
@@ -371,7 +372,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Noop => exit(0),
+        Some(Commands::Noop) => exit(0),
         _ => (),
     }
 
@@ -403,7 +404,7 @@ static mut SOCK_CHILD: Option<UnixStream> = None;
 use blockon::*;
 
 fn cmd(
-    cli: Cli,
+    mut cli: Cli,
     cwd: PathBuf,
     cb: Option<Box<dyn FnOnce() -> Result<()>>>,
 ) -> Result<(), anyhow::Error> {
@@ -414,8 +415,13 @@ fn cmd(
     }
 
     let node_name = "local";
+    let command = if let Some(cmd) = cli.command {
+        cmd
+    } else {
+        Commands::Info
+    };
 
-    Ok(match cli.command {
+    Ok(match command {
         Commands::TestGUI {} => {
             SIGINT_RES.store(SigintResponse::Exit, SeqCst);
             block_on(async {
@@ -483,10 +489,10 @@ fn cmd(
         } => {
             let cl = Cli {
                 log: cli.log,
-                command: Commands::Node {
+                command: Some(Commands::Node {
                     id: Some(id),
                     op: NodeOps::Run { cmd: op, uid, args }.into(),
-                },
+                }),
                 sigint: cli.sigint,
             };
             cmd(cl, cwd, nonecb)?;
@@ -512,7 +518,7 @@ fn cmd(
                         Cli {
                             log: cli.log,
                             sigint: 1,
-                            command: Commands::New {
+                            command: Some(Commands::New {
                                 pid: None,
                                 tun2proxy: None,
                                 cmd: None,
@@ -530,7 +536,7 @@ fn cmd(
                                     "192.168.2.2/24".parse()?
                                 }),
                                 replace: None,
-                            },
+                            }),
                         },
                         cwd.clone(),
                         Some(Box::new(move || {
@@ -546,7 +552,7 @@ fn cmd(
                                 Cli {
                                     log: cli.log,
                                     sigint: 1,
-                                    command: Commands::TUN2proxy {
+                                    command: Some(Commands::TUN2proxy {
                                         cmd: TUN2ProxyCmd::FromArgs {
                                             args: TUNC {
                                                 layer: Layer::L3,
@@ -556,7 +562,7 @@ fn cmd(
                                             iargs,
                                         },
                                         setup: true,
-                                    },
+                                    })
                                 },
                                 cwd,
                                 nonecb,
@@ -581,13 +587,13 @@ fn cmd(
                     cmd(
                         Cli {
                             log: cli.log,
-                            command: Commands::Node {
+                            command: Some(Commands::Node {
                                 id: None,
                                 op: NodeOps::RM {
                                     ids: vec![node as u32],
                                 }
                                 .into(),
-                            },
+                            }),
                             sigint: 1,
                         },
                         cwd,
@@ -820,7 +826,7 @@ fn cmd(
                 .net
                 .must()?
                 .to_owned();
-            
+
             block_on(async move {
                 graphs.clear_ns(src, &serv).await?;
 
@@ -840,6 +846,7 @@ fn cmd(
 
                 if src == out {
                     warn!("src ns == target ns");
+                    bail!("unusual usage");
                 }
 
                 if let Some(ref tun2proxy) = tun2proxy {
@@ -1455,10 +1462,10 @@ fn cmd(
                                             Cli {
                                                 log: None,
                                                 sigint: 1,
-                                                command: Commands::Node {
+                                                command: Some(Commands::Node {
                                                     id: Some(NodeAddr::Ix(*id)),
                                                     op: NodeOps::Restore { fd }.into(),
-                                                },
+                                                }),
                                             },
                                             cwd.clone(),
                                             nonecb,
@@ -1625,7 +1632,7 @@ fn cmd(
                 Cli {
                     log: None,
                     sigint: 1,
-                    command: Commands::New {
+                    command: Some(Commands::New {
                         pid: None,
                         tun2proxy: Some(path.into()),
                         cmd: your_shell(None, Some(uid))?,
@@ -1639,7 +1646,7 @@ fn cmd(
                         associated: None,
                         assoc_ip: None,
                         replace: None,
-                    },
+                    }),
                 },
                 cwd,
                 nonecb,

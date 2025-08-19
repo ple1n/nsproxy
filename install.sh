@@ -1,0 +1,1 @@
+sudo ./target/release/nsproxy install -s 
