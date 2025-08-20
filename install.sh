@@ -1,1 +1,1 @@
-sudo ./target/release/nsproxy install -s 
+sudo ./target/debug/nsproxy install -s 

@@ -34,6 +34,17 @@ pub fn block_on_2<'f, K: Send, F: Future<Output = K> + Send + 'f>(
     Ok(rt.block_on(future))
 }
 
+pub fn block_on_current<'f, K: Send, F: Future<Output = K> + Send + 'f>(
+    future: F,
+) -> Result<F::Output> {
+    let rt = {
+        let mut rtb = tokio::runtime::Builder::new_current_thread();
+        rtb.enable_all();
+        rtb.build()?
+    };
+    Ok(rt.block_on(future))
+}
+
 #[test]
 fn consec() -> Result<()> {
     block_on_2(
