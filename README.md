@@ -1,6 +1,8 @@
 # nsproxy
 
-ie. Kernel-Network-Namespace-Proxy
+> Spend 96 hours configuring Docker and it won't be using your proxy. That's why you need _nsproxy_.
+
+Kernel-Network-Namespace-Proxy. 
 
 Available commands 
 
@@ -145,6 +147,10 @@ I just tested two terminals with `flatpak tun` inside a nsproxy ns. Both showed 
 ## On using Docker
 
 Docker installs things, by default, with a daemon, so you can not run a docker-install command in nsproxy and expect it work.
+
+You can run `systemctl stop docker.service docker.socket`, and start `dockerd` in a netns.
+
+Docker downloads images through `dockerd`.
 
 ## An attempt to run Ywallet on Fedora
 
@@ -308,7 +314,9 @@ Secondly, based on my past usage, it's really hard to configure everything right
 
 - Why not just use Docker?
 
-A: I already wrote this and it's based on the same primitives Docker uses. 
+A: I already wrote about this and it's based on the same primitives Docker uses. 
+
+Almost every software doesn't treat proxying seriously. You can spend hours and hours and the softwares won't pick up your proxy. That's just my past experience endlessly vindicated.
 
 ## Dev
 

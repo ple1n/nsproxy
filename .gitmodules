@@ -47,3 +47,12 @@
 [submodule "nsproxy-ui"]
     path = nsproxy-ui
     url = https://github.com/planetoryd/nsproxy_egui
+[submodule "netlink-packet-route"]
+	path = netlink-packet-route
+	url = https://github.com/rust-netlink/netlink-packet-route
+[submodule "netlink-packet-utils"]
+	path = netlink-packet-utils
+	url = https://github.com/ple1n/netlink-packet-utils
+[submodule "netlink-packet-core"]
+	path = netlink-packet-core
+	url = https://github.com/ple1n/netlink-packet-core

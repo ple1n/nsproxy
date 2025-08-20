@@ -5,6 +5,9 @@
 #![feature(ip_bits)]
 #![allow(static_mut_refs)]
 
+use console_subscriber::ConsoleLayer;
+use core::panic;
+use futures::stream::TryStreamExt;
 use std::collections::HashSet;
 use std::env::{current_exe, var};
 use std::fmt::format;
@@ -19,8 +22,12 @@ use std::path::Path;
 use std::process::{Command, Stdio, exit};
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use std::{fs::File, io::Read, os::fd::AsFd, path::PathBuf};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::PidPath::Selfproc;
 use anyhow::{anyhow, bail, ensure};
@@ -35,21 +42,21 @@ use futures::{FutureExt, SinkExt};
 use id_alloc::NetRange;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{SIGTERM, uid_t};
-use log::LevelFilter::{self, Debug};
 use log::{debug, error};
 use netlink_ops::netlink::{GetPidOrFd, NLDriver, NLHandle, PidOrFd, VPairKey, VethConn, nl_ctx};
-use netlink_ops::rtnetlink::Handle;
+use netlink_ops::rtnetlink::netlink_packet_route::RouteMessage;
 use netlink_ops::rtnetlink::netlink_packet_utils::byteorder::{
     BigEndian, ReadBytesExt, WriteBytesExt,
 };
 use netlink_ops::rtnetlink::netlink_proto::{NetlinkCodec, new_connection_from_socket};
 use netlink_ops::rtnetlink::netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_ops::rtnetlink::netlink_sys::{Socket, TokioSocket};
+use netlink_ops::rtnetlink::{Handle, IpVersion};
 use netlink_ops::state::{Existence, ExpCollection};
 use nix::fcntl::{OFlag, open};
 use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::signal::{SigHandler, signal};
-use nix::sys::stat::Mode;
+use nix::sys::stat::{umask, Mode};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
     ForkResult, Pid, Uid, close, fork, geteuid, getgid, getpid, getppid, getuid, sethostname,
@@ -86,15 +93,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use sys::NSEnter;
 use tarpc::serde_transport::Transport;
 use tokio::net::unix::pipe::Sender;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::instrument::WithSubscriber;
 use tracing::{Level, info, warn};
 use tracing_log::LogTracer;
-use tracing_subscriber::FmtSubscriber;
-use tun::{AsyncDevice, Configuration, Device, Layer};
+use tracing_subscriber::{FmtSubscriber, Layer, Registry};
+use tun::{AsyncDevice, Configuration, Device, Layer as TUNLayer};
 use tun2socks5::IArgs;
 use zbus::zvariant::NoneValue;
+
+const TUN_NAME: &str = "tun0";
 
 #[derive(Parser)]
 #[command(
@@ -184,6 +193,19 @@ enum Commands {
         /// configure network routing
         #[arg(long)]
         setup: bool,
+    },
+    /// Unfinished feature.
+    /// Convenience command for starting up a TUN right here in this net-ns, and reverts it when this process ends
+    /// This command can be used directly. By default routes are setup to route all traffic through the TUn
+    /// The routes are removed when this process exits
+    TUN {
+        path: PathBuf,
+        /// Generate an SNI log
+        #[arg(long, short)]
+        log: bool,
+        /// Flush all routes when process exits
+        #[arg(long, short)]
+        no_cleanup: bool,
     },
     Info,
     /// Enter the initialized user&mnt ns
@@ -306,6 +328,8 @@ static SIGINT_COUNTER: AtomicU8 = AtomicU8::new(0);
 static SIGINT_GOAL: AtomicU8 = AtomicU8::new(1);
 static TEARDOWN: Atomic<TeardownState> = Atomic::new(TeardownState::Disabled);
 static FORK_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static ROUTES_ADDED: RwLock<Option<HashSet<RouteMessage>>> = RwLock::const_new(None);
+static FLUSH_ROUTES_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
 use bytemuck::NoUninit;
 
@@ -315,6 +339,7 @@ pub enum SigintResponse {
     TeardownCurrNode,
     Ignore,
     Exit,
+    RemoveRoutes,
 }
 
 #[derive(NoUninit, Clone, Copy, Debug)]
@@ -356,7 +381,49 @@ extern "C" fn handle_sigint(signal: libc::c_int) {
             TEARDOWN.store(TeardownState::Doing, SeqCst);
             SIGINT_RES.store(SigintResponse::Exit, SeqCst);
         }
+        SigintResponse::RemoveRoutes => {
+            remove_routes();
+        }
     }
+}
+
+fn remove_routes() {
+    if !FLUSH_ROUTES_ON_EXIT.load(SeqCst) {
+        warn!("route flush / cleanup disabled");
+        return;
+    }
+
+    log_error(|| {
+        let k = std::thread::spawn(|| {
+            block_on_current(async {
+                let mut len = 0;
+                let mut counter = 0;
+                let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                let ipver = |v| async {
+                    let mut counter = 0;
+                    let mut ro = wh.conn.rawh.route().get(v).execute();
+                    while let Some(route) = ro.try_next().await? {
+                        wh.conn.rawh.route().del(route).execute().await?;
+                        counter += 1;
+                    }
+                    anyhow::Ok(counter)
+                };
+                counter += ipver(IpVersion::V4).await?;
+                counter += ipver(IpVersion::V6).await?;
+
+                warn!("removed {} routes", counter);
+                aok!()
+            })?
+        })
+        .join();
+        if let Err(e) = k {
+            std::panic::resume_unwind(e);
+        } else {
+            k.unwrap()
+        }
+    });
+
+    exit(0);
 }
 
 fn main() -> Result<()> {
@@ -375,14 +442,31 @@ fn main() -> Result<()> {
         Some(Commands::Noop) => exit(0),
         _ => (),
     }
+    let num: u32 = rand::random();
+    let debugger_path = PathBuf::from(format!("/tmp/nsproxy{}", num));
 
-    let subscriber = FmtSubscriber::builder()
-        .compact()
-        .without_time()
-        .with_max_level(cli.log.unwrap_or(Level::INFO))
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-    LogTracer::init()?;
+    umask(Mode::empty()); // allow socket to be world readable
+    let sp = ConsoleLayer::builder()
+        .server_addr(debugger_path.clone())
+        .spawn::<Registry>();
+
+    tracing_subscriber::registry()
+        .with(sp)
+        .with(tracing_subscriber::fmt::layer().with_filter(LevelFilter::INFO))
+        .init();
+
+    // let subscriber = FmtSubscriber::builder()
+    //     .compact()
+    //     .without_time()
+    //     .with_max_level(cli.log.unwrap_or(Level::INFO))
+    //     .finish();
+    // tracing::subscriber::set_global_default(subscriber)?;
+    // LogTracer::init()?;
+
+    warn!(
+        "Tokio console at file://localhost{}",
+        &debugger_path.to_string_lossy()
+    );
     info!("SHA1: {}", env!("VERGEN_GIT_SHA"));
     let cwd = std::env::current_dir()?;
 
@@ -555,14 +639,14 @@ fn cmd(
                                     command: Some(Commands::TUN2proxy {
                                         cmd: TUN2ProxyCmd::FromArgs {
                                             args: TUNC {
-                                                layer: Layer::L3,
+                                                layer: TUNLayer::L3,
                                                 tun_name: None,
                                                 mtu: None,
                                             },
                                             iargs,
                                         },
                                         setup: true,
-                                    })
+                                    }),
                                 },
                                 cwd,
                                 nonecb,
@@ -857,7 +941,7 @@ fn cmd(
                     );
                     let socks2t = Socks2TUN::new(&tun2proxy, edge)?;
                     let rel = socks2t
-                        .write((Layer::L3, Some(pspath.clone())), &serv)
+                        .write((TUNLayer::L3, Some(pspath.clone())), &serv)
                         .await?;
                     graphs.data[edge].replace(rel);
                 }
@@ -966,6 +1050,86 @@ fn cmd(
                 aok!()
             })??;
         }
+        Commands::TUN {
+            path,
+            log,
+            no_cleanup: cleanup,
+        } => {
+            let mut cf = File::open(&path)?;
+            let mut k: IArgs = serde_json::from_reader(&mut cf)?;
+            info!("configuring TUN and network routing");
+            SIGINT_RES.store(SigintResponse::RemoveRoutes, SeqCst);
+            FLUSH_ROUTES_ON_EXIT.store(!cleanup, SeqCst);
+
+            let dev: tun::platform::Device = {
+                let args = TUNC {
+                    layer: TUNLayer::L3,
+                    tun_name: None,
+                    mtu: None,
+                };
+                let mut conf: Configuration = Default::default();
+                #[cfg(target_os = "linux")]
+                conf.platform(|config| {
+                    config.packet_information(true);
+                    config.apply_settings(false);
+                });
+                conf.layer(args.layer);
+                if let Some(na) = args.tun_name {
+                    conf.name(na);
+                } else {
+                    conf.name(TUN_NAME);
+                }
+                let mut dev = tun::create(&conf)?;
+                if let Some(mtu) = args.mtu.or(Some(DEFAULT_MTU)) {
+                    dev.set_mtu((mtu).try_into().unwrap())?;
+                }
+                dev.enabled(true)?;
+                dev.set_nonblock()?;
+                dev.persist()?;
+                assert!(dev.has_packet_information());
+                dev
+            };
+            let mut routes = HashSet::new();
+            block_on(async {
+                let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
+                let li = wh.conn.get_link(TUN_NAME.parse()?).await?;
+                let mut add = |a| routes.extend(a);
+                let _ = wh
+                    .conn
+                    .ip_add_route(li.header.index, None, Some(true))
+                    .await
+                    .map(&mut add);
+                let _ = wh
+                    .conn
+                    .ip_add_route(li.header.index, None, Some(false))
+                    .await
+                    .map(&mut add);
+
+                let _ = wh
+                    .conn
+                    .add_addr_dev(IpNetwork::new("100.64.0.2".parse()?, 16)?, li.header.index)
+                    .await;
+                info!("total {} routes", routes.len());
+
+                let mut g = ROUTES_ADDED.write().await;
+                *g = Some(routes);
+                // It must have a source addr so the TUN driver can send packets back.
+                // It shows as 0.0.0.0 if there isn't an ddress
+                let li = wh.conn.get_link("lo".parse()?).await?;
+                wh.conn.set_link_up(li.header.index).await?;
+
+                let current_uid = what_uid(None, true)?;
+                let (pspath, paths): (PathBuf, PathState) = PathState::load(current_uid)?;
+                let paths: Paths = paths.into();
+
+                tun2proxy_with_api(k, dev, paths).await?;
+
+                aok!()
+            })??;
+
+            // Run TUN
+            remove_routes();
+        }
         Commands::TUN2proxy { cmd, setup } => {
             SIGINT_RES.store(SigintResponse::Exit, SeqCst);
             let (pspath, paths): (PathBuf, PathState) = PathState::load(what_uid(None, true)?)?;
@@ -974,7 +1138,6 @@ fn cmd(
                 TUN2ProxyCmd::FromArgs { args, iargs } => false,
                 TUN2ProxyCmd::Systemd { path, id } => true,
             };
-            let default_tun_name = "tun0";
 
             let dev = if getfd_systemd {
                 // Setns, recv FD, start daemon
@@ -1008,7 +1171,7 @@ fn cmd(
                 if let Some(na) = args.tun_name {
                     conf.name(na);
                 } else {
-                    conf.name(default_tun_name);
+                    conf.name(TUN_NAME);
                 }
                 let mut dev = tun::create(&conf)?;
                 if let Some(mtu) = args.mtu.or(Some(DEFAULT_MTU)) {
@@ -1024,7 +1187,7 @@ fn cmd(
                 info!("configuring TUN and network routing");
                 block_on(async {
                     let wh = NLDriver::new(NLHandle::new_self_proc_tokio()?);
-                    let li = wh.conn.get_link(default_tun_name.parse()?).await?;
+                    let li = wh.conn.get_link(TUN_NAME.parse()?).await?;
                     wh.conn
                         .ip_add_route(li.header.index, None, Some(true))
                         .await?;
@@ -1204,7 +1367,7 @@ fn cmd(
                             );
                             let socks2t = Socks2TUN::new(&path, edge)?;
                             let rel = socks2t
-                                .write((Layer::L3, Some(pspath.clone())), &serv)
+                                .write((TUNLayer::L3, Some(pspath.clone())), &serv)
                                 .await?;
                             graphs.data[edge].replace(rel);
                             graphs.dump_file(&paths, uid)?;
@@ -1661,6 +1824,89 @@ fn cmd(
         }
         _ => todo!(),
     })
+}
+
+async fn tun2proxy_with_api(
+    mut iargs: IArgs,
+    dev: tun::platform::Device,
+    paths: Paths,
+) -> anyhow::Result<()> {
+    warn!("Tun2proxy with RPC enabled, serving");
+    use futures::StreamExt;
+    use nsproxy_common::rpc::*;
+    use tarpc::serde_transport::unix;
+    use tarpc::tokio_serde::formats::*;
+    use tokio::sync::mpsc::channel;
+
+    if let Some(ref mut p) = iargs.state {
+        let mut f = p.file_name().unwrap().to_owned();
+        let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?;
+        f.push(format!("_ns_{}", netns.unique));
+        // WARN This will cause problems when you have multiple TUNs in one NS, and use one config
+        p.set_file_name(f);
+    }
+    log::info!("{:?}", iargs);
+    let dev = AsyncDevice::new(dev)?;
+
+    let sock = paths.sock("rpc")?;
+
+    let path = if let Some(ei) = iargs.id {
+        let sp = sock.for_ix(EdgeI::from(ei as u32));
+        Some(sp)
+    } else if let Some(ref name) = iargs.name {
+        Some(std::env::current_dir()?.join(format!("{}.sock", name)))
+    } else {
+        None
+    };
+
+    let sx_report = if let Some(sp) = path {
+        if sp.exists() {
+            std::fs::remove_file(&sp)?;
+        }
+        info!("rpc on {:?} mode 777", &sp);
+        drop(paths);
+
+        let mut rpc = unix::listen(&sp, Bincode::<FromServer, FromClient>::default).await?;
+        std::fs::set_permissions(&sp, Permissions::from_mode(0o777)).unwrap();
+        let (sx, mut rx) = channel::<FromClient>(5);
+
+        tokio::spawn(
+            #[allow(unreachable_code)]
+            async move {
+                let mut t = None;
+                loop {
+                    futures::select! {
+                        d = rpc.next().fuse() => {
+                            if let Some(d) = d {
+                                t = Some(d?);
+                            } else {
+                                break;
+                            }
+                        }
+                        x = rx.recv().fuse() => {
+                            if let Some(x) = x {
+                                if let Some(c) = &mut t {
+                                    let rx = c.send(x).await;
+                                    if rx.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                }
+                aok!()
+            },
+        );
+        Some(sx)
+    } else {
+        warn!("supply --id or --name to enable RPC");
+        None
+    };
+    let (sx, rx) = mpsc::channel(1);
+    tun2socks5::main_entry(dev, DEFAULT_MTU.try_into()?, true, iargs, rx, sx, sx_report).await?;
+
+    aok!()
 }
 
 fn summarize_graph(graphs: &Graphs) -> Result<()> {

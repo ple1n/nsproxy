@@ -41,8 +41,22 @@ pub fn path_to_str(pa: &Path) -> Result<&str> {
     pa.to_str().ok_or(NonUTF8Error.into())
 }
 
+use thiserror;
+
+#[derive(thiserror::Error, Debug)]
+#[error("omitted")]
+pub struct EmptyError;
+
 pub macro aok() {
     Ok::<(), anyhow::Error>(())
+}
+
+pub fn log_error(mut f: impl FnMut() -> anyhow::Result<()>) {
+    let er = f();
+    if let Err(e) = er {
+        tracing::error!("{:?}", e);
+
+    }
 }
 
 pub const PROBE_TUN: &str = "tunp";
