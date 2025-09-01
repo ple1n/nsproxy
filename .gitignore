@@ -6,3 +6,4 @@ geph.json
 nsproxy
 install
 release
+*.out.*
