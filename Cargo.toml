@@ -49,6 +49,8 @@ tun-rs = { version = "2.7.2", features = ["async_io"] }
 flume = "0.11.1"
 tun2socks5 = { path = "./tun2socks5" }
 netlink-ops = { path = "./netlink-ops" }
+pidfd = { path = "./pidfd" }
+fs4 = { version = "0.13", features = ["tokio"] }
 
 [dependencies]
 anyhow = "1.0.75"
@@ -98,7 +100,7 @@ owo-colors = "3.5.0"
 inotify = "0.10.2"
 futures = "0.3.29"
 procfs = "0.16.0"
-fs4 = "0.7.0"
+
 linux-raw-sys = { version = "0.6.3", features = ["ioctl"] }
 passfd = { version = "*" }
 derive-new = "0.6.0"
