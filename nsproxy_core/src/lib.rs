@@ -2,34 +2,35 @@
 #![allow(async_fn_in_trait)]
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::fd::AsFd;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Ok;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use ipnetwork::Ipv4Network;
 use ipnetwork::Ipv6Network;
+use nsproxy_common::ExactNS;
+use nsproxy_common::NSFrom;
 use rtnetlink::Handle;
 use rtnetlink::RouteAddRequest;
-use rtnetlink::RouteGetResolve;
-use rtnetlink::netlink_packet_route::AddressMessage;
-use rtnetlink::netlink_packet_route::IFF_UP;
-use rtnetlink::netlink_packet_route::LinkMessage;
-use rtnetlink::netlink_packet_route::RouteFlags;
-use rtnetlink::netlink_packet_route::RouteMessage;
-use rtnetlink::netlink_packet_route::RtnlMessage;
-use rtnetlink::netlink_packet_route::link;
-use rtnetlink::netlink_packet_route::route;
-use rtnetlink::netlink_proto::Connection;
+use rtnetlink::{RouteGetResolve, netlink_packet_route::{AddressMessage, IFF_UP, LinkMessage, RouteFlags, RouteMessage, RtnlMessage, link, route}, netlink_proto::Connection};
 use serde::Deserialize;
 use serde::Serialize;
+use serde_untagged::UntaggedEnumVisitor;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::time::timeout;
 pub use tun2socks5;
+pub mod sys;
 pub mod utils;
 
 pub struct TunMaker {
@@ -370,5 +371,193 @@ impl Default for TunMaker {
             ipv4: "100.68.0.1/24".try_into().unwrap(),
             ipv6: "fe80::bc2e:4aff:fe02:c223/64".try_into().unwrap(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct PathState {
+    root_config: PathBuf,
+}
+
+pub type Paths = Arc<PathState>;
+
+pub trait PathsBinds {
+    fn root(&self) -> PathBuf;
+    fn mount(&self, ns: ExactNS) -> PathBuf;
+    fn mount_user_space(&self, user_ns: ExactNS, ns: ExactNS) -> PathBuf;
+    fn readable_config(&self) -> PathBuf;
+    fn mount_private(&self) -> PathBuf;
+    fn make_mount_point(&self, path: PathBuf) -> Result<()> {
+        std::fs::File::create(&path)?;
+        Ok(())
+    }
+}
+
+use fs4::tokio::AsyncFileExt;
+
+/// The entirety of persisted runtime state.
+pub struct TotalConfig {
+    fd: tokio::fs::File,
+    path: Paths,
+    data: Result<NsproxyConfig>,
+}
+
+#[derive(Deserialize, Clone, Serialize, Debug)]
+pub struct NsproxyConfig {
+    container: HashMap<String, Namespace>,
+    veth: HashMap<String, VethConf>,
+    link: Vec<LinkConf>,
+}
+
+#[derive(Deserialize, Clone, Serialize, Debug)]
+pub struct LinkConf {
+    global_route: bool,
+    proxy: String,
+    proxied: NSID,
+    source: NSID,
+}
+
+#[derive(Deserialize, Clone, Debug, Serialize)]
+pub struct Namespace {
+    user: Option<NSID>,
+    mnt: Option<NSID>,
+    net: NSID,
+}
+
+#[derive(Deserialize, Clone, Debug, Serialize)]
+pub struct VethConf {
+    src_ip4: Ipv4Addr,
+    dst_ip4: Option<Ipv4Addr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NSID {
+    PID(i32),
+    Path(PathBuf),
+}
+
+impl<'d> Deserialize<'d> for NSID {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'d>,
+    {
+        use std::result::Result::Ok;
+        UntaggedEnumVisitor::new()
+            .string(|v| Ok(NSID::Path(PathBuf::from(v))))
+            .i32(|v| Ok(NSID::PID(v)))
+            .deserialize(deserializer)
+    }
+}
+
+impl Serialize for NSID {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::PID(p) => serializer.serialize_i32(*p),
+            Self::Path(p) => serializer.serialize_str(
+                p.to_str()
+                    .ok_or(serde::ser::Error::custom("path invalid"))?,
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_untag() {
+    #[derive(Deserialize, Debug, Serialize)]
+    struct Example {
+        k: NSID,
+    }
+
+    let sx: Example = toml_edit::de::from_str("k = \"sss/ssss\"").unwrap();
+    dbg!(&sx);
+    let sx: Example = toml_edit::de::from_str("k = 2").unwrap();
+    dbg!(&sx);
+
+    let sx: Namespace = toml_edit::de::from_str(
+        r#"
+            user = 3 
+            net = "/path/"
+     "#,
+    )
+    .unwrap();
+    dbg!(&sx);
+
+    let sx = toml_edit::ser::to_string_pretty(&Example {
+        k: NSID::Path(PathBuf::from("/test")),
+    });
+    dbg!(&sx);
+
+    let sx: NsproxyConfig = toml_edit::de::from_str(
+        r#"
+            [container.geph]
+            net = "/run/1.ns"
+            [veth.geph]
+            src_ip4 = "1.1.1.1"
+            [[link]]
+            global_route = false
+            proxy = "socks5"
+            proxied = 2
+            source = 3
+     "#,
+    )
+    .unwrap();
+    dbg!(&sx);
+
+    let sx = toml_edit::ser::to_string_pretty(&sx);
+    println!("{}", sx.unwrap());
+}
+
+impl TotalConfig {
+    pub async fn new(path: Paths) -> Result<TotalConfig> {
+        let mut c = TotalConfig {
+            fd: fs::File::open(path.readable_config()).await?,
+            path,
+            data: Err(anyhow!("not loaded")),
+        };
+        let re = c.fd.try_lock_exclusive()?;
+        if re {
+            Ok(c)
+        } else {
+            tracing::error!("config file locked.. waiting");
+            let f = c.fd.unlock_async();
+            let k: std::result::Result<
+                std::result::Result<(), std::io::Error>,
+                tokio::time::error::Elapsed,
+            > = timeout(Duration::from_secs(20), f).await;
+            match k {
+                Result::Ok(_) => {}
+                Err(_) => {
+                    bail!("timeout reached");
+                }
+            }   
+            let mut buf = Vec::with_capacity(4096);
+            c.fd.read_to_end(&mut buf).await?;
+            c.data = Ok(toml_edit::de::from_slice(&buf)?);
+            Ok(c)
+        }
+    }
+    pub async fn save(&mut self) {}
+}
+
+impl PathsBinds for Paths {
+    fn root(&self) -> PathBuf {
+        self.root_config.clone()
+    }
+    fn mount(&self, ns: ExactNS) -> PathBuf {
+        self.root_config.join(ns.unique.to_string() + ".ns")
+    }
+    fn mount_private(&self) -> PathBuf {
+        self.root_config.join("priv_mnt")
+    }
+    fn mount_user_space(&self, user_ns: ExactNS, ns: ExactNS) -> PathBuf {
+        self.mount_private()
+            .join(user_ns.unique.to_string() + ".user")
+            .join(ns.unique.to_string() + ".ns")
+    }
+    fn readable_config(&self) -> PathBuf {
+        self.root_config.join("nsproxyd.toml")
     }
 }
