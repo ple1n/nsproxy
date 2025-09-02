@@ -356,7 +356,6 @@ impl TunState {
         if let Some(dev) = &self.fd {
             self.dev_index = dev.if_index()?;
             self.tun_is_up = dev.is_running()?;
-
             self.sync.basic_synced = true;
         }
 

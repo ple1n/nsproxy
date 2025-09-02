@@ -2,8 +2,14 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 use clap_complete_nushell::Nushell;
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
-use std::{collections::HashSet, error::Error, io, time::UNIX_EPOCH};
-use tokio::task;
+use rand::{distr::Distribution, rng};
+use std::{
+    collections::HashSet,
+    error::Error,
+    io,
+    time::{Duration, UNIX_EPOCH},
+};
+use tokio::{task, time::sleep};
 
 /// Simple HTTP client with clap
 #[derive(Parser)]
@@ -61,10 +67,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 reqwest::Client::builder().build()?
             };
+            let mut rng = rng();
+            // This matches real usage more closely
+            let dist = rand::distr::Uniform::new(Duration::from_millis(0), Duration::from_millis(1000))?;
             for _ in 0..count {
                 let url = url.clone();
                 let req = c.get(url);
+                let delay = dist.sample(&mut rng);
                 handles.push(async move {
+                    sleep(delay).await;
                     let resp = req.send().await;
                     resp
                 });
