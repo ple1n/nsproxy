@@ -1,9 +1,11 @@
+use anyhow::Result;
+use nsproxy_common::{ExactNS, UniqueFile};
+use procfs::process::Namespace;
+use serde::Serialize;
 use std::{
     collections::{HashMap, hash_map::Entry},
     hash::Hash,
 };
-use anyhow::Result;
-use serde::Serialize;
 use tokio::fs;
 
 pub trait MapExt {
@@ -33,4 +35,16 @@ pub async fn dump_as_json<V: Serialize>(val: &V, name: &str) -> Result<()> {
     let s = serde_json::to_string_pretty(val)?;
     fs::write(format!("./{}.out.json", name), s).await?;
     Ok(())
+}
+pub trait ToExactNs {
+    fn to_exactns(self) -> ExactNS;
+}
+
+impl ToExactNs for Namespace {
+    fn to_exactns(self) -> ExactNS {
+        ExactNS {
+            unique: UniqueFile::new(self.identifier, self.device_id),
+            source: nsproxy_common::NSSource::Path(self.path),
+        }
+    }
 }

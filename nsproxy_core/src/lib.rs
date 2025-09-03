@@ -18,11 +18,18 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use ipnetwork::Ipv4Network;
 use ipnetwork::Ipv6Network;
+use libc::pid_t;
 use nsproxy_common::ExactNS;
 use nsproxy_common::NSFrom;
 use rtnetlink::Handle;
 use rtnetlink::RouteAddRequest;
-use rtnetlink::{RouteGetResolve, netlink_packet_route::{AddressMessage, IFF_UP, LinkMessage, RouteFlags, RouteMessage, RtnlMessage, link, route}, netlink_proto::Connection};
+use rtnetlink::{
+    RouteGetResolve,
+    netlink_packet_route::{
+        AddressMessage, IFF_UP, LinkMessage, RouteFlags, RouteMessage, RtnlMessage, link, route,
+    },
+    netlink_proto::Connection,
+};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_untagged::UntaggedEnumVisitor;
@@ -37,6 +44,7 @@ pub struct TunMaker {
     pub name: String,
     pub ipv4: Ipv4Network,
     pub ipv6: Ipv6Network,
+    pub mtu: u16,
 }
 
 #[derive(Default)]
@@ -205,6 +213,12 @@ pub fn tokio_netlink_conn() -> Result<Handle> {
     Ok(handle)
 }
 
+pub fn smol_netlink_conn() -> Result<Handle> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+    Ok(handle)
+}
+
 /// this trait might be useful 'cause we might have wrappers over Handle, and Handles typed over net ns
 pub trait NetlinkOps {
     async fn fetch_routing_table(&self) -> Result<RoutingTable>;
@@ -320,8 +334,7 @@ impl TunMaker {
             .ipv4(self.ipv4.ip(), self.ipv4.prefix(), None)
             .ipv6(self.ipv6.ip(), self.ipv6.prefix())
             .packet_information(false)
-            .mtu(1400)
-            // .offload(offload)
+            .mtu(self.mtu)
             .build_async()?;
 
         Ok(TunState {
@@ -370,6 +383,7 @@ impl Default for TunMaker {
             name: "tun1".to_owned(),
             ipv4: "100.68.0.1/24".try_into().unwrap(),
             ipv6: "fe80::bc2e:4aff:fe02:c223/64".try_into().unwrap(),
+            mtu: 1500
         }
     }
 }
@@ -391,6 +405,9 @@ pub trait PathsBinds {
         std::fs::File::create(&path)?;
         Ok(())
     }
+    fn socket_server(&self) -> PathBuf {
+        self.root().join("nsproxy.sock")
+    }
 }
 
 use fs4::tokio::AsyncFileExt;
@@ -404,30 +421,30 @@ pub struct TotalConfig {
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
 pub struct NsproxyConfig {
-    container: HashMap<String, Namespace>,
-    veth: HashMap<String, VethConf>,
-    link: Vec<LinkConf>,
+    pub container: HashMap<String, Namespace>,
+    pub veth: HashMap<String, VethConf>,
+    pub link: Vec<LinkConf>,
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
 pub struct LinkConf {
-    global_route: bool,
-    proxy: String,
-    proxied: NSID,
-    source: NSID,
+    pub global_route: bool,
+    pub proxy: String,
+    pub proxied: NSID,
+    pub source: NSID,
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]
 pub struct Namespace {
-    user: Option<NSID>,
-    mnt: Option<NSID>,
-    net: NSID,
+    pub user: Option<NSID>,
+    pub mnt: Option<NSID>,
+    pub net: NSID,
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]
 pub struct VethConf {
-    src_ip4: Ipv4Addr,
-    dst_ip4: Option<Ipv4Addr>,
+    pub src_ip4: Ipv4Addr,
+    pub dst_ip4: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone)]
@@ -532,7 +549,7 @@ impl TotalConfig {
                 Err(_) => {
                     bail!("timeout reached");
                 }
-            }   
+            }
             let mut buf = Vec::with_capacity(4096);
             c.fd.read_to_end(&mut buf).await?;
             c.data = Ok(toml_edit::de::from_slice(&buf)?);
