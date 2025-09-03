@@ -1,6 +1,7 @@
 //! Misc low-level code
 
 use anyhow::{bail, ensure};
+use clone3::Clone3;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{pid_t, stat, syscall, uid_t};
 use nix::{
@@ -359,3 +360,36 @@ pub fn unshare_user_standalone(
 }
 
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
+
+pub fn clone3<const NEW_NET: bool>() -> Result<Clone3Result> {
+    let (x, y) = UnixStream::pair()?;
+    let mut pidfd = -1;
+    let mut syscall = Clone3::default();
+    if NEW_NET {
+        syscall.flag_newnet();
+    }
+    syscall.flag_pidfd(&mut pidfd);
+    match unsafe { syscall.call() }? {
+        0 => Ok(Clone3Result::IsChild { tx: x }),
+        id => Ok(Clone3Result::Parent {
+            child_pid: id,
+            child_pidfd: pidfd,
+            tx: y,
+        }),
+    }
+}
+
+pub enum Clone3Result {
+    Parent {
+        child_pid: i32,
+        child_pidfd: i32,
+        tx: UnixStream,
+    },
+    IsChild {
+        tx: UnixStream,
+    },
+}
+
+impl Clone3Result {
+    fn wait_for_child() {}
+}

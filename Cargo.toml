@@ -51,6 +51,8 @@ tun2socks5 = { path = "./tun2socks5" }
 netlink-ops = { path = "./netlink-ops" }
 pidfd = { path = "./pidfd" }
 fs4 = { version = "0.13", features = ["tokio"] }
+rlimit = "0.10.1"
+passfd = { version = "*" }
 
 [dependencies]
 anyhow = "1.0.75"
@@ -116,7 +118,7 @@ tarpc = { version = "0.34.0", features = [
 ] }
 rand = "0.8.5"
 rand_distr = "0.4.3"
-rlimit = "0.10.1"
+
 console-subscriber = "0.4.1"
 
 # daemonize-me = "2.0.1"

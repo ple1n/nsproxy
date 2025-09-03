@@ -815,6 +815,7 @@ fn cmd(
             })??;
             // Prune is called twice because some NSes are visible only in userns
             let (mut sp, mut sc) = UnixStream::pair()?;
+            sp.clon
             let mut buf = [0; 1];
             let mut nl_fd = None;
             let mut forked = false;
