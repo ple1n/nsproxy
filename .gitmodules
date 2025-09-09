@@ -2,3 +2,51 @@
 	path = crates/netlink-ops
 	url = https://github.com/ple1n/netlink-ops
 	branch = master
+[submodule "crates/rust-tun"]
+	path = crates/rust-tun
+	url = https://github.com/ple1n/rust-tun
+	branch = master
+[submodule "crates/rtnetlink"]
+	path = crates/rtnetlink
+	url = https://github.com/ple1n/rtnetlink
+	branch = main
+[submodule "crates/rustables"]
+	path = crates/rustables
+	url = https://github.com/ple1n/rustables
+	branch = netnsp
+[submodule "crates/netlink-packet-audit"]
+	path = crates/netlink-packet-audit
+	url = https://github.com/ple1n/netlink-packet-audit
+	branch = main
+[submodule "crates/netlink-sys"]
+	path = crates/netlink-sys
+	url = https://github.com/ple1n/netlink-sys
+	branch = main
+[submodule "crates/netlink-proto"]
+	path = crates/netlink-proto
+	url = https://github.com/ple1n/netlink-proto
+	branch = main
+[submodule "crates/tun2socks5"]
+	path = crates/tun2socks5
+	url = https://github.com/ple1n/tun2socks5
+	branch = master
+[submodule "crates/socks5-impl"]
+	path = crates/socks5-impl
+	url = https://github.com/ple1n/socks5-impl
+	branch = master
+[submodule "crates/pidfd"]
+	path = crates/pidfd
+	url = https://github.com/ple1n/pidfd
+	branch = master
+[submodule "crates/ipstack"]
+	path = crates/ipstack
+	url = https://github.com/ple1n/ipstack
+	branch = main
+[submodule "crates/clone3"]
+	path = crates/clone3
+	url = https://github.com/ple1n/clone3
+	branch = master
+[submodule "crates/nsproxy-ui"]
+	path = crates/nsproxy-ui
+	url = https://github.com/ple1n/nsproxy_egui
+	branch = master
