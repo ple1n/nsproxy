@@ -1,0 +1,4 @@
+[submodule "crates/netlink-ops"]
+	path = crates/netlink-ops
+	url = https://github.com/ple1n/netlink-ops
+	branch = master
