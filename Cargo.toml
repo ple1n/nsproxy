@@ -2,7 +2,6 @@ workspace.members = [
     "derive",
     "common",
     "rust-tun",
-    "netlink-ops",
     "netlink-packet-audit",
     "netlink-proto",
     "netlink-sys",
@@ -11,7 +10,8 @@ workspace.members = [
     "id_alloc",
     "tun2socks5",
     "ipstack",
-    "tun_bench", "nsproxy_core",
+    "tun_bench",
+    "nsproxy_core",
 ]
 
 [package]
@@ -48,7 +48,6 @@ sudo_check = []
 tun-rs = { version = "2.7.2", features = ["async_io"] }
 flume = "0.11.1"
 tun2socks5 = { path = "./tun2socks5" }
-netlink-ops = { path = "./netlink-ops" }
 pidfd = { path = "./pidfd" }
 fs4 = { version = "0.13", features = ["tokio"] }
 rlimit = "0.10.1"
@@ -71,6 +70,9 @@ nix = { version = "0.27.1", features = [
     "user",
     "ioctl",
     "signal",
+    "socket",
+    "uio",
+    "user"
 ] }
 rust-ini = "0.20.0"
 serde = { version = "1.0.190", features = ["derive"] }
@@ -79,11 +81,7 @@ thiserror = "1.0.50"
 xdg = "2.5.2"
 nsproxy-derive = { path = "./derive" }
 nsproxy-common = { path = "./common" }
-zbus = { version = "3.14", features = ["tokio"] }
-systemd-zbus = "0.1.1"
-libsystemd = "0.7.0"
 pidfd = { path = "./pidfd" }
-netlink-ops = { workspace = true }
 capctl = "0.2.3"
 tokio = { version = "1.34.0", features = ["net", "tracing"] }
 petgraph = { version = "0.6.4" }
