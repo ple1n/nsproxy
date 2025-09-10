@@ -46,7 +46,15 @@
 	path = crates/clone3
 	url = https://github.com/ple1n/clone3
 	branch = master
-[submodule "crates/nsproxy-ui"]
-	path = crates/nsproxy-ui
-	url = https://github.com/ple1n/nsproxy_egui
-	branch = master
+[submodule "crates/netlink-packet-route"]
+	path = crates/netlink-packet-route
+	url = https://github.com/ple1n/netlink-packet-route
+	branch = main
+[submodule "crates/netlink-packet-utils"]
+	path = crates/netlink-packet-utils
+	url = https://github.com/ple1n/netlink-packet-utils
+	branch = main
+[submodule "crates/netlink-packet-core"]
+	path = crates/netlink-packet-core
+	url = https://github.com/ple1n/netlink-packet-core
+	branch = main
