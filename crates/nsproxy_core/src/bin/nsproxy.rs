@@ -13,6 +13,7 @@ use nix::{
 use nsproxy_common::{ExactNS, NSFrom, forever};
 use nsproxy_core::{
     NsproxyConfig, Paths, PathsBinds, TunMaker,
+    shell::ShellPrefs,
     sys::{Clone3Result, NSEnter},
     tokio_netlink_conn,
     utils::ToExactNs,
@@ -21,22 +22,13 @@ use passfd::FdPassingExt;
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    ffi::OsStr,
-    fs::{self, Permissions},
-    io::ErrorKind,
-    mem::ManuallyDrop,
-    os::{
+    collections::HashMap, ffi::OsStr, fs::{self, Permissions}, io::ErrorKind, mem::ManuallyDrop, os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
             fs::{MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
-    },
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
+    }, path::{Path, PathBuf}, process::exit, str::FromStr, sync::Arc, time::Duration
 };
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -88,6 +80,8 @@ enum MainCommand {
         /// Activate other containers too
         #[arg(short, long)]
         all: bool,
+        #[arg(short, long)]
+        shell: Option<String>,
     },
     /// Activate all containers
     Up,
@@ -180,6 +174,7 @@ fn main() -> anyhow::Result<()> {
             uid,
             keep,
             all,
+            shell,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -188,6 +183,10 @@ fn main() -> anyhow::Result<()> {
             let self_net = ns.0.get(OsStr::new("net")).unwrap();
             let self_netns = self_net.clone().to_exactns();
             let dst_ns = try_resolve_nsinput(dst.clone())?;
+            let mut shell_prefs = ShellPrefs::default();
+            shell_prefs.prefer_shell = shell;
+            shell_prefs.adjust();
+
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
             if let Some(proxy) = proxy {
@@ -214,14 +213,16 @@ fn main() -> anyhow::Result<()> {
                             info!("send TUN fd");
                             tx.send_fd(raw)?;
                             drop(dev);
-                            
+
                             let rt = tokio::runtime::Builder::new_multi_thread()
                                 .enable_all()
                                 .build()?;
                             rt.block_on(async {
-                                forever!().await;
-                                info!("child waiting");
-                            });
+                                shell_prefs.spawn_and_block().await?;
+
+                                exit(0);
+                                aok!()
+                            })?;
                         }
                         Clone3Result::Parent {
                             child_pid,

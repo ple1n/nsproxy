@@ -54,6 +54,7 @@ netlink-packet-core = { path = "crates/netlink-packet-core" }
 fs4 = { version = "0.13", features = ["tokio"] }
 rlimit = "0.10.1"
 passfd = { version = "*" }
+which = "8.0.0"
 
 [dependencies]
 anyhow = "1.0.75"

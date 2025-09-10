@@ -1,6 +1,7 @@
 #![feature(decl_macro)]
 #![allow(async_fn_in_trait)]
 #![feature(ip_as_octets)]
+#![feature(setgroups)]
 
 use std::collections::HashMap;
 use std::fs::File;
