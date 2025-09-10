@@ -28,7 +28,7 @@ use std::{
     os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
-            fs::PermissionsExt,
+            fs::{MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -259,6 +259,13 @@ fn main() -> anyhow::Result<()> {
             let f = std::fs::File::open(&fd)?;
             let perms = Permissions::from_mode(0o6755);
             f.set_permissions(perms)?;
+            let meta = f.metadata()?;
+            warn!(
+                "sproxy, uid={:?}, gid={}, suid={}",
+                meta.uid(),
+                meta.gid(),
+                meta.permissions().mode() & 0o4000 != 0
+            );
         }
         _ => unimplemented!(),
     }
