@@ -585,3 +585,13 @@ impl PathsBinds for Paths {
         self.root_config.join("nsproxyd.toml")
     }
 }
+
+pub macro aok {
+    () => {
+        Ok::<(), anyhow::Error>(())
+    },
+    (#ty:ty) => {
+        Ok::<#ty, anyhow::Error>(())
+    }
+}
+

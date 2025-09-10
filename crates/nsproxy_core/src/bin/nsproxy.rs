@@ -23,11 +23,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs,
+    fs::{self, Permissions},
     io::ErrorKind,
     os::{
         fd::{AsRawFd, IntoRawFd},
-        unix::net::{UnixListener, UnixStream},
+        unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     str::FromStr,
@@ -88,6 +91,11 @@ enum MainCommand {
     Up,
     /// Command the tool
     Exec,
+    /// Install nsproxy to a folder
+    Install {
+        #[arg(default_value = "./install")]
+        dir: PathBuf,
+    },
 }
 
 impl std::str::FromStr for NsInput {
@@ -214,6 +222,32 @@ fn main() -> anyhow::Result<()> {
                     todo!()
                 }
             }
+        }
+        MainCommand::Install { dir: dstdir } => {
+            if !dstdir.exists() {
+                bail!(
+                    "target directory {:?} does not exist. you have to create it manually",
+                    &dstdir
+                )
+            }
+            let selfprog = std::env::current_exe()?;
+            let mut sproxyf = selfprog.clone();
+            let overwrite = |src: &Path, path: &Path| {
+                warn!("installing {:?} to {:?}", src, path);
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+                std::fs::copy(src, path)?;
+                aok!()
+            };
+            let selfprogdst = dstdir.join(selfprog.file_name().unwrap());
+            overwrite(&selfprog, &selfprogdst)?;
+            sproxyf.set_file_name("sproxy");
+            let fd = dstdir.join(sproxyf.file_name().unwrap());
+            overwrite(&sproxyf, &fd)?;
+            let f = std::fs::File::open(&fd)?;
+            let perms = Permissions::from_mode(0o6755);
+            f.set_permissions(perms)?;
         }
         _ => unimplemented!(),
     }
