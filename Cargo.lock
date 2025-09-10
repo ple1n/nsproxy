@@ -2457,14 +2457,12 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-audit"
-version = "0.5.1"
+version = "0.6.1"
 dependencies = [
- "anyhow",
- "byteorder",
  "bytes 1.10.1",
  "lazy_static",
  "log",
- "netlink-packet-core 0.7.0",
+ "netlink-packet-core 0.8.0",
  "netlink-packet-utils 0.6.0",
  "netlink-proto",
 ]
@@ -2483,24 +2481,12 @@ dependencies = [
 [[package]]
 name = "netlink-packet-core"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "745d789fe0958caf7252f5e1e900ce5c09b6a5bf05c7bba02a9cc600866ce31e"
-dependencies = [
- "pastey",
-]
-
-[[package]]
-name = "netlink-packet-route"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053998cea5a306971f88580d0829e90f270f940befd7cf928da179d4187a5a66"
 dependencies = [
  "anyhow",
- "bitflags 1.3.2",
  "byteorder",
- "libc",
- "netlink-packet-core 0.7.0",
- "netlink-packet-utils 0.5.2",
+ "netlink-packet-route 0.25.1",
+ "netlink-packet-utils 0.6.0",
+ "pastey",
 ]
 
 [[package]]
@@ -2526,7 +2512,7 @@ dependencies = [
  "libc",
  "log",
  "netlink-packet-core 0.8.0",
- "netlink-sys 0.8.7",
+ "netlink-sys 0.8.5",
  "pretty_assertions",
 ]
 
@@ -2553,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "netlink-proto"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-std",
@@ -2562,11 +2548,11 @@ dependencies = [
  "futures",
  "log",
  "netlink-packet-audit",
- "netlink-packet-core 0.7.0",
- "netlink-packet-route 0.17.1",
+ "netlink-packet-core 0.8.0",
+ "netlink-packet-route 0.25.1",
  "netlink-sys 0.8.5",
  "nix 0.26.4",
- "thiserror 1.0.63",
+ "thiserror 2.0.16",
  "tokio",
 ]
 
@@ -2583,8 +2569,8 @@ dependencies = [
  "log",
  "mio 0.8.11",
  "netlink-packet-audit",
- "netlink-packet-core 0.7.0",
- "netlink-packet-route 0.17.1",
+ "netlink-packet-core 0.8.0",
+ "netlink-packet-route 0.25.1",
  "tokio",
  "tokio-send-fd",
 ]
@@ -2705,19 +2691,15 @@ dependencies = [
  "fork",
  "fully_pub",
  "futures",
- "id_alloc",
  "inotify",
  "ipnetwork 0.20.0",
  "libc",
  "linux-raw-sys 0.6.5",
  "log",
  "nix 0.27.1",
- "nsproxy-common",
- "nsproxy-derive",
  "owo-colors",
  "passfd",
  "petgraph",
- "pidfd 0.2.4",
  "proc-mounts",
  "procfs 0.16.0",
  "rand 0.8.5",
@@ -2752,17 +2734,6 @@ dependencies = [
  "pidfd 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "thiserror 1.0.63",
-]
-
-[[package]]
-name = "nsproxy-derive"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "nsproxy-common",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
 ]
 
 [[package]]
@@ -3653,7 +3624,7 @@ dependencies = [
 
 [[package]]
 name = "rtnetlink"
-version = "0.13.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "async-global-executor",
@@ -3662,12 +3633,12 @@ dependencies = [
  "futures",
  "ipnetwork 0.18.0",
  "log",
- "netlink-packet-core 0.7.0",
+ "netlink-packet-core 0.8.0",
  "netlink-packet-route 0.25.1",
  "netlink-packet-utils 0.6.0",
  "netlink-proto",
  "netlink-sys 0.8.5",
- "nix 0.26.4",
+ "nix 0.29.0",
  "thiserror 1.0.63",
  "tokio",
 ]
