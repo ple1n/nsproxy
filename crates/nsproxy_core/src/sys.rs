@@ -13,7 +13,7 @@ use nix::{
         setresgid, setresuid, setuid,
     },
 };
-use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR};
 use std::{
     collections::{HashMap, HashSet},
     env::var,
@@ -358,8 +358,6 @@ pub fn unshare_user_standalone(
 
     Ok(())
 }
-
-pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 
 pub fn clone3<const NEW_NET: bool>() -> Result<Clone3Result> {
     let (x, y) = UnixStream::pair()?;
