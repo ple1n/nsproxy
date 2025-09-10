@@ -29,6 +29,10 @@ use rtnetlink::RouteAddRequest;
 use rtnetlink::RouteMessageBuilder;
 use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::address::AddressMessage;
+use rtnetlink::packet_route::link::InfoKind;
+use rtnetlink::packet_route::link::LinkAttribute;
+use rtnetlink::packet_route::link::LinkFlags;
+use rtnetlink::packet_route::link::LinkInfo;
 use rtnetlink::packet_route::link::LinkMessage;
 use rtnetlink::packet_route::route::RouteAddress;
 use rtnetlink::packet_route::route::RouteAttribute;
@@ -102,12 +106,12 @@ pub struct RoutingTable {
 impl NetlinkParseUpdate for AddressMessage {
     type Repr = AddressResponse;
     fn parse_update(&self, parsed: &mut Self::Repr) -> Result<()> {
-        for msg in self.attributes {
+        for msg in &self.attributes {
             match msg {
                 AddressAttribute::Address(ip) => {
                     parsed
                         .addrs
-                        .push(IpNetwork::new(ip, self.header.prefix_lens)?);
+                        .push(IpNetwork::new(ip.to_owned(), self.header.prefix_len)?);
                 }
                 _ => (),
             }
@@ -149,15 +153,15 @@ impl NetlinkParseUpdate for RouteMessage {
             Ok(ip)
         };
 
-        for msg in self.attributes {
+        for msg in &self.attributes {
             match msg {
                 RouteAttribute::PrefSource(ip) => {
-                    if let Some(ip) = make(ip)? {
+                    if let Some(ip) = make(ip.to_owned())? {
                         parsed.source_addrs.push(ip);
                     }
                 }
                 RouteAttribute::Destination(ip) => {
-                    if let Some(ip) = make(ip)? {
+                    if let Some(ip) = make(ip.to_owned())? {
                         parsed.source_addrs.push(ip);
                     }
                 }
@@ -175,43 +179,41 @@ pub struct LinkDev {
     pub up: bool,
     pub index: u32,
     pub max_mtu: Option<u32>,
-    pub kind: Option<link::nlas::InfoKind>,
+    pub kind: Option<InfoKind>,
     pub name: Option<String>,
 }
 
 impl NetlinkParse for LinkMessage {
     type Repr = LinkDev;
     fn parse(&self) -> Result<Self::Repr> {
-        use rtnetlink::netlink_packet_route::rtnl::link::nlas::Nla;
-        let link = self;
-        let up = link.header.flags & IFF_UP != 0;
-        let index = link.header.index;
+        let up = self.header.flags & LinkFlags::Up != LinkFlags::empty();
+        let index = self.header.index;
         let mut max_mtu = None;
         let mut kind = None;
         let mut name = None;
-
-        for n in &self.nlas {
-            match n {
-                Nla::IfName(n) => name = Some(n.to_owned()),
-                Nla::OperState(s) => match s {
+        for a in &self.attributes {
+            match a {
+                LinkAttribute::IfName(n) => name = Some(n.to_owned()),
+                LinkAttribute::OperState(s) => match s {
                     _ => (),
                 },
-                Nla::Info(k) => {
+                LinkAttribute::LinkInfo(k) => {
                     for i in k {
                         match i {
-                            link::nlas::Info::Kind(x) => {
+                            LinkInfo::Kind(x) => {
                                 kind = Some(x.to_owned());
                             }
                             _ => (),
                         }
                     }
                 }
-                Nla::MaxMtu(max) => {
+                LinkAttribute::MaxMtu(max) => {
                     max_mtu = Some(*max);
                 }
-                _ => (),
+                _ => {}
             }
         }
+
         Ok(LinkDev {
             up,
             index,
@@ -255,7 +257,9 @@ use crate::utils::dump_as_toml;
 
 impl NetlinkOps for Handle {
     async fn fetch_routing_table(&self) -> Result<RoutingTable> {
-        let mut k = self.route().get(rtnetlink::IpVersion::V4).execute();
+        let m = RouteMessageBuilder::<IpAddr>::new().build();
+
+        let mut k = self.route().get(m).execute();
         let mut table = RoutingTable::default();
 
         while let Some(msg) = k.try_next().await? {
@@ -344,8 +348,13 @@ impl TunMaker {
     /// There isnt a need to call this method after make()
     /// Not sure which part changed the routing. Kernel default, or some lib.
     pub async fn add_route(&self, nl: &Handle, dev: &TUNDev) -> Result<()> {
-        nl.add_route(dev.if_index()?, self.ipv4.ip().into(), self.ipv4.ip().into(), self.ipv4.prefix())
-            .await?;
+        nl.add_route(
+            dev.if_index()?,
+            self.ipv4.ip().into(),
+            self.ipv4.ip().into(),
+            self.ipv4.prefix(),
+        )
+        .await?;
 
         Ok(())
     }
