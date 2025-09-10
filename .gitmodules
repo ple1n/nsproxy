@@ -1,7 +1,3 @@
-[submodule "crates/netlink-ops"]
-	path = crates/netlink-ops
-	url = https://github.com/ple1n/netlink-ops
-	branch = master
 [submodule "crates/rust-tun"]
 	path = crates/rust-tun
 	url = https://github.com/ple1n/rust-tun
@@ -29,7 +25,7 @@
 [submodule "crates/tun2socks5"]
 	path = crates/tun2socks5
 	url = https://github.com/ple1n/tun2socks5
-	branch = master
+	branch = v3
 [submodule "crates/socks5-impl"]
 	path = crates/socks5-impl
 	url = https://github.com/ple1n/socks5-impl
@@ -41,7 +37,7 @@
 [submodule "crates/ipstack"]
 	path = crates/ipstack
 	url = https://github.com/ple1n/ipstack
-	branch = main
+	branch = v3
 [submodule "crates/clone3"]
 	path = crates/clone3
 	url = https://github.com/ple1n/clone3
