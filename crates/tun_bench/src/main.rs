@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             name: None,
         };
         let (qsx, qrx) = mpsc::channel(5);
-        tun2socks5::main_entry(dev, mtu, false, args, qrx, qsx, None).await?;
+        tun2socks5::main_entry(dev, mtu, false, args).await?;
 
         anyhow::Ok(())
     });

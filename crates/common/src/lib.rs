@@ -25,6 +25,8 @@ use serde::{de::Visitor, Deserialize, Serialize};
 
 pub mod rpc;
 
+pub const UID_HINT_VAR: &str = "NSPROXY_UID";
+
 /// Represents an NS anchored to a process, or a file
 /// Equality iff .unique equals
 #[public]
