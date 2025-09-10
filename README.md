@@ -322,6 +322,4 @@ Almost every software doesn't treat proxying seriously. You can spend hours and 
 
 a tool is available for ./tun2socks5 testing https://github.com/ple1n/dns_stress_test
 
-TODO
-+ Add nsproxy monitor, to show live logs. systemd sucks to use.
-+ Integrate it with https://github.com/daeuniverse/dae 
+Due to how terrible git is, I have included 2 scripts for working with submodules. 

@@ -1064,20 +1064,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dashmap"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2103,16 +2089,14 @@ dependencies = [
 name = "ipstack"
 version = "0.0.2"
 dependencies = [
- "dashmap",
  "etherparse",
- "flume",
  "futures",
- "rand 0.9.2",
  "thiserror 1.0.63",
  "tokio",
  "tracing",
- "tun-rs",
+ "tun 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "udp-stream 0.0.9",
+ "wintun",
 ]
 
 [[package]]
@@ -4682,6 +4666,24 @@ dependencies = [
  "log",
  "packet",
  "serde",
+ "thiserror 1.0.63",
+ "tokio",
+ "tokio-util",
+ "wintun",
+]
+
+[[package]]
+name = "tun"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0adb9992bbd5ca76f3847ed579ad4ee8defb2ec2eea918cceef17ccc66fa4fd4"
+dependencies = [
+ "byteorder",
+ "bytes 1.10.1",
+ "futures-core",
+ "ioctl-sys",
+ "libc",
+ "log",
  "thiserror 1.0.63",
  "tokio",
  "tokio-util",
