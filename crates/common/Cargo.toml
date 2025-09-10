@@ -17,3 +17,4 @@ owo-colors = "3.5.0"
 pidfd = "0.2.4"
 serde = { version = "1.0.193", features = ["derive"] }
 thiserror = "1.0.50"
+tracing = "0.1.41"

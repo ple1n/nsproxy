@@ -37,8 +37,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tracing::{info, warn};
-use tun2socks5::{ArgMode, aok, tun_rs::AsyncDevice};
+use tracing::{info, level_filters::LevelFilter, warn};
+use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tun2socks5::{ArgMode, IArgs, aok, tun_rs::AsyncDevice};
 
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
@@ -67,13 +68,13 @@ enum MainCommand {
     /// Set up some containers
     Run {
         /// Source network namespace (src=/path OR src=1234)
-        #[arg(long, default_value = "This")]
+        #[arg(long, default_value = "this")]
         src: NsInput,
         /// Target network namespace (dst=/path OR dst=1234)
-        #[arg(long, default_value = "New")]
+        #[arg(long, default_value = "new")]
         dst: NsInput,
-        #[command(subcommand)]
-        proxy: Option<ArgMode>,
+        #[command(flatten)]
+        proxy: Option<IArgs>,
         /// Make veths (optional name, default "veth0")
         #[arg(long, value_name = "NAME", default_missing_value = "veth0")]
         veth: Option<Option<String>>,
@@ -104,6 +105,10 @@ impl std::str::FromStr for NsInput {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(pid) = s.parse::<i32>() {
             Ok(NsInput::Pid(pid))
+        } else if s == "new" {
+            Ok(NsInput::New)
+        } else if s == "this" {
+            Ok(NsInput::This)
         } else {
             Ok(NsInput::Path(PathBuf::from(s)))
         }
@@ -147,6 +152,12 @@ fn smoltcp_clone3() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html
+    tracing_subscriber::registry()
+        .with(fmt::Layer::new().with_filter(LevelFilter::DEBUG))
+        .init();
+
     let state_dir = PathBuf::from("./nsproxy.state");
     fs::create_dir_all(&state_dir)?;
     let pid = nix::unistd::Pid::this();
@@ -179,7 +190,7 @@ fn main() -> anyhow::Result<()> {
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
             if let Some(proxy) = proxy {
-                let mut iargs = proxy.to_iargs()?;
+                let mut iargs = proxy;
                 let tun_name = iargs.name.unwrap_or(tun_name.clone());
                 iargs.name = Some(tun_name.clone());
                 if dst != NsInput::This {
