@@ -156,6 +156,7 @@ pub trait NSFrom<S>: Sized {
 
 impl NSFrom<PathBuf> for ExactNS {
     fn from_source(path: PathBuf) -> Result<Self> {
+        tracing::info!("stating exact NS at {:?}", &path);
         let stat = nix::sys::stat::stat(&path)?;
         Ok(Self {
             unique: stat.into(),

@@ -2734,6 +2734,7 @@ dependencies = [
  "pidfd 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "thiserror 1.0.63",
+ "tracing",
 ]
 
 [[package]]
@@ -2766,6 +2767,7 @@ dependencies = [
  "tokio",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
  "tun2socks5",
  "uzers 0.12.1",
 ]
