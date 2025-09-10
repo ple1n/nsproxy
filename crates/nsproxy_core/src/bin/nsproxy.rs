@@ -10,7 +10,7 @@ use nix::{
     sched::{CloneFlags, unshare},
     unistd::Pid,
 };
-use nsproxy_common::{ExactNS, NSFrom};
+use nsproxy_common::{ExactNS, NSFrom, forever};
 use nsproxy_core::{
     NsproxyConfig, Paths, PathsBinds, TunMaker,
     sys::{Clone3Result, NSEnter},
@@ -25,6 +25,7 @@ use std::{
     ffi::OsStr,
     fs::{self, Permissions},
     io::ErrorKind,
+    mem::ManuallyDrop,
     os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
@@ -207,15 +208,27 @@ fn main() -> anyhow::Result<()> {
                             tun.mtu = mtu;
                             let mut state = tun.make()?;
                             state.sync_basic()?;
-                            let raw = state.fd.unwrap().as_raw_fd();
+                            let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
+                            // let dev = ManuallyDrop::new(dev);
+                            let raw = dev.as_raw_fd();
+                            info!("send TUN fd");
                             tx.send_fd(raw)?;
-                            // start shell
+                            drop(dev);
+                            
+                            let rt = tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .build()?;
+                            rt.block_on(async {
+                                forever!().await;
+                                info!("child waiting");
+                            });
                         }
                         Clone3Result::Parent {
                             child_pid,
                             child_pidfd,
                             tx,
                         } => {
+                            info!("recved fd");
                             let dev = tx.recv_fd()?;
                             let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
                             let rt = tokio::runtime::Builder::new_multi_thread()
