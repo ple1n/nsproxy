@@ -1,0 +1,1 @@
+cargo b --bins -p nsproxy_core
