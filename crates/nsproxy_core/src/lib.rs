@@ -46,6 +46,8 @@ use tokio::time::timeout;
 pub use tun2socks5;
 pub mod sys;
 pub mod utils;
+pub mod shell;
+pub mod prelude;
 
 pub struct TunMaker {
     pub name: String,
@@ -588,7 +590,7 @@ impl PathsBinds for Paths {
 
 pub macro aok {
     () => {
-        Ok::<(), anyhow::Error>(())
+        ::core::result::Result::Ok::<(), anyhow::Error>(())
     },
     (#ty:ty) => {
         Ok::<#ty, anyhow::Error>(())
