@@ -41,3 +41,4 @@ futures_codec = "0.4.1"
 procfs = "=0.18.0"
 clone3.path = "../clone3"
 passfd.workspace = true
+tracing-subscriber = "0.3.20"
