@@ -1,3 +1,4 @@
+#![feature(exact_size_is_empty)]
 #![feature(decl_macro)]
 #![allow(async_fn_in_trait)]
 #![feature(ip_as_octets)]
@@ -50,6 +51,7 @@ pub mod prelude;
 pub mod shell;
 pub mod sys;
 pub mod utils;
+pub mod env;
 
 pub struct TunMaker {
     pub name: String,
