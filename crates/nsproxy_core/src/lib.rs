@@ -25,6 +25,7 @@ use libc::pid_t;
 use nsproxy_common::ExactNS;
 use nsproxy_common::NSFrom;
 use rtnetlink::Handle;
+use rtnetlink::LinkUnspec;
 use rtnetlink::LinkVeth;
 use rtnetlink::RouteAddRequest;
 use rtnetlink::RouteMessageBuilder;
@@ -45,10 +46,10 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 pub use tun2socks5;
+pub mod prelude;
+pub mod shell;
 pub mod sys;
 pub mod utils;
-pub mod shell;
-pub mod prelude;
 
 pub struct TunMaker {
     pub name: String,
@@ -63,7 +64,7 @@ pub struct TunState {
     default_route: bool,
     tun_is_up: bool,
     name: String,
-    dev_index: u32,
+    pub dev_index: u32,
     sync: SyncStatus,
 }
 
@@ -248,6 +249,7 @@ pub trait NetlinkOps {
     async fn add_route(&self, index: u32, pref_src: IpAddr, dst: IpAddr, prefix: u8) -> Result<()>;
     async fn ip_add_default_route(&self, index: u32) -> Result<()>;
     async fn test_route(&self, ip: IpAddr) -> Result<Option<RouteMessage>>;
+    async fn up_lo(&self) -> Result<()>;
 }
 
 use tun2socks5::ipstack::TUNDev;
@@ -311,7 +313,7 @@ impl NetlinkOps for Handle {
         Ok(())
     }
     async fn ip_add_default_route(&self, index: u32) -> Result<()> {
-        let route = RouteMessageBuilder::<IpAddr>::new()
+        let route = RouteMessageBuilder::<Ipv4Addr>::new()
             .output_interface(index)
             .build();
         self.route().add(route).execute().await?;
@@ -325,6 +327,17 @@ impl NetlinkOps for Handle {
         let vec: Vec<_> = routes.try_collect().await?;
         assert!(vec.len() <= 1);
         Ok(vec.get(0).cloned())
+    }
+    async fn up_lo(&self) -> Result<()> {
+        let mut s = self.link().get().match_name("lo".to_owned()).execute();
+        if let Some(lo) = s.next().await {
+            let lo = lo?;
+            self.link()
+                .set(LinkUnspec::new_with_index(lo.header.index).up().build())
+                .execute()
+                .await?;
+        }
+        aok!()
     }
 }
 
@@ -597,4 +610,3 @@ pub macro aok {
         Ok::<#ty, anyhow::Error>(())
     }
 }
-
