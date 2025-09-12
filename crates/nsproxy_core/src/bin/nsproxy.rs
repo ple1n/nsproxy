@@ -1,3 +1,4 @@
+use capctl::prctl;
 /// This binary will at most spawn 2 processes (including itself)
 /// It's intended to be minimal, which can be used later in higher order composition such as in GUI
 use clap::{
@@ -234,7 +235,7 @@ fn main() -> anyhow::Result<()> {
                                 tx.send_fd(raw)?;
                                 drop(dev);
 
-                                let rt = tokio::runtime::Builder::new_multi_thread()
+                                let rt = tokio::runtime::Builder::new_current_thread()
                                     .enable_all()
                                     .build()?;
                                 rt.block_on(async {
@@ -247,6 +248,7 @@ fn main() -> anyhow::Result<()> {
                                         warn!("adding TUN as default route");
                                         nl.ip_add_default_route(state.dev_index).await?;
                                     }
+
                                     shell_prefs.spawn_and_block().await?;
 
                                     exit(0);
