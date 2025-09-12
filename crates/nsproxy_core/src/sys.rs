@@ -389,5 +389,7 @@ pub enum Clone3Result {
 }
 
 impl Clone3Result {
-    fn wait_for_child() {}
+    fn wait_for_child() {
+        
+    }
 }
