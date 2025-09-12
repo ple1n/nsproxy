@@ -1,7 +1,7 @@
 #!/usr/bin/env fish
 
 # Initialize submodules if necessary
-git submodule update --init --recursive
+# git submodule update --init --recursive
 
 # Iterate over each submodule in the status
 for submodule in (git submodule status --recursive)
