@@ -14,6 +14,7 @@ use nix::{
     },
 };
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR};
+use pidfd::PidFd;
 use std::{
     collections::{HashMap, HashSet},
     env::var,
@@ -28,7 +29,7 @@ use std::{
         unix::{ffi::OsStrExt, net::UnixStream},
     },
     path::{Path, PathBuf},
-    process::exit,
+    process::{ExitStatus, exit},
     sync::mpsc::sync_channel,
 };
 use tracing::info;
@@ -389,7 +390,20 @@ pub enum Clone3Result {
 }
 
 impl Clone3Result {
-    fn wait_for_child() {
-        
+    pub async fn wait_for_child(&self) -> Result<ExitStatus> {
+        match self {
+            Self::Parent {
+                child_pid,
+                child_pidfd,
+                tx,
+            } => {
+                let fd = unsafe { PidFd::from_raw_fd(*child_pidfd) };
+                let k = fd.into_future().await?;
+                Ok(k)
+            }
+            _ => {
+                unreachable!()
+            }
+        }
     }
 }
