@@ -106,7 +106,9 @@ impl ShellPrefs {
                     child_pid,
                     child_pidfd,
                     tx,
-                } => {},
+                } => {
+
+                },
             }
             Ok(clone)
         } else {

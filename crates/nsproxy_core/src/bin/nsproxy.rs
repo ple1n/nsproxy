@@ -249,8 +249,9 @@ fn main() -> anyhow::Result<()> {
                                         nl.ip_add_default_route(state.dev_index).await?;
                                     }
 
-                                    shell_prefs.spawn_and_block().await?;
-
+                                    let clone = shell_prefs.spawn()?;
+                                    clone.wait_for_child().await?;
+                                    
                                     exit(0);
                                     aok!()
                                 })?;
