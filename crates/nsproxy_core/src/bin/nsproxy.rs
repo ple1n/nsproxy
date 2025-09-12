@@ -8,7 +8,7 @@ use futures::AsyncWriteExt;
 use futures_lite::future::block_on;
 use nix::{
     sched::{CloneFlags, unshare},
-    unistd::Pid,
+    unistd::{Pid, getresgid, getresuid},
 };
 use nsproxy_common::{ExactNS, NSFrom, forever};
 use nsproxy_core::{
@@ -22,13 +22,23 @@ use passfd::FdPassingExt;
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, ffi::OsStr, fs::{self, Permissions}, io::ErrorKind, mem::ManuallyDrop, os::{
+    collections::HashMap,
+    ffi::OsStr,
+    fs::{self, Permissions},
+    io::ErrorKind,
+    mem::ManuallyDrop,
+    os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
             fs::{MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
-    }, path::{Path, PathBuf}, process::exit, str::FromStr, sync::Arc, time::Duration
+    },
+    path::{Path, PathBuf},
+    process::exit,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -194,50 +204,66 @@ fn main() -> anyhow::Result<()> {
                 let tun_name = iargs.name.unwrap_or(tun_name.clone());
                 iargs.name = Some(tun_name.clone());
                 if dst != NsInput::This {
-                    match nsproxy_core::sys::clone3::<true>()? {
-                        Clone3Result::IsChild { tx } => {
-                            if let Some(dst) = dst_ns {
-                                dst.enter(CloneFlags::CLONE_NEWNET)?;
-                            }
-                            if dst != NsInput::New {
-                                bail!("unexpected {:?}", &dst);
-                            }
-                            let mut tun = TunMaker::default();
-                            tun.name = tun_name.clone();
-                            tun.mtu = mtu;
-                            let mut state = tun.make()?;
-                            state.sync_basic()?;
-                            let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
-                            // let dev = ManuallyDrop::new(dev);
-                            let raw = dev.as_raw_fd();
-                            info!("send TUN fd");
-                            tx.send_fd(raw)?;
-                            drop(dev);
+                    let clone = nsproxy_core::sys::clone3::<true>();
+                    match clone {
+                        Ok(clone) => {
+                            match clone {
+                                Clone3Result::IsChild { tx } => {
+                                    if let Some(dst) = dst_ns {
+                                        dst.enter(CloneFlags::CLONE_NEWNET)?;
+                                    }
+                                    if dst != NsInput::New {
+                                        bail!("unexpected {:?}", &dst);
+                                    }
+                                    let mut tun = TunMaker::default();
+                                    tun.name = tun_name.clone();
+                                    tun.mtu = mtu;
+                                    let mut state = tun.make()?;
+                                    state.sync_basic()?;
+                                    let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
+                                    // let dev = ManuallyDrop::new(dev);
+                                    let raw = dev.as_raw_fd();
+                                    info!("send TUN fd");
+                                    tx.send_fd(raw)?;
+                                    drop(dev);
 
-                            let rt = tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()?;
-                            rt.block_on(async {
-                                shell_prefs.spawn_and_block().await?;
+                                    let rt = tokio::runtime::Builder::new_multi_thread()
+                                        .enable_all()
+                                        .build()?;
+                                    rt.block_on(async {
+                                        shell_prefs.spawn_and_block().await?;
 
-                                exit(0);
-                                aok!()
-                            })?;
+                                        exit(0);
+                                        aok!()
+                                    })?;
+                                }
+                                Clone3Result::Parent {
+                                    child_pid,
+                                    child_pidfd,
+                                    tx,
+                                } => {
+                                    info!("recved fd");
+                                    let dev = tx.recv_fd()?;
+                                    let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
+                                    let rt = tokio::runtime::Builder::new_multi_thread()
+                                        .enable_all()
+                                        .build()?;
+                                    rt.block_on(async move {
+                                        tun2socks5::main_entry(dev, mtu, false, iargs).await
+                                    })?;
+                                }
+                            }
                         }
-                        Clone3Result::Parent {
-                            child_pid,
-                            child_pidfd,
-                            tx,
-                        } => {
-                            info!("recved fd");
-                            let dev = tx.recv_fd()?;
-                            let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
-                            let rt = tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()?;
-                            rt.block_on(async move {
-                                tun2socks5::main_entry(dev, mtu, false, iargs).await
-                            })?;
+                        // This is what you dont get in Unix philosophy. User experience.
+                        Err(er) => {
+                            warn!("Clone3 failed with {:?}", &er);
+                            let res = getresuid()?;
+                            if res.real.is_root() {
+                                warn!("Uid-{:?}", res);
+                            } else {
+                                warn!("Is this the executable set with SUID? Uid={:?}", res)
+                            }
+
                         }
                     }
                 } else {
