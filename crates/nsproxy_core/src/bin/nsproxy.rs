@@ -67,7 +67,7 @@ enum NsInput {
     New,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum MainCommand {
     /// Set up some containers
     Run {
@@ -99,6 +99,8 @@ enum MainCommand {
         /// Do not set TUN as default route.
         #[arg(short, long)]
         no_default: bool,
+        #[arg(short, long)]
+        log: Option<LevelFilter>,
     },
     /// Activate all containers
     Up,
@@ -165,10 +167,10 @@ fn smoltcp_clone3() -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let (layer, reload_handle) =
+        tracing_subscriber::reload::Layer::new(fmt::Layer::new().with_filter(LevelFilter::DEBUG));
     // https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html
-    tracing_subscriber::registry()
-        .with(fmt::Layer::new().with_filter(LevelFilter::DEBUG))
-        .init();
+    tracing_subscriber::registry().with(layer).init();
 
     let state_dir = PathBuf::from("./nsproxy.state");
     fs::create_dir_all(&state_dir)?;
@@ -194,6 +196,7 @@ fn main() -> anyhow::Result<()> {
             shell,
             default,
             no_default,
+            log,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -251,7 +254,7 @@ fn main() -> anyhow::Result<()> {
 
                                     let clone = shell_prefs.spawn()?;
                                     clone.wait_for_child().await?;
-                                    
+
                                     exit(0);
                                     aok!()
                                 })?;
@@ -267,6 +270,9 @@ fn main() -> anyhow::Result<()> {
                                 let rt = tokio::runtime::Builder::new_multi_thread()
                                     .enable_all()
                                     .build()?;
+                                if let Some(log) = log {
+                                    reload_handle.modify(|k| *k.filter_mut() = log)?;
+                                }
                                 rt.block_on(async move {
                                     tun2socks5::main_entry(dev, mtu, false, iargs).await
                                 })?;
