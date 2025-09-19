@@ -1,1 +1,0 @@
-nsproxy socks2tun -t ./test_proxy.json 
