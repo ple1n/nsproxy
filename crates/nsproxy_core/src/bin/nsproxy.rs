@@ -20,6 +20,7 @@ use nsproxy_core::{
     utils::ToExactNs,
 };
 use passfd::FdPassingExt;
+use pidfd::PidFd;
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -132,41 +133,6 @@ impl std::str::FromStr for NsInput {
     }
 }
 
-/// this has to be studied because Tokio completely fucks up this tool.
-#[test]
-fn smoltcp_clone3() -> anyhow::Result<()> {
-    let proc = procfs::process::Process::myself()?;
-    let ns = proc.namespaces()?;
-    let net = ns.0.get(OsStr::new("net"));
-    let stat = proc.stat()?;
-    println!("threads: {}, pid {}", stat.num_threads, stat.pid);
-    dbg!(&net);
-    println!("start async");
-    block_on(async {
-        smol::Timer::after(Duration::from_secs(1)).await;
-        let mut call = clone3::Clone3::default();
-        call.flag_newnet();
-        let p = unsafe { call.call()? };
-        println!("p {}", p);
-        let proc = procfs::process::Process::myself()?;
-        let ns = proc.namespaces()?;
-        let net = ns.0.get(OsStr::new("net"));
-        dbg!(&net);
-
-        let proc = procfs::process::Process::myself()?;
-        let stat = proc.stat()?;
-        println!("threads: {}, pid {}", stat.num_threads, stat.pid);
-
-        aok!()
-    })?;
-    println!("exit async");
-    let proc = procfs::process::Process::myself()?;
-    let stat = proc.stat()?;
-    println!("threads: {}, pid {}", stat.num_threads, stat.pid);
-
-    aok!()
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -235,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                                     bail!("unexpected {:?}", &dst);
                                 }
                                 enable_ping_all()?;
-                                
+
                                 let mut tun = TunMaker::default();
                                 tun.name = tun_name.clone();
                                 tun.mtu = mtu;
@@ -306,6 +272,15 @@ fn main() -> anyhow::Result<()> {
                                 if let Some(log) = log {
                                     reload_handle.modify(|k| *k.filter_mut() = log)?;
                                 }
+
+                                rt.spawn(async move {
+                                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
+                                    let k = fd.into_future().await?;
+                                    // Against Unix philosophy again, the tool does not confuse users. 
+                                    warn!("Shell has exited but nsproxy is still running. Press CtrlC to exit.");
+                                    aok!()
+                                });
+
                                 rt.block_on(async move {
                                     use tokio::io::AsyncWriteExt;
 
