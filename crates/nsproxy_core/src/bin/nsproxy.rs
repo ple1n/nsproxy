@@ -15,18 +15,18 @@ use nsproxy_common::{ExactNS, NSFrom, forever};
 use nsproxy_core::{
     NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::ShellPrefs,
-    sys::{Clone3Result, NSEnter},
+    sys::{Clone3Result, NSEnter, enable_ping_all},
     tokio_netlink_conn,
     utils::ToExactNs,
 };
 use passfd::FdPassingExt;
-use rtnetlink::Handle;
+use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::OsStr,
     fs::{self, Permissions},
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd, IntoRawFd},
@@ -79,9 +79,9 @@ enum MainCommand {
         dst: NsInput,
         #[command(flatten)]
         proxy: Option<IArgs>,
-        /// Make veths (optional name, default "veth0")
-        #[arg(long, value_name = "NAME", default_missing_value = "veth0")]
-        veth: Option<Option<String>>,
+        /// Make veths, with inner IP defaulting to 100.120.0.2/24
+        #[arg(short, long)]
+        veth: bool,
         /// change uid after entering shell
         #[arg(short, long)]
         uid: Option<u32>,
@@ -101,6 +101,9 @@ enum MainCommand {
         no_default: bool,
         #[arg(short, long)]
         log: Option<LevelFilter>,
+        /// Mount namespaces that are created such that you can access them by paths later
+        #[arg(short, long)]
+        mount: bool,
     },
     /// Activate all containers
     Up,
@@ -172,8 +175,12 @@ fn main() -> anyhow::Result<()> {
     // https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html
     tracing_subscriber::registry().with(layer).init();
 
-    let state_dir = PathBuf::from("./nsproxy.state");
-    fs::create_dir_all(&state_dir)?;
+    let make_state_dir = || {
+        let state_dir = PathBuf::from("./nsproxy.state");
+        fs::create_dir_all(&state_dir)?;
+        aok!()
+    };
+
     let pid = nix::unistd::Pid::this();
 
     use rlimit as rl;
@@ -197,6 +204,7 @@ fn main() -> anyhow::Result<()> {
             default,
             no_default,
             log,
+            mount,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -208,7 +216,7 @@ fn main() -> anyhow::Result<()> {
             let mut shell_prefs = ShellPrefs::default();
             shell_prefs.prefer_shell = shell;
             shell_prefs.adjust();
-
+            let ns_moved = [0; 1];
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
             if let Some(proxy) = proxy {
@@ -226,6 +234,8 @@ fn main() -> anyhow::Result<()> {
                                 if dst != NsInput::New {
                                     bail!("unexpected {:?}", &dst);
                                 }
+                                enable_ping_all()?;
+                                
                                 let mut tun = TunMaker::default();
                                 tun.name = tun_name.clone();
                                 tun.mtu = mtu;
@@ -242,14 +252,37 @@ fn main() -> anyhow::Result<()> {
                                     .enable_all()
                                     .build()?;
                                 rt.block_on(async {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut read = vec![0; 1];
+                                    tx.set_nonblocking(true)?;
+                                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
                                     let add_default = (dst == NsInput::New && !no_default)
                                         || (dst == NsInput::This && default);
 
+                                    let nl = tokio_netlink_conn()?;
+                                    nl.up_lo().await?;
+
                                     if add_default {
-                                        let nl = tokio_netlink_conn()?;
-                                        nl.up_lo().await?;
                                         warn!("adding TUN as default route");
                                         nl.ip_add_default_route(state.dev_index).await?;
+                                    }
+                                    if veth {
+                                        tx.read(&mut read).await;
+                                        let dev = nl.fetch_link_by_name("v_in".to_owned()).await?;
+                                        nl.address()
+                                            .add(dev.header.index, "100.120.0.2".parse()?, 24)
+                                            .execute()
+                                            .await?;
+
+                                        nl.link()
+                                            .set(
+                                                LinkMessageBuilder::<LinkUnspec>::default()
+                                                    .index(dev.header.index)
+                                                    .up()
+                                                    .build(),
+                                            )
+                                            .execute()
+                                            .await?;
                                     }
 
                                     let clone = shell_prefs.spawn()?;
@@ -274,6 +307,38 @@ fn main() -> anyhow::Result<()> {
                                     reload_handle.modify(|k| *k.filter_mut() = log)?;
                                 }
                                 rt.block_on(async move {
+                                    use tokio::io::AsyncWriteExt;
+
+                                    let nl = tokio_netlink_conn()?;
+                                    tx.set_nonblocking(true)?;
+                                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                                    if veth {
+                                        info!("attempting to add veths named, v_out, v_in");
+                                        nl.add_veth("v_out", "v_in").await;
+                                        let vin = nl.fetch_link_by_name("v_in".to_owned()).await?;
+                                        let msg: LinkMessageBuilder<LinkVeth> =
+                                            LinkMessageBuilder::default()
+                                                .index(vin.header.index)
+                                                .setns_by_pid(child_pid as u32);
+                                        nl.link().set(msg.build()).execute().await;
+                                        tx.write(&ns_moved).await?;
+
+                                        let vout =
+                                            nl.fetch_link_by_name("v_out".to_owned()).await?;
+                                        nl.address()
+                                            .add(vout.header.index, "100.120.0.1".parse()?, 24)
+                                            .execute()
+                                            .await?;
+                                        nl.link()
+                                            .set(
+                                                LinkMessageBuilder::<LinkUnspec>::default()
+                                                    .index(vout.header.index)
+                                                    .up()
+                                                    .build(),
+                                            )
+                                            .execute()
+                                            .await?;
+                                    }
                                     tun2socks5::main_entry(dev, mtu, false, iargs).await
                                 })?;
                             }
