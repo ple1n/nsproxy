@@ -3,6 +3,9 @@ name = "nsproxy_core"
 version = "3.0.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "s"
+
 [dependencies]
 anyhow = "1.0.99"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
