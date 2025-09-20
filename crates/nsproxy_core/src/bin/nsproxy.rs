@@ -11,7 +11,7 @@ use nix::{
     sched::{CloneFlags, unshare},
     unistd::{Pid, getresgid, getresuid},
 };
-use nsproxy_common::{ExactNS, NSFrom, forever};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
 use nsproxy_core::{
     NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::ShellPrefs,
@@ -106,10 +106,19 @@ enum MainCommand {
         #[arg(short, long)]
         mount: bool,
     },
-    /// Activate all containers
-    Up,
-    /// Command the tool
-    Exec,
+    /// Find by process and enter an existing nsproxy namespace
+    /// Enter the best-match based on searching arguments provided
+    Enter {
+        /// List only
+        #[arg(short, long)]
+        list: bool,
+        /// Search for proxy port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        #[arg(short, long)]
+        shell: Option<String>,
+    },
     /// Install nsproxy to a folder
     Install {
         #[arg(default_value = "./install")]
@@ -335,6 +344,103 @@ fn main() -> anyhow::Result<()> {
                     state.sync_basic()?;
                     todo!()
                 }
+            }
+        }
+        /// We are just putting state in proc now, basically. Seems cleaner
+        MainCommand::Enter { list, port, shell } => {
+            let mut shell_prefs = ShellPrefs::default();
+            shell_prefs.prefer_shell = shell;
+            shell_prefs.adjust();
+
+            #[derive(Debug)]
+            struct FoundProcess {
+                cmd: Vec<String>,
+                args: Cli,
+                ns: Option<UniqueFile>,
+                match_port: bool,
+                score: u32,
+                pid: i32,
+            }
+            let mut nsproxy_procs = Vec::new();
+            let mut found = Vec::new();
+            let procs = procfs::process::all_processes()?;
+            for proc in procs {
+                let proc = proc;
+                if let Ok(p) = proc {
+                    if let Ok(cmd) = p.cmdline() {
+                        if cmd.get(0).map(|k| k.contains("sproxy")).unwrap_or_default() {
+                            nsproxy_procs.push(p);
+                        }
+                    }
+                }
+            }
+            for np in nsproxy_procs {
+                let ns = np.namespaces();
+                if let Ok(ns) = ns {
+                    let net =
+                        ns.0.get(OsStr::new("net"))
+                            .map(|k| UniqueFile::new(k.identifier, k.device_id));
+                    let cmds = np.cmdline()?;
+                    let args = Cli::parse_from(&cmds);
+                    if list {
+                        println!("{:?} {:?}", np.cmdline().unwrap(), net);
+                        println!("{:?}", args);
+                    }
+                    found.push(FoundProcess {
+                        cmd: cmds,
+                        args,
+                        ns: net,
+                        match_port: false,
+                        score: 0,
+                        pid: np.pid,
+                    });
+                }
+            }
+            for np in found.iter_mut() {
+                match &np.args.cmd {
+                    MainCommand::Run {
+                        src,
+                        dst,
+                        proxy,
+                        veth,
+                        uid,
+                        keep,
+                        all,
+                        shell,
+                        default,
+                        no_default,
+                        log,
+                        mount,
+                    } => {
+                        if *veth {
+                            np.score += 1
+                        }
+                        if let Some(port) = port {
+                            if let Some(p) = proxy {
+                                if p.proxy.addr.port() == port {
+                                    np.match_port = true;
+                                    np.score += 1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            warn!("Found {} nsproxy processes", found.len());
+            let max = found.iter().max_by_key(|k| k.score);
+            if let Some(max) = max {
+                warn!("best match {:?}", max.cmd);
+                let ns = NSSource::Pid(max.pid);
+                ns.enter(CloneFlags::CLONE_NEWNET)?;
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+
+                rt.block_on(async {
+                    shell_prefs.spawn_and_block().await
+                })?;
             }
         }
         MainCommand::Install { dir: dstdir } => {
