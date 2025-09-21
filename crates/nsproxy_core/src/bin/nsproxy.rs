@@ -380,20 +380,31 @@ fn main() -> anyhow::Result<()> {
                     let net =
                         ns.0.get(OsStr::new("net"))
                             .map(|k| UniqueFile::new(k.identifier, k.device_id));
+
                     let cmds = np.cmdline()?;
-                    let args = Cli::parse_from(&cmds);
-                    if list {
-                        println!("{:?} {:?}", np.cmdline().unwrap(), net);
-                        println!("{:?}", args);
+                    if let Some(exe) = cmds.get(0) {
+                        let path = PathBuf::from(exe);
+                        let file = path.file_name();
+                        if let Some(file) = file {
+                            let file = file.to_string_lossy();
+                            if file == "nsproxy" || file == "sproxy" {
+                                if list {
+                                    println!("{:?} {:?}", np.cmdline().unwrap(), net);
+                                }
+                                let args = Cli::parse_from(&cmds);
+                                found.push(FoundProcess {
+                                    cmd: cmds,
+                                    args,
+                                    ns: net,
+                                    match_port: false,
+                                    score: 0,
+                                    pid: np.pid,
+                                });
+                            } else {
+                                println!("{:?} {:?} filename={}, skipped", np.cmdline().unwrap(), net, file);
+                            }
+                        }
                     }
-                    found.push(FoundProcess {
-                        cmd: cmds,
-                        args,
-                        ns: net,
-                        match_port: false,
-                        score: 0,
-                        pid: np.pid,
-                    });
                 }
             }
             for np in found.iter_mut() {
@@ -438,9 +449,7 @@ fn main() -> anyhow::Result<()> {
                     .enable_all()
                     .build()?;
 
-                rt.block_on(async {
-                    shell_prefs.spawn_and_block().await
-                })?;
+                rt.block_on(async { shell_prefs.spawn_and_block().await })?;
             }
         }
         MainCommand::Install { dir: dstdir } => {
