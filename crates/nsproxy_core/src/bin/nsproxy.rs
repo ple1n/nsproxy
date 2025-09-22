@@ -14,7 +14,7 @@ use nix::{
 use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
 use nsproxy_core::{
     NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
-    shell::ShellPrefs,
+    shell::{ShellArgs, ShellPrefs},
     sys::{Clone3Result, NSEnter, enable_ping_all},
     tokio_netlink_conn,
     utils::ToExactNs,
@@ -83,17 +83,12 @@ enum MainCommand {
         /// Make veths, with inner IP defaulting to 100.120.0.2/24
         #[arg(short, long)]
         veth: bool,
-        /// change uid after entering shell
-        #[arg(short, long)]
-        uid: Option<u32>,
         /// Persist this container, add it to config file
         #[arg(short, long)]
         keep: bool,
         /// Activate other containers too
         #[arg(short, long)]
         all: bool,
-        #[arg(short, long)]
-        shell: Option<String>,
         /// Set TUN as default route. This defaults to true for new net ns
         #[arg(short, long)]
         default: bool,
@@ -105,6 +100,8 @@ enum MainCommand {
         /// Mount namespaces that are created such that you can access them by paths later
         #[arg(short, long)]
         mount: bool,
+        #[command(flatten)]
+        sargs: ShellArgs,
     },
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
@@ -116,8 +113,8 @@ enum MainCommand {
         #[arg(short, long)]
         port: Option<u16>,
 
-        #[arg(short, long)]
-        shell: Option<String>,
+        #[command(flatten)]
+        sargs: ShellArgs,
     },
     /// Install nsproxy to a folder
     Install {
@@ -172,14 +169,13 @@ fn main() -> anyhow::Result<()> {
             dst,
             proxy,
             veth,
-            uid,
             keep,
             all,
-            shell,
             default,
             no_default,
             log,
             mount,
+            sargs,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -189,7 +185,7 @@ fn main() -> anyhow::Result<()> {
             let self_netns = self_net.clone().to_exactns();
             let dst_ns = try_resolve_nsinput(dst.clone())?;
             let mut shell_prefs = ShellPrefs::default();
-            shell_prefs.prefer_shell = shell;
+            shell_prefs.take_args(sargs);
             shell_prefs.adjust();
             let ns_moved = [0; 1];
             // Tun2socks runs in SRC ns, connects to the socks5 in it
@@ -347,9 +343,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
         /// We are just putting state in proc now, basically. Seems cleaner
-        MainCommand::Enter { list, port, shell } => {
+        MainCommand::Enter { list, port, sargs } => {
             let mut shell_prefs = ShellPrefs::default();
-            shell_prefs.prefer_shell = shell;
+            shell_prefs.take_args(sargs);
             shell_prefs.adjust();
 
             #[derive(Debug)]
@@ -401,7 +397,12 @@ fn main() -> anyhow::Result<()> {
                                     pid: np.pid,
                                 });
                             } else {
-                                println!("{:?} {:?} filename={}, skipped", np.cmdline().unwrap(), net, file);
+                                println!(
+                                    "{:?} {:?} filename={}, skipped",
+                                    np.cmdline().unwrap(),
+                                    net,
+                                    file
+                                );
                             }
                         }
                     }
@@ -414,14 +415,13 @@ fn main() -> anyhow::Result<()> {
                         dst,
                         proxy,
                         veth,
-                        uid,
                         keep,
                         all,
-                        shell,
                         default,
                         no_default,
                         log,
                         mount,
+                        sargs,
                     } => {
                         if *veth {
                             np.score += 1
