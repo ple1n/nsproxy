@@ -1,7 +1,11 @@
 use std::{
+    collections::BTreeSet,
     env::{current_dir, var},
     ffi::{CStr, CString, OsString},
-    os::unix::{process::CommandExt, raw::{gid_t, uid_t}},
+    os::unix::{
+        process::CommandExt,
+        raw::{gid_t, uid_t},
+    },
     path::PathBuf,
     str::FromStr,
 };
@@ -24,6 +28,7 @@ use crate::{
 #[derive(Default)]
 pub struct ShellPrefs {
     gids: Vec<Group>,
+    gids_raw: BTreeSet<u32>,
     pub uid: Option<uid_t>,
     /// Main GID
     pub gid: Option<gid_t>,
@@ -40,7 +45,43 @@ pub struct ShellPrefs {
     env: Vec<CString>,
 }
 
+#[derive(clap::Parser, Clone, Debug)]
+pub struct ShellArgs {
+    /// Defaults to your currrent log-in user
+    #[arg(short, long)]
+    pub uid: Option<u32>,
+    /// Also comes with defaults
+    #[arg(short, long)]
+    pub gid: Option<u32>,
+    /// Any executable name; will be resolved the same way 'which' does
+    #[arg(short, long)]
+    pub shell: Option<String>,
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// By default, the gids are taken from log-in default supplemental groups
+    /// You can override the entire vector.
+    #[arg(long, value_delimiter = ',')]
+    pub gids: Vec<u32>,
+}
+
 impl ShellPrefs {
+    pub fn take_args(&mut self, args: ShellArgs) {
+        if let Some(uid) = args.uid {
+            self.uid = Some(uid);
+        }
+        if let Some(gid) = args.gid {
+            self.gid = Some(gid);
+        }
+        if let Some(shell) = args.shell {
+            self.prefer_shell = Some(shell);
+        }
+        if let Some(cwd) = args.cwd {
+            self.cwd = Some(cwd);
+        }
+        if !args.gids.is_empty() {
+            self.gids_raw = args.gids.into_iter().collect();
+        }
+    }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations
     pub fn adjust(&mut self) -> Result<()> {
         if self.uid == None {
@@ -99,10 +140,12 @@ impl ShellPrefs {
             ))?);
         }
         self.env = vec;
+        if self.gids_raw.is_empty() {
+            for g in &self.gids {
+                self.gids_raw.insert(g.gid());
+            }
+        }
         aok!()
-    }
-    pub fn gids_raw(&self) -> Vec<u32> {
-        self.gids.iter().map(|k| k.gid()).collect()
     }
     pub fn spawn(mut self) -> Result<Clone3Result> {
         if let Some(name) = &self.prefer_shell {
@@ -137,12 +180,12 @@ impl ShellPrefs {
             let mut cmd = std::process::Command::new(cmd);
             let uid = self.uid.ok_or(anyhow!("can not find suitable uid"))?;
             cmd.uid(uid);
-            let gids = self.gids_raw();
+            let gids: Vec<_> = self.gids_raw.iter().collect();
             warn!("spawn process with gids {:?}", &gids);
             if let Some(gid) = self.gid {
                 cmd.gid(gid);
             }
-            cmd.groups(&gids);
+            cmd.groups(&gids.iter().map(|k| **k).collect::<Vec<u32>>());
             if let Some(cwd) = &self.cwd {
                 cmd.current_dir(cwd);
             }
@@ -155,10 +198,10 @@ impl ShellPrefs {
         aok!()
     }
     pub fn drop_privs(&self) -> Result<()> {
-        info!("drop privs, gids to {:?}", self.gids_raw());
+        info!("drop privs, gids to {:?}", self.gids_raw);
         setgroups(
             &self
-                .gids_raw()
+                .gids_raw
                 .iter()
                 .map(|g| Gid::from_raw(*g))
                 .collect::<Vec<_>>(),
