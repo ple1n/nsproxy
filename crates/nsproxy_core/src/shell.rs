@@ -73,14 +73,14 @@ impl ShellPrefs {
             if self.gid.is_none() {
                 self.gid = Some(gid_in);
             } else {
-                let egid = getegid();
-                if egid.as_raw() != 0 {
-                    self.gid = Some(egid.as_raw())
-                } else {
-                    if !self.wants_root {
-                        bail!("can not decide gid to use");
-                    }
-                }
+                // let egid = getegid();
+                // if egid.as_raw() != 0 {
+                //     self.gid = Some(egid.as_raw())
+                // } else {
+                //     if !self.wants_root {
+                //         bail!("can not decide gid to use");
+                //     }
+                // }
             }
             let ushell = user.shell().to_owned();
             self.shell = ushell.into();
@@ -139,6 +139,9 @@ impl ShellPrefs {
             cmd.uid(uid);
             let gids = self.gids_raw();
             warn!("spawn process with gids {:?}", &gids);
+            if let Some(gid) = self.gid {
+                cmd.gid(gid);
+            }
             cmd.groups(&gids);
             if let Some(cwd) = &self.cwd {
                 cmd.current_dir(cwd);
