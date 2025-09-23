@@ -33,7 +33,7 @@ pub struct Alloc<IP: IPOps> {
 impl<IP: IPOps> Alloc<IP> {
     pub fn init(interval: IP, cap: usize) -> Self {
         Self {
-            pool: Arc::new(Pool::new_prefilled(
+            pool: Arc::new(Pool::new(
                 cap,
                 Allocator {
                     interval: interval.clone(),
