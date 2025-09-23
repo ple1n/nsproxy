@@ -6,6 +6,7 @@ It is
 2. replacement for `sudo` when you work with network namespaces heavily
 3. a handy tool to isolate traffic of select processes, where you can launch Wireshark inside to inspect the containerized traffic. 
 4. a containerization-capable daemon for self-hosted web stacks, where you get virtual local domains assigned with zero setup
+5. an extra layer to harden each Librewolf profile with privileged namespaces
 
 - Maximal compatiblity. Run system package managers, obscure softwares, arbitrary AppImages, proxied.
 - Minimal trust. Softwares are no longer entrusted to use proxies and DNS properly. Nor should you assume it.
