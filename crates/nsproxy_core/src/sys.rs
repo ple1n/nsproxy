@@ -13,8 +13,9 @@ use nix::{
         setresgid, setresuid, setuid,
     },
 };
-use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR, UniqueFile};
 use pidfd::PidFd;
+use procfs::process::Process;
 use std::{
     collections::{HashMap, HashSet},
     env::var,
@@ -45,7 +46,7 @@ use nix::{
     libc::{AT_FDCWD, MS_PRIVATE, SYS_mount_setattr, c_int},
 };
 
-use crate::{Paths, PathsBinds};
+use crate::{Paths, PathsBinds, aok};
 
 fn mount_single(pid: &PidPath, bind_at: &Path, dry_run: bool, name: &str) -> Result<()> {
     let path: PathBuf = ["/proc/", pid.to_str().as_ref(), "ns", name]
@@ -406,4 +407,38 @@ impl Clone3Result {
             }
         }
     }
+}
+
+/// Mapping of browser profile and namespace 
+pub struct ProfileNSMap {
+    pub map: HashMap<pid_t, PathBuf>
+}
+
+pub struct UniqueFile2 {
+    dev_maj: u32,
+    dev_min: u32,
+    inode: u64
+}
+
+#[derive(Default)]
+pub struct Locks {
+    pub pids: HashMap<pid_t, Vec<UniqueFile>>,
+    pub paths: HashMap<UniqueFile, PathBuf>
+}
+
+pub fn list_locks() -> Result<()> {
+    let mut resp = Locks::default();
+    let locks = procfs::locks()?;
+    for lock in locks  {
+        if let Some(pid) = lock.pid {
+            let fds = Process::new(pid)?.fd()?;
+            for fd in fds {
+                let fd = fd?;
+                fstat(fd.fd);
+            }
+        }
+    }
+
+
+    aok!()
 }

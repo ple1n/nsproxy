@@ -121,6 +121,8 @@ enum MainCommand {
         #[arg(default_value = "./install")]
         dir: PathBuf,
     },
+    /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
+    /// The wrapper handles such problems
     Wrap {
         /// The executable to hook.
         #[arg(short, long)]
@@ -497,7 +499,7 @@ fn main() -> anyhow::Result<()> {
             let fd = dstdir.join(sproxyf.file_name().unwrap());
             overwrite(&sproxyf, &fd)?;
         }
-        /// TODO: proper perms 
+        // TODO: proper perms
         MainCommand::Wrap { bin, undo } => {
             let mut nswrap_path = std::env::current_exe()?;
             nswrap_path.set_file_name("nswrap");
