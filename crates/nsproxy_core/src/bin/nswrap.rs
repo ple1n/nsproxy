@@ -12,7 +12,7 @@ use nix::unistd::execve;
 
 fn main() {
     let self_exe = std::env::current_exe().unwrap();
-    let wrapped = self_exe.with_extension(".wrapped");
+    let wrapped = self_exe.with_extension("wrapped");
     let args = env::args()
         .map(|k| CString::new(k).unwrap())
         .collect::<Vec<_>>();
@@ -25,9 +25,10 @@ fn main() {
         })
         .collect();
     println!("Executing wrapped binary: {:?}", wrapped);
-    execve(
+    let k = execve(
         &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
         &args,
         &env,
     );
+    println!("exited with {:?}", k);
 }
