@@ -3,6 +3,7 @@
 use std::{future::pending, sync::Arc, time::Duration};
 
 use anyhow::{Result, bail};
+use futures::channel::mpsc::unbounded;
 use nsproxy_core::{
     TunMaker, tokio_netlink_conn,
     tun2socks5::{self, ArgProxy, IArgs},
@@ -57,7 +58,9 @@ async fn main() -> Result<()> {
             id: None,
             name: None,
         };
-        tun2socks5::main_entry(dev, mtu, false, args).await?;
+
+        let (sx, rx) = unbounded();
+        tun2socks5::main_entry(dev, mtu, false, args, rx).await?;
 
         anyhow::Ok(())
     });
