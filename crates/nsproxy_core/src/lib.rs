@@ -42,16 +42,17 @@ use rtnetlink::packet_route::route::RouteAttribute;
 use rtnetlink::packet_route::route::RouteMessage;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use serde_untagged::UntaggedEnumVisitor;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 pub use tun2socks5;
+pub mod env;
 pub mod prelude;
 pub mod shell;
 pub mod sys;
 pub mod utils;
-pub mod env;
 
 pub struct TunMaker {
     pub name: String,
@@ -611,4 +612,9 @@ pub macro aok {
     (#ty:ty) => {
         Ok::<#ty, anyhow::Error>(())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HotConfig {
+    pub dns: HashMap<String, Value>,
 }

@@ -5,15 +5,19 @@ use clap::{
     Parser, Subcommand, ValueEnum,
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
 };
-use futures::AsyncWriteExt;
+use futures::{
+    AsyncWriteExt, SinkExt, StreamExt,
+    channel::mpsc::{self, unbounded},
+};
 use futures_lite::future::block_on;
 use nix::{
     sched::{CloneFlags, unshare},
     unistd::{Pid, getresgid, getresuid},
 };
+use notify::{Event, EventKind, RecommendedWatcher, Watcher};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
 use nsproxy_core::{
-    NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
+    HotConfig, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::{ShellArgs, ShellPrefs},
     sys::{Clone3Result, NSEnter, enable_ping_all},
     tokio_netlink_conn,
@@ -29,6 +33,7 @@ use std::{
     fs::{self, Permissions},
     io::{ErrorKind, Write},
     mem::ManuallyDrop,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
@@ -42,20 +47,40 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync;
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use tun2socks5::{ArgMode, IArgs, aok, tun_rs::AsyncDevice};
+use tun2socks5::{ArgMode, IArgs, VirtDNSChange, aok, dns::TUNResponse, tun_rs::AsyncDevice};
 
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Working state directory
-    #[arg(short, long, default_value = "./")]
-    state: PathBuf,
+    #[arg(short, long, default_value = "./nsproxy.json")]
+    conf: PathBuf,
     #[command(subcommand)]
     cmd: MainCommand,
+}
+
+fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
+    let (mut tx, rx) = tokio::sync::mpsc::channel(1);
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    let watcher = RecommendedWatcher::new(
+        move |res: std::result::Result<Event, notify::Error>| match res {
+            Ok(res) => {
+                if matches!(res.kind, EventKind::Modify(_)) {
+                    let _ = tx.try_send(());
+                }
+            }
+            _ => {}
+        },
+        notify::Config::default(),
+    )?;
+
+    Ok((watcher, rx))
 }
 
 /// Representation of a namespace input (PID or Path)
@@ -205,88 +230,89 @@ fn main() -> anyhow::Result<()> {
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
                 match clone {
-                    Ok(clone) => match clone {
-                        Clone3Result::IsChild { tx } => {
-                            if let Some(dst) = dst_ns {
-                                dst.enter(CloneFlags::CLONE_NEWNET)?;
-                            }
-                            if dst != NsInput::New {
-                                bail!("unexpected {:?}", &dst);
-                            }
-                            enable_ping_all()?;
-
-                            let mut tun = TunMaker::default();
-                            tun.name = tun_name.clone();
-                            tun.mtu = mtu;
-                            let mut state = tun.make()?;
-                            state.sync_basic()?;
-                            let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
-                            let raw = dev.as_raw_fd();
-
-                            info!("send TUN fd");
-                            tx.send_fd(raw)?;
-                            drop(dev);
-
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()?;
-                            rt.block_on(async {
-                                use tokio::io::AsyncReadExt;
-                                let mut read = vec![0; 1];
-                                tx.set_nonblocking(true)?;
-                                let mut tx = tokio::net::UnixStream::from_std(tx)?;
-                                let add_default = (dst == NsInput::New && !no_default)
-                                    || (dst == NsInput::This && default);
-
-                                let nl = tokio_netlink_conn()?;
-                                nl.up_lo().await?;
-
-                                if add_default {
-                                    warn!("adding TUN as default route");
-                                    nl.ip_add_default_route(state.dev_index).await?;
+                    Ok(clone) => {
+                        match clone {
+                            Clone3Result::IsChild { tx } => {
+                                if let Some(dst) = dst_ns {
+                                    dst.enter(CloneFlags::CLONE_NEWNET)?;
                                 }
-                                if veth {
-                                    tx.read(&mut read).await;
-                                    let dev = nl.fetch_link_by_name("v_in".to_owned()).await?;
-                                    nl.address()
-                                        .add(dev.header.index, "100.120.0.2".parse()?, 24)
-                                        .execute()
-                                        .await?;
+                                if dst != NsInput::New {
+                                    bail!("unexpected {:?}", &dst);
+                                }
+                                enable_ping_all()?;
 
-                                    nl.link()
-                                        .set(
-                                            LinkMessageBuilder::<LinkUnspec>::default()
-                                                .index(dev.header.index)
-                                                .up()
-                                                .build(),
-                                        )
-                                        .execute()
-                                        .await?;
+                                let mut tun = TunMaker::default();
+                                tun.name = tun_name.clone();
+                                tun.mtu = mtu;
+                                let mut state = tun.make()?;
+                                state.sync_basic()?;
+                                let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
+                                let raw = dev.as_raw_fd();
+
+                                info!("send TUN fd");
+                                tx.send_fd(raw)?;
+                                drop(dev);
+
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()?;
+                                rt.block_on(async {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut read = vec![0; 1];
+                                    tx.set_nonblocking(true)?;
+                                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                                    let add_default = (dst == NsInput::New && !no_default)
+                                        || (dst == NsInput::This && default);
+
+                                    let nl = tokio_netlink_conn()?;
+                                    nl.up_lo().await?;
+
+                                    if add_default {
+                                        warn!("adding TUN as default route");
+                                        nl.ip_add_default_route(state.dev_index).await?;
+                                    }
+                                    if veth {
+                                        tx.read(&mut read).await;
+                                        let dev = nl.fetch_link_by_name("v_in".to_owned()).await?;
+                                        nl.address()
+                                            .add(dev.header.index, "100.120.0.2".parse()?, 24)
+                                            .execute()
+                                            .await?;
+
+                                        nl.link()
+                                            .set(
+                                                LinkMessageBuilder::<LinkUnspec>::default()
+                                                    .index(dev.header.index)
+                                                    .up()
+                                                    .build(),
+                                            )
+                                            .execute()
+                                            .await?;
+                                    }
+
+                                    let clone = shell_prefs.spawn()?;
+                                    clone.wait_for_child().await?;
+
+                                    exit(0);
+                                    aok!()
+                                })?;
+                            }
+                            Clone3Result::Parent {
+                                child_pid,
+                                child_pidfd,
+                                tx,
+                            } => {
+                                info!("recved fd");
+                                let dev = tx.recv_fd()?;
+                                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
+                                let rt = tokio::runtime::Builder::new_multi_thread()
+                                    .enable_all()
+                                    .build()?;
+                                if let Some(log) = log {
+                                    reload_handle.modify(|k| *k.filter_mut() = log)?;
                                 }
 
-                                let clone = shell_prefs.spawn()?;
-                                clone.wait_for_child().await?;
-
-                                exit(0);
-                                aok!()
-                            })?;
-                        }
-                        Clone3Result::Parent {
-                            child_pid,
-                            child_pidfd,
-                            tx,
-                        } => {
-                            info!("recved fd");
-                            let dev = tx.recv_fd()?;
-                            let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
-                            let rt = tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()?;
-                            if let Some(log) = log {
-                                reload_handle.modify(|k| *k.filter_mut() = log)?;
-                            }
-
-                            rt.spawn(async move {
+                                rt.spawn(async move {
                                     let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
                                     let k = fd.into_future().await?;
                                     // Against Unix philosophy again, the tool does not confuse users. 
@@ -294,7 +320,7 @@ fn main() -> anyhow::Result<()> {
                                     aok!()
                                 });
 
-                            rt.block_on(async move {
+                                rt.block_on(async move {
                                 use tokio::io::AsyncWriteExt;
 
                                 let nl = tokio_netlink_conn()?;
@@ -326,13 +352,69 @@ fn main() -> anyhow::Result<()> {
                                         .execute()
                                         .await?;
                                 }
-                                tun2socks5::main_entry(dev, mtu, false, iargs).await?;
+
+                                let (mut tunsx, tunrx) = unbounded();
+                                tokio::spawn(async move {
+                                    let (mut wx, mut rx) = async_watcher()?;
+                                    wx.watch(&cli.conf, notify::RecursiveMode::NonRecursive)?;
+                                    info!("watch config");
+
+                                    loop {
+                                        if let Some(_) = rx.recv().await {
+                                            let fc = tokio::fs::read_to_string(&cli.conf).await?;
+                                            match serde_json::from_str::<HotConfig>(&fc) {
+                                                Ok(newconf) => {
+                                                    info!("config hot reload");
+                                                    use serde_json::Value;
+                                                    for (domain, spec) in newconf.dns {
+                                                        let target = match spec {
+                                                            Value::String(ipstr) => {
+                                                                if let Ok(addr) =
+                                                                    ipstr.parse::<SocketAddr>()
+                                                                {
+                                                                    Some(TUNResponse::NAT(addr))
+                                                                } else {
+                                                                    Some(TUNResponse::ProxiedHost(ipstr))
+                                                                }
+                                                            }
+                                                            Value::Number(port) => Some(TUNResponse::NAT(
+                                                                SocketAddrV4::new(Ipv4Addr::LOCALHOST, {
+                                                                    let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
+                                                                    let p : u16 = p.try_into()?;
+                                                                    p
+                                                                }).into()
+                                                            )),
+                                                            _ => None
+                                                        };
+                                                        if let Some(target) = target {
+                                                            let delta = VirtDNSChange { domain, target };
+                                                            tunsx.send(delta);
+                                                        }
+
+                                                    }
+                                                }
+                                                _ => {
+                                                    warn!("config changed, but is invalid");
+                                                }
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    warn!("config watching ended");
+
+                                    aok!()
+                                });
+
+                                tun2socks5::main_entry(dev, mtu, false, iargs, tunrx).await?;
                                 warn!("tun exited");
                                 std::future::pending::<()>().await;
                                 aok!()
                             })?;
+                            }
                         }
-                    },
+                    }
                     // This is what you dont get in Unix philosophy. User experience.
                     Err(er) => {
                         warn!("Clone3 failed with {:?}", &er);
@@ -536,7 +618,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 pub fn try_resolve_nsinput(nsi: NsInput) -> Result<Option<ExactNS>> {
     match nsi {
