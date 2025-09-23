@@ -47,3 +47,4 @@ passfd.workspace = true
 tracing-subscriber = "0.3.20"
 which.workspace = true
 multimap = "0.10.1"
+notify = "8.2.0"
