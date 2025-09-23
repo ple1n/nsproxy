@@ -3,8 +3,7 @@ use nsproxy_common::{ExactNS, UniqueFile};
 use procfs::process::Namespace;
 use serde::Serialize;
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    hash::Hash,
+    collections::{HashMap, hash_map::Entry}, ffi::{CStr, CString, OsStr}, hash::Hash
 };
 use tokio::fs;
 
