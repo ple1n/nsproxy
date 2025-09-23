@@ -48,12 +48,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mtu = dev.mtu()?;
         let args = IArgs {
-            proxy: ArgProxy::from_url("socks5://127.0.0.1:2080")?,
+            proxy: ArgProxy::from_url("socks5://127.0.0.1:2080")?.into(),
             ipv6_enabled: false,
             dns: tun2socks5::ArgDns::Handled,
             dns_addr: "127.2.2.2".parse()?,
             bypass: Default::default(),
-            state: None,
             designated: None,
             id: None,
             name: None,
