@@ -121,6 +121,13 @@ enum MainCommand {
         #[arg(default_value = "./install")]
         dir: PathBuf,
     },
+    Wrap {
+        /// The executable to hook.
+        #[arg(short, long)]
+        bin: String,
+        #[arg(short, long)]
+        undo: bool,
+    },
 }
 
 impl std::str::FromStr for NsInput {
@@ -472,6 +479,7 @@ fn main() -> anyhow::Result<()> {
             let selfprogdst = dstdir.join(selfprog.file_name().unwrap());
             overwrite(&selfprog, &selfprogdst)?;
             sproxyf.set_file_name("sproxy");
+
             let fd = dstdir.join(sproxyf.file_name().unwrap());
             overwrite(&sproxyf, &fd)?;
             let f = std::fs::File::open(&fd)?;
@@ -484,6 +492,41 @@ fn main() -> anyhow::Result<()> {
                 meta.gid(),
                 meta.permissions().mode() & 0o4000 != 0
             );
+
+            sproxyf.set_file_name("nswrap");
+            let fd = dstdir.join(sproxyf.file_name().unwrap());
+            overwrite(&sproxyf, &fd)?;
+        }
+        /// TODO: proper perms 
+        MainCommand::Wrap { bin, undo } => {
+            let mut nswrap_path = std::env::current_exe()?;
+            nswrap_path.set_file_name("nswrap");
+            warn!("use nswrap at {:?}", &nswrap_path);
+            let exist = nswrap_path.try_exists()?;
+            if !exist {
+                bail!("can not access nswrap");
+            }
+            let dst = which::which(bin)?;
+            warn!("binary resolved to {:?}", &dst);
+            let actual = dst.with_extension("wrapped");
+            if actual.try_exists()? {
+                if undo {
+                    info!("mv {:?} {:?}", &actual, &dst);
+                    fs::rename(&actual, &dst)?;
+                } else {
+                    info!("cp {:?} {:?}", &nswrap_path, &dst);
+                    fs::copy(nswrap_path, dst)?;
+                }
+            } else {
+                if undo {
+                    warn!("nothing to do. there is no .wrapped file");
+                } else {
+                    info!("mv {:?} {:?}", &dst, &actual);
+                    fs::rename(&dst, actual)?;
+                    info!("cp {:?} {:?}", &nswrap_path, &dst);
+                    fs::copy(nswrap_path, dst)?;
+                }
+            }
         }
         _ => unimplemented!(),
     }
