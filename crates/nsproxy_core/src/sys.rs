@@ -4,10 +4,15 @@ use anyhow::{bail, ensure};
 use clone3::Clone3;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{pid_t, stat, syscall, uid_t};
+use multimap::MultiMap;
 use nix::{
     mount::{MntFlags, MsFlags, mount, umount, umount2},
     sched::{CloneFlags, setns, unshare},
-    sys::{signal::kill, stat::fstat, wait::waitpid},
+    sys::{
+        signal::kill,
+        stat::{fstat, makedev},
+        wait::waitpid,
+    },
     unistd::{
         ForkResult, Gid, Pid, Uid, fork, getresuid, getuid, initgroups, seteuid, setgroups,
         setresgid, setresuid, setuid,
@@ -15,7 +20,7 @@ use nix::{
 };
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR, UniqueFile};
 use pidfd::PidFd;
-use procfs::process::Process;
+use procfs::process::{FDTarget, Process};
 use std::{
     collections::{HashMap, HashSet},
     env::var,
@@ -409,36 +414,36 @@ impl Clone3Result {
     }
 }
 
-/// Mapping of browser profile and namespace 
+/// Mapping of browser profile and namespace
 pub struct ProfileNSMap {
-    pub map: HashMap<pid_t, PathBuf>
-}
-
-pub struct UniqueFile2 {
-    dev_maj: u32,
-    dev_min: u32,
-    inode: u64
+    pub map: HashMap<pid_t, PathBuf>,
 }
 
 #[derive(Default)]
 pub struct Locks {
-    pub pids: HashMap<pid_t, Vec<UniqueFile>>,
-    pub paths: HashMap<UniqueFile, PathBuf>
+    pub pids: MultiMap<pid_t, UniqueFile>,
+    pub paths: HashMap<UniqueFile, FDTarget>,
 }
 
-pub fn list_locks() -> Result<()> {
+pub fn list_locks() -> Result<Locks> {
     let mut resp = Locks::default();
     let locks = procfs::locks()?;
-    for lock in locks  {
+    for lock in locks {
         if let Some(pid) = lock.pid {
             let fds = Process::new(pid)?.fd()?;
+            let dev = makedev(lock.devmaj as u64, lock.devmin as u64);
+            let lockfile = UniqueFile::new(lock.inode, dev);
+            resp.pids.insert(pid, lockfile);
             for fd in fds {
                 let fd = fd?;
-                fstat(fd.fd);
+                let stat = fstat(fd.fd)?;
+                let file: UniqueFile = stat.into();
+                if file == lockfile {
+                    let _ = resp.paths.insert(file, fd.target);
+                }
             }
         }
     }
 
-
-    aok!()
+    Ok(resp)
 }
