@@ -1,6 +1,11 @@
 # nsproxy v3
 
-a compatbility layer from sockets to SOCKS
+It is 
+
+1. a compatbility layer from sockets to SOCKS
+2. replacement for `sudo` when you work with network namespaces heavily
+3. a handy tool to isolate traffic of select processes, where you can launch Wireshark inside to inspect the containerized traffic. 
+4. a containerization-capable daemon for self-hosted web stacks, where you get virtual local domains assigned with zero setup
 
 - Maximal compatiblity. Run system package managers, obscure softwares, arbitrary AppImages, proxied.
 - Minimal trust. Softwares are no longer entrusted to use proxies and DNS properly. Nor should you assume it.
