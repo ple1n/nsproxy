@@ -66,6 +66,42 @@ Rustnet is truly handy in this case.
 
 ![Rustnet](image.png)
 
+Rustnet doesn't seem to work on TUN created by nsproxy, inside a container as I tested.
+
+You can still do network monitoring involving QUIC with wireshark, in an nsproxy container.
+
+```sh
+sproxy enter -u 0 # finds an existing namespace and enters
+wireshark
+```
+
+![quic-wire](image-1.png)
+
+Doing analysis in a container is roughly the same as outside. 
+
+### Having the browser use SOCKS5 through a veth, or use TUN?
+
+![](image-2.png)
+
+sproxy can connect a veth from a container, to your 'default namespace'. 
+
+By default, `veth.host` and `veth.peer` are mapped to corresponding IP addresses through the virtual DNS mechanism.
+
+The container above was created by 
+
+```sh
+sproxy run -p socks5://127.0.0.1:7770 -v 
+# v for veths, p for proxy
+```
+
+You can re-enter this namespace by `sproxy enter`
+
+`sproxy enter` traverses `/proc/` to find the namespaces that you might want to enter. 
+
+From the perspective of less memory copying, you should set browser to use `veth.host`, as exposed by nsproxy, and have your proxy server listening at `veth.host`. 
+
+Using TUN, on the other hand, quite counter-intuitively might offer performance as browsers tend to avoid QUIC when it tries to use a SOCKS proxy.
+
 ## Tor and other anonymity networks
 
 Nsproxy works with Tor. 
