@@ -14,3 +14,9 @@ It is
 - Maximal portability, minimal dependencies. Run nsproxy without desktop environment and chroot to rescue your system. 
 - Non-sandbox. Not intended to be a sandbox. Ask flatpak to incorporate features in this project, if you want. 
 - Not a new docker. This is a handy tool that follows the user loyally. 
+
+## dev
+
+Stop making modules private. Dependencies Shall hide nothing from me. 80% of forks in this projeet are due to some items being private.
+
+Encapsulation is a failure, a failed feature coming from OOP.

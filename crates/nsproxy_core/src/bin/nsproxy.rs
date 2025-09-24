@@ -31,7 +31,8 @@ use pidfd::PidFd;
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
+    convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
     io::{ErrorKind, Write},
@@ -53,7 +54,14 @@ use std::{
 use tokio::sync;
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use tun2socks5::{ArgMode, IArgs, VirtDNSChange, aok, dns::TUNResponse, tun_rs::AsyncDevice};
+use tun2socks5::{
+    ArgMode, IArgs, VirtDNSChange, aok,
+    dns::{TUNResponse, VirtDNSHandle},
+    flume,
+    ipstack::stream::{IpStackStream, IpStackTcpStream},
+    tun_rs::AsyncDevice,
+};
+use warp::server::accept::Accept;
 
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
@@ -175,6 +183,24 @@ impl std::str::FromStr for NsInput {
             Ok(NsInput::Path(PathBuf::from(s)))
         }
     }
+}
+
+struct ServerItem<F, R> {
+    warp: warp::Server<F, WarpAcceptor, R>,
+    marked: bool,
+}
+
+struct WarpAcceptor {
+    rx: flume::Receiver<(PathBuf, IpStackTcpStream)>,
+}
+
+impl Accept for WarpAcceptor {
+    type IO = hyper_util::rt::TokioIo<IpStackTcpStream>;
+    type AcceptError = Infallible;
+    type Accepting = std::future::Ready<Result<Self::IO, Self::AcceptError>>;
+    //  fn accept(&mut self) -> impl Future<Output = std::result::Result<Self::Accepting, std::io::Error>> {
+    //     self.rx.recv_async()
+    // }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -359,96 +385,12 @@ fn main() -> anyhow::Result<()> {
                                     }
 
                                     let (vdns_sx, vdns_rx) = oneshot::channel();
-                                    tokio::spawn(async move {
-                                        let (mut wx, mut rx) = async_watcher()?;
-                                        wx.watch(&cli.conf, notify::RecursiveMode::NonRecursive)?;
-                                        info!("watch config");
-                                        let vdns: std::result::Result<
-                                            tun2socks5::dns::VirtDNSHandle,
-                                            oneshot::Canceled,
-                                        > = vdns_rx.await;
-                                        let vdns = vdns?;
-                                        loop {
-                                            if let Some(_) = rx.recv().await {
-                                                let fc =
-                                                    tokio::fs::read_to_string(&cli.conf).await?;
-                                                match serde_json::from_str::<HotConfig>(&fc) {
-                                                    Ok(newconf) => {
-                                                        info!("config hot reload");
-                                                        use serde_json::Value;
-                                                        for (domain, ip) in newconf.dns {
-                                                            let target = TUNResponse::Unreachable;
-                                                            if let Ok(addr) = ip.parse::<Ipv4Addr>()
-                                                            {
-                                                                info!(
-                                                                    "DNS {} -> {}",
-                                                                    &domain, addr
-                                                                );
-                                                                vdns.pin(
-                                                                    Some(addr),
-                                                                    domain,
-                                                                    target,
-                                                                );
-                                                            };
-                                                        }
-                                                        for (domain, spec) in newconf.tun {
-                                                            let target = match spec {
-                                                                Value::String(ipstr) => {
-                                                                    let target = if let Ok(addr) =
-                                                                        ipstr.parse::<SocketAddr>()
-                                                                    {
-                                                                        info!(
-                                                                            "NAT-out {} -> {}",
-                                                                            &domain, addr
-                                                                        );
-                                                                        TUNResponse::NATByTUN(addr)
-                                                                    } else {
-                                                                        info!(
-                                                                            "Host {} -> {}",
-                                                                            &domain, ipstr
-                                                                        );
-                                                                        TUNResponse::ProxiedHost(
-                                                                            ipstr,
-                                                                        )
-                                                                    };
-                                                                    vdns.pin(None, domain, target);
-                                                                }
-                                                                Value::Number(port) => {
-                                                                    let p = port.as_u64().ok_or(
-                                                                        anyhow!("invalid port"),
-                                                                    )?;
-                                                                    let p: u16 = p.try_into()?;
-                                                                    let addr = SocketAddrV4::new(
-                                                                        Ipv4Addr::LOCALHOST,
-                                                                        p,
-                                                                    )
-                                                                    .into();
-                                                                    info!(
-                                                                        "NAT-out {} -> {}",
-                                                                        &domain, addr
-                                                                    );
-                                                                    let target =
-                                                                        TUNResponse::NATByTUN(addr);
-                                                                    vdns.pin(None, domain, target);
-                                                                }
-                                                                _ => (),
-                                                            };
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        warn!("config changed, but is invalid");
-                                                    }
-                                                }
-                                            } else {
-                                                break;
-                                            }
-                                        }
+                                    let (st_sx, acceptor) = flume::unbounded();
 
-                                        warn!("config watching ended");
-                                        aok!()
-                                    });
+                                    tokio::spawn(watch_config(vdns_rx, cli.conf.clone(), acceptor));
 
-                                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx).await?;
+                                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx, st_sx)
+                                        .await?;
                                     warn!("tun exited");
                                     std::future::pending::<()>().await;
                                     aok!()
@@ -657,6 +599,87 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn watch_config(
+    vdns_rx: oneshot::Receiver<VirtDNSHandle>,
+    conf: PathBuf,
+    acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
+) -> Result<()> {
+    let (mut wx, mut rx) = async_watcher()?;
+    wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
+    info!("watch config");
+
+    let mut warps: HashMap<PathBuf, ServerItem<_, _>> = HashMap::new();
+    let vdns: std::result::Result<tun2socks5::dns::VirtDNSHandle, oneshot::Canceled> =
+        vdns_rx.await;
+    let vdns = vdns?;
+    loop {
+        if let Some(_) = rx.recv().await {
+            let fc = tokio::fs::read_to_string(&conf).await?;
+            match serde_json::from_str::<HotConfig>(&fc) {
+                Ok(newconf) => {
+                    info!("config hot reload");
+                    use serde_json::Value;
+                    warps.iter_mut().map(|(k, v)| v.marked = false);
+                    for (domain, ip) in newconf.dns {
+                        let target = TUNResponse::Unreachable;
+                        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+                            info!("DNS {} -> {}", &domain, addr);
+                            vdns.pin(Some(addr), domain, target);
+                        };
+                    }
+                    for (domain, spec) in newconf.tun {
+                        match spec {
+                            Value::String(mapstr) => {
+                                if let Ok(addr) = mapstr.parse::<SocketAddr>() {
+                                    info!("NAT-out {} -> {}", &domain, addr);
+                                    let target = TUNResponse::NATByTUN(addr);
+                                } else if let Ok(path) = mapstr.parse::<PathBuf>() {
+                                    info!("Files {} -> {}", &domain, mapstr);
+                                    match warps.entry(path.clone()) {
+                                        Entry::Vacant(e) => {
+                                            let f = warp::fs::dir(path.clone());
+                                            let wa = WarpAcceptor {
+                                                rx: acceptor.clone(),
+                                            };
+                                            let ws = warp::serve(f).incoming(wa);
+                                            e.insert(ServerItem {
+                                                warp: ws,
+                                                marked: true,
+                                            });
+                                        }
+                                        Entry::Occupied(mut e) => {
+                                            e.get_mut().marked = true;
+                                        }
+                                    }
+                                    let target = TUNResponse::Files(path);
+                                    vdns.pin(None, domain, target);
+                                }
+                            }
+                            Value::Number(port) => {
+                                let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
+                                let p: u16 = p.try_into()?;
+                                let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
+                                info!("NAT-out {} -> {}", &domain, addr);
+                                let target = TUNResponse::NATByTUN(addr);
+                                vdns.pin(None, domain, target);
+                            }
+                            _ => (),
+                        };
+                    }
+                }
+                _ => {
+                    warn!("config changed, but is invalid");
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    warn!("config watching ended");
+    aok!()
 }
 
 use anyhow::{Result, anyhow, bail};
