@@ -12,7 +12,7 @@ lto = false         # No link-time optimization
 
 [profile.release]
 strip = false
-opt-level = 3
+opt-level = "s"
 lto = true
 debug = true
 # Just strip manually

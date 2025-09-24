@@ -37,6 +37,7 @@ use std::{
     convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
+    future::{pending, ready},
     io::{ErrorKind, Write},
     mem::ManuallyDrop,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -192,15 +193,30 @@ struct ServerItem {
 }
 
 struct WarpAcceptor {
+    path: PathBuf,
     rx: flume::Receiver<(PathBuf, IpStackTcpStream)>,
 }
 
 impl Accept for WarpAcceptor {
     type IO = hyper_util::rt::TokioIo<IpStackTcpStream>;
-    type AcceptError = Infallible;
+    type AcceptError = flume::RecvError;
     type Accepting = std::future::Ready<Result<Self::IO, Self::AcceptError>>;
     async fn accept(&mut self) -> std::result::Result<Self::Accepting, std::io::Error> {
-        todo!()
+        loop {
+            let rx: std::result::Result<(PathBuf, IpStackTcpStream), flume::RecvError> =
+                self.rx.recv_async().await;
+            match rx {
+                Ok((p, s)) => {
+                    if p == self.path {
+                        info!("accepted stream");
+                        return Ok(ready(Ok(hyper_util::rt::TokioIo::new( s))));
+                    }
+                },
+                Err(e) => {
+                    return Ok(ready(Err(e)));
+                }
+            }
+        }
     }
 }
 
@@ -650,6 +666,7 @@ async fn watch_config(
                                             let f = warp::fs::dir(path.clone());
                                             let wa = WarpAcceptor {
                                                 rx: acceptor.clone(),
+                                                path: path.clone()
                                             };
                                             let ws = warp::serve(f).incoming(wa);
                                             futs.push(ws.run());
@@ -682,9 +699,10 @@ async fn watch_config(
 
             anyhow::Ok(futs)
         };
+        info!("serving {} file roots", futs.len());
         futs = select! {
-            k = rx.recv() =>if let Some(_) = k { o.await?} else {break;},
-            _ = join_all(futs) => {
+            k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
+            _ = join_all(futs), if futs.len() > 0 => {
                 Vec::new()
             }
         }
