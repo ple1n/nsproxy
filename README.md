@@ -100,8 +100,6 @@ You can re-enter this namespace by `sproxy enter`
 
 From the perspective of less memory copying, you should set browser to use `veth.host`, as exposed by nsproxy, and have your proxy server listening at `veth.host`. 
 
-Using TUN, on the other hand, quite counter-intuitively might offer performance as browsers tend to avoid QUIC when it tries to use a SOCKS proxy.
-
 ## Tor and other anonymity networks
 
 Nsproxy works with Tor. 
