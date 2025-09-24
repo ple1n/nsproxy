@@ -11,8 +11,10 @@ use futures::{
         mpsc::{self, unbounded},
         oneshot,
     },
+    future::join_all,
 };
 use futures_lite::future::block_on;
+use libc::KERN_HOTPLUG;
 use nix::{
     sched::{CloneFlags, unshare},
     unistd::{Pid, getresgid, getresuid},
@@ -51,7 +53,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync;
+use tokio::{select, sync};
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use tun2socks5::{
@@ -185,8 +187,7 @@ impl std::str::FromStr for NsInput {
     }
 }
 
-struct ServerItem<F, R> {
-    warp: warp::Server<F, WarpAcceptor, R>,
+struct ServerItem {
     marked: bool,
 }
 
@@ -198,9 +199,9 @@ impl Accept for WarpAcceptor {
     type IO = hyper_util::rt::TokioIo<IpStackTcpStream>;
     type AcceptError = Infallible;
     type Accepting = std::future::Ready<Result<Self::IO, Self::AcceptError>>;
-    //  fn accept(&mut self) -> impl Future<Output = std::result::Result<Self::Accepting, std::io::Error>> {
-    //     self.rx.recv_async()
-    // }
+    async fn accept(&mut self) -> std::result::Result<Self::Accepting, std::io::Error> {
+        todo!()
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -610,18 +611,25 @@ async fn watch_config(
     wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
     info!("watch config");
 
-    let mut warps: HashMap<PathBuf, ServerItem<_, _>> = HashMap::new();
+    let mut warps: HashMap<PathBuf, ServerItem> = HashMap::new();
     let vdns: std::result::Result<tun2socks5::dns::VirtDNSHandle, oneshot::Canceled> =
         vdns_rx.await;
     let vdns = vdns?;
+    let mut futs = Vec::new();
     loop {
-        if let Some(_) = rx.recv().await {
+        let vdns = vdns.clone();
+        let conf = &conf;
+        let warps = &mut warps;
+        let acceptor = acceptor.clone();
+        let o = async move {
+            let mut futs = Vec::new();
+
             let fc = tokio::fs::read_to_string(&conf).await?;
             match serde_json::from_str::<HotConfig>(&fc) {
                 Ok(newconf) => {
                     info!("config hot reload");
                     use serde_json::Value;
-                    warps.iter_mut().map(|(k, v)| v.marked = false);
+                    warps.iter_mut().map(|(p, k)| k.marked = false);
                     for (domain, ip) in newconf.dns {
                         let target = TUNResponse::Unreachable;
                         if let Ok(addr) = ip.parse::<Ipv4Addr>() {
@@ -644,10 +652,8 @@ async fn watch_config(
                                                 rx: acceptor.clone(),
                                             };
                                             let ws = warp::serve(f).incoming(wa);
-                                            e.insert(ServerItem {
-                                                warp: ws,
-                                                marked: true,
-                                            });
+                                            futs.push(ws.run());
+                                            e.insert(ServerItem { marked: true });
                                         }
                                         Entry::Occupied(mut e) => {
                                             e.get_mut().marked = true;
@@ -673,8 +679,14 @@ async fn watch_config(
                     warn!("config changed, but is invalid");
                 }
             }
-        } else {
-            break;
+
+            anyhow::Ok(futs)
+        };
+        futs = select! {
+            k = rx.recv() =>if let Some(_) = k { o.await?} else {break;},
+            _ = join_all(futs) => {
+                Vec::new()
+            }
         }
     }
 
