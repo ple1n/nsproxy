@@ -7,7 +7,10 @@ use clap::{
 };
 use futures::{
     AsyncWriteExt, SinkExt, StreamExt,
-    channel::mpsc::{self, unbounded},
+    channel::{
+        mpsc::{self, unbounded},
+        oneshot,
+    },
 };
 use futures_lite::future::block_on;
 use nix::{
@@ -353,12 +356,13 @@ fn main() -> anyhow::Result<()> {
                                         .await?;
                                 }
 
-                                let (mut tunsx, tunrx) = unbounded();
+                                let (vdns_sx, vdns_rx) = oneshot::channel();
                                 tokio::spawn(async move {
                                     let (mut wx, mut rx) = async_watcher()?;
                                     wx.watch(&cli.conf, notify::RecursiveMode::NonRecursive)?;
                                     info!("watch config");
-
+                                    let vdns: std::result::Result<tun2socks5::dns::VirtDNSHandle, oneshot::Canceled> = vdns_rx.await;
+                                    let vdns= vdns?;
                                     loop {
                                         if let Some(_) = rx.recv().await {
                                             let fc = tokio::fs::read_to_string(&cli.conf).await?;
@@ -377,20 +381,19 @@ fn main() -> anyhow::Result<()> {
                                                                     Some(TUNResponse::ProxiedHost(ipstr))
                                                                 }
                                                             }
-                                                            Value::Number(port) => Some(TUNResponse::NAT(
-                                                                SocketAddrV4::new(Ipv4Addr::LOCALHOST, {
-                                                                    let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
+                                                            Value::Number(port) => {   
+                                                                let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
                                                                     let p : u16 = p.try_into()?;
-                                                                    p
-                                                                }).into()
-                                                            )),
+                                                                    Some(TUNResponse::NAT(
+                                                      SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into()
+                                                            ))},
                                                             _ => None
                                                         };
                                                         if let Some(target) = target {
-                                                            let delta = VirtDNSChange { domain, target };
-                                                            tunsx.send(delta);
+                                                            vdns.pin(None,domain, target);
+                                                        } else {
+                                                            warn!("invalid {}", domain);
                                                         }
-
                                                     }
                                                 }
                                                 _ => {
@@ -403,11 +406,10 @@ fn main() -> anyhow::Result<()> {
                                     }
 
                                     warn!("config watching ended");
-
                                     aok!()
                                 });
 
-                                tun2socks5::main_entry(dev, mtu, false, iargs, tunrx).await?;
+                                tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx).await?;
                                 warn!("tun exited");
                                 std::future::pending::<()>().await;
                                 aok!()
