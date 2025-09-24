@@ -616,5 +616,6 @@ pub macro aok {
 
 #[derive(Serialize, Deserialize)]
 pub struct HotConfig {
-    pub dns: HashMap<String, Value>,
+    pub dns: HashMap<String, String>,
+    pub tun: HashMap<String, Value>,
 }
