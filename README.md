@@ -15,8 +15,28 @@ It is
 - Non-sandbox. Not intended to be a sandbox. Ask flatpak to incorporate features in this project, if you want. 
 - Not a new docker. This is a handy tool that follows the user loyally. 
 
+## Minimal configuration state
+
+No `/etc/`, `/usr/`, `$xdg`, and such hierarchy of fallbacks that serve no purpose but confusion. 
+
+Nsproxy only takes command line arguments, one hot-reloaded config file, reads procfs and communicates with kernel through netlink.
+
+## Virtual DNS and files served through a TUN 
+
+See `./nsproxy.json` which is similar to the configuration I use. The feature is particularly handy in cases of self-hosting.
+
+```fish
+sproxy enter
+sudo setcap CAP_NET_BIND_SERVICE=+ep (which node)
+npx vite preview --port 80
+```
+
+I run Cinny in an nsproxy container and direct virtual DNS to resolve multiple hosts to localhost, which enables me to use multiple accounts on Cinny.
+
+Nsproxy can also serve static files directly through the TUN device.
+
 ## dev
 
-Stop making modules private. Dependencies Shall hide nothing from me. 80% of forks in this projeet are due to some items being private.
+Stop making modules private. Dependencies Shall hide nothing from me. 80% of forks in this project are due to some items being private.
 
 Encapsulation is a failure, a failed feature coming from OOP.
