@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         };
 
         let (sx, rx) = channel();
-        tun2socks5::main_entry(dev, mtu, false, args, sx).await?;
+        tun2socks5::main_entry(dev, mtu, false, args, sx, todo!()).await?;
 
         anyhow::Ok(())
     });

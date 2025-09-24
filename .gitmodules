@@ -54,3 +54,6 @@
 	path = crates/netlink-packet-core
 	url = https://github.com/ple1n/netlink-packet-core
 	branch = main
+[submodule "crates/warp"]
+	path = crates/warp
+	url = https://github.com/ple1n/warp
