@@ -1,6 +1,6 @@
 [package]
 name = "nsproxy_core"
-version = "3.1.2"
+version.workspace = true
 edition = "2024"
 
 [profile.release]
@@ -49,4 +49,12 @@ which.workspace = true
 multimap = "0.10.1"
 notify = "8.2.0"
 warp = { path = "../warp", features = ["server"] }
-hyper-util = { version = "0.1.12", features = ["server", "server-graceful", "server-auto", "http1", "http2", "service", "tokio"] }
+hyper-util = { version = "0.1.12", features = [
+    "server",
+    "server-graceful",
+    "server-auto",
+    "http1",
+    "http2",
+    "service",
+    "tokio",
+] }
