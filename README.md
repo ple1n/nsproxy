@@ -32,6 +32,7 @@ See `./nsproxy.json` which is similar to the configuration I use. The feature is
 sproxy enter
 sudo setcap CAP_NET_BIND_SERVICE=+ep (realpath (which node)) # works on fish
 npm i
+npx vite build
 npx vite preview --port 80
 ```
 
