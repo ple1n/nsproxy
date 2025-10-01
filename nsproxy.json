@@ -1,7 +1,7 @@
 {
     "dns": {
-        "schizo.cinny.localhost": "127.0.0.1",
-        "h.cinny.localhost": "127.0.0.1"
+        "schizo.cinny.localhost.": "127.0.0.1",
+        "h.cinny.localhost.": "127.0.0.1"
     },
     "tun": {}
 }
