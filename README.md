@@ -27,9 +27,11 @@ Nsproxy only takes command line arguments, one hot-reloaded config file, reads p
 
 See `./nsproxy.json` which is similar to the configuration I use. The feature is particularly handy in cases of self-hosting.
 
-```fish
+```sh
+# steps to start a local cinny instance in nsproxy container
 sproxy enter
-sudo setcap CAP_NET_BIND_SERVICE=+ep (which node)
+sudo setcap CAP_NET_BIND_SERVICE=+ep (realpath (which node)) # works on fish
+npm i
 npx vite preview --port 80
 ```
 
