@@ -121,6 +121,7 @@ enum MainCommand {
         #[command(flatten)]
         tun: IArgs,
         /// Make veths, with inner IP defaulting to 100.120.0.2/24
+        /// Not supporting more than one veth for now
         #[arg(short, long)]
         veth: bool,
         /// Persist this container, add it to config file
@@ -170,6 +171,11 @@ enum MainCommand {
         #[arg(short, long)]
         undo: bool,
     },
+    Clean {
+        /// Does a simple removal of default veth
+        #[arg(short, long)]
+        veth: bool,
+    },
 }
 
 impl std::str::FromStr for NsInput {
@@ -209,9 +215,9 @@ impl Accept for WarpAcceptor {
                 Ok((p, s)) => {
                     if p == self.path {
                         info!("accepted stream");
-                        return Ok(ready(Ok(hyper_util::rt::TokioIo::new( s))));
+                        return Ok(ready(Ok(hyper_util::rt::TokioIo::new(s))));
                     }
-                },
+                }
                 Err(e) => {
                     return Ok(ready(Err(e)));
                 }
@@ -581,6 +587,22 @@ fn main() -> anyhow::Result<()> {
             let fd = dstdir.join(sproxyf.file_name().unwrap());
             overwrite(&sproxyf, &fd)?;
         }
+        MainCommand::Clean { veth } => {
+            if veth {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+
+                rt.block_on(async {
+                    let cmd = tokio_netlink_conn()?;
+                    info!("trying to remove v_out if it exists");
+                    let default_v = cmd.fetch_link_by_name("v_out".to_owned()).await?;
+                    cmd.link().del(default_v.header.index).execute().await?;
+                    warn!("v_out removed");
+                    aok!(())
+                })?;
+            }
+        }
         // TODO: proper perms
         MainCommand::Wrap { bin, undo } => {
             let mut nswrap_path = std::env::current_exe()?;
@@ -666,7 +688,7 @@ async fn watch_config(
                                             let f = warp::fs::dir(path.clone());
                                             let wa = WarpAcceptor {
                                                 rx: acceptor.clone(),
-                                                path: path.clone()
+                                                path: path.clone(),
                                             };
                                             let ws = warp::serve(f).incoming(wa);
                                             futs.push(ws.run());
