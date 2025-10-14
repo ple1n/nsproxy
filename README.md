@@ -17,6 +17,12 @@ It is an identity separation tool like Whonix for the paranoid, but much more pr
 - Non-sandbox. Not intended to be a sandbox. Ask flatpak to incorporate features in this project, if you want. 
 - Not a new docker. This is a handy tool that follows the user loyally. 
 
+## Usage and compilation
+
+`install_release.sh` should install an `opt=3` optimized version to your `/usr/local`
+
+For releases, I use `release_upx.sh` which is a compressed `opt=3` binary.
+
 ## Minimal configuration state
 
 No `/etc/`, `/usr/`, `$xdg`, and such hierarchy of fallbacks that serve no purpose but confusion. 
