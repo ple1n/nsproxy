@@ -25,7 +25,7 @@
 [submodule "crates/tun2socks5"]
 	path = crates/tun2socks5
 	url = https://github.com/ple1n/tun2socks5
-	branch = v3
+	branch = tentative_merge
 [submodule "crates/socks5-impl"]
 	path = crates/socks5-impl
 	url = https://github.com/ple1n/socks5-impl
@@ -37,7 +37,7 @@
 [submodule "crates/ipstack"]
 	path = crates/ipstack
 	url = https://github.com/ple1n/ipstack
-	branch = v3
+	branch = tentative_merge
 [submodule "crates/clone3"]
 	path = crates/clone3
 	url = https://github.com/ple1n/clone3
