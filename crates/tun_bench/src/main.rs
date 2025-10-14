@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
             bypass: Default::default(),
             designated: None,
             id: None,
-            name: None,
+            tun_name: None,
         };
 
         let (sx, rx) = channel();
