@@ -10,9 +10,10 @@ debug = true        # Keep debug symbols
 incremental = true  # Enable incremental builds
 codegen-units = 256 # More parallelism in LLVM codegen (default is ~16)
 lto = false         # No link-time optimization
+
 [profile.release]
 strip = false
-opt-level = "s"
+opt-level = 3
 lto = true
 debug = true
 # Just strip manually
