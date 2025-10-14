@@ -143,6 +143,9 @@ enum MainCommand {
         mount: bool,
         #[command(flatten)]
         sargs: ShellArgs,
+        /// Instance name
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
@@ -153,7 +156,9 @@ enum MainCommand {
         /// Search for proxy port
         #[arg(short, long)]
         port: Option<u16>,
-
+        /// Instance name
+        #[arg(short, long)]
+        name: Option<String>,
         #[command(flatten)]
         sargs: ShellArgs,
     },
@@ -263,6 +268,7 @@ fn main() -> anyhow::Result<()> {
             log,
             mount,
             sargs,
+            name
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -278,8 +284,8 @@ fn main() -> anyhow::Result<()> {
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
             let mut iargs = proxy;
-            let tun_name = iargs.name.unwrap_or(tun_name.clone());
-            iargs.name = Some(tun_name.clone());
+            let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
+            iargs.tun_name = Some(tun_name.clone());
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
                 match clone {
@@ -440,7 +446,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         /// We are just putting state in proc now, basically. Seems cleaner
-        MainCommand::Enter { list, port, sargs } => {
+        MainCommand::Enter {
+            list,
+            port,
+            sargs,
+            name,
+        } => {
             let mut shell_prefs = ShellPrefs::default();
             shell_prefs.take_args(sargs);
             shell_prefs.adjust();
@@ -519,6 +530,7 @@ fn main() -> anyhow::Result<()> {
                         log,
                         mount,
                         sargs,
+                        name: name1,
                     } => {
                         if *veth {
                             np.score += 1
@@ -530,6 +542,9 @@ fn main() -> anyhow::Result<()> {
                                     np.score += 1;
                                 }
                             }
+                        }
+                        if &name == name1 {
+                            np.score += 1;
                         }
                     }
                     _ => {}
