@@ -614,8 +614,12 @@ pub macro aok {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
     pub dns: HashMap<String, String>,
     pub tun: HashMap<String, Value>,
+    /// Map devs from a mac address to an IP address
+    /// This commands nsproxy to move the devices into the new namespace
+    /// And assign them with the provided IP addresses
+    pub devs_by_mac: HashMap<String, String>,
 }
