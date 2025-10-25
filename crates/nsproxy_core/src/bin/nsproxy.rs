@@ -15,6 +15,7 @@ use futures::{
     future::join_all,
 };
 use futures_lite::future::block_on;
+use hardware_address::MacAddr;
 use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
 use nix::{
@@ -71,7 +72,6 @@ use tun2socks5::{
     tun_rs::AsyncDevice,
 };
 use warp::server::accept::Accept;
-
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
 #[derive(Parser, Debug)]
@@ -797,26 +797,17 @@ async fn watch_config(
                                         }
                                     }
                                 }
-                                LinkAttribute::Address(mac) => {
-                                    warn!("found mac {:?}", mac);
-                                    // let macstr = mac
-                                    //     .iter()
-                                    //     .map(|k| format!("{:02x}", k))
-                                    //     .collect::<Vec<String>>()
-                                    //     .join(":");
-                                    // if let Some(ipstr) = newconf.devs.get(&macstr) {
-                                    //     if let Ok(ip) = ipstr.parse::<Ipv4Addr>() {
-                                    //         info!(
-                                    //             "assigning IP {} to dev {} with MAC {}",
-                                    //             ip, name, macstr
-                                    //         );
-                                    //         handle
-                                    //             .address()
-                                    //             .add(msg.header.index, ip, 24)
-                                    //             .execute()
-                                    //             .await?;
-                                    //     }
-                                    // }
+                                LinkAttribute::Address(mac) => {    
+                                    if mac.len() == 6 {
+                                        info!("found mac {:?}", mac);
+                                        let mac: [u8; 6] = mac[..6].try_into().unwrap();
+                                        let macstr = MacAddr::from_raw(mac).to_colon_separated();
+                                        if let Some(ipstr) = newconf.devs.get(&macstr) {
+                                            if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+
+                                            }
+                                        }
+                                    };
                                 }
                                 _ => {}
                             }

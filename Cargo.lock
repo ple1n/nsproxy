@@ -1693,6 +1693,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hardware-address"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36fca164ea873ea6d164c3b9e6bc59a70e172d28a57b8513528ed4f5ec127c9f"
+dependencies = [
+ "paste",
+ "thiserror 2.0.16",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2759,6 +2769,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "futures-util",
  "futures_codec",
+ "hardware-address",
  "hyper-util",
  "ipnetwork 0.21.1",
  "libc",
