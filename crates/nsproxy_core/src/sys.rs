@@ -21,6 +21,7 @@ use nix::{
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UID_HINT_VAR, UniqueFile};
 use pidfd::PidFd;
 use procfs::process::{FDTarget, Process};
+use rtnetlink::SELF_NS_PATH;
 use std::{
     collections::{HashMap, HashSet},
     env::var,
@@ -337,6 +338,14 @@ pub fn what_uid(uid: Option<u32>, allow_root: bool) -> Result<u32> {
             }
         }
     }
+}
+
+pub fn check_selfns() -> Result<()> {
+    let f = File::open(SELF_NS_PATH)?;
+    let stat = fstat(f.as_raw_fd())?;
+    info!("self ns {:?}", &stat);
+
+    aok!()
 }
 
 /// Unshare the process into a separate userns, rootless

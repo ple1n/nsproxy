@@ -14,6 +14,8 @@ use futures::{
     },
     future::join_all,
 };
+use tokio::io::AsyncWriteExt as TokioWriteExt;
+
 use futures_lite::future::block_on;
 use hardware_address::MacAddr;
 use ipnetwork::{IpNetwork, Ipv4Network};
@@ -22,12 +24,12 @@ use nix::{
     sched::{CloneFlags, unshare},
     unistd::{Pid, getresgid, getresuid},
 };
-use notify::{Event, EventKind, RecommendedWatcher, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
 use nsproxy_core::{
     HotConfig, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::{ShellArgs, ShellPrefs},
-    sys::{Clone3Result, NSEnter, enable_ping_all, mount_ns, rm_mount},
+    sys::{Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_ns, rm_mount},
     tokio_netlink_conn,
     utils::ToExactNs,
 };
@@ -93,7 +95,8 @@ fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<(
     let watcher = RecommendedWatcher::new(
         move |res: std::result::Result<Event, notify::Error>| match res {
             Ok(res) => {
-                if matches!(res.kind, EventKind::Modify(_)) {
+                if matches!(res.kind, EventKind::Modify(ModifyKind::Data(_))) {
+                    info!("file data changed");
                     let _ = tx.try_send(());
                 }
             }
@@ -358,8 +361,22 @@ fn main() -> anyhow::Result<()> {
                                     }
 
                                     tokio::spawn(async move {
-                                        tx.read(&mut read).await?;
-
+                                        let conf = cli.conf;
+                                        for _ in 0..10 {
+                                            let k = tx.read(&mut read[..]).await?;
+                                            if k < 1 {
+                                                info!("<1");
+                                                continue;
+                                            }
+                                            let fc = tokio::fs::read_to_string(&conf).await?;
+                                            match serde_json::from_str::<HotConfig>(&fc) {
+                                                Ok(newconf) => {
+                                                    enumerate_links(None, &HotConfig::default())
+                                                        .await?;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
                                         aok!()
                                     });
 
@@ -711,7 +728,7 @@ async fn watch_config(
     conf: PathBuf,
     acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
     child_pid: u32,
-    tx: tokio::net::UnixStream,
+    mut tx: tokio::net::UnixStream,
 ) -> Result<()> {
     let (mut wx, mut rx) = async_watcher()?;
     wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
@@ -729,7 +746,7 @@ async fn watch_config(
         let warps = &mut warps;
         let acceptor = acceptor.clone();
         let prev_conf = &mut prev_conf_;
-
+        let tx = &mut tx;
         let o = async move {
             warn!("config hot reload");
 
@@ -745,6 +762,7 @@ async fn watch_config(
                     use serde_json::Value;
                     warps.iter_mut().map(|(p, k)| k.marked = false);
 
+                    info!("enumerate link devices in parent process");
                     enumerate_links(Some(child_pid), &newconf).await?;
 
                     if let Some(vdns) = &vdns {
@@ -794,6 +812,7 @@ async fn watch_config(
                             };
                         }
                     }
+                    tx.write(&[1u8]).await?;
 
                     *prev_conf = Some(cloned);
                 }
@@ -822,54 +841,72 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
     let handle = tokio_netlink_conn()?;
 
     let mut links = handle.link().get().execute();
-    'outer: while let Some(msg) = links.try_next().await? {
-        for nla in msg.attributes.into_iter() {
-            match nla {
-                LinkAttribute::IfName(name) => {
-                    if let Some(ipstr) = newconf.devs.get(&name) {
-                        if let Some(pid) = child_pid {
-                            let msg: LinkMessageBuilder<LinkUnspec> = LinkMessageBuilder::default()
-                                .index(msg.header.index)
-                                .setns_by_pid(pid);
-                            handle.link().set(msg.build()).execute().await?;
+    'outer: loop {
+        match links.try_next().await {
+            Ok(Some(msg)) => {
+                for nla in msg.attributes.into_iter() {
+                    match nla {
+                        LinkAttribute::IfName(name) => {
+                            info!("found interface {}", &name);
+                            if let Some(ipstr) = newconf.devs.get(&name) {
+                                if let Some(pid) = child_pid {
+                                    let msg: LinkMessageBuilder<LinkUnspec> =
+                                        LinkMessageBuilder::default()
+                                            .index(msg.header.index)
+                                            .setns_by_pid(pid);
+                                    handle.link().set(msg.build()).execute().await?;
+                                }
+                                if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+                                    info!("assigning IP {} to dev {}", ip, name);
+                                    let _ = handle
+                                        .address()
+                                        .add(msg.header.index, ip.ip(), ip.prefix())
+                                        .execute()
+                                        .await;
+                                }
+                            }
+                            continue 'outer;
                         }
-                        if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-                            info!("assigning IP {} to dev {}", ip, name);
-                            let _ = handle
-                                .address()
-                                .add(msg.header.index, ip.ip(), ip.prefix())
-                                .execute()
-                                .await;
+                        LinkAttribute::Address(mac) => {
+                            info!("found mac {:?}", mac);
+                            if mac.len() == 6 {
+                                let mac: [u8; 6] = mac[..6].try_into().unwrap();
+                                let macstr = MacAddr::from_raw(mac).to_colon_separated();
+                                if let Some(pid) = child_pid {
+                                    let msg: LinkMessageBuilder<LinkUnspec> =
+                                        LinkMessageBuilder::default()
+                                            .index(msg.header.index)
+                                            .setns_by_pid(pid);
+                                    handle.link().set(msg.build()).execute().await?;
+                                }
+                                if let Some(ipstr) = newconf.devs.get(&macstr) {
+                                    if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+                                        info!("assigning IP {} to dev {}", ip, macstr);
+                                        let _ = handle
+                                            .address()
+                                            .add(msg.header.index, ip.ip(), ip.prefix())
+                                            .execute()
+                                            .await;
+                                    }
+                                }
+                            };
                         }
+                        LinkAttribute::PermAddress(addr) => {
+                            info!("found PermAddress {:?}", addr);
+                        }
+                        _ => {}
                     }
                 }
-                LinkAttribute::Address(mac) => {
-                    if mac.len() == 6 {
-                        info!("found mac {:?}", mac);
-                        let mac: [u8; 6] = mac[..6].try_into().unwrap();
-                        let macstr = MacAddr::from_raw(mac).to_colon_separated();
-                        if let Some(pid) = child_pid {
-                            let msg: LinkMessageBuilder<LinkUnspec> = LinkMessageBuilder::default()
-                                .index(msg.header.index)
-                                .setns_by_pid(pid);
-                            handle.link().set(msg.build()).execute().await?;
-                        }
-                        if let Some(ipstr) = newconf.devs.get(&macstr) {
-                            if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-                                info!("assigning IP {} to dev {}", ip, macstr);
-                                let _ = handle
-                                    .address()
-                                    .add(msg.header.index, ip.ip(), ip.prefix())
-                                    .execute()
-                                    .await;
-                            }
-                        }
-                    };
-                }
-                _ => {}
             }
+            Err(er) => {
+                warn!("link enumeration failed with {:?}", er);
+                break 'outer;
+            }
+            _ => {}
         }
     }
+
+    info!("iter finished");
 
     aok!()
 }
