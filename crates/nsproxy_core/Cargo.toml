@@ -58,3 +58,4 @@ hyper-util = { version = "0.1.12", features = [
     "service",
     "tokio",
 ] }
+hardware-address = { version = "0.2.0", features = ["std"] }

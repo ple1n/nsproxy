@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             tun_name: None,
         };
 
-        let (sx, rx) = channel();
+        let (sx, rx) = futures::channel::mpsc::channel(1);
         tun2socks5::main_entry(dev, mtu, false, args, sx, todo!()).await?;
 
         anyhow::Ok(())
