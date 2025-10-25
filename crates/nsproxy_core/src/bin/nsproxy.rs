@@ -186,6 +186,8 @@ enum MainCommand {
         #[arg(short, long)]
         veth: bool,
     },
+    /// Generates an empty config file
+    Gen { save_to: PathBuf },
 }
 
 impl std::str::FromStr for NsInput {
@@ -664,6 +666,12 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        MainCommand::Gen { save_to } => {
+            let conf = HotConfig::default();
+            let json = serde_json::to_string_pretty(&conf)?;
+
+            std::fs::write(&save_to, json)?;
+        }
         _ => unimplemented!(),
     }
 
@@ -684,11 +692,13 @@ async fn watch_config(
         vdns_rx.await;
     let vdns = vdns?;
     let mut futs = Vec::new();
+    let mut prev_conf_ = None;
     loop {
         let vdns = vdns.clone();
         let conf = &conf;
         let warps = &mut warps;
         let acceptor = acceptor.clone();
+        let prev_conf = &mut prev_conf_;
         let o = async move {
             let mut futs = Vec::new();
 
@@ -696,6 +706,10 @@ async fn watch_config(
             match serde_json::from_str::<HotConfig>(&fc) {
                 Ok(newconf) => {
                     info!("config hot reload");
+                    let cloned = newconf.clone();
+                    if prev_conf.as_ref().unwrap() == &cloned {
+                        return Ok(futs);
+                    }
                     use serde_json::Value;
                     warps.iter_mut().map(|(p, k)| k.marked = false);
                     for (domain, ip) in newconf.dns {
@@ -743,6 +757,12 @@ async fn watch_config(
                             _ => (),
                         };
                     }
+
+                    for (mac, ip) in newconf.devs_by_mac {
+
+                    }
+
+                    *prev_conf = Some(cloned);
                 }
                 _ => {
                     warn!("config changed, but is invalid");
