@@ -80,9 +80,9 @@ Rustnet is truly handy in this case.
 
 ![Rustnet](image.png)
 
-Rustnet doesn't seem to work on TUN created by nsproxy, inside a container as I tested.
+Rustnet has added support for TUN. You can run rustnet in an nsproxy shell to monitor all connections.
 
-You can still do network monitoring involving QUIC with wireshark, in an nsproxy container.
+You can do network monitoring involving QUIC with wireshark, in an nsproxy container.
 
 ```sh
 sproxy enter -u 0 # finds an existing namespace and enters
@@ -113,6 +113,22 @@ You can re-enter this namespace by `sproxy enter`
 `sproxy enter` traverses `/proc/` to find the namespaces that you might want to enter. 
 
 From the perspective of less memory copying, you should set browser to use `veth.host`, as exposed by nsproxy, and have your proxy server listening at `veth.host`. 
+
+## Performance of the TUN userspace networking stack
+
+1. Bandwidth
+
+![](./speed-single.png)
+
+2. Concurrent connections
+
+This measures its capability to _"accept"_ new connections, which is good enough for running `cargo build`s in nsproxy, various package managers, or regular web browsing, kicking off hundreds of connections per second.
+
+But it's usually recommended to use the `veth.host` the Socks5 proxy directly, instead of routing through the TUN.
+
+3. Virtual DNS
+
+Sometimes the first DNS request fails, but it has been improved over the versions.
 
 ## Tor and other anonymity networks
 
