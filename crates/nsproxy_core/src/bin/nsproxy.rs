@@ -5,6 +5,7 @@ use clap::{
     Parser, Subcommand, ValueEnum,
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
 };
+use futures::stream::TryStreamExt;
 use futures::{
     AsyncWriteExt, SinkExt, StreamExt,
     channel::{
@@ -14,6 +15,7 @@ use futures::{
     future::join_all,
 };
 use futures_lite::future::block_on;
+use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
 use nix::{
     sched::{CloneFlags, unshare},
@@ -30,6 +32,10 @@ use nsproxy_core::{
 };
 use passfd::FdPassingExt;
 use pidfd::PidFd;
+use rtnetlink::packet_route::{
+    AddressFamily,
+    link::{LinkAttribute, LinkExtentMask},
+};
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -79,7 +85,8 @@ struct Cli {
 
 fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
     let (mut tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.try_send(());
+    let tx1 = tx.clone();
+    tokio::spawn(async move { tx1.send(()).await });
 
     // Automatically select the best implementation for your platform.
     // You can also access each implementation directly e.g. INotifyWatcher.
@@ -420,14 +427,23 @@ fn main() -> anyhow::Result<()> {
                                             .await?;
                                     }
 
-                                    let (vdns_sx, vdns_rx) = oneshot::channel();
+                                    let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
                                     let (st_sx, acceptor) = flume::unbounded();
 
                                     tokio::spawn(watch_config(vdns_rx, cli.conf.clone(), acceptor));
 
-                                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx, st_sx)
-                                        .await?;
+                                    tun2socks5::main_entry(
+                                        dev,
+                                        mtu,
+                                        false,
+                                        iargs,
+                                        vdns_sx.clone(),
+                                        st_sx,
+                                    )
+                                    .await?;
                                     warn!("tun exited");
+                                    let _ = vdns_sx.send(None).await;
+
                                     std::future::pending::<()>().await;
                                     aok!()
                                 })?;
@@ -679,7 +695,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn watch_config(
-    vdns_rx: oneshot::Receiver<VirtDNSHandle>,
+    mut vdns_rx: mpsc::Receiver<Option<VirtDNSHandle>>,
     conf: PathBuf,
     acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
 ) -> Result<()> {
@@ -688,78 +704,123 @@ async fn watch_config(
     info!("watch config");
 
     let mut warps: HashMap<PathBuf, ServerItem> = HashMap::new();
-    let vdns: std::result::Result<tun2socks5::dns::VirtDNSHandle, oneshot::Canceled> =
-        vdns_rx.await;
-    let vdns = vdns?;
+    let vdns: Option<Option<VirtDNSHandle>> = vdns_rx.next().await;
+    let vdns = vdns.unwrap();
     let mut futs = Vec::new();
     let mut prev_conf_ = None;
+
     loop {
         let vdns = vdns.clone();
-        let conf = &conf;
+        let conf = conf.clone();
         let warps = &mut warps;
         let acceptor = acceptor.clone();
         let prev_conf = &mut prev_conf_;
-        let o = async move {
-            let mut futs = Vec::new();
 
+        let o = async move {
+            warn!("config hot reload");
+
+            let mut futs = Vec::new();
+            let conf = conf;
             let fc = tokio::fs::read_to_string(&conf).await?;
             match serde_json::from_str::<HotConfig>(&fc) {
                 Ok(newconf) => {
-                    info!("config hot reload");
                     let cloned = newconf.clone();
-                    if prev_conf.as_ref().unwrap() == &cloned {
+                    if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
                         return Ok(futs);
                     }
                     use serde_json::Value;
                     warps.iter_mut().map(|(p, k)| k.marked = false);
-                    for (domain, ip) in newconf.dns {
-                        let target = TUNResponse::Unreachable;
-                        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-                            info!("DNS {} -> {}", &domain, addr);
-                            vdns.pin(Some(addr), domain, target);
-                        };
-                    }
-                    for (domain, spec) in newconf.tun {
-                        match spec {
-                            Value::String(mapstr) => {
-                                if let Ok(addr) = mapstr.parse::<SocketAddr>() {
+
+                    if let Some(vdns) = &vdns {
+                        for (domain, ip) in newconf.dns {
+                            let target = TUNResponse::Unreachable;
+                            if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+                                info!("DNS {} -> {}", &domain, addr);
+                                vdns.pin(Some(addr), domain, target);
+                            };
+                        }
+                        for (domain, spec) in newconf.tun {
+                            match spec {
+                                Value::String(mapstr) => {
+                                    if let Ok(addr) = mapstr.parse::<SocketAddr>() {
+                                        info!("NAT-out {} -> {}", &domain, addr);
+                                        let target = TUNResponse::NATByTUN(addr);
+                                    } else if let Ok(path) = mapstr.parse::<PathBuf>() {
+                                        info!("Files {} -> {}", &domain, mapstr);
+                                        match warps.entry(path.clone()) {
+                                            Entry::Vacant(e) => {
+                                                let f = warp::fs::dir(path.clone());
+                                                let wa = WarpAcceptor {
+                                                    rx: acceptor.clone(),
+                                                    path: path.clone(),
+                                                };
+                                                let ws = warp::serve(f).incoming(wa);
+                                                futs.push(ws.run());
+                                                e.insert(ServerItem { marked: true });
+                                            }
+                                            Entry::Occupied(mut e) => {
+                                                e.get_mut().marked = true;
+                                            }
+                                        }
+                                        let target = TUNResponse::Files(path);
+                                        vdns.pin(None, domain, target);
+                                    }
+                                }
+                                Value::Number(port) => {
+                                    let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
+                                    let p: u16 = p.try_into()?;
+                                    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
                                     info!("NAT-out {} -> {}", &domain, addr);
                                     let target = TUNResponse::NATByTUN(addr);
-                                } else if let Ok(path) = mapstr.parse::<PathBuf>() {
-                                    info!("Files {} -> {}", &domain, mapstr);
-                                    match warps.entry(path.clone()) {
-                                        Entry::Vacant(e) => {
-                                            let f = warp::fs::dir(path.clone());
-                                            let wa = WarpAcceptor {
-                                                rx: acceptor.clone(),
-                                                path: path.clone(),
-                                            };
-                                            let ws = warp::serve(f).incoming(wa);
-                                            futs.push(ws.run());
-                                            e.insert(ServerItem { marked: true });
-                                        }
-                                        Entry::Occupied(mut e) => {
-                                            e.get_mut().marked = true;
-                                        }
-                                    }
-                                    let target = TUNResponse::Files(path);
                                     vdns.pin(None, domain, target);
                                 }
-                            }
-                            Value::Number(port) => {
-                                let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
-                                let p: u16 = p.try_into()?;
-                                let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
-                                info!("NAT-out {} -> {}", &domain, addr);
-                                let target = TUNResponse::NATByTUN(addr);
-                                vdns.pin(None, domain, target);
-                            }
-                            _ => (),
-                        };
+                                _ => (),
+                            };
+                        }
                     }
 
-                    for (mac, ip) in newconf.devs_by_mac {
+                    let handle = tokio_netlink_conn()?;
 
+                    let mut links = handle.link().get().execute();
+                    'outer: while let Some(msg) = links.try_next().await? {
+                        for nla in msg.attributes.into_iter() {
+                            match nla {
+                                LinkAttribute::IfName(name) => {
+                                    if let Some(ipstr) = newconf.devs.get(&name) {
+                                        if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+                                            info!("assigning IP {} to dev {}", ip, name);
+                                            handle
+                                                .address()
+                                                .add(msg.header.index, ip.ip(), ip.prefix())
+                                                .execute()
+                                                .await?;
+                                        }
+                                    }
+                                }
+                                LinkAttribute::Address(mac) => {
+                                    warn!("found mac {:?}", mac);
+                                    // let macstr = mac
+                                    //     .iter()
+                                    //     .map(|k| format!("{:02x}", k))
+                                    //     .collect::<Vec<String>>()
+                                    //     .join(":");
+                                    // if let Some(ipstr) = newconf.devs.get(&macstr) {
+                                    //     if let Ok(ip) = ipstr.parse::<Ipv4Addr>() {
+                                    //         info!(
+                                    //             "assigning IP {} to dev {} with MAC {}",
+                                    //             ip, name, macstr
+                                    //         );
+                                    //         handle
+                                    //             .address()
+                                    //             .add(msg.header.index, ip, 24)
+                                    //             .execute()
+                                    //             .await?;
+                                    //     }
+                                    // }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
 
                     *prev_conf = Some(cloned);
@@ -771,6 +832,7 @@ async fn watch_config(
 
             anyhow::Ok(futs)
         };
+
         info!("serving {} file roots", futs.len());
         futs = select! {
             k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
