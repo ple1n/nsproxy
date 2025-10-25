@@ -357,6 +357,12 @@ fn main() -> anyhow::Result<()> {
                                             .await?;
                                     }
 
+                                    tokio::spawn(async move {
+                                        tx.read(&mut read).await?;
+
+                                        aok!()
+                                    });
+
                                     let clone = shell_prefs.spawn()?;
                                     clone.wait_for_child().await?;
 
@@ -430,7 +436,13 @@ fn main() -> anyhow::Result<()> {
                                     let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
                                     let (st_sx, acceptor) = flume::unbounded();
 
-                                    tokio::spawn(watch_config(vdns_rx, cli.conf.clone(), acceptor));
+                                    tokio::spawn(watch_config(
+                                        vdns_rx,
+                                        cli.conf.clone(),
+                                        acceptor,
+                                        child_pid as u32,
+                                        tx,
+                                    ));
 
                                     tun2socks5::main_entry(
                                         dev,
@@ -698,6 +710,8 @@ async fn watch_config(
     mut vdns_rx: mpsc::Receiver<Option<VirtDNSHandle>>,
     conf: PathBuf,
     acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
+    child_pid: u32,
+    tx: tokio::net::UnixStream,
 ) -> Result<()> {
     let (mut wx, mut rx) = async_watcher()?;
     wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
@@ -730,6 +744,8 @@ async fn watch_config(
                     }
                     use serde_json::Value;
                     warps.iter_mut().map(|(p, k)| k.marked = false);
+
+                    enumerate_links(Some(child_pid), &newconf).await?;
 
                     if let Some(vdns) = &vdns {
                         for (domain, ip) in newconf.dns {
@@ -779,41 +795,6 @@ async fn watch_config(
                         }
                     }
 
-                    let handle = tokio_netlink_conn()?;
-
-                    let mut links = handle.link().get().execute();
-                    'outer: while let Some(msg) = links.try_next().await? {
-                        for nla in msg.attributes.into_iter() {
-                            match nla {
-                                LinkAttribute::IfName(name) => {
-                                    if let Some(ipstr) = newconf.devs.get(&name) {
-                                        if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-                                            info!("assigning IP {} to dev {}", ip, name);
-                                            handle
-                                                .address()
-                                                .add(msg.header.index, ip.ip(), ip.prefix())
-                                                .execute()
-                                                .await?;
-                                        }
-                                    }
-                                }
-                                LinkAttribute::Address(mac) => {    
-                                    if mac.len() == 6 {
-                                        info!("found mac {:?}", mac);
-                                        let mac: [u8; 6] = mac[..6].try_into().unwrap();
-                                        let macstr = MacAddr::from_raw(mac).to_colon_separated();
-                                        if let Some(ipstr) = newconf.devs.get(&macstr) {
-                                            if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-
-                                            }
-                                        }
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
                     *prev_conf = Some(cloned);
                 }
                 _ => {
@@ -834,6 +815,62 @@ async fn watch_config(
     }
 
     warn!("config watching ended");
+    aok!()
+}
+
+pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Result<()> {
+    let handle = tokio_netlink_conn()?;
+
+    let mut links = handle.link().get().execute();
+    'outer: while let Some(msg) = links.try_next().await? {
+        for nla in msg.attributes.into_iter() {
+            match nla {
+                LinkAttribute::IfName(name) => {
+                    if let Some(ipstr) = newconf.devs.get(&name) {
+                        if let Some(pid) = child_pid {
+                            let msg: LinkMessageBuilder<LinkUnspec> = LinkMessageBuilder::default()
+                                .index(msg.header.index)
+                                .setns_by_pid(pid);
+                            handle.link().set(msg.build()).execute().await?;
+                        }
+                        if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+                            info!("assigning IP {} to dev {}", ip, name);
+                            let _ = handle
+                                .address()
+                                .add(msg.header.index, ip.ip(), ip.prefix())
+                                .execute()
+                                .await;
+                        }
+                    }
+                }
+                LinkAttribute::Address(mac) => {
+                    if mac.len() == 6 {
+                        info!("found mac {:?}", mac);
+                        let mac: [u8; 6] = mac[..6].try_into().unwrap();
+                        let macstr = MacAddr::from_raw(mac).to_colon_separated();
+                        if let Some(pid) = child_pid {
+                            let msg: LinkMessageBuilder<LinkUnspec> = LinkMessageBuilder::default()
+                                .index(msg.header.index)
+                                .setns_by_pid(pid);
+                            handle.link().set(msg.build()).execute().await?;
+                        }
+                        if let Some(ipstr) = newconf.devs.get(&macstr) {
+                            if let Ok(ip) = ipstr.parse::<IpNetwork>() {
+                                info!("assigning IP {} to dev {}", ip, macstr);
+                                let _ = handle
+                                    .address()
+                                    .add(msg.header.index, ip.ip(), ip.prefix())
+                                    .execute()
+                                    .await;
+                            }
+                        }
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
     aok!()
 }
 
