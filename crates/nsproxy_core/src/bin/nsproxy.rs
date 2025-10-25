@@ -14,7 +14,7 @@ use futures::{
     },
     future::join_all,
 };
-use tokio::io::AsyncWriteExt as TokioWriteExt;
+use tokio::{io::AsyncWriteExt as TokioWriteExt, time::sleep};
 
 use futures_lite::future::block_on;
 use hardware_address::MacAddr;
@@ -37,7 +37,7 @@ use passfd::FdPassingExt;
 use pidfd::PidFd;
 use rtnetlink::packet_route::{
     AddressFamily,
-    link::{LinkAttribute, LinkExtentMask},
+    link::{LinkAttribute, LinkExtentMask, LinkFlags, LinkHeader},
 };
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
@@ -362,7 +362,7 @@ fn main() -> anyhow::Result<()> {
 
                                     tokio::spawn(async move {
                                         let conf = cli.conf;
-                                        for _ in 0..10 {
+                                        for _ in 0..20 {
                                             let k = tx.read(&mut read[..]).await?;
                                             if k < 1 {
                                                 info!("<1");
@@ -371,6 +371,7 @@ fn main() -> anyhow::Result<()> {
                                             let fc = tokio::fs::read_to_string(&conf).await?;
                                             match serde_json::from_str::<HotConfig>(&fc) {
                                                 Ok(newconf) => {
+                                                    // sleep(Duration::from_millis(1000)).await;
                                                     enumerate_links(None, &HotConfig::default())
                                                         .await?;
                                                 }
@@ -855,9 +856,18 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
                                             .index(msg.header.index)
                                             .setns_by_pid(pid);
                                     handle.link().set(msg.build()).execute().await?;
+                                    info!("set dev to ns");
                                 }
                                 if let Ok(ip) = ipstr.parse::<IpNetwork>() {
                                     info!("assigning IP {} to dev {}", ip, name);
+                                    let mut hd = LinkHeader::default();
+                                    hd.flags = LinkFlags::Up;
+                                    let msgset: LinkMessageBuilder<LinkUnspec> =
+                                        LinkMessageBuilder::default()
+                                            .index(msg.header.index)
+                                            .set_header(hd);
+                                    let rx = handle.link().set_port(msgset.build()).execute().await;
+                                    info!("set link up {:?}", rx);
                                     let _ = handle
                                         .address()
                                         .add(msg.header.index, ip.ip(), ip.prefix())
