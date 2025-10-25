@@ -232,6 +232,30 @@ unsafe fn mount_setattr(
     Errno::result(k).map(drop)
 }
 
+pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
+    warn!("bind mounting {:?} onto {:?}", source, dst);
+    if dst.exists() {
+        remove_file(dst)?;
+    }
+    File::create(dst)?;
+    mount(
+        Some(source),
+        dst,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )?;
+
+    Ok(())
+}
+
+pub fn rm_mount(dst: &Path) -> Result<()> {
+    warn!("remove bind-mount {:?}", dst);
+    umount(dst)?;
+    remove_file(dst)?;
+    Ok(())
+}
+
 pub fn check_capsys() -> Result<()> {
     let caps = capctl::CapState::get_current().unwrap();
     if !caps.effective.has(capctl::Cap::SYS_ADMIN) {
