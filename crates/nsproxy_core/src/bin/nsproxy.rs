@@ -371,9 +371,7 @@ fn main() -> anyhow::Result<()> {
                                             let fc = tokio::fs::read_to_string(&conf).await?;
                                             match serde_json::from_str::<HotConfig>(&fc) {
                                                 Ok(newconf) => {
-                                                    // sleep(Duration::from_millis(1000)).await;
-                                                    enumerate_links(None, &HotConfig::default())
-                                                        .await?;
+                                                    enumerate_links(None, &newconf).await?;
                                                 }
                                                 _ => {}
                                             }
@@ -860,19 +858,18 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
                                 }
                                 if let Ok(ip) = ipstr.parse::<IpNetwork>() {
                                     info!("assigning IP {} to dev {}", ip, name);
+                                    let _ = handle
+                                        .address()
+                                        .add(msg.header.index, ip.ip(), ip.prefix())
+                                        .execute()
+                                        .await;
                                     let mut hd = LinkHeader::default();
                                     hd.flags = LinkFlags::Up;
                                     let msgset: LinkMessageBuilder<LinkUnspec> =
                                         LinkMessageBuilder::default()
                                             .index(msg.header.index)
                                             .set_header(hd);
-                                    let rx = handle.link().set_port(msgset.build()).execute().await;
-                                    info!("set link up {:?}", rx);
-                                    let _ = handle
-                                        .address()
-                                        .add(msg.header.index, ip.ip(), ip.prefix())
-                                        .execute()
-                                        .await;
+                                    let _ = handle.link().set_port(msgset.build()).execute().await;
                                 }
                             }
                             continue 'outer;
@@ -912,11 +909,11 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
                 warn!("link enumeration failed with {:?}", er);
                 break 'outer;
             }
-            _ => {}
+            Ok(None) => {
+                break 'outer;
+            }
         }
     }
-
-    info!("iter finished");
 
     aok!()
 }
