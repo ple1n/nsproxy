@@ -863,13 +863,12 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
                                         .add(msg.header.index, ip.ip(), ip.prefix())
                                         .execute()
                                         .await;
-                                    let mut hd = LinkHeader::default();
-                                    hd.flags = LinkFlags::Up;
-                                    let msgset: LinkMessageBuilder<LinkUnspec> =
-                                        LinkMessageBuilder::default()
-                                            .index(msg.header.index)
-                                            .set_header(hd);
-                                    let _ = handle.link().set_port(msgset.build()).execute().await;
+
+                                    let _ = handle
+                                        .link()
+                                        .set(LinkUnspec::new_with_index(msg.header.index).up().build())
+                                        .execute()
+                                        .await;
                                 }
                             }
                             continue 'outer;
