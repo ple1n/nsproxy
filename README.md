@@ -23,10 +23,14 @@ It is an identity separation tool like Whonix for the paranoid, but much more pr
 
 For releases, I use `release_upx.sh` which is a compressed `opt=3` binary.
 
-## V3.2 Major fixes
+### V3.2 Major fixes
 
 - Nsproxy used to have problem with flatpak installs, due to implementation errors in TCP stack, the speed of download diminishes gradually until zero.
 - V3.2 merged upstream ipstack implementation which increased performance drastically, overall
+
+### V3.3 Major Fixes
+
+- The virtual DNS by default only responds with a mapped virtual IPV6 address, which is hashed off the domain being requested. This sidesteps all the async/locking/ip-allocation problems with reasonable collision resistance. 
 
 ## Minimal configuration state
 
