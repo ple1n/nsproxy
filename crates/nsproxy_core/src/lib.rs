@@ -320,6 +320,10 @@ impl NetlinkOps for Handle {
             .output_interface(index)
             .build();
         self.route().add(route).execute().await?;
+        let route = RouteMessageBuilder::<Ipv6Addr>::new()
+            .output_interface(index)
+            .build();
+        self.route().add(route).execute().await?;
         Ok(())
     }
     async fn test_route(&self, ip: IpAddr) -> Result<Option<RouteMessage>> {
