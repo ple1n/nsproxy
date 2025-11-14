@@ -2,6 +2,7 @@
 members = [
     "crates/*"
 ]
+resolver = "3"
 
 [profile.dev]
 panic = "abort"
