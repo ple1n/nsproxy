@@ -250,9 +250,9 @@ impl Accept for WarpAcceptor {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
+    // DEBUG is annoying because its filled with TCP retransmission logs
     let (layer, reload_handle) =
-        tracing_subscriber::reload::Layer::new(fmt::Layer::new().with_filter(LevelFilter::DEBUG));
+        tracing_subscriber::reload::Layer::new(fmt::Layer::new().with_filter(LevelFilter::INFO));
     // https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html
     tracing_subscriber::registry().with(layer).init();
 
