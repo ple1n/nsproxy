@@ -138,6 +138,20 @@ Sometimes the first DNS request fails, but it has been improved over the version
 
 Nsproxy works with Tor. 
 
+## Docker, flatpak, various package managers
+
+Currently flatpak installs with the command, so you can the `flatpak install` in the nsproxy shell to get proxied.
+
+Docker installs images through the daemon. The quick fix is
+
+```sh
+sudo systemctl stop docker
+sproxy enter
+sudo dockerd
+# This runs docker in the nsproxy which faciliates pulling images in a network-constrained environment but you can later just re-run in outside
+```
+
+
 ## DNS
 
 Socks5 is a protocol that establishes a bidirectional byte stream, when you connect to the TCP endpoint of a SOCKS server and supply a HOST in the handshake. The HOST can be either an IP address or a domain name. 
