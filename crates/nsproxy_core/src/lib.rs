@@ -5,12 +5,14 @@
 #![feature(setgroups)]
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::File;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +49,7 @@ use serde_untagged::UntaggedEnumVisitor;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
+use tracing::level_filters::LevelFilter;
 pub use tun2socks5;
 pub mod env;
 pub mod prelude;
@@ -255,11 +258,13 @@ pub trait NetlinkOps {
     async fn up_lo(&self) -> Result<()>;
 }
 
+use tun2socks5::IArgs;
 use tun2socks5::ipstack::TUNDev;
 use tun2socks5::tun_rs::AsyncDevice;
 use tun2socks5::tun_rs::DeviceBuilder;
 use utils::MapExt;
 
+use crate::shell::ShellArgs;
 use crate::utils::dump_as_json;
 use crate::utils::dump_as_toml;
 
@@ -626,4 +631,137 @@ pub struct HotConfig {
     /// This commands nsproxy to move the devices into the new namespace
     /// And assign them with the provided IP addresses
     pub devs: HashMap<String, String>,
+}
+
+use clap::{
+    Parser, Subcommand, ValueEnum,
+    builder::{TypedValueParser, ValueParser, ValueParserFactory},
+};
+
+/// NSProxy V3
+/// Manage netns redirection with SOCKS5 proxy configuration
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    #[arg(short, long, default_value = "./nsproxy.json")]
+    pub conf: PathBuf,
+    #[command(subcommand)]
+    pub cmd: MainCommand,
+}
+
+/// Representation of a namespace input (PID or Path)
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum NsInput {
+    Pid(i32),
+    Path(PathBuf),
+    /// this process
+    This,
+    New,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum MainCommand {
+    /// Set up some containers
+    Run {
+        /// Source network namespace (src=/path OR src=1234)
+        #[arg(long, default_value = "this")]
+        src: NsInput,
+        /// Target network namespace (dst=/path OR dst=1234)
+        #[arg(long, default_value = "new")]
+        dst: NsInput,
+        #[command(flatten)]
+        tun: IArgs,
+        /// Make veths, with inner IP defaulting to 100.120.0.2/24
+        /// Not supporting more than one veth for now
+        #[arg(short, long)]
+        veth: bool,
+        /// Persist this container, add it to config file
+        #[arg(short, long)]
+        keep: bool,
+        /// Activate other containers too
+        #[arg(short, long)]
+        all: bool,
+        /// Set TUN as default route. This defaults to true for new net ns
+        #[arg(short, long)]
+        default: bool,
+        /// Do not set TUN as default route.
+        #[arg(short, long)]
+        no_default: bool,
+        #[arg(short, long)]
+        log: Option<LevelFilter>,
+        /// Mount namespaces that are created such that you can access them by paths later
+        #[arg(short, long)]
+        mount: Option<PathBuf>,
+        #[command(flatten)]
+        sargs: ShellArgs,
+        /// Instance name
+        #[arg(long)]
+        name: Option<String>,
+        /// Profile name for browsers
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Find by process and enter an existing nsproxy namespace
+    /// Enter the best-match based on searching arguments provided
+    Enter {
+        /// List processes found
+        #[arg(short, long)]
+        list: bool,
+        /// Search for proxy port
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Instance name
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Enter by path
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        sargs: ShellArgs,
+    },
+
+    /// Install nsproxy to a folder
+    Install {
+        #[arg(default_value = "./install")]
+        dir: PathBuf,
+    },
+    /// Remove a bind-mount file
+    Rm { file: PathBuf },
+    /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
+    /// The wrapper handles such problems
+    Wrap {
+        /// The executable to hook.
+        #[arg(short, long)]
+        bin: String,
+        #[arg(short, long)]
+        undo: bool,
+    },
+    Clean {
+        /// Does a simple removal of default veth
+        #[arg(short, long)]
+        veth: bool,
+    },
+    /// Generates an empty config file
+    Gen { save_to: PathBuf },
+}
+
+impl std::str::FromStr for NsInput {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use std::result::Result::Ok;
+
+        if let Ok(pid) = s.parse::<i32>() {
+            Ok(NsInput::Pid(pid))
+        } else if s == "new" {
+            Ok(NsInput::New)
+        } else if s == "this" {
+            Ok(NsInput::This)
+        } else {
+            Ok(NsInput::Path(PathBuf::from(s)))
+        }
+    }
+}
+
+pub fn to_cstr(f: &str) -> CString {
+    CString::from_str(f).unwrap()
 }
