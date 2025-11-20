@@ -50,6 +50,7 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tracing::level_filters::LevelFilter;
+use tracing::warn;
 pub use tun2socks5;
 pub mod env;
 pub mod prelude;
@@ -153,33 +154,36 @@ mod tests {
 
     #[test]
     fn test_find_vacant_ipv4() {
-        let net: Ipv4Network = "100.120.0.0/24".parse().unwrap();
+        let net: Ipv4Network = "100.64.0.0/10".parse().unwrap();
         let used: Vec<Ipv4Addr> = vec![
-            "100.120.0.3".parse::<_>().unwrap(),
-            "100.120.1.2".parse::<_>().unwrap(),
+            "100.64.0.5".parse::<_>().unwrap(),
         ];
 
-        let vacant = find_vacant_ipv4(used, net).expect("should find a vacant addr");
+        let vacant = find_vacant_ipv4_subnet(used, net, 2).expect("should find a vacant addr");
         dbg!(vacant);
+        dbg!(veth_addr_for(vacant, 2, true));
+        dbg!(veth_addr_for(vacant, 2, false));
+
     }
 }
 
-/// Find a vacant IPv4 address inside `net` that is not contained in `used`.
-/// Returns the first available host address as an `Ipv4Network` with the
-/// same prefix as `net`, or `None` if no free address found.
-pub fn find_vacant_ipv4(mut used: Vec<Ipv4Addr>, net: Ipv4Network) -> Option<Ipv4Addr> {
+pub fn find_vacant_ipv4_subnet(
+    mut used: Vec<Ipv4Addr>,
+    net: Ipv4Network,
+    host_bits: u8,
+) -> Option<Ipv4Addr> {
     let first = net.nth(0).unwrap();
     let last = Ipv4Addr::from_bits(net.network().to_bits() | (!0 >> net.prefix()));
     used.push(first);
     used.push(last);
     used.sort();
-    let bits: Vec<_> = used.iter().map(|x| x.to_bits()).collect();
+    let bits: Vec<_> = used.iter().map(|x| x.to_bits() >> host_bits).collect();
 
     let mut ix = None;
     for x in 0..bits.len() - 1 {
         let diff = bits[x + 1] - bits[x];
         // need 2 consecutive vacant ips
-        if diff > 2 && (bits[x] % 2 == 0) {
+        if diff > 1 {
             ix = Some(x);
             break;
         }
@@ -187,11 +191,15 @@ pub fn find_vacant_ipv4(mut used: Vec<Ipv4Addr>, net: Ipv4Network) -> Option<Ipv
     if let Some(ix) = ix {
         let start = bits[ix];
         let ip = start + 1;
-        let ip = Ipv4Addr::from_bits(ip);
+        let ip = Ipv4Addr::from_bits(ip << host_bits);
         Some(ip)
     } else {
         None
     }
+}
+
+pub fn veth_addr_for(subnet: Ipv4Addr, host_bits: u8, host: bool) -> Ipv4Addr {
+    Ipv4Addr::from_bits(subnet.to_bits() & !0 << host_bits | if host { 1 } else { 2 })
 }
 
 pub trait IpExt {
@@ -312,6 +320,7 @@ pub trait NetlinkOps {
     async fn fetch_link_addrs(&self, index: u32) -> Result<AddressResponse>;
     async fn fetch_all_ip_addrs(&self) -> Result<Vec<IpNetwork>>;
     async fn add_veth(&self, name_a: &str, name_b: &str) -> Result<()>;
+    async fn remove_link_if_exists(&self, name: &str) -> Result<()>;
     async fn add_route(&self, index: u32, pref_src: IpAddr, dst: IpAddr, prefix: u8) -> Result<()>;
     async fn ip_add_default_route(&self, index: u32) -> Result<()>;
     async fn test_route(&self, ip: IpAddr) -> Result<Option<RouteMessage>>;
@@ -378,11 +387,23 @@ impl NetlinkOps for Handle {
         Ok(res)
     }
     async fn add_veth(&self, name: &str, peer: &str) -> Result<()> {
+        // remove existing links with these names if they exist
+        let _ = self.remove_link_if_exists(name).await;
+        let _ = self.remove_link_if_exists(peer).await;
+
         self.link()
             .add(LinkVeth::new(name, peer).build())
             .execute()
             .await?;
 
+        Ok(())
+    }
+    async fn remove_link_if_exists(&self, name: &str) -> Result<()> {
+        warn!("removed obsolete device {}", name);
+        let mut links = self.link().get().match_name(name.to_owned()).execute();
+        if let Some(link) = links.try_next().await? {
+            self.link().del(link.header.index).execute().await?;
+        }
         Ok(())
     }
     async fn add_route(&self, index: u32, pref_src: IpAddr, dst: IpAddr, prefix: u8) -> Result<()> {
