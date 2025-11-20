@@ -241,7 +241,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
-                                        let ip = Ipv4Addr::from_octets(read).next();
+                                        let ip = veth_addr_for(Ipv4Addr::from_octets(read), host_bits, false);
 
                                         let dev = nl.fetch_link_by_name(v_in).await?;
                                         nl.address()
@@ -355,7 +355,7 @@ fn main() -> anyhow::Result<()> {
 
                                             let vout = nl.fetch_link_by_name(v_out.clone()).await?;
                                             nl.address()
-                                                .add(vout.header.index, subnet.into(), subnet_prefix)
+                                                .add(vout.header.index, veth_addr_for(subnet, host_bits, true).into(), subnet_prefix)
                                                 .execute()
                                                 .await?;
                                             nl.link()
