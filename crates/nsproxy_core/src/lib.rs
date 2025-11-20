@@ -153,12 +153,13 @@ mod tests {
 
     #[test]
     fn test_find_vacant_ipv4() {
-        let net: Ipv4Network = "10.0.0.0/30".parse().unwrap();
+        let net: Ipv4Network = "100.120.0.0/24".parse().unwrap();
         let used: Vec<Ipv4Addr> = vec![
-            "10.0.0.1".parse::<_>().unwrap(),
+            "100.120.0.3".parse::<_>().unwrap(),
+            "100.120.1.2".parse::<_>().unwrap(),
         ];
 
-        let vacant = find_vacant_ipv4(&used, net).expect("should find a vacant addr");
+        let vacant = find_vacant_ipv4(used, net).expect("should find a vacant addr");
         dbg!(vacant);
     }
 }
@@ -166,9 +167,10 @@ mod tests {
 /// Find a vacant IPv4 address inside `net` that is not contained in `used`.
 /// Returns the first available host address as an `Ipv4Network` with the
 /// same prefix as `net`, or `None` if no free address found.
-pub fn find_vacant_ipv4(used: &[Ipv4Addr], net: Ipv4Network) -> Option<Ipv4Addr> {
+pub fn find_vacant_ipv4(mut used: Vec<Ipv4Addr>, net: Ipv4Network) -> Option<Ipv4Addr> {
+    let first = net.nth(0).unwrap();
     let last = Ipv4Addr::from_bits(net.network().to_bits() | (!0 >> net.prefix()));
-    let mut used = used.to_vec();
+    used.push(first);
     used.push(last);
     used.sort();
     let bits: Vec<_> = used.iter().map(|x| x.to_bits()).collect();
@@ -176,7 +178,8 @@ pub fn find_vacant_ipv4(used: &[Ipv4Addr], net: Ipv4Network) -> Option<Ipv4Addr>
     let mut ix = None;
     for x in 0..bits.len() - 1 {
         let diff = bits[x + 1] - bits[x];
-        if diff > 1 {
+        // need 2 consecutive vacant ips
+        if diff > 2 {
             ix = Some(x);
             break;
         }
@@ -188,6 +191,16 @@ pub fn find_vacant_ipv4(used: &[Ipv4Addr], net: Ipv4Network) -> Option<Ipv4Addr>
         Some(ip)
     } else {
         None
+    }
+}
+
+pub trait IpExt {
+    fn next(&self) -> Self;
+}
+
+impl IpExt for Ipv4Addr {
+    fn next(&self) -> Self {
+        Ipv4Addr::from_bits(self.to_bits() + 1)
     }
 }
 
@@ -297,7 +310,7 @@ pub trait NetlinkOps {
     async fn fetch_routing_table(&self) -> Result<RoutingTable>;
     async fn fetch_link_by_name(&self, name: String) -> Result<LinkMessage>;
     async fn fetch_link_addrs(&self, index: u32) -> Result<AddressResponse>;
-    async fn fetch_all_ipv4_addrs(&self) -> Result<Vec<IpNetwork>>;
+    async fn fetch_all_ip_addrs(&self) -> Result<Vec<IpNetwork>>;
     async fn add_veth(&self, name_a: &str, name_b: &str) -> Result<()>;
     async fn add_route(&self, index: u32, pref_src: IpAddr, dst: IpAddr, prefix: u8) -> Result<()>;
     async fn ip_add_default_route(&self, index: u32) -> Result<()>;
@@ -350,7 +363,7 @@ impl NetlinkOps for Handle {
 
         Ok(resp)
     }
-    async fn fetch_all_ipv4_addrs(&self) -> Result<Vec<IpNetwork>> {
+    async fn fetch_all_ip_addrs(&self) -> Result<Vec<IpNetwork>> {
         let mut addrs = self.address().get().execute();
         let mut res: Vec<IpNetwork> = Vec::new();
 
@@ -358,9 +371,7 @@ impl NetlinkOps for Handle {
             let mut resp = AddressResponse::default();
             msg.parse_update(&mut resp)?;
             for ip in resp.addrs {
-                if ip.is_ipv4() {
-                    res.push(ip);
-                }
+                res.push(ip);
             }
         }
 
@@ -805,6 +816,8 @@ pub enum MainCommand {
         #[arg(short, long)]
         veth: bool,
     },
+    /// Netlink testing: print all IPv4 addresses
+    Netlink,
     /// Generates an empty config file
     Gen { save_to: PathBuf },
 }
