@@ -59,3 +59,4 @@ hyper-util = { version = "0.1.12", features = [
     "tokio",
 ] }
 hardware-address = { version = "0.2.0", features = ["std"] }
+atty = "0.2.14"
