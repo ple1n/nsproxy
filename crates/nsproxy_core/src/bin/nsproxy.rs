@@ -26,8 +26,9 @@ use nix::{
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
+use nsproxy_core::*;
 use nsproxy_core::{
-    HotConfig, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
+    Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::{ShellArgs, ShellPrefs},
     sys::{Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_ns, rm_mount},
     tokio_netlink_conn,
@@ -75,7 +76,6 @@ use tun2socks5::{
 };
 use warp::server::accept::Accept;
 
-
 fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
     let (mut tx, rx) = tokio::sync::mpsc::channel(1);
     let tx1 = tx.clone();
@@ -98,7 +98,6 @@ fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<(
 
     Ok((watcher, rx))
 }
-
 
 struct ServerItem {
     marked: bool,
@@ -164,7 +163,7 @@ fn main() -> anyhow::Result<()> {
             mount,
             sargs,
             name,
-            profile
+            profile,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -375,10 +374,20 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                let tun = TunMaker::default();
-                let mut state = tun.make()?;
-                state.sync_basic()?;
-                todo!()
+                if let Some(url) = &iargs.proxy {
+                    let tun = TunMaker::default();
+                    let mut state = tun.make()?;
+                    state.sync_basic()?;
+                } else {
+                    warn!("netns did not change");
+
+                    let clone = shell_prefs.spawn()?;
+                    let rt = tokio::runtime::Builder::new_current_thread().build()?;
+                    rt.block_on(async {
+                        clone.wait_for_child().await
+                    })?;
+                    warn!("exit");
+                }
             }
         }
         MainCommand::Rm { file } => {
@@ -476,7 +485,7 @@ fn main() -> anyhow::Result<()> {
                             mount,
                             sargs,
                             name: name1,
-                            profile
+                            profile,
                         } => {
                             if *veth {
                                 np.score += 1

@@ -728,6 +728,8 @@ pub enum MainCommand {
     Rm { file: PathBuf },
     /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
     /// The wrapper handles such problems
+    /// Warning. xdg-open takes the binary pointed by within .desktop file, which may differ from the path resolved by $PATH
+    /// eg. /usr/share/librewolf/librewolf
     Wrap {
         /// The executable to hook.
         #[arg(short, long)]
