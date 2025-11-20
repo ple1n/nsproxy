@@ -133,6 +133,11 @@ impl Accept for WarpAcceptor {
     }
 }
 
+struct AssignedIps {
+    vout: Ipv4Addr,
+    vin: Ipv4Addr,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // DEBUG is annoying because its filled with TCP retransmission logs
@@ -308,6 +313,8 @@ fn main() -> anyhow::Result<()> {
                                     aok!()
                                 });
 
+                                let mut vethips = None;
+
                                 rt.block_on(async move {
                                     use tokio::io::AsyncWriteExt;
 
@@ -330,6 +337,10 @@ fn main() -> anyhow::Result<()> {
 
                                         let v1: Option<Ipv4Addr> = find_vacant_ipv4(ips, veth_net);
                                         if let Some(v_out_ip) = v1 {
+                                            vethips = Some(AssignedIps {
+                                                vout: v_out_ip,
+                                                vin: v_out_ip.next(),
+                                            });
                                             nl.add_veth(&v_out, &v_in).await;
                                             let vin = nl.fetch_link_by_name(v_in.clone()).await?;
                                             let msg: LinkMessageBuilder<LinkVeth> =
@@ -367,6 +378,7 @@ fn main() -> anyhow::Result<()> {
                                         acceptor,
                                         child_pid as u32,
                                         tx,
+                                        vethips,
                                     ));
 
                                     tun2socks5::main_entry(
@@ -660,16 +672,32 @@ async fn watch_config(
     acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
     child_pid: u32,
     mut tx: tokio::net::UnixStream,
+    veths: Option<AssignedIps>,
 ) -> Result<()> {
-    let (mut wx, mut rx) = async_watcher()?;
-    wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
-    info!("watch config");
-
     let mut warps: HashMap<PathBuf, ServerItem> = HashMap::new();
     let vdns: Option<Option<VirtDNSHandle>> = vdns_rx.next().await;
     let vdns = vdns.unwrap();
     let mut futs = Vec::new();
     let mut prev_conf_ = None;
+
+    if let Some(vdns) = &vdns
+        && let Some(veth) = veths
+    {
+        vdns.pin(
+            Some(veth.vout),
+            "veth.host.".to_owned(),
+            TUNResponse::Unreachable,
+        );
+        vdns.pin(
+            Some(veth.vin),
+            "veth.peer.".to_owned(),
+            TUNResponse::Unreachable,
+        );
+    }
+
+    let (mut wx, mut rx) = async_watcher()?;
+    wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
+    info!("watch config");
 
     loop {
         let vdns = vdns.clone();

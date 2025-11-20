@@ -179,7 +179,7 @@ pub fn find_vacant_ipv4(mut used: Vec<Ipv4Addr>, net: Ipv4Network) -> Option<Ipv
     for x in 0..bits.len() - 1 {
         let diff = bits[x + 1] - bits[x];
         // need 2 consecutive vacant ips
-        if diff > 2 {
+        if diff > 2 && (bits[x] % 2 == 0) {
             ix = Some(x);
             break;
         }
