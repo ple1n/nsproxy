@@ -20,18 +20,12 @@ use std::io::{self, Write};
 use nix::unistd::execve;
 
 fn is_interactive() -> bool {
-    // common CI hint
-    if std::env::var_os("CI").is_some() {
-        return false;
-    }
-
     // atty quick check
     if atty::is(Stream::Stdin) || atty::is(Stream::Stdout) || atty::is(Stream::Stderr) {
         return true;
     }
-
-    // fallback: try /dev/tty (succeeds only when there's a controlling terminal)
-    OpenOptions::new().read(true).open("/dev/tty").is_ok()
+    
+    false
 }
 
 fn prompt_confirm(prompt: &str, default: bool) -> bool {
@@ -221,7 +215,8 @@ fn main() -> Result<()> {
         .collect();
     let program = self_exe.file_name();
     let Some(name) = program else {
-        println!("{:?}. can not get file name", self_exe);
+        let mut prompt = detect_prompt();
+        prompt.notify("nswrap", &format!("{:?}. can not get file name", self_exe));
         return Ok(());
     };
     let name = name.to_string_lossy();
@@ -250,7 +245,7 @@ fn main() -> Result<()> {
                         ),
                         true,
                     ) {
-                        println!("Aborted by user.");
+                        prompt.notify("nswrap", "Aborted by user.");
                         return Ok(());
                     }
                     let exe_args = [
@@ -264,12 +259,12 @@ fn main() -> Result<()> {
                         &exe_args,
                         &env,
                     );
-                    println!("exited with {:?}", k);
+                    prompt.notify("nswrap", &format!("exited with {:?}", k));
                 } else {
                     if let Some(profile) = profile {
                         if !prompt.confirm(&format!("Execute {:?} -p {}", self_exe, profile,), true)
                         {
-                            println!("Aborted by user.");
+                            prompt.notify("nswrap", "Aborted by user.");
                             return Ok(());
                         }
 
@@ -278,17 +273,17 @@ fn main() -> Result<()> {
                             &args,
                             &env,
                         );
-                        println!("exited with {:?}", k);
+                        prompt.notify("nswrap", &format!("exited with {:?}", k));
                     } else {
-                        println!("can not find a suitable profile. do nothing")
+                        prompt.notify("nswrap", "can not find a suitable profile. do nothing");
                     }
                 }
             } else {
-                println!("can not find relevant nsproxy process")
+                prompt.notify("nswrap", "can not find relevant nsproxy process");
             }
         }
         _ => {
-            println!("unsupported");
+            prompt.notify("nswrap", "unsupported");
         }
     }
 
