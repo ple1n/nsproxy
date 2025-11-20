@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
 use crate::{
-    env::CommandEnv,
+    env::{CommandEnv, ENV_PROFILE},
     prelude::*,
     sys::{Clone3Result, clone3},
 };
@@ -81,6 +81,16 @@ impl ShellPrefs {
         if !args.gids.is_empty() {
             self.gids_raw = args.gids.into_iter().collect();
         }
+    }
+    pub fn set_nsproxy_env(&mut self, browser_profile: Option<String>) {
+        self.env.push(
+            CString::from_str(&format!(
+                "{}={}",
+                ENV_PROFILE,
+                browser_profile.unwrap_or("UNSPEC".to_string())
+            ))
+            .unwrap(),
+        );
     }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations
     pub fn adjust(&mut self) -> Result<()> {
