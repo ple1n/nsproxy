@@ -15,7 +15,9 @@ pub struct CommandEnv {
 impl fmt::Debug for CommandEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug_command_env = f.debug_struct("CommandEnv");
-        debug_command_env.field("clear", &self.clear).field("vars", &self.vars);
+        debug_command_env
+            .field("clear", &self.clear)
+            .field("vars", &self.vars);
         debug_command_env.finish()
     }
 }
@@ -44,7 +46,11 @@ impl CommandEnv {
     }
 
     pub fn capture_if_changed(&self) -> Option<BTreeMap<EnvKey, OsString>> {
-        if self.is_unchanged() { None } else { Some(self.capture()) }
+        if self.is_unchanged() {
+            None
+        } else {
+            Some(self.capture())
+        }
     }
 
     // The following functions build up changes
@@ -98,7 +104,9 @@ impl<'a> Iterator for CommandEnvs<'a> {
     type Item = (&'a OsStr, Option<&'a OsStr>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(key, value)| (key.as_ref(), value.as_deref()))
+        self.iter
+            .next()
+            .map(|(key, value)| (key.as_ref(), value.as_deref()))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -114,3 +122,5 @@ impl<'a> ExactSizeIterator for CommandEnvs<'a> {
         self.iter.is_empty()
     }
 }
+
+pub static ENV_PROFILE: &'static str = "NSPROXY_PROFILE_BROWSER";

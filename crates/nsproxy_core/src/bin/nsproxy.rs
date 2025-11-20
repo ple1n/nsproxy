@@ -182,6 +182,7 @@ fn main() -> anyhow::Result<()> {
             let mut shell_prefs = ShellPrefs::default();
             shell_prefs.take_args(sargs);
             shell_prefs.adjust();
+            shell_prefs.set_nsproxy_env(profile);
             let ns_moved = [0; 1];
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
