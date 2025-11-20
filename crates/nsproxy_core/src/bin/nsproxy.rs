@@ -181,6 +181,10 @@ fn main() -> anyhow::Result<()> {
             let mut iargs = proxy;
             let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
             iargs.tun_name = Some(tun_name.clone());
+            let vname = name.unwrap_or("v".to_owned());
+            let v_in = format!("{vname}_in");
+            let v_out = format!("{vname}_out");
+
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
                 match clone {
@@ -227,7 +231,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
-                                        let dev = nl.fetch_link_by_name("v_in".to_owned()).await?;
+                                        let dev = nl.fetch_link_by_name(v_in).await?;
                                         nl.address()
                                             .add(dev.header.index, "100.120.0.2".parse()?, 24)
                                             .execute()
@@ -306,9 +310,9 @@ fn main() -> anyhow::Result<()> {
                                     tx.set_nonblocking(true)?;
                                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
                                     if veth {
-                                        info!("attempting to add veths named, v_out, v_in");
-                                        nl.add_veth("v_out", "v_in").await;
-                                        let vin = nl.fetch_link_by_name("v_in".to_owned()).await?;
+                                        info!("attempting to add veths named, {}, {}", &v_out, &v_in);
+                                        nl.add_veth(&v_out, &v_in).await;
+                                        let vin = nl.fetch_link_by_name(v_in.clone()).await?;
                                         let msg: LinkMessageBuilder<LinkVeth> =
                                             LinkMessageBuilder::default()
                                                 .index(vin.header.index)
@@ -317,7 +321,7 @@ fn main() -> anyhow::Result<()> {
                                         tx.write(&ns_moved).await?;
 
                                         let vout =
-                                            nl.fetch_link_by_name("v_out".to_owned()).await?;
+                                            nl.fetch_link_by_name(v_out.clone()).await?;
                                         nl.address()
                                             .add(vout.header.index, "100.120.0.1".parse()?, 24)
                                             .execute()
@@ -383,9 +387,7 @@ fn main() -> anyhow::Result<()> {
 
                     let clone = shell_prefs.spawn()?;
                     let rt = tokio::runtime::Builder::new_current_thread().build()?;
-                    rt.block_on(async {
-                        clone.wait_for_child().await
-                    })?;
+                    rt.block_on(async { clone.wait_for_child().await })?;
                     warn!("exit");
                 }
             }

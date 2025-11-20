@@ -145,6 +145,52 @@ pub fn octets_to_addr(a: &[u8], prefix: u8) -> Result<Option<IpNetwork>> {
     Ok(ip)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipnetwork::{IpNetwork, Ipv4Network};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_find_vacant_ipv4() {
+        let net: Ipv4Network = "10.0.0.0/30".parse().unwrap();
+        let used: Vec<Ipv4Addr> = vec![
+            "10.0.0.1".parse::<_>().unwrap(),
+        ];
+
+        let vacant = find_vacant_ipv4(&used, net).expect("should find a vacant addr");
+        dbg!(vacant);
+    }
+}
+
+/// Find a vacant IPv4 address inside `net` that is not contained in `used`.
+/// Returns the first available host address as an `Ipv4Network` with the
+/// same prefix as `net`, or `None` if no free address found.
+pub fn find_vacant_ipv4(used: &[Ipv4Addr], net: Ipv4Network) -> Option<Ipv4Addr> {
+    let last = Ipv4Addr::from_bits(net.network().to_bits() | (!0 >> net.prefix()));
+    let mut used = used.to_vec();
+    used.push(last);
+    used.sort();
+    let bits: Vec<_> = used.iter().map(|x| x.to_bits()).collect();
+
+    let mut ix = None;
+    for x in 0..bits.len() - 1 {
+        let diff = bits[x + 1] - bits[x];
+        if diff > 1 {
+            ix = Some(x);
+            break;
+        }
+    }
+    if let Some(ix) = ix {
+        let start = bits[ix];
+        let ip = start + 1;
+        let ip = Ipv4Addr::from_bits(ip);
+        Some(ip)
+    } else {
+        None
+    }
+}
+
 impl NetlinkParseUpdate for RouteMessage {
     type Repr = RouteEntry;
     fn parse_update(&self, parsed: &mut Self::Repr) -> Result<()> {
@@ -251,6 +297,7 @@ pub trait NetlinkOps {
     async fn fetch_routing_table(&self) -> Result<RoutingTable>;
     async fn fetch_link_by_name(&self, name: String) -> Result<LinkMessage>;
     async fn fetch_link_addrs(&self, index: u32) -> Result<AddressResponse>;
+    async fn fetch_all_ipv4_addrs(&self) -> Result<Vec<IpNetwork>>;
     async fn add_veth(&self, name_a: &str, name_b: &str) -> Result<()>;
     async fn add_route(&self, index: u32, pref_src: IpAddr, dst: IpAddr, prefix: u8) -> Result<()>;
     async fn ip_add_default_route(&self, index: u32) -> Result<()>;
@@ -302,6 +349,22 @@ impl NetlinkOps for Handle {
         }
 
         Ok(resp)
+    }
+    async fn fetch_all_ipv4_addrs(&self) -> Result<Vec<IpNetwork>> {
+        let mut addrs = self.address().get().execute();
+        let mut res: Vec<IpNetwork> = Vec::new();
+
+        while let Some(msg) = addrs.try_next().await? {
+            let mut resp = AddressResponse::default();
+            msg.parse_update(&mut resp)?;
+            for ip in resp.addrs {
+                if ip.is_ipv4() {
+                    res.push(ip);
+                }
+            }
+        }
+
+        Ok(res)
     }
     async fn add_veth(&self, name: &str, peer: &str) -> Result<()> {
         self.link()
