@@ -12,7 +12,7 @@ use std::{
 use atty::Stream;
 use clap::Parser;
 use notify_rust::Notification;
-use nsproxy_core::{Cli, MainCommand, to_cstr};
+use nsproxy_core::{Cli, MainCommand, env::ENV_PROFILE, to_cstr};
 use procfs::process::Process;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -24,7 +24,7 @@ fn is_interactive() -> bool {
     if atty::is(Stream::Stdin) || atty::is(Stream::Stdout) || atty::is(Stream::Stderr) {
         return true;
     }
-    
+
     false
 }
 
@@ -145,58 +145,6 @@ fn detect_prompt() -> Box<dyn Prompt> {
     Box::new(TtyPrompt)
 }
 
-/// Walk up the ancestor chain starting from the current process and return
-/// the pid of the first process whose `cmdline` first element matches the
-/// provided `matcher` closure.
-fn find_ancestor_with_cmd_prefix<F>(mut matcher: F) -> Option<i32>
-where
-    F: FnMut(&str) -> bool,
-{
-    // First check current process
-    let mut pid = std::process::id() as i32;
-
-    // limit depth to avoid pathological loops
-    for _depth in 0..128 {
-        if pid <= 0 {
-            break;
-        }
-
-        if let Ok(proc) = Process::new(pid) {
-            if let Ok(cmdline) = proc.cmdline() {
-                if let Some(first) = cmdline.first() {
-                    if matcher(first) {
-                        return Some(pid);
-                    }
-                }
-            }
-
-            // move to parent: for the first hop prefer libc::getppid()
-            if pid == std::process::id() as i32 {
-                let p = nix::unistd::getppid().as_raw() as i32;
-                if p == 0 || p == pid {
-                    break;
-                }
-                pid = p;
-                continue;
-            }
-
-            // otherwise, read ppid from /proc/<pid>/stat
-            if let Ok(stat) = proc.stat() {
-                let p = stat.ppid as i32;
-                if p == 0 || p == pid {
-                    break;
-                }
-                pid = p;
-                continue;
-            }
-            break;
-        } else {
-            break;
-        }
-    }
-
-    None
-}
 use anyhow::Result;
 
 fn main() -> Result<()> {
@@ -222,25 +170,22 @@ fn main() -> Result<()> {
     let name = name.to_string_lossy();
     let mut prompt = detect_prompt();
 
+    let profile = std::env::var(ENV_PROFILE)?;
+    let profile = if profile == "UNSPEC" {
+        None
+    } else {
+        Some(profile)
+    };
     match name {
         Cow::Borrowed("librewolf") | Cow::Borrowed("firefox") => {
-            let pp = find_ancestor_with_cmd_prefix(|f| f.starts_with("sproxy"));
-            if let Some(pp) = pp {
-                let sproxy = Process::new(pp)?;
-                let sargs = Cli::parse_from(sproxy.cmdline()?);
-                let profile = match sargs.cmd {
-                    MainCommand::Run { name, profile, .. } => profile,
-                    _ => None,
-                };
+            if let Some(pp) = profile {
                 let url = args.get(1);
-                if let Some(url) = url
-                    && let Some(profile) = profile
-                {
+                if let Some(url) = url {
                     if !prompt.confirm(
                         &format!(
                             "Execute {:?} -P {} {:?}",
                             self_exe,
-                            profile,
+                            pp,
                             url.to_string_lossy()
                         ),
                         true,
@@ -251,7 +196,7 @@ fn main() -> Result<()> {
                     let exe_args = [
                         to_cstr(wrapped.to_str().unwrap()),
                         to_cstr("-P"),
-                        to_cstr(&profile),
+                        to_cstr(&pp),
                         url.to_owned(),
                     ];
                     let k = execve(
@@ -261,25 +206,23 @@ fn main() -> Result<()> {
                     );
                     prompt.notify("nswrap", &format!("exited with {:?}", k));
                 } else {
-                    if let Some(profile) = profile {
-                        if !prompt.confirm(&format!("Execute {:?} -p {}", self_exe, profile,), true)
-                        {
-                            prompt.notify("nswrap", "Aborted by user.");
-                            return Ok(());
-                        }
-
-                        let k = execve(
-                            &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
-                            &args,
-                            &env,
-                        );
-                        prompt.notify("nswrap", &format!("exited with {:?}", k));
-                    } else {
-                        prompt.notify("nswrap", "can not find a suitable profile. do nothing");
+                    if !prompt.confirm(&format!("Execute {:?} -p {}", self_exe, pp), true) {
+                        prompt.notify("nswrap", "Aborted by user.");
+                        return Ok(());
                     }
+                    let exe_args = [
+                        to_cstr(wrapped.to_str().unwrap()),
+                        to_cstr("-P"),
+                        to_cstr(&pp),
+                    ];
+                    let k = execve(
+                        &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
+                        &exe_args,
+                        &env,
+                    );
                 }
             } else {
-                prompt.notify("nswrap", "can not find relevant nsproxy process");
+                prompt.notify("nswrap", "can not find relevant nsproxy data");
             }
         }
         _ => {
