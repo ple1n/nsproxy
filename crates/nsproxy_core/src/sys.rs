@@ -11,7 +11,7 @@ use nix::{
     sys::{
         signal::kill,
         stat::{fstat, makedev},
-        wait::waitpid,
+        wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::{
         ForkResult, Gid, Pid, Uid, fork, getresuid, getuid, initgroups, seteuid, setgroups,

@@ -142,6 +142,7 @@ fn main() -> Result<()> {
         .collect();
     let program = self_exe.file_name();
     let Some(name) = program else {
+        println!("{:?}. can not get file name", self_exe);
         return Ok(());
     };
     let name = name.to_string_lossy();
@@ -198,6 +199,8 @@ fn main() -> Result<()> {
                             &env,
                         );
                         println!("exited with {:?}", k);
+                    } else {
+                        println!("can not find a suitable profile. do nothing")
                     }
                 }
             } else {
