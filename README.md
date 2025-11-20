@@ -55,6 +55,21 @@ I run Cinny in an nsproxy container and direct virtual DNS to resolve multiple h
 
 Nsproxy can also serve static files directly through the TUN device.
 
+## Binary proxy
+
+This is a solution that prevents unintended network namespace escapes. This is not designed for malicious escapes, ie, the app in question is cooperative but unaware of your opsec needs.
+
+```sh
+VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns The wrapper handles such problems
+
+Usage: sproxy wrap [OPTIONS] --bin <BIN>
+
+Options:
+  -b, --bin <BIN>  The executable to hook
+  -u, --undo       
+  -h, --help       Print help
+```
+
 ## Recommended practice for using with Clash
 
 > Clash or other potentially untrusted proxies.
