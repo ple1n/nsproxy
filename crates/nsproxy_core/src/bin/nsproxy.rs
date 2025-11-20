@@ -191,7 +191,9 @@ fn main() -> anyhow::Result<()> {
             let vname = name.unwrap_or("v".to_owned());
             let v_in = format!("{vname}_in");
             let v_out = format!("{vname}_out");
-            let veth_net: Ipv4Network = "100.120.0.0/24".parse()?;
+            let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
+            let host_bits = 2;
+            let subnet_prefix = 32 - host_bits;
 
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
@@ -243,7 +245,7 @@ fn main() -> anyhow::Result<()> {
 
                                         let dev = nl.fetch_link_by_name(v_in).await?;
                                         nl.address()
-                                            .add(dev.header.index, ip.into(), 24)
+                                            .add(dev.header.index, ip.into(), subnet_prefix)
                                             .execute()
                                             .await?;
 
@@ -335,11 +337,12 @@ fn main() -> anyhow::Result<()> {
                                             })
                                             .collect();
 
-                                        let v1: Option<Ipv4Addr> = find_vacant_ipv4(ips, veth_net);
-                                        if let Some(v_out_ip) = v1 {
+                                        let v1: Option<Ipv4Addr> =
+                                            find_vacant_ipv4_subnet(ips, veth_net, host_bits);
+                                        if let Some(subnet) = v1 {
                                             vethips = Some(AssignedIps {
-                                                vout: v_out_ip,
-                                                vin: v_out_ip.next(),
+                                                vout: veth_addr_for(subnet, host_bits, true),
+                                                vin: veth_addr_for(subnet, host_bits, false),
                                             });
                                             nl.add_veth(&v_out, &v_in).await;
                                             let vin = nl.fetch_link_by_name(v_in.clone()).await?;
@@ -348,11 +351,11 @@ fn main() -> anyhow::Result<()> {
                                                     .index(vin.header.index)
                                                     .setns_by_pid(child_pid as u32);
                                             nl.link().set(msg.build()).execute().await;
-                                            tx.write(v_out_ip.as_octets()).await?;
+                                            tx.write(subnet.as_octets()).await?;
 
                                             let vout = nl.fetch_link_by_name(v_out.clone()).await?;
                                             nl.address()
-                                                .add(vout.header.index, v_out_ip.into(), 24)
+                                                .add(vout.header.index, subnet.into(), subnet_prefix)
                                                 .execute()
                                                 .await?;
                                             nl.link()
