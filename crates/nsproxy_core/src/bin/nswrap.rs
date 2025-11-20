@@ -11,6 +11,7 @@ use std::{
 
 use atty::Stream;
 use clap::Parser;
+use notify_rust::Notification;
 use nsproxy_core::{Cli, MainCommand, to_cstr};
 use procfs::process::Process;
 use std::fs::OpenOptions;
@@ -41,23 +42,6 @@ fn prompt_confirm(prompt: &str, default: bool) -> bool {
 
     let hint = if default { "Y/n" } else { "y/N" };
 
-    // Prefer writing to /dev/tty so redirections don't interfere
-    if let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") {
-        let _ = write!(tty, "{} [{}] ", prompt, hint);
-        let _ = tty.flush();
-        let mut input = String::new();
-        use std::io::BufRead;
-        let mut reader = io::BufReader::new(tty);
-        if reader.read_line(&mut input).is_ok() {
-            let ans = input.trim().to_ascii_lowercase();
-            if ans.is_empty() {
-                return default;
-            }
-            return matches!(ans.chars().next(), Some('y'));
-        }
-        return default;
-    }
-
     // Fallback to stdin/stdout
     print!("{} [{}] ", prompt, hint);
     let _ = io::stdout().flush();
@@ -70,6 +54,101 @@ fn prompt_confirm(prompt: &str, default: bool) -> bool {
         return matches!(ans.chars().next(), Some('y'));
     }
     default
+}
+
+/// Abstraction for sending notifications and asking for confirmation.
+trait Prompt {
+    fn notify(&mut self, summary: &str, body: &str);
+    fn confirm(&mut self, prompt: &str, default: bool) -> bool;
+}
+
+/// TTY-based prompt (interactive terminal)
+struct TtyPrompt;
+impl Prompt for TtyPrompt {
+    fn notify(&mut self, _summary: &str, body: &str) {
+        // on TTY, just print the message
+        eprintln!("{}", { body });
+    }
+
+    fn confirm(&mut self, prompt: &str, default: bool) -> bool {
+        prompt_confirm(prompt, default)
+    }
+}
+
+/// Desktop prompt implementation. Tries `zenity` or `kdialog` for confirmations
+/// (graphical dialogs). For notifications, uses `notify-send` if available as a
+/// fallback to DBus notifications.
+struct DesktopPrompt;
+impl DesktopPrompt {
+    fn run_cmd_confirm(cmd: &str, args: &[&str]) -> Option<bool> {
+        match std::process::Command::new(cmd).args(args).status() {
+            Ok(status) => Some(status.success()),
+            Err(_) => None,
+        }
+    }
+
+    fn send_notification_cmd(summary: &str, body: &str) {
+        // try DBus notification via notify-rust, fall back to notify-send
+        if Notification::new()
+            .summary(summary)
+            .body(body)
+            .show()
+            .is_err()
+        {
+            let _ = std::process::Command::new("notify-send")
+                .arg(summary)
+                .arg(body)
+                .status();
+        }
+    }
+}
+
+impl Prompt for DesktopPrompt {
+    fn notify(&mut self, summary: &str, body: &str) {
+        // best-effort: try notify-send, otherwise print to stderr
+        DesktopPrompt::send_notification_cmd(summary, body);
+    }
+
+    fn confirm(&mut self, prompt: &str, default: bool) -> bool {
+        // try zenity
+        if let Some(res) =
+            DesktopPrompt::run_cmd_confirm("zenity", &["--question", "--text", prompt])
+        {
+            return res;
+        }
+
+        // try kdialog
+        if let Some(res) = DesktopPrompt::run_cmd_confirm("kdialog", &["--yesno", prompt]) {
+            return res;
+        }
+
+        // fall back to notify and default
+        DesktopPrompt::send_notification_cmd("Question", prompt);
+        default
+    }
+}
+
+/// Choose appropriate prompt implementation:
+/// - If we detect an interactive TTY, use TtyPrompt
+/// - Otherwise, if desktop session env present, use DesktopPrompt
+fn detect_prompt() -> Box<dyn Prompt> {
+    let is_tty = is_interactive();
+    if is_tty {
+        return Box::new(TtyPrompt);
+    }
+
+    // heuristics for desktop session
+    let has_display = std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("XDG_SESSION_TYPE").is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+
+    if has_display {
+        return Box::new(DesktopPrompt);
+    }
+
+    // final fallback to TTY behavior
+    Box::new(TtyPrompt)
 }
 
 /// Walk up the ancestor chain starting from the current process and return
@@ -146,6 +225,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let name = name.to_string_lossy();
+    let mut prompt = detect_prompt();
 
     match name {
         Cow::Borrowed("librewolf") | Cow::Borrowed("firefox") => {
@@ -161,7 +241,7 @@ fn main() -> Result<()> {
                 if let Some(url) = url
                     && let Some(profile) = profile
                 {
-                    if !prompt_confirm(
+                    if !prompt.confirm(
                         &format!(
                             "Execute {:?} -P {} {:?}",
                             self_exe,
@@ -187,7 +267,7 @@ fn main() -> Result<()> {
                     println!("exited with {:?}", k);
                 } else {
                     if let Some(profile) = profile {
-                        if !prompt_confirm(&format!("Execute {:?} -p {}", self_exe, profile,), true)
+                        if !prompt.confirm(&format!("Execute {:?} -p {}", self_exe, profile,), true)
                         {
                             println!("Aborted by user.");
                             return Ok(());
