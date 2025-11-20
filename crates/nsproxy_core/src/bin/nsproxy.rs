@@ -866,7 +866,11 @@ pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Res
 
                                     let _ = handle
                                         .link()
-                                        .set(LinkUnspec::new_with_index(msg.header.index).up().build())
+                                        .set(
+                                            LinkUnspec::new_with_index(msg.header.index)
+                                                .up()
+                                                .build(),
+                                        )
                                         .execute()
                                         .await;
                                 }
