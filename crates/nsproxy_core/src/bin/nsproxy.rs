@@ -1,3 +1,5 @@
+#![feature(ip_as_octets)]
+
 use capctl::prctl;
 /// This binary will at most spawn 2 processes (including itself)
 /// It's intended to be minimal, which can be used later in higher order composition such as in GUI
@@ -184,6 +186,7 @@ fn main() -> anyhow::Result<()> {
             let vname = name.unwrap_or("v".to_owned());
             let v_in = format!("{vname}_in");
             let v_out = format!("{vname}_out");
+            let veth_net: Ipv4Network = "100.120.0.0/24".parse()?;
 
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
@@ -216,7 +219,7 @@ fn main() -> anyhow::Result<()> {
                                     .build()?;
                                 rt.block_on(async {
                                     use tokio::io::AsyncReadExt;
-                                    let mut read = vec![0; 1];
+                                    let mut read = [0u8; 4];
                                     tx.set_nonblocking(true)?;
                                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
                                     let add_default = (dst == NsInput::New && !no_default)
@@ -231,9 +234,11 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
+                                        let ip = Ipv4Addr::from_octets(read).next();
+
                                         let dev = nl.fetch_link_by_name(v_in).await?;
                                         nl.address()
-                                            .add(dev.header.index, "100.120.0.2".parse()?, 24)
+                                            .add(dev.header.index, ip.into(), 24)
                                             .execute()
                                             .await?;
 
@@ -250,10 +255,10 @@ fn main() -> anyhow::Result<()> {
 
                                     tokio::spawn(async move {
                                         let conf = cli.conf;
-                                        for _ in 0..20 {
+                                        let mut read = [0u8; 24];
+                                        loop {
                                             let k = tx.read(&mut read[..]).await?;
                                             if k < 1 {
-                                                info!("<1");
                                                 continue;
                                             }
                                             let fc = tokio::fs::read_to_string(&conf).await?;
@@ -310,31 +315,47 @@ fn main() -> anyhow::Result<()> {
                                     tx.set_nonblocking(true)?;
                                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
                                     if veth {
-                                        info!("attempting to add veths named, {}, {}", &v_out, &v_in);
-                                        nl.add_veth(&v_out, &v_in).await;
-                                        let vin = nl.fetch_link_by_name(v_in.clone()).await?;
-                                        let msg: LinkMessageBuilder<LinkVeth> =
-                                            LinkMessageBuilder::default()
-                                                .index(vin.header.index)
-                                                .setns_by_pid(child_pid as u32);
-                                        nl.link().set(msg.build()).execute().await;
-                                        tx.write(&ns_moved).await?;
+                                        info!(
+                                            "attempting to add veths named, {}, {}",
+                                            &v_out, &v_in
+                                        );
+                                        let addrs = nl.fetch_all_ip_addrs().await?;
+                                        let ips: Vec<_> = addrs
+                                            .iter()
+                                            .filter_map(|f| match f {
+                                                IpNetwork::V4(v4) => Some(v4.ip()),
+                                                _ => None,
+                                            })
+                                            .collect();
 
-                                        let vout =
-                                            nl.fetch_link_by_name(v_out.clone()).await?;
-                                        nl.address()
-                                            .add(vout.header.index, "100.120.0.1".parse()?, 24)
-                                            .execute()
-                                            .await?;
-                                        nl.link()
-                                            .set(
-                                                LinkMessageBuilder::<LinkUnspec>::default()
-                                                    .index(vout.header.index)
-                                                    .up()
-                                                    .build(),
-                                            )
-                                            .execute()
-                                            .await?;
+                                        let v1: Option<Ipv4Addr> = find_vacant_ipv4(ips, veth_net);
+                                        if let Some(v_out_ip) = v1 {
+                                            nl.add_veth(&v_out, &v_in).await;
+                                            let vin = nl.fetch_link_by_name(v_in.clone()).await?;
+                                            let msg: LinkMessageBuilder<LinkVeth> =
+                                                LinkMessageBuilder::default()
+                                                    .index(vin.header.index)
+                                                    .setns_by_pid(child_pid as u32);
+                                            nl.link().set(msg.build()).execute().await;
+                                            tx.write(v_out_ip.as_octets()).await?;
+
+                                            let vout = nl.fetch_link_by_name(v_out.clone()).await?;
+                                            nl.address()
+                                                .add(vout.header.index, v_out_ip.into(), 24)
+                                                .execute()
+                                                .await?;
+                                            nl.link()
+                                                .set(
+                                                    LinkMessageBuilder::<LinkUnspec>::default()
+                                                        .index(vout.header.index)
+                                                        .up()
+                                                        .build(),
+                                                )
+                                                .execute()
+                                                .await?;
+                                        } else {
+                                            tracing::error!("cannot find any vacant ip");
+                                        }
                                     }
 
                                     let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
@@ -612,6 +633,20 @@ fn main() -> anyhow::Result<()> {
             let json = serde_json::to_string_pretty(&conf)?;
 
             std::fs::write(&save_to, json)?;
+        }
+        MainCommand::Netlink => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            rt.block_on(async {
+                let nl = tokio_netlink_conn()?;
+                let addrs = nl.fetch_all_ip_addrs().await?;
+                for a in addrs {
+                    println!("{}", a);
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
         }
         _ => unimplemented!(),
     }
