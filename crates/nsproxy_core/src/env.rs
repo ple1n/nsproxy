@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::{env, fmt};
+
+use tracing::warn;
 
 pub type EnvKey = OsString;
 
@@ -132,4 +135,20 @@ pub static ENV_NS: &'static str = "NSROXY_NS";
 #[derive(strum::EnumString, strum::IntoStaticStr, strum::Display, strum::AsRefStr)]
 pub enum NswrapEnv {
     Confirm,
+}
+
+pub fn name_to_mount_path(name: impl AsRef<Path>) -> PathBuf {
+    PathBuf::from("/run/").join(name).with_extension("ns")
+}
+
+pub fn args_deduce_mount(name: &Option<String>, mount: &Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(name) = &name
+        && mount.is_none()
+    {
+        let path = name_to_mount_path(name);
+        warn!("Mount path not specified, defaults to {:?}", &path);
+        Some(path)
+    } else {
+        None
+    }
 }

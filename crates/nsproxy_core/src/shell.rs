@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
 use crate::{
-    env::{CommandEnv, ENV_PROFILE},
+    env::{CommandEnv, ENV_NS, ENV_PROFILE},
     prelude::*,
     sys::{Clone3Result, clone3},
 };
@@ -92,6 +92,20 @@ impl ShellPrefs {
                 "{}={}",
                 ENV_PROFILE,
                 browser_profile.unwrap_or("UNSPEC".to_string())
+            ))
+            .unwrap(),
+        );
+    }
+    pub fn set_ns_env(&mut self, ns: Option<&str>) {
+        warn!(
+            "setting env variable for netns {:?}",
+            &ns
+        );
+        self.env.push_front(
+            CString::from_str(&format!(
+                "{}={}",
+                ENV_NS,
+                ns.unwrap_or("UNSPEC")
             ))
             .unwrap(),
         );
