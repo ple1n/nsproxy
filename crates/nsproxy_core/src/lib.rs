@@ -842,6 +842,7 @@ pub enum MainCommand {
     Netlink,
     /// Generates an empty config file
     Gen { save_to: PathBuf },
+    /// Identify current net-ns context
     #[command(alias = "i")]
     Id {},
 }

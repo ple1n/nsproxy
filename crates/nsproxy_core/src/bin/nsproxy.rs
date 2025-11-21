@@ -28,7 +28,6 @@ use nix::{
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
-use nsproxy_core::*;
 use nsproxy_core::{
     Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     shell::{ShellArgs, ShellPrefs},
@@ -36,6 +35,7 @@ use nsproxy_core::{
     tokio_netlink_conn,
     utils::ToExactNs,
 };
+use nsproxy_core::{env::ENV_PROFILE, *};
 use passfd::FdPassingExt;
 use pidfd::PidFd;
 use rtnetlink::packet_route::{
@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
             default,
             no_default,
             log,
-            mount,
+            mut mount,
             sargs,
             name,
             profile,
@@ -189,12 +189,20 @@ fn main() -> anyhow::Result<()> {
             let mut iargs = proxy;
             let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
             iargs.tun_name = Some(tun_name.clone());
-            let vname = name.unwrap_or("v".to_owned());
+            let vname = name.clone().unwrap_or("v".to_owned());
             let v_in = format!("{vname}_in");
             let v_out = format!("{vname}_out");
             let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
             let host_bits = 2;
             let subnet_prefix = 32 - host_bits;
+
+            if let Some(name) = &name
+                && mount.is_none()
+            {
+                let path = PathBuf::from("/run/").join(name).with_extension("ns");
+                warn!("Mount path not specified, defaults to {:?}", &path);
+                mount = Some(path)
+            }
 
             if dst != NsInput::This {
                 let clone = nsproxy_core::sys::clone3::<true>();
@@ -440,6 +448,10 @@ fn main() -> anyhow::Result<()> {
         MainCommand::Rm { file } => {
             rm_mount(&file)?;
         }
+        MainCommand::Id {} => {
+            let profile = std::env::var(ENV_PROFILE);
+            println!("Browser profile {} {:?}", ENV_PROFILE, profile);
+        }
         /// We are just putting state in proc now, basically. Seems cleaner
         MainCommand::Enter {
             list,
@@ -574,7 +586,7 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 let rx = shell_prefs.spawn()?;
                 rx.wait_for_child().await?;
-                
+
                 aok!()
             })?;
         }
