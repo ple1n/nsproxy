@@ -27,9 +27,10 @@ use nix::{
     unistd::{Pid, getresgid, getresuid},
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use nsproxy_common::{ExactNS, NSFrom, NSSource, UniqueFile, forever};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
     Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
+    env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     shell::{ShellArgs, ShellPrefs},
     sys::{Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_ns, rm_mount},
     tokio_netlink_conn,
@@ -196,12 +197,9 @@ fn main() -> anyhow::Result<()> {
             let host_bits = 2;
             let subnet_prefix = 32 - host_bits;
 
-            if let Some(name) = &name
-                && mount.is_none()
-            {
-                let path = PathBuf::from("/run/").join(name).with_extension("ns");
-                warn!("Mount path not specified, defaults to {:?}", &path);
-                mount = Some(path)
+            mount = args_deduce_mount(&name, &mount);
+            if let Some(mount) = &mount {
+                shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
             }
 
             if dst != NsInput::This {
@@ -451,6 +449,14 @@ fn main() -> anyhow::Result<()> {
         MainCommand::Id {} => {
             let profile = std::env::var(ENV_PROFILE);
             println!("Browser profile {} {:?}", ENV_PROFILE, profile);
+            let ns = std::env::var(ENV_NS);
+            println!("Network namespace {} {:?}", ENV_NS, ns);
+            if let Ok(ns) = ns {
+                let path = PathBuf::from(ns);
+                let ns = ExactNS::from_source(path)?;
+                let ns_self = ExactNS::from_source((PidPath::Selfproc, "net"))?;
+                println!("env={} proc_self={}", ns.unique, ns_self.unique);
+            }
         }
         /// We are just putting state in proc now, basically. Seems cleaner
         MainCommand::Enter {
@@ -477,6 +483,7 @@ fn main() -> anyhow::Result<()> {
                     match_port: bool,
                     score: u32,
                     pid: i32,
+                    mount: Option<String>,
                 }
                 let mut nsproxy_procs = Vec::new();
                 let mut found = Vec::new();
@@ -509,6 +516,9 @@ fn main() -> anyhow::Result<()> {
                                         println!("{:?} {:?}", np.cmdline().unwrap(), net);
                                     }
                                     let args = Cli::parse_from(&cmds);
+                                    let envs = np.environ()?;
+                                    let mount = envs.get(OsStr::new(ENV_NS));
+                                    let mount = mount.map(|k| k.to_str().unwrap().to_owned());
                                     found.push(FoundProcess {
                                         cmd: cmds,
                                         args,
@@ -516,6 +526,7 @@ fn main() -> anyhow::Result<()> {
                                         match_port: false,
                                         score: 0,
                                         pid: np.pid,
+                                        mount,
                                     });
                                 } else {
                                     println!(
@@ -569,11 +580,18 @@ fn main() -> anyhow::Result<()> {
                 let max = found.iter().max_by_key(|k| k.score);
                 if let Some(max) = max {
                     warn!("best match {:?}", max.cmd);
-                    let profile = match &max.args.cmd {
-                        MainCommand::Run { profile, .. } => profile.clone(),
-                        _ => None,
+                    let (profile) = match &max.args.cmd {
+                        MainCommand::Run {
+                            profile,
+                            name,
+                            mount,
+                            ..
+                        } => (profile.clone()),
+                        _ => (None),
                     };
                     shell_prefs.set_nsproxy_env(profile);
+                    // shell_prefs.set_ns_env(mount.as_ref().map(|k| k.to_str().unwrap()));
+                    shell_prefs.set_ns_env(max.mount.as_ref().map(|k| k.as_str()));
                     let ns = NSSource::Pid(max.pid);
                     ns.enter(CloneFlags::CLONE_NEWNET)?;
                 }
