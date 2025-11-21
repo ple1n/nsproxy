@@ -101,13 +101,15 @@ impl DesktopPrompt {
         }
     }
 
-    fn send_notification_cmd(summary: Option<&str>, body: &str) {
+    fn send_notification_cmd(title: Option<&str>, body: &str) {
         // try DBus notification via notify-rust, fall back to notify-send
         if {
             let mut n = Notification::new();
-            n.body(body);
-            if let Some(s) = summary {
+            if let Some(s) = title {
                 n.summary(s);
+                n.body(body);
+            } else {
+                n.summary(body);
             }
             n.show().is_err()
         }
