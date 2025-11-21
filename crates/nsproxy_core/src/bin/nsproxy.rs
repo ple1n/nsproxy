@@ -456,6 +456,11 @@ fn main() -> anyhow::Result<()> {
                 let ns = ExactNS::from_source(path)?;
                 let ns_self = ExactNS::from_source((PidPath::Selfproc, "net"))?;
                 println!("env={} proc_self={}", ns.unique, ns_self.unique);
+                if ns.unique == ns_self.unique {
+                    println!("network namespace matches claim");
+                } else {
+                    warn!("netns mismatch");
+                }
             }
         }
         /// We are just putting state in proc now, basically. Seems cleaner
@@ -570,7 +575,7 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             if &name == name1 {
-                                np.score += 1;
+                                np.score += 10;
                             }
                         }
                         _ => {}
