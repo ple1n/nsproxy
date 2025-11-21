@@ -31,6 +31,16 @@ Nsproxy isolates traffic of an entire process tree, as how kernel namespace is d
 
 ![](./vscodeprompt.png)
 
+
+```sh
+Usage: sproxy wrap [OPTIONS] --bin <BIN>
+
+Options:
+  -b, --bin <BIN>  The executable to hook
+  -u, --undo       
+  -h, --help       Print help
+```
+
 ## minimal configuration state
 
 No `/etc/`, `/usr/`, `$xdg`, and such hierarchy of fallbacks that serve no purpose but confusion. 
@@ -53,21 +63,6 @@ npx vite preview --port 80
 I run Cinny in an nsproxy container and direct virtual DNS to resolve multiple hosts to localhost, which enables me to use multiple accounts on Cinny.
 
 Nsproxy can also serve static files directly through the TUN device.
-
-## binary proxy
-
-This is a solution that prevents unintended network namespace escapes. This is not designed for malicious escapes, ie, the app in question is cooperative but unaware of your opsec needs.
-
-```sh
-VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns The wrapper handles such problems
-
-Usage: sproxy wrap [OPTIONS] --bin <BIN>
-
-Options:
-  -b, --bin <BIN>  The executable to hook
-  -u, --undo       
-  -h, --help       Print help
-```
 
 ## recommended practice for using with Clash
 
