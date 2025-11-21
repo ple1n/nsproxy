@@ -242,7 +242,11 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
-                                        let ip = veth_addr_for(Ipv4Addr::from_octets(read), host_bits, false);
+                                        let ip = veth_addr_for(
+                                            Ipv4Addr::from_octets(read),
+                                            host_bits,
+                                            false,
+                                        );
 
                                         let dev = nl.fetch_link_by_name(v_in).await?;
                                         nl.address()
@@ -356,7 +360,11 @@ fn main() -> anyhow::Result<()> {
 
                                             let vout = nl.fetch_link_by_name(v_out.clone()).await?;
                                             nl.address()
-                                                .add(vout.header.index, veth_addr_for(subnet, host_bits, true).into(), subnet_prefix)
+                                                .add(
+                                                    vout.header.index,
+                                                    veth_addr_for(subnet, host_bits, true).into(),
+                                                    subnet_prefix,
+                                                )
                                                 .execute()
                                                 .await?;
                                             nl.link()
@@ -509,6 +517,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+
                 for np in found.iter_mut() {
                     match &np.args.cmd {
                         MainCommand::Run {
@@ -548,6 +557,11 @@ fn main() -> anyhow::Result<()> {
                 let max = found.iter().max_by_key(|k| k.score);
                 if let Some(max) = max {
                     warn!("best match {:?}", max.cmd);
+                    let profile = match &max.args.cmd {
+                        MainCommand::Run { profile, .. } => profile.clone(),
+                        _ => None,
+                    };
+                    shell_prefs.set_nsproxy_env(profile);
                     let ns = NSSource::Pid(max.pid);
                     ns.enter(CloneFlags::CLONE_NEWNET)?;
                 }
@@ -557,7 +571,12 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
 
-            rt.block_on(async { shell_prefs.spawn_and_block().await })?;
+            rt.block_on(async {
+                let rx = shell_prefs.spawn()?;
+                rx.wait_for_child().await?;
+                
+                aok!()
+            })?;
         }
         MainCommand::Install { dir: dstdir } => {
             if !dstdir.exists() {
