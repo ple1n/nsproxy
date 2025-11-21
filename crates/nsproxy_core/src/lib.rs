@@ -155,15 +155,12 @@ mod tests {
     #[test]
     fn test_find_vacant_ipv4() {
         let net: Ipv4Network = "100.64.0.0/10".parse().unwrap();
-        let used: Vec<Ipv4Addr> = vec![
-            "100.64.0.5".parse::<_>().unwrap(),
-        ];
+        let used: Vec<Ipv4Addr> = vec!["100.64.0.5".parse::<_>().unwrap()];
 
         let vacant = find_vacant_ipv4_subnet(used, net, 2).expect("should find a vacant addr");
         dbg!(vacant);
         dbg!(veth_addr_for(vacant, 2, true));
         dbg!(veth_addr_for(vacant, 2, false));
-
     }
 }
 
@@ -757,6 +754,7 @@ pub enum NsInput {
 #[derive(Debug, Clone, Subcommand)]
 pub enum MainCommand {
     /// Set up some containers
+    #[command(alias = "r")]
     Run {
         /// Source network namespace (src=/path OR src=1234)
         #[arg(long, default_value = "this")]
@@ -796,6 +794,7 @@ pub enum MainCommand {
         #[arg(long)]
         profile: Option<String>,
     },
+    #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
     Enter {
@@ -832,15 +831,19 @@ pub enum MainCommand {
         #[arg(short, long)]
         undo: bool,
     },
+    #[command(alias = "c")]
     Clean {
         /// Does a simple removal of default veth
         #[arg(short, long)]
         veth: bool,
     },
+    #[command(alias = "n")]
     /// Netlink testing: print all IPv4 addresses
     Netlink,
     /// Generates an empty config file
     Gen { save_to: PathBuf },
+    #[command(alias = "i")]
+    Id {},
 }
 
 impl std::str::FromStr for NsInput {
