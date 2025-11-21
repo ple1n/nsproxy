@@ -1,4 +1,4 @@
-# nsproxy v3
+# _nsproxy_
 
 It is
 
@@ -17,28 +17,27 @@ It is an identity separation tool like Whonix for the paranoid, but much more pr
 - Non-sandbox. Not intended to be a sandbox. Ask flatpak to incorporate features in this project, if you want. 
 - Not a new docker. This is a handy tool that follows the user loyally. 
 
-## Usage and compilation
+## usage and compilation
 
 `install_release.sh` should install an `opt=3` optimized version to your `/usr/local`
 
 For releases, I use `release_upx.sh` which is a compressed `opt=3` binary.
 
-### V3.2 Major fixes
+## _nswrap_, securely contain links opened by Vscode
 
-- Nsproxy used to have problem with flatpak installs, due to implementation errors in TCP stack, the speed of download diminishes gradually until zero.
-- V3.2 merged upstream ipstack implementation which increased performance drastically, overall
+The security assumption is _faulty proxy handling but not malicious_, which happens to be the case for most applications and workflow. Nearly all programs can not pick up SOCKS5 environment variables, and even firefox leaked DNS. All of that would not happen in nsproxy.
 
-### V3.3 Major Fixes
+Nsproxy isolates traffic of an entire process tree, as how kernel namespace is designed, in the same way Docker makes containers. Applications may escape the net-ns through dBus or various other IPC, systemd, etc. In cases such as browsers, nswrap handles the escape.
 
-- The virtual DNS by default only responds with a mapped virtual IPV6 address, which is hashed off the domain being requested. This sidesteps all the async/locking/ip-allocation problems with reasonable collision resistance. 
+![](./vscodeprompt.png)
 
-## Minimal configuration state
+## minimal configuration state
 
 No `/etc/`, `/usr/`, `$xdg`, and such hierarchy of fallbacks that serve no purpose but confusion. 
 
 Nsproxy only takes command line arguments, one hot-reloaded config file, reads procfs and communicates with kernel through netlink.
 
-## Virtual DNS and files served through a TUN 
+## virtual DNS and files served through a TUN 
 
 See `./nsproxy.json` which is similar to the configuration I use. The feature is particularly handy in cases of self-hosting.
 
@@ -55,7 +54,7 @@ I run Cinny in an nsproxy container and direct virtual DNS to resolve multiple h
 
 Nsproxy can also serve static files directly through the TUN device.
 
-## Binary proxy
+## binary proxy
 
 This is a solution that prevents unintended network namespace escapes. This is not designed for malicious escapes, ie, the app in question is cooperative but unaware of your opsec needs.
 
@@ -70,7 +69,7 @@ Options:
   -h, --help       Print help
 ```
 
-## Recommended practice for using with Clash
+## recommended practice for using with Clash
 
 > Clash or other potentially untrusted proxies.
 
@@ -112,7 +111,7 @@ wireshark
 
 Doing analysis in a container is roughly the same as outside. 
 
-### Having the browser use SOCKS5 through a veth, or use TUN?
+### having the browser use SOCKS5 through a veth, or use TUN?
 
 ![](image-2.png)
 
@@ -133,7 +132,7 @@ You can re-enter this namespace by `sproxy enter`
 
 From the perspective of less memory copying, you should set browser to use `veth.host`, as exposed by nsproxy, and have your proxy server listening at `veth.host`. 
 
-## Performance of the TUN userspace networking stack
+## performance of the TUN userspace networking stack
 
 1. Bandwidth
 
@@ -219,3 +218,12 @@ Nsproxy does best effort to remove AAAA entries when you resolve DNS through a p
 Stop making modules private. Dependencies Shall hide nothing from me. 80% of forks in this project are due to some items being private.
 
 Encapsulation is a failure, a failed feature coming from OOP.
+
+### V3.2 Major fixes
+
+- Nsproxy used to have problem with flatpak installs, due to implementation errors in TCP stack, the speed of download diminishes gradually until zero.
+- V3.2 merged upstream ipstack implementation which increased performance drastically, overall
+
+### V3.3 Major Fixes
+
+- The virtual DNS by default only responds with a mapped virtual IPV6 address, which is hashed off the domain being requested. This sidesteps all the async/locking/ip-allocation problems with reasonable collision resistance. 
