@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     env::{current_dir, var},
     ffi::{CStr, CString, OsString},
     os::unix::{
@@ -42,7 +42,7 @@ pub struct ShellPrefs {
     /// The PATHS can be different in the user shell
     pub prefer_shell: Option<String>,
     args: Vec<CString>,
-    env: Vec<CString>,
+    env: VecDeque<CString>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -87,8 +87,7 @@ impl ShellPrefs {
             "setting env variable for brwoser profile {:?}",
             &browser_profile
         );
-        self.env.insert(
-            0,
+        self.env.push_front(
             CString::from_str(&format!(
                 "{}={}",
                 ENV_PROFILE,
@@ -146,9 +145,9 @@ impl ShellPrefs {
         }
         let cmd_env = CommandEnv::default();
         let envs = cmd_env.capture();
-        let mut vec: Vec<CString> = Default::default();
+        let mut vec: VecDeque<CString> = Default::default();
         for (k, v) in envs {
-            vec.push(CString::new(format!(
+            vec.push_back(CString::new(format!(
                 "{}={}",
                 k.to_str().unwrap(),
                 v.to_str().unwrap()
@@ -173,7 +172,7 @@ impl ShellPrefs {
                     let cmd = CString::new(cmd.to_str().unwrap())?;
                     self.drop_privs()?;
 
-                    execve(cmd.as_c_str(), &self.args, &self.env);
+                    execve(cmd.as_c_str(), &self.args, self.env.make_contiguous());
                 }
                 Clone3Result::Parent {
                     child_pid,
