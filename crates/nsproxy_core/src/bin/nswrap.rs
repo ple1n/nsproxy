@@ -2,11 +2,7 @@
 //! This is meant to drop in replace/mask executables.
 
 use std::{
-    borrow::Cow,
-    env,
-    ffi::{CStr, CString, OsString},
-    os::unix::ffi::OsStringExt,
-    str::FromStr,
+    borrow::Cow, collections::VecDeque, env, ffi::{CStr, CString, OsString}, os::unix::ffi::OsStringExt, str::FromStr
 };
 
 use atty::Stream;
@@ -153,7 +149,7 @@ fn main() -> Result<()> {
     let args = env::args()
         .map(|k| CString::new(k).unwrap())
         .collect::<Vec<_>>();
-    let env: Vec<CString> = env::vars()
+    let mut env: VecDeque<CString> = env::vars()
         .map(|(k, v)| {
             let mut s = k;
             s.push('=');
@@ -202,7 +198,7 @@ fn main() -> Result<()> {
                     let k = execve(
                         &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
                         &exe_args,
-                        &env,
+                        env.make_contiguous(),
                     );
                     prompt.notify("nswrap", &format!("exited with {:?}", k));
                 } else {
@@ -218,7 +214,7 @@ fn main() -> Result<()> {
                     let k = execve(
                         &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
                         &exe_args,
-                        &env,
+                        env.make_contiguous(),
                     );
                 }
             } else {
