@@ -57,7 +57,7 @@ fn prompt_confirm(prompt: &str, default: bool) -> bool {
 
 /// Abstraction for sending notifications and asking for confirmation.
 trait Prompt {
-    fn notify(&mut self, summary: &str, body: &str);
+    fn notify(&mut self, summary: Option<&str>, body: &str);
     fn confirm(&mut self, prompt: &str, default: bool) -> bool;
     fn set_silent(&mut self, silent: bool);
 }
@@ -69,7 +69,7 @@ struct TtyPrompt {
 }
 
 impl Prompt for TtyPrompt {
-    fn notify(&mut self, _summary: &str, body: &str) {
+    fn notify(&mut self, _summary: Option<&str>, body: &str) {
         // on TTY, just print the message
         eprintln!("{}", { body });
     }
@@ -77,7 +77,7 @@ impl Prompt for TtyPrompt {
         if !self.silent {
             prompt_confirm(prompt, default)
         } else {
-            self.notify("Auto-confirmed", prompt);
+            self.notify(None, prompt);
             true
         }
     }
@@ -101,16 +101,19 @@ impl DesktopPrompt {
         }
     }
 
-    fn send_notification_cmd(summary: &str, body: &str) {
+    fn send_notification_cmd(summary: Option<&str>, body: &str) {
         // try DBus notification via notify-rust, fall back to notify-send
-        if Notification::new()
-            .summary(summary)
-            .body(body)
-            .show()
-            .is_err()
+        if {
+            let mut n = Notification::new();
+            n.body(body);
+            if let Some(s) = summary {
+                n.summary(s);
+            }
+            n.show().is_err()
+        }
         {
             let _ = std::process::Command::new("notify-send")
-                .arg(summary)
+                .arg("nswrap")
                 .arg(body)
                 .status();
         }
@@ -118,7 +121,7 @@ impl DesktopPrompt {
 }
 
 impl Prompt for DesktopPrompt {
-    fn notify(&mut self, summary: &str, body: &str) {
+    fn notify(&mut self, summary: Option<&str>, body: &str) {
         // best-effort: try notify-send, otherwise print to stderr
         if !self.silent {
             DesktopPrompt::send_notification_cmd(summary, body);
@@ -144,7 +147,7 @@ impl Prompt for DesktopPrompt {
             }
 
             // fall back to notify and default
-            DesktopPrompt::send_notification_cmd("Question", prompt);
+            DesktopPrompt::send_notification_cmd(None, prompt);
             default
         }
     }
@@ -192,7 +195,7 @@ fn main() -> Result<()> {
     let program = self_exe.file_name();
     let Some(name) = program else {
         let mut prompt = detect_prompt();
-        prompt.notify("nswrap", &format!("{:?}. can not get file name", self_exe));
+        prompt.notify(None, &format!("{:?}. can not get file name", self_exe));
         return Ok(());
     };
     let name = name.to_string_lossy();
@@ -237,7 +240,7 @@ fn main() -> Result<()> {
                             ),
                             true,
                         ) {
-                            prompt.notify("nswrap", "Aborted by user.");
+                            prompt.notify(None, "Aborted by user.");
                             return Ok(());
                         }
                         let exe_args = [
@@ -251,10 +254,10 @@ fn main() -> Result<()> {
                             &exe_args,
                             env.make_contiguous(),
                         );
-                        prompt.notify("nswrap", &format!("exited with {:?}", k));
+                        prompt.notify(None, &format!("exited with {:?}", k));
                     } else {
                         if !prompt.confirm(&format!("Execute {:?} -p {}", self_exe, pp), true) {
-                            prompt.notify("nswrap", "Aborted by user.");
+                            prompt.notify(None, "Aborted by user.");
                             return Ok(());
                         }
                         let exe_args = [
@@ -269,17 +272,15 @@ fn main() -> Result<()> {
                         );
                     }
                 } else {
-                    prompt.notify("nswrap", "can not find relevant nsproxy data");
+                    prompt.notify(None, "can not find relevant nsproxy data");
                 }
             }
             _ => {
-                prompt.notify("nswrap", "unsupported");
+                prompt.notify(None, "unsupported");
             }
         }
     } else {
-        println!(
-            "Nsproxy context is required. Use sproxy enter or other commands to enter a shell. Application not started for security reasons"
-        );
+        prompt.notify(Some("nswrap needs a context"), "Use sproxy enter or other commands to enter a shell. Application not started for security reasons");
     }
 
     Ok(())
