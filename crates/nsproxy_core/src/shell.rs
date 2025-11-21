@@ -83,7 +83,12 @@ impl ShellPrefs {
         }
     }
     pub fn set_nsproxy_env(&mut self, browser_profile: Option<String>) {
-        self.env.push(
+        warn!(
+            "setting env variable for brwoser profile {:?}",
+            &browser_profile
+        );
+        self.env.insert(
+            0,
             CString::from_str(&format!(
                 "{}={}",
                 ENV_PROFILE,
@@ -182,31 +187,31 @@ impl ShellPrefs {
         }
     }
 
-    pub async fn spawn_and_block(mut self) -> Result<()> {
-        if let Some(name) = &self.prefer_shell {
-            self.shell = Some(which::which(name)?);
-        }
-        if let Some(cmd) = &self.shell {
-            let mut cmd = std::process::Command::new(cmd);
-            let uid = self.uid.ok_or(anyhow!("can not find suitable uid"))?;
-            cmd.uid(uid);
-            let gids: Vec<_> = self.gids_raw.iter().collect();
-            warn!("spawn process with gids {:?}", &gids);
-            if let Some(gid) = self.gid {
-                cmd.gid(gid);
-            }
-            cmd.groups(&gids.iter().map(|k| **k).collect::<Vec<u32>>());
-            if let Some(cwd) = &self.cwd {
-                cmd.current_dir(cwd);
-            }
-            let mut acmd = tokio::process::Command::from(cmd);
-            let mut c = acmd.spawn()?;
-            c.wait().await;
-        } else {
-            warn!("no shell or program specified");
-        }
-        aok!()
-    }
+    // pub async fn spawn_and_block(mut self) -> Result<()> {
+    //     if let Some(name) = &self.prefer_shell {
+    //         self.shell = Some(which::which(name)?);
+    //     }
+    //     if let Some(cmd) = &self.shell {
+    //         let mut cmd = std::process::Command::new(cmd);
+    //         let uid = self.uid.ok_or(anyhow!("can not find suitable uid"))?;
+    //         cmd.uid(uid);
+    //         let gids: Vec<_> = self.gids_raw.iter().collect();
+    //         warn!("spawn process with gids {:?}", &gids);
+    //         if let Some(gid) = self.gid {
+    //             cmd.gid(gid);
+    //         }
+    //         cmd.groups(&gids.iter().map(|k| **k).collect::<Vec<u32>>());
+    //         if let Some(cwd) = &self.cwd {
+    //             cmd.current_dir(cwd);
+    //         }
+    //         let mut acmd = tokio::process::Command::from(cmd);
+    //         let mut c = acmd.spawn()?;
+    //         c.wait().await;
+    //     } else {
+    //         warn!("no shell or program specified");
+    //     }
+    //     aok!()
+    // }
     pub fn drop_privs(&self) -> Result<()> {
         info!("drop privs, gids to {:?}", self.gids_raw);
         setgroups(
