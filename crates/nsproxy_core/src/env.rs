@@ -124,3 +124,9 @@ impl<'a> ExactSizeIterator for CommandEnvs<'a> {
 }
 
 pub static ENV_PROFILE: &'static str = "NSPROXY_PROFILE_BROWSER";
+pub static ENV_NSWRAP: &'static str = "NSWRAP";
+
+#[derive(strum::EnumString, strum::IntoStaticStr, strum::Display, strum::AsRefStr)]
+pub enum NswrapEnv {
+    Confirm,
+}
