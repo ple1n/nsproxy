@@ -87,27 +87,20 @@ impl ShellPrefs {
             "setting env variable for brwoser profile {:?}",
             &browser_profile
         );
-        self.env.push_front(
-            CString::from_str(&format!(
-                "{}={}",
-                ENV_PROFILE,
-                browser_profile.unwrap_or("UNSPEC".to_string())
-            ))
-            .unwrap(),
-        );
+        let val = browser_profile.unwrap_or("UNSPEC".to_string());
+        unsafe {
+            std::env::set_var(ENV_PROFILE, &val);
+        }
+        self.env
+            .push_front(CString::from_str(&format!("{}={}", ENV_PROFILE, val)).unwrap());
     }
     pub fn set_ns_env(&mut self, ns: Option<&str>) {
-        warn!(
-            "setting env variable for netns {:?}",
-            &ns
-        );
+        warn!("setting env variable for netns {:?}", &ns);
+        unsafe {
+            std::env::set_var(ENV_NS, ns.unwrap_or("UNSPEC"));
+        }
         self.env.push_front(
-            CString::from_str(&format!(
-                "{}={}",
-                ENV_NS,
-                ns.unwrap_or("UNSPEC")
-            ))
-            .unwrap(),
+            CString::from_str(&format!("{}={}", ENV_NS, ns.unwrap_or("UNSPEC"))).unwrap(),
         );
     }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations

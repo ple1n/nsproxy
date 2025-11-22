@@ -518,12 +518,18 @@ fn main() -> anyhow::Result<()> {
                                 let file = file.to_string_lossy();
                                 if file == "nsproxy" || file == "sproxy" {
                                     if list {
-                                        println!("{:?} {:?}", np.cmdline().unwrap(), net);
+                                        println!(
+                                            "{:?} {:?} {}",
+                                            np.cmdline().unwrap(),
+                                            net,
+                                            np.pid
+                                        );
                                     }
                                     let args = Cli::parse_from(&cmds);
-                                    let envs = np.environ()?;
-                                    let mount = envs.get(OsStr::new(ENV_NS));
-                                    let mount = mount.map(|k| k.to_str().unwrap().to_owned());
+                                    // let envs = np.environ()?;
+                                    // let mount = envs.get(OsStr::new(ENV_NS));
+                                    // let mount = mount.map(|k| k.to_str().unwrap().to_owned());
+                                    let mount = None;
                                     found.push(FoundProcess {
                                         cmd: cmds,
                                         args,
@@ -585,18 +591,22 @@ fn main() -> anyhow::Result<()> {
                 let max = found.iter().max_by_key(|k| k.score);
                 if let Some(max) = max {
                     warn!("best match {:?}", max.cmd);
+                    let mut m = None;
                     let (profile) = match &max.args.cmd {
                         MainCommand::Run {
                             profile,
                             name,
                             mount,
                             ..
-                        } => (profile.clone()),
+                        } => {
+                            m = m.or_else(|| name.as_ref().map(name_to_mount_path));
+                            (profile.clone())
+                        }
                         _ => (None),
                     };
+                    let m = m.as_ref().map(|k| k.to_str().unwrap());
                     shell_prefs.set_nsproxy_env(profile);
-                    // shell_prefs.set_ns_env(mount.as_ref().map(|k| k.to_str().unwrap()));
-                    shell_prefs.set_ns_env(max.mount.as_ref().map(|k| k.as_str()));
+                    shell_prefs.set_ns_env(m);
                     let ns = NSSource::Pid(max.pid);
                     ns.enter(CloneFlags::CLONE_NEWNET)?;
                 }
