@@ -112,8 +112,7 @@ impl DesktopPrompt {
                 n.summary(body);
             }
             n.show().is_err()
-        }
-        {
+        } {
             let _ = std::process::Command::new("notify-send")
                 .arg("nswrap")
                 .arg(body)
@@ -273,6 +272,23 @@ fn main() -> Result<()> {
                             env.make_contiguous(),
                         );
                     }
+                } else {
+                    prompt.notify(None, "can not find relevant nsproxy data");
+                }
+            }
+            // we don't trust vscode well enough to do identity separation, but, let's require at least any of netns to be present.
+            Cow::Borrowed("code-insiders") | Cow::Borrowed("code") => {
+                if let Some(pp) = profile {
+                    if !prompt.confirm(&format!("Execute {:?}", self_exe), true) {
+                        prompt.notify(None, "Aborted by user.");
+                        return Ok(());
+                    }
+                    let exe_args = [to_cstr(wrapped.to_str().unwrap())];
+                    let k = execve(
+                        &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
+                        &exe_args,
+                        env.make_contiguous(),
+                    );
                 } else {
                     prompt.notify(None, "can not find relevant nsproxy data");
                 }
