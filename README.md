@@ -202,6 +202,14 @@ This is not necessarily the secure choice.
 
 Your proxy may resolve the name through conventional means, leaking DNS data. 
 
+## Choice of upstream proxy can be your weak point
+
+[clash](https://github.com/clash-verge-rev/clash-verge-rev) or similar common proxy solutions have numerous, and messy dependencies.
+
+Nsproxy containerizes applications and passes traffic to the upstream proxy program of your choice, which can be the OPSEC weak point.
+
+It's recommended to use [geph](https://github.com/geph-official/geph5) which has a monolithic codebase primarily done by one person, or other single-protocoled proxy solutions, ie, directly use overtls, or Tor, where the developers are aware of your privacy needs.
+
 ## IPv6
 
 Many SOCKS5 proxies are not IPV6 capable, which breaks some websites.
