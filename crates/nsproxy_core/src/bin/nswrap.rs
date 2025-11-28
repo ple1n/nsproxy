@@ -182,9 +182,9 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let self_exe = std::env::current_exe().unwrap();
     let wrapped = self_exe.with_extension("wrapped");
-    let args = env::args()
+    let mut args = env::args()
         .map(|k| CString::new(k).unwrap())
-        .collect::<Vec<_>>();
+        .collect::<VecDeque<_>>();
     let mut env: VecDeque<CString> = env::vars()
         .map(|(k, v)| {
             let mut s = k;
@@ -279,14 +279,16 @@ fn main() -> Result<()> {
             // we don't trust vscode well enough to do identity separation, but, let's require at least any of netns to be present.
             Cow::Borrowed("code-insiders") | Cow::Borrowed("code") => {
                 if let Some(pp) = profile {
+                    args.pop_front();
+                    args.push_front(to_cstr(wrapped.to_str().unwrap()));
                     if !prompt.confirm(&format!("Execute {:?}", self_exe), true) {
                         prompt.notify(None, "Aborted by user.");
                         return Ok(());
                     }
-                    let exe_args = [to_cstr(wrapped.to_str().unwrap())];
+
                     let k = execve(
                         &CString::from_str(wrapped.to_str().unwrap()).unwrap(),
-                        &exe_args,
+                        &args.make_contiguous(),
                         env.make_contiguous(),
                     );
                 } else {

@@ -1,5 +1,7 @@
 # _nsproxy_
 
+_Support [room](https://matrix.to/#/#nsproxy:tilde.horse) on matrix._
+
 It is
 
 1. a compatbility layer from sockets to SOCKS
