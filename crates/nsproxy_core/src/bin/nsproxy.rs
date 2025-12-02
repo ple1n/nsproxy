@@ -446,11 +446,19 @@ fn main() -> anyhow::Result<()> {
         MainCommand::Rm { file } => {
             rm_mount(&file)?;
         }
-        MainCommand::Id {} => {
+        MainCommand::Id { pid } => {
             let profile = std::env::var(ENV_PROFILE);
             println!("Browser profile {} {:?}", ENV_PROFILE, profile);
             let ns = std::env::var(ENV_NS);
             println!("Network namespace {} {:?}", ENV_NS, ns);
+
+            let proc = if let Some(pid) = pid {
+                let ns_proc = ExactNS::from_source((PidPath::N(pid as i32), "net"))?;
+                Some(ns_proc)
+            } else {
+                None
+            };
+
             if let Ok(ns) = ns {
                 let path = PathBuf::from(ns);
                 let ns = ExactNS::from_source(path)?;
@@ -460,6 +468,15 @@ fn main() -> anyhow::Result<()> {
                     println!("network namespace matches claim");
                 } else {
                     warn!("netns mismatch");
+                }
+
+                if let Some(proc) = proc {
+                    println!("PID-{} -> {}", pid.unwrap(), proc.unique);
+                    if proc.unique == ns_self.unique {
+                        println!("PID-{} = this process, regarding net-ns", pid.unwrap());
+                    } else {
+                        println!("PID-{} does NOT match this process, regarding net-ns", pid.unwrap());
+                    }
                 }
             }
         }
@@ -660,7 +677,10 @@ fn main() -> anyhow::Result<()> {
             warn!("Installing symlink {:?} -> {:?}", &short_path, &fd);
             symlink(&fd, short_path);
             let short_path_unpriv = dstdir.join("nsp");
-            warn!("Installing symlink {:?} -> {:?}", &short_path_unpriv, &selfprogdst);
+            warn!(
+                "Installing symlink {:?} -> {:?}",
+                &short_path_unpriv, &selfprogdst
+            );
             symlink(&selfprogdst, short_path_unpriv);
 
             sproxyf.set_file_name("nswrap");

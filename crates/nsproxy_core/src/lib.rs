@@ -844,7 +844,10 @@ pub enum MainCommand {
     Gen { save_to: PathBuf },
     /// Identify current net-ns
     #[command(alias = "i")]
-    Id {},
+    Id {
+        /// Optionally supply an PID
+        pid: Option<u32>
+    },
 }
 
 impl std::str::FromStr for NsInput {
