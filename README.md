@@ -163,6 +163,12 @@ sudo dockerd
 ```
 
 
+## Use Podman not docker
+
+You can of course run a dockerd, in an nsproxy container, and stop the systemd-run docker daemon. Or I have considered adding a mount namespace feature to nsproxy but I doubt the effort is justifiable. 
+
+Podman is daemon-less, which means it can be as a whole contained in an nsproxy container.
+
 ## DNS
 
 Socks5 is a protocol that establishes a bidirectional byte stream, when you connect to the TCP endpoint of a SOCKS server and supply a HOST in the handshake. The HOST can be either an IP address or a domain name. 
