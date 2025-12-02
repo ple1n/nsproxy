@@ -69,7 +69,7 @@ Nsproxy can also serve static files directly through the TUN device.
 You may also use `sp` in place of `sproxy` and `nsp` in place of `nsproxy`, the symlinks have been created during install.
 
 ```sh
-$ sp i
+$ sp i # regular check, identify current NS
 sudo check disabled
 2025-12-02T23:36:15.890451Z  INFO nsproxy: open file limits, soft=524288, hard=524288. trying to raise soft limit to max
 Browser profile NSPROXY_PROFILE_BROWSER Ok("base_p")
