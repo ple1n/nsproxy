@@ -57,7 +57,7 @@ use std::{
     os::{
         fd::{AsRawFd, IntoRawFd},
         unix::{
-            fs::{MetadataExt, PermissionsExt},
+            fs::{MetadataExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
         },
     },
@@ -651,11 +651,17 @@ fn main() -> anyhow::Result<()> {
             f.set_permissions(perms)?;
             let meta = f.metadata()?;
             warn!(
-                "sproxy, uid={:?}, gid={}, suid={}",
+                "{fd:?}, uid={:?}, gid={}, suid={}",
                 meta.uid(),
                 meta.gid(),
                 meta.permissions().mode() & 0o4000 != 0
             );
+            let short_path = dstdir.join("sp");
+            warn!("Installing symlink {:?} -> {:?}", &short_path, &fd);
+            symlink(&fd, short_path);
+            let short_path_unpriv = dstdir.join("nsp");
+            warn!("Installing symlink {:?} -> {:?}", &short_path_unpriv, &selfprogdst);
+            symlink(&selfprogdst, short_path_unpriv);
 
             sproxyf.set_file_name("nswrap");
             let fd = dstdir.join(sproxyf.file_name().unwrap());
