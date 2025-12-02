@@ -66,6 +66,20 @@ I run Cinny in an nsproxy container and direct virtual DNS to resolve multiple h
 
 Nsproxy can also serve static files directly through the TUN device.
 
+You may also use `sp` in place of `sproxy` and `nsp` in place of `nsproxy`, the symlinks have been created during install.
+
+```sh
+$ sp i
+sudo check disabled
+2025-12-02T23:36:15.890451Z  INFO nsproxy: open file limits, soft=524288, hard=524288. trying to raise soft limit to max
+Browser profile NSPROXY_PROFILE_BROWSER Ok("base_p")
+Network namespace NSROXY_NS Ok("/run/p1.ns")
+2025-12-02T23:36:15.890524Z  INFO nsproxy_common: stating exact NS at "/run/p1.ns"
+2025-12-02T23:36:15.890549Z  INFO nsproxy_common: stating exact NS at "/proc/1676953/ns/net"
+env=4_4026533567 proc_self=4_4026533567
+network namespace matches claim
+```
+
 ## recommended practice for using with Clash
 
 > Clash or other potentially untrusted proxies.
