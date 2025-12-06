@@ -1,10 +1,7 @@
 [package]
 name = "nsproxy_core"
-version = "3.1.3"
+version = "3.2.3"
 edition = "2024"
-
-[profile.release]
-opt-level = "s"
 
 [dependencies]
 anyhow = "1.0.99"
