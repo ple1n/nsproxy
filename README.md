@@ -6,9 +6,12 @@ It is
 
 1. a compatbility layer from sockets to SOCKS
 2. replacement for `sudo` when you work with network namespaces heavily
-3. a handy tool to isolate traffic of select processes, where you can launch Wireshark inside to inspect the containerized traffic. 
+3. a handy tool to isolate traffic of select processes, where you can launch Wireshark or [RustNet](https://github.com/domcyrus/rustnet) inside to inspect the containerized traffic. 
 4. a containerization-capable daemon for self-hosted web stacks, where you get virtual local domains assigned with zero setup
 5. an extra layer to harden each Librewolf profile with privileged namespaces
+6. a proxy container for *Podman* or Docker
+  - Podman is recommended because it does not run a daemon through systemd which escapes nsproxy
+7. as a better alternative to `/usr/bin/ip` the tool
 
 It is an identity separation tool like Whonix for the paranoid, but much more practical and delightful to use. 
 
