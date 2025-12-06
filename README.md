@@ -1,6 +1,6 @@
 # _nsproxy_
 
-_Support [room](https://matrix.to/#/#nsproxy:tilde.horse) on matrix._
+_Support [room](https://matrix.to/#/#nsproxy:schizo.vip) on matrix._
 
 It is
 
@@ -175,7 +175,6 @@ sproxy enter
 sudo dockerd
 # This runs docker in the nsproxy which faciliates pulling images in a network-constrained environment but you can later just re-run in outside
 ```
-
 
 ## Use Podman not docker
 
