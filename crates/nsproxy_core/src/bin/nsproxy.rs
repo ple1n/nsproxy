@@ -140,7 +140,7 @@ struct AssignedIps {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     // DEBUG is annoying because its filled with TCP retransmission logs
     let (layer, reload_handle) =
         tracing_subscriber::reload::Layer::new(fmt::Layer::new().with_filter(LevelFilter::INFO));
@@ -183,7 +183,7 @@ fn main() -> anyhow::Result<()> {
             let mut shell_prefs = ShellPrefs::default();
             shell_prefs.take_args(sargs);
             shell_prefs.adjust();
-            shell_prefs.set_nsproxy_env(profile);
+            shell_prefs.set_nsproxy_env(profile.clone());
             let ns_moved = [0; 1];
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
@@ -200,6 +200,12 @@ fn main() -> anyhow::Result<()> {
             mount = args_deduce_mount(&name, &mount);
             if let Some(mount) = &mount {
                 shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
+            }
+
+            if cli.conf.is_none() {
+                if let Some(p) = &profile {
+                    cli.conf = Some(PathBuf::from(".").join(p))
+                }
             }
 
             if dst != NsInput::This {
@@ -273,20 +279,23 @@ fn main() -> anyhow::Result<()> {
 
                                     tokio::spawn(async move {
                                         let conf = cli.conf;
-                                        let mut read = [0u8; 24];
-                                        loop {
-                                            let k = tx.read(&mut read[..]).await?;
-                                            if k < 1 {
-                                                continue;
-                                            }
-                                            let fc = tokio::fs::read_to_string(&conf).await?;
-                                            match serde_json::from_str::<HotConfig>(&fc) {
-                                                Ok(newconf) => {
-                                                    enumerate_links(None, &newconf).await?;
+                                        if let Some(conf) = conf {
+                                            let mut read = [0u8; 24];
+                                            loop {
+                                                let k = tx.read(&mut read[..]).await?;
+                                                if k < 1 {
+                                                    continue;
                                                 }
-                                                _ => {}
+                                                let fc = tokio::fs::read_to_string(&conf).await?;
+                                                match serde_json::from_str::<HotConfig>(&fc) {
+                                                    Ok(newconf) => {
+                                                        enumerate_links(None, &newconf).await?;
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
                                         }
+
                                         aok!()
                                     });
 
@@ -475,7 +484,10 @@ fn main() -> anyhow::Result<()> {
                     if proc.unique == ns_self.unique {
                         println!("PID-{} = this process, regarding net-ns", pid.unwrap());
                     } else {
-                        println!("PID-{} does NOT match this process, regarding net-ns", pid.unwrap());
+                        println!(
+                            "PID-{} does NOT match this process, regarding net-ns",
+                            pid.unwrap()
+                        );
                     }
                 }
             }
@@ -762,7 +774,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn watch_config(
     mut vdns_rx: mpsc::Receiver<Option<VirtDNSHandle>>,
-    conf: PathBuf,
+    conf: Option<PathBuf>,
     acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
     child_pid: u32,
     mut tx: tokio::net::UnixStream,
@@ -789,104 +801,106 @@ async fn watch_config(
         );
     }
 
-    let (mut wx, mut rx) = async_watcher()?;
-    wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
-    info!("watch config");
+    if let Some(conf) = conf {
+        let (mut wx, mut rx) = async_watcher()?;
+        wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
+        info!("watch config");
 
-    loop {
-        let vdns = vdns.clone();
-        let conf = conf.clone();
-        let warps = &mut warps;
-        let acceptor = acceptor.clone();
-        let prev_conf = &mut prev_conf_;
-        let tx = &mut tx;
-        let o = async move {
-            warn!("config hot reload");
+        loop {
+            let vdns = vdns.clone();
+            let conf = conf.clone();
+            let warps = &mut warps;
+            let acceptor = acceptor.clone();
+            let prev_conf = &mut prev_conf_;
+            let tx = &mut tx;
+            let o = async move {
+                warn!("config hot reload");
 
-            let mut futs = Vec::new();
-            let conf = conf;
-            let fc = tokio::fs::read_to_string(&conf).await?;
-            match serde_json::from_str::<HotConfig>(&fc) {
-                Ok(newconf) => {
-                    let cloned = newconf.clone();
-                    if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
-                        return Ok(futs);
-                    }
-                    use serde_json::Value;
-                    warps.iter_mut().map(|(p, k)| k.marked = false);
-
-                    info!("enumerate link devices in parent process");
-                    enumerate_links(Some(child_pid), &newconf).await?;
-
-                    if let Some(vdns) = &vdns {
-                        for (domain, ip) in newconf.dns {
-                            let target = TUNResponse::Unreachable;
-                            if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-                                info!("DNS {} -> {}", &domain, addr);
-                                vdns.pin(Some(addr), domain, target);
-                            };
+                let mut futs = Vec::new();
+                let conf = conf;
+                let fc = tokio::fs::read_to_string(&conf).await?;
+                match serde_json::from_str::<HotConfig>(&fc) {
+                    Ok(newconf) => {
+                        let cloned = newconf.clone();
+                        if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
+                            return Ok(futs);
                         }
-                        for (domain, spec) in newconf.tun {
-                            match spec {
-                                Value::String(mapstr) => {
-                                    if let Ok(addr) = mapstr.parse::<SocketAddr>() {
+                        use serde_json::Value;
+                        warps.iter_mut().map(|(p, k)| k.marked = false);
+
+                        info!("enumerate link devices in parent process");
+                        enumerate_links(Some(child_pid), &newconf).await?;
+
+                        if let Some(vdns) = &vdns {
+                            for (domain, ip) in newconf.dns {
+                                let target = TUNResponse::Unreachable;
+                                if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+                                    info!("DNS {} -> {}", &domain, addr);
+                                    vdns.pin(Some(addr), domain, target);
+                                };
+                            }
+                            for (domain, spec) in newconf.tun {
+                                match spec {
+                                    Value::String(mapstr) => {
+                                        if let Ok(addr) = mapstr.parse::<SocketAddr>() {
+                                            info!("NAT-out {} -> {}", &domain, addr);
+                                            let target = TUNResponse::NATByTUN(addr);
+                                        } else if let Ok(path) = mapstr.parse::<PathBuf>() {
+                                            info!("Files {} -> {}", &domain, mapstr);
+                                            match warps.entry(path.clone()) {
+                                                Entry::Vacant(e) => {
+                                                    let f = warp::fs::dir(path.clone());
+                                                    let wa = WarpAcceptor {
+                                                        rx: acceptor.clone(),
+                                                        path: path.clone(),
+                                                    };
+                                                    let ws = warp::serve(f).incoming(wa);
+                                                    futs.push(ws.run());
+                                                    e.insert(ServerItem { marked: true });
+                                                }
+                                                Entry::Occupied(mut e) => {
+                                                    e.get_mut().marked = true;
+                                                }
+                                            }
+                                            let target = TUNResponse::Files(path);
+                                            vdns.pin(None, domain, target);
+                                        }
+                                    }
+                                    Value::Number(port) => {
+                                        let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
+                                        let p: u16 = p.try_into()?;
+                                        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
                                         info!("NAT-out {} -> {}", &domain, addr);
                                         let target = TUNResponse::NATByTUN(addr);
-                                    } else if let Ok(path) = mapstr.parse::<PathBuf>() {
-                                        info!("Files {} -> {}", &domain, mapstr);
-                                        match warps.entry(path.clone()) {
-                                            Entry::Vacant(e) => {
-                                                let f = warp::fs::dir(path.clone());
-                                                let wa = WarpAcceptor {
-                                                    rx: acceptor.clone(),
-                                                    path: path.clone(),
-                                                };
-                                                let ws = warp::serve(f).incoming(wa);
-                                                futs.push(ws.run());
-                                                e.insert(ServerItem { marked: true });
-                                            }
-                                            Entry::Occupied(mut e) => {
-                                                e.get_mut().marked = true;
-                                            }
-                                        }
-                                        let target = TUNResponse::Files(path);
                                         vdns.pin(None, domain, target);
                                     }
-                                }
-                                Value::Number(port) => {
-                                    let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
-                                    let p: u16 = p.try_into()?;
-                                    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
-                                    info!("NAT-out {} -> {}", &domain, addr);
-                                    let target = TUNResponse::NATByTUN(addr);
-                                    vdns.pin(None, domain, target);
-                                }
-                                _ => (),
-                            };
+                                    _ => (),
+                                };
+                            }
                         }
+                        tx.write(&[1u8]).await?;
+
+                        *prev_conf = Some(cloned);
                     }
-                    tx.write(&[1u8]).await?;
-
-                    *prev_conf = Some(cloned);
+                    _ => {
+                        warn!("config changed, but is invalid");
+                    }
                 }
-                _ => {
-                    warn!("config changed, but is invalid");
+
+                anyhow::Ok(futs)
+            };
+
+            info!("serving {} file roots", futs.len());
+            futs = select! {
+                k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
+                _ = join_all(futs), if futs.len() > 0 => {
+                    Vec::new()
                 }
-            }
-
-            anyhow::Ok(futs)
-        };
-
-        info!("serving {} file roots", futs.len());
-        futs = select! {
-            k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
-            _ = join_all(futs), if futs.len() > 0 => {
-                Vec::new()
             }
         }
-    }
 
-    warn!("config watching ended");
+        warn!("config watching ended");
+    }
     aok!()
 }
 

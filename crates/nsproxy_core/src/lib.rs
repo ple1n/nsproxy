@@ -735,8 +735,8 @@ use clap::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    #[arg(short, long, default_value = "./nsproxy.json")]
-    pub conf: PathBuf,
+    #[arg(short, long)]
+    pub conf: Option<PathBuf>,
     #[command(subcommand)]
     pub cmd: MainCommand,
 }
