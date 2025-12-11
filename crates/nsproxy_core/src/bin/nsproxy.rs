@@ -32,7 +32,10 @@ use nsproxy_core::{
     Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, TunMaker,
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     shell::{ShellArgs, ShellPrefs},
-    sys::{Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_ns, rm_mount},
+    sys::{
+        Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_bind, mount_bind_root,
+        mount_ns, rm_mount,
+    },
     tokio_netlink_conn,
     utils::ToExactNs,
 };
@@ -46,7 +49,7 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
@@ -68,7 +71,7 @@ use std::{
     time::Duration,
 };
 use tokio::{select, sync};
-use tracing::{info, level_filters::LevelFilter, warn};
+use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use tun2socks5::{
     ArgMode, IArgs, VirtDNSChange, aok,
@@ -168,10 +171,11 @@ fn main() -> anyhow::Result<()> {
             default,
             no_default,
             log,
-            mut mount,
+            bind: mut mount,
             sargs,
             name,
             profile,
+            mnt,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -206,10 +210,17 @@ fn main() -> anyhow::Result<()> {
                 if let Some(p) = &profile {
                     cli.conf = Some(PathBuf::from(".").join(p))
                 }
+                warn!("Live config is not specified. Use sp -c ./nsproxy.json run");
+            }
+
+            if !mnt {
+                warn!(
+                    "Not directed to use a new mount namespace. Mounts will operate on root namespace. Use --mnt"
+                );
             }
 
             if dst != NsInput::This {
-                let clone = nsproxy_core::sys::clone3::<true>();
+                let clone = nsproxy_core::sys::clone3::<true>(mnt);
                 match clone {
                     Ok(clone) => {
                         match clone {
@@ -221,6 +232,10 @@ fn main() -> anyhow::Result<()> {
                                     bail!("unexpected {:?}", &dst);
                                 }
                                 enable_ping_all()?;
+
+                                if mnt {
+                                    mount_bind_root()?;
+                                }
 
                                 let mut tun = TunMaker::default();
                                 tun.name = tun_name.clone();
@@ -277,19 +292,51 @@ fn main() -> anyhow::Result<()> {
                                             .await?;
                                     }
 
+                                    // TODO: Top level async task should be wrapped and logged
+                                    // Otherwise errors go silent
                                     tokio::spawn(async move {
                                         let conf = cli.conf;
                                         if let Some(conf) = conf {
+                                            let mut mnt: HashMap<PathBuf, PathBuf> =
+                                                Default::default();
                                             let mut read = [0u8; 24];
                                             loop {
+                                                info!("in-ns wait for config");
                                                 let k = tx.read(&mut read[..]).await?;
                                                 if k < 1 {
                                                     continue;
                                                 }
+                                                info!("in-ns reload config");
                                                 let fc = tokio::fs::read_to_string(&conf).await?;
                                                 match serde_json::from_str::<HotConfig>(&fc) {
                                                     Ok(newconf) => {
-                                                        enumerate_links(None, &newconf).await?;
+                                                        for (s, t) in mnt.clone() {
+                                                            if let Some(new) = newconf.mnt.get(&s)
+                                                            {
+                                                                // skip
+                                                            } else {
+                                                                rm_mount(&t);
+                                                                mnt.remove(&s);
+                                                            }
+                                                        }
+                                                        for (s, t) in newconf.mnt.clone() {
+                                                            if let Some(current) = mnt.get(&s)
+                                                                && current == &t
+                                                            {
+                                                                // skip
+                                                            } else {
+                                                                let x = mount_bind(&s, &t);
+                                                                if let Err(e) = x {
+                                                                    error!("Bind mount {:?}", &e);
+                                                                }
+                                                                mnt.insert(s, t);
+                                                            }
+                                                        }
+
+                                                        let _ =
+                                                            enumerate_links(None, &newconf).await;
+
+                                                        // TODO: remove stale mounts
                                                     }
                                                     _ => {}
                                                 }
@@ -593,10 +640,11 @@ fn main() -> anyhow::Result<()> {
                             default,
                             no_default,
                             log,
-                            mount,
+                            bind: mount,
                             sargs,
                             name: name1,
                             profile,
+                            mnt,
                         } => {
                             if *veth {
                                 np.score += 1
@@ -625,7 +673,7 @@ fn main() -> anyhow::Result<()> {
                         MainCommand::Run {
                             profile,
                             name,
-                            mount,
+                            bind: mount,
                             ..
                         } => {
                             m = m.or_else(|| name.as_ref().map(name_to_mount_path));
@@ -836,7 +884,7 @@ async fn watch_config(
                                 let target = TUNResponse::Unreachable;
                                 if let Ok(addr) = ip.parse::<Ipv4Addr>() {
                                     info!("DNS {} -> {}", &domain, addr);
-                                    vdns.pin(Some(addr), domain, target);
+                                    vdns.pin(Some(addr), domain, target)?;
                                 };
                             }
                             for (domain, spec) in newconf.tun {
@@ -863,7 +911,7 @@ async fn watch_config(
                                                 }
                                             }
                                             let target = TUNResponse::Files(path);
-                                            vdns.pin(None, domain, target);
+                                            vdns.pin(None, domain, target)?;
                                         }
                                     }
                                     Value::Number(port) => {
@@ -878,8 +926,8 @@ async fn watch_config(
                                 };
                             }
                         }
+                        info!("ping child");
                         tx.write(&[1u8]).await?;
-
                         *prev_conf = Some(cloned);
                     }
                     _ => {
@@ -890,7 +938,7 @@ async fn watch_config(
                 anyhow::Ok(futs)
             };
 
-            info!("serving {} file roots", futs.len());
+            info!("serving {} file roots. wait for new event.", futs.len());
             futs = select! {
                 k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
                 _ = join_all(futs), if futs.len() > 0 => {

@@ -173,7 +173,7 @@ impl ShellPrefs {
             self.shell = Some(which::which(name)?);
         }
         if let Some(cmd) = &self.shell {
-            let clone = clone3::<false>()?;
+            let clone = clone3::<false>(false)?;
             match &clone {
                 Clone3Result::IsChild { tx } => {
                     let cmd = CString::new(cmd.to_str().unwrap())?;

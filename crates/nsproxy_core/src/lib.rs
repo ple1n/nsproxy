@@ -723,6 +723,8 @@ pub struct HotConfig {
     /// This commands nsproxy to move the devices into the new namespace
     /// And assign them with the provided IP addresses
     pub devs: HashMap<String, String>,
+    /// Bind mounts
+    pub mnt: HashMap<PathBuf, PathBuf>,
 }
 
 use clap::{
@@ -784,7 +786,7 @@ pub enum MainCommand {
         log: Option<LevelFilter>,
         /// Mount namespaces that are created such that you can access them by paths later
         #[arg(short, long)]
-        mount: Option<PathBuf>,
+        bind: Option<PathBuf>,
         #[command(flatten)]
         sargs: ShellArgs,
         /// Instance name
@@ -793,6 +795,9 @@ pub enum MainCommand {
         /// Profile name for browsers
         #[arg(long)]
         profile: Option<String>,
+        /// Use a new mount namespace
+        #[arg(short, long)]
+        mnt: bool,
     },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
@@ -846,7 +851,7 @@ pub enum MainCommand {
     #[command(alias = "i")]
     Id {
         /// Optionally supply an PID
-        pid: Option<u32>
+        pid: Option<u32>,
     },
 }
 
