@@ -233,6 +233,7 @@ unsafe fn mount_setattr(
     Errno::result(k).map(drop)
 }
 
+/// Automatically removes dst if exists
 pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
     warn!("bind mounting {:?} onto {:?}", source, dst);
     if dst.exists() {
@@ -244,6 +245,36 @@ pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
         dst,
         None::<&str>,
         MsFlags::MS_BIND,
+        None::<&str>,
+    )?;
+
+    Ok(())
+}
+
+pub fn mount_bind(source: &Path, dst: &Path) -> Result<()> {
+    warn!("bind mounting {:?} onto {:?}", source, dst);
+    if dst.exists() {
+        remove_file(dst)?;
+    }
+    File::create(dst)?;
+    mount(
+        Some(source),
+        dst,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+
+    Ok(())
+}
+
+pub fn mount_bind_root() -> Result<()> {
+    info!("mount root space");
+    mount(
+        None as Option<&Path>,
+        &PathBuf::from("/"),
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
     )?;
 
@@ -399,14 +430,18 @@ pub fn unshare_user_standalone(
     Ok(())
 }
 
-pub fn clone3<const NEW_NET: bool>() -> Result<Clone3Result> {
+pub fn clone3<const NEW_NET: bool>(mnt: bool) -> Result<Clone3Result> {
     let (x, y) = UnixStream::pair()?;
     let mut pidfd = -1;
     let mut syscall = Clone3::default();
     if NEW_NET {
         syscall.flag_newnet();
     }
+    if mnt {
+        syscall.flag_newns();
+    }
     syscall.flag_pidfd(&mut pidfd);
+    warn!("Clone3 with NEW_NET={}, NEW_NS={}", NEW_NET, mnt);
     match unsafe { syscall.call() }? {
         0 => Ok(Clone3Result::IsChild { tx: x }),
         id => Ok(Clone3Result::Parent {

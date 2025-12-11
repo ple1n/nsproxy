@@ -4,5 +4,8 @@
         "h.cinny.localhost.": "127.0.0.1"
     },
     "tun": {},
-    "devs": {}
+    "devs": {},
+    "mnt": {
+        "README.md": "./install/readme.md"
+    }
 }
