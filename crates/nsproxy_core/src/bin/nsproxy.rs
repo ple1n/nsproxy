@@ -581,8 +581,20 @@ fn main() -> anyhow::Result<()> {
             shell_prefs.adjust();
 
             if let Some(path) = path {
-                let ns = NSSource::Path(path);
+                let ns = NSSource::Path(path.clone());
                 ns.enter(CloneFlags::CLONE_NEWNET)?;
+                let nsdata = path.with_extension("json");
+                let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
+                    std::fs::read_to_string(&nsdata).ok().and_then(|content| serde_json::from_str(&content).ok())
+                } else {
+                    None
+                };
+                if let Some(ns_alive) = ns_alive {
+                    shell_prefs.set_nsproxy_env(ns_alive.browser_profile);
+                    shell_prefs.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
+                } else {
+                    error!("NS data not found at {:?}", nsdata)
+                }
             } else {
                 // enter through a found process
                 #[derive(Debug)]
