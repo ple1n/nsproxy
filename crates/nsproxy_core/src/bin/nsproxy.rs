@@ -379,7 +379,15 @@ fn main() -> anyhow::Result<()> {
                                     let path = format!("/proc/{}/ns/net", child_pid);
                                     let path = PathBuf::from(path);
                                     mount_ns(&path, &mount)?;
-                                    
+
+                                    let ns_alive = nsproxy_core::NsAlive {
+                                        browser_profile: profile.clone(),
+                                        bind_mount: mount.clone(),
+                                    };
+                                    let json = serde_json::to_string_pretty(&ns_alive)?;
+                                    let jsonpath = mount.with_extension("json");
+                                    std::fs::write(&jsonpath, json)?;
+                                    warn!("Auxiliary data written to {:?}", &jsonpath)
                                 }
                                 tx.write(&[0]);
 
@@ -894,7 +902,7 @@ async fn watch_config(
                         if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
                             return Ok(futs);
                         }
-                        use serde_json::Value;
+                        use serde_json::{self, Value};
                         warps.iter_mut().map(|(p, k)| k.marked = false);
 
                         info!("enumerate link devices in parent process");
