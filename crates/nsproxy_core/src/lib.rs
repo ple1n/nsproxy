@@ -732,6 +732,12 @@ use clap::{
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
 };
 
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct NsAlive {
+    pub browser_profile: Option<String>,
+    pub bind_mount: PathBuf
+}
+
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
 #[derive(Parser, Debug)]
