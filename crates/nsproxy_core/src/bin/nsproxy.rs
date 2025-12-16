@@ -54,7 +54,7 @@ use std::{
     ffi::OsStr,
     fs::{self, Permissions},
     future::{pending, ready},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     mem::ManuallyDrop,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::{
@@ -233,7 +233,9 @@ fn main() -> anyhow::Result<()> {
                 match clone {
                     Ok(clone) => {
                         match clone {
-                            Clone3Result::IsChild { tx } => {
+                            Clone3Result::IsChild { mut tx } => {
+                                let mut buf = [0; 8];
+
                                 if let Some(dst) = dst_ns {
                                     dst.enter(CloneFlags::CLONE_NEWNET)?;
                                 }
@@ -241,10 +243,6 @@ fn main() -> anyhow::Result<()> {
                                     bail!("unexpected {:?}", &dst);
                                 }
                                 enable_ping_all()?;
-
-                                if mnt {
-                                    mount_bind_root()?;
-                                }
 
                                 let mut tun = TunMaker::default();
                                 tun.name = tun_name.clone();
@@ -257,6 +255,11 @@ fn main() -> anyhow::Result<()> {
                                 info!("send TUN fd");
                                 tx.send_fd(raw)?;
                                 drop(dev);
+
+                                tx.read(&mut buf)?; // wait for bind mount;
+                                if mnt {
+                                    mount_bind_root()?;
+                                }
 
                                 let rt = tokio::runtime::Builder::new_current_thread()
                                     .enable_all()
@@ -366,24 +369,25 @@ fn main() -> anyhow::Result<()> {
                             Clone3Result::Parent {
                                 child_pid,
                                 child_pidfd,
-                                tx,
+                                mut tx,
                             } => {
                                 info!("recved fd");
                                 let dev = tx.recv_fd()?;
                                 let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
-                                let rt = tokio::runtime::Builder::new_multi_thread()
-                                    .enable_all()
-                                    .build()?;
-                                if let Some(log) = log {
-                                    reload_handle.modify(|k| *k.filter_mut() = log)?;
-                                }
 
                                 if let Some(mount) = mount {
                                     let path = format!("/proc/{}/ns/net", child_pid);
                                     let path = PathBuf::from(path);
                                     mount_ns(&path, &mount)?;
                                 }
+                                tx.write(&[0]);
 
+                                let rt = tokio::runtime::Builder::new_multi_thread()
+                                    .enable_all()
+                                    .build()?;
+                                if let Some(log) = log {
+                                    reload_handle.modify(|k| *k.filter_mut() = log)?;
+                                }
                                 rt.spawn(async move {
                                     let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
                                     let k = fd.into_future().await?;

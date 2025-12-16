@@ -237,7 +237,7 @@ unsafe fn mount_setattr(
 pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
     warn!("bind mounting {:?} onto {:?}", source, dst);
     if dst.exists() {
-        remove_file(dst)?;
+        let _ = rm_mount(dst);
     }
     File::create(dst)?;
     mount(
@@ -254,7 +254,7 @@ pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
 pub fn mount_bind(source: &Path, dst: &Path) -> Result<()> {
     warn!("bind mounting {:?} onto {:?}", source, dst);
     if dst.exists() {
-        remove_file(dst)?;
+        let _ = rm_mount(dst);
     }
     File::create(dst)?;
     mount(
