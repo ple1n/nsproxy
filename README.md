@@ -58,7 +58,7 @@ See `./nsproxy.json` which is similar to the configuration I use. The feature is
 
 ```sh
 # steps to start a local cinny instance in nsproxy container
-sproxy enter
+sp enter
 sudo setcap CAP_NET_BIND_SERVICE=+ep (realpath (which node)) # works on fish
 npm i
 npx vite build
