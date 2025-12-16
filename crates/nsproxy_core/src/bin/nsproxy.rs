@@ -204,13 +204,22 @@ fn main() -> anyhow::Result<()> {
             mount = args_deduce_mount(&name, &mount);
             if let Some(mount) = &mount {
                 shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
+            } else {
+                // Clear any existing NS env if it exists
+                shell_prefs.set_ns_env(None);
             }
 
             if cli.conf.is_none() {
-                if let Some(p) = &profile {
-                    cli.conf = Some(PathBuf::from(".").join(p))
-                }
                 warn!("Live config is not specified. Use sp -c ./nsproxy.json run");
+                if let Some(p) = &profile {
+                    let conf = PathBuf::from(".").join(p).with_extension("json");
+                    if conf.exists() {
+                        cli.conf = Some(conf);
+                        warn!("config file defaults to {:?}", &cli.conf);
+                    } else {
+                        warn!("config file defaults to {:?} but its not found", &conf);
+                    }
+                }
             }
 
             if !mnt {
@@ -304,15 +313,16 @@ fn main() -> anyhow::Result<()> {
                                                 info!("in-ns wait for config");
                                                 let k = tx.read(&mut read[..]).await?;
                                                 if k < 1 {
-                                                    continue;
+                                                    error!("in-ns config watcher exits due to EOF");
+                                                    // EOF??
+                                                    break;
                                                 }
                                                 info!("in-ns reload config");
                                                 let fc = tokio::fs::read_to_string(&conf).await?;
                                                 match serde_json::from_str::<HotConfig>(&fc) {
                                                     Ok(newconf) => {
                                                         for (s, t) in mnt.clone() {
-                                                            if let Some(new) = newconf.mnt.get(&s)
-                                                            {
+                                                            if let Some(new) = newconf.mnt.get(&s) {
                                                                 // skip
                                                             } else {
                                                                 rm_mount(&t);
@@ -446,14 +456,18 @@ fn main() -> anyhow::Result<()> {
                                     let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
                                     let (st_sx, acceptor) = flume::unbounded();
 
-                                    tokio::spawn(watch_config(
-                                        vdns_rx,
-                                        cli.conf.clone(),
-                                        acceptor,
-                                        child_pid as u32,
-                                        tx,
-                                        vethips,
-                                    ));
+                                    tokio::spawn(async move {
+                                        let x = watch_config(
+                                            vdns_rx,
+                                            cli.conf.clone(),
+                                            acceptor,
+                                            child_pid as u32,
+                                            tx,
+                                            vethips,
+                                        )
+                                        .await;
+                                        warn!("out-ns, watcher exited {:?}", x);
+                                    });
 
                                     tun2socks5::main_entry(
                                         dev,
@@ -516,25 +530,27 @@ fn main() -> anyhow::Result<()> {
             };
 
             if let Ok(ns) = ns {
-                let path = PathBuf::from(ns);
-                let ns = ExactNS::from_source(path)?;
-                let ns_self = ExactNS::from_source((PidPath::Selfproc, "net"))?;
-                println!("env={} proc_self={}", ns.unique, ns_self.unique);
-                if ns.unique == ns_self.unique {
-                    println!("network namespace matches claim");
-                } else {
-                    warn!("netns mismatch");
-                }
-
-                if let Some(proc) = proc {
-                    println!("PID-{} -> {}", pid.unwrap(), proc.unique);
-                    if proc.unique == ns_self.unique {
-                        println!("PID-{} = this process, regarding net-ns", pid.unwrap());
+                if ns != "UNSPEC" {
+                    let path = PathBuf::from(ns);
+                    let ns = ExactNS::from_source(path)?;
+                    let ns_self = ExactNS::from_source((PidPath::Selfproc, "net"))?;
+                    println!("env={} proc_self={}", ns.unique, ns_self.unique);
+                    if ns.unique == ns_self.unique {
+                        println!("network namespace matches claim");
                     } else {
-                        println!(
-                            "PID-{} does NOT match this process, regarding net-ns",
-                            pid.unwrap()
-                        );
+                        warn!("netns mismatch");
+                    }
+
+                    if let Some(proc) = proc {
+                        println!("PID-{} -> {}", pid.unwrap(), proc.unique);
+                        if proc.unique == ns_self.unique {
+                            println!("PID-{} = this process, regarding net-ns", pid.unwrap());
+                        } else {
+                            println!(
+                                "PID-{} does NOT match this process, regarding net-ns",
+                                pid.unwrap()
+                            );
+                        }
                     }
                 }
             }
@@ -948,6 +964,8 @@ async fn watch_config(
         }
 
         warn!("config watching ended");
+    } else {
+        error!("no config specified. config watcher stopped");
     }
     aok!()
 }
