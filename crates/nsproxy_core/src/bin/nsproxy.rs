@@ -379,6 +379,7 @@ fn main() -> anyhow::Result<()> {
                                     let path = format!("/proc/{}/ns/net", child_pid);
                                     let path = PathBuf::from(path);
                                     mount_ns(&path, &mount)?;
+                                    
                                 }
                                 tx.write(&[0]);
 
