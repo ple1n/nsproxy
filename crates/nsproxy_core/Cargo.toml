@@ -59,3 +59,4 @@ hyper-util = { version = "0.1.12", features = [
 hardware-address = { version = "0.2.0", features = ["std"] }
 atty = "0.2.14"
 strum = { version = "0.27.2", features = ["derive"] }
+socks5-impl = { path = "../socks5-impl" }
