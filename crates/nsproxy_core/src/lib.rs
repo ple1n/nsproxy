@@ -859,6 +859,10 @@ pub enum MainCommand {
         /// Optionally supply an PID
         pid: Option<u32>,
     },
+    /// Serve a socks5 proxy server that could be used to escape a container
+    Serve {
+        port: u32
+    }
 }
 
 impl std::str::FromStr for NsInput {

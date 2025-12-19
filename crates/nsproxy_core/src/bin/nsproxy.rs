@@ -161,6 +161,9 @@ fn main() -> anyhow::Result<()> {
     rl::Resource::NOFILE.set(hard, hard)?;
 
     match cli.cmd {
+        MainCommand::Serve { port } => {
+            
+        }
         MainCommand::Run {
             src,
             dst,
