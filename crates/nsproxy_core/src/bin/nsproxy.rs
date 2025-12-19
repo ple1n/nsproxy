@@ -915,6 +915,42 @@ fn main() -> anyhow::Result<()> {
                 Ok::<(), anyhow::Error>(())
             })?;
         }
+        MainCommand::Forward { src, dst } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+
+            if dst == src {
+                bail!("src==dst dead loop");
+            }
+
+            rt.block_on(async {
+                let list = format!("0.0.0.0:{}", src);
+                let listener = tokio::net::TcpListener::bind(&list).await?;
+                info!("tcp forward listening on {}", &list);
+                
+                loop {
+                    let (mut client, _) = listener.accept().await?;
+                    let dst_addr = format!("127.0.0.1:{}", dst);
+                    
+                    tokio::spawn(async move {
+                        match tokio::net::TcpStream::connect(&dst_addr).await {
+                            Ok(mut server) => {
+                                info!("forwarded connection to {}", dst_addr);
+                                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut server).await {
+                                    warn!("forward error: {}", e);
+                                } 
+                            }
+                            Err(e) => {
+                                warn!("failed to connect to {}: {}", dst_addr, e);
+                            }
+                        }
+                    });
+                }
+
+                aok!()
+            })?;
+        }
         _ => unimplemented!(),
     }
 

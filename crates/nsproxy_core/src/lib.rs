@@ -717,6 +717,7 @@ pub macro aok {
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
+    /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
     pub tun: HashMap<String, Value>,
     /// Map devs from a mac address (or interface name) to an IP address
@@ -725,6 +726,8 @@ pub struct HotConfig {
     pub devs: HashMap<String, String>,
     /// Bind mounts
     pub mnt: HashMap<PathBuf, PathBuf>,
+    /// Mapping of localhost in container to localhost outside container
+    pub locals: HashMap<u32, u32>
 }
 
 use clap::{
@@ -870,6 +873,11 @@ pub enum MainCommand {
         /// Use socks5 proxy (address:port)
         #[arg(short, long)]
         proxy: Option<String>,
+    },
+    /// TCP forward
+    Forward {
+        src: u32,
+        dst: u32
     }
 }
 
