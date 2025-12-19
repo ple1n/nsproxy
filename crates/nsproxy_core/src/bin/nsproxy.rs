@@ -282,26 +282,6 @@ fn main() -> anyhow::Result<()> {
                                 tx.send_fd(raw)?;
                                 drop(dev);
 
-                                let initial_conf = if let Some(conf) = &cli.conf {
-                                    let fc = std::fs::read_to_string(&conf)?;
-                                    match serde_json::from_str::<HotConfig>(&fc) {
-                                        Ok(newconf) => Some(newconf),
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                if let Some(newconf) = initial_conf {
-                                    for (src, dst) in &newconf.locals {
-                                        // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
-                                        let bind = std::net::TcpListener::bind(format!("127.0.0.1:{}", src))?;
-                                        let raw = bind.as_raw_fd();
-                                        tx.write(&src.to_le_bytes())?;
-                                        tx.send_fd(raw)?;
-                                    }
-                                }
-
                                 tx.read(&mut buf)?; // wait for bind mount;
                                 if mnt {
                                     mount_bind_root()?;
@@ -312,6 +292,8 @@ fn main() -> anyhow::Result<()> {
                                     .build()?;
                                 rt.block_on(async {
                                     use tokio::io::AsyncReadExt;
+                                    use tokio_send_fd::SendFd;
+
                                     let mut read = [0u8; 4];
                                     tx.set_nonblocking(true)?;
                                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
@@ -320,6 +302,16 @@ fn main() -> anyhow::Result<()> {
 
                                     let nl = tokio_netlink_conn()?;
                                     nl.up_lo().await?;
+
+                                    let initial_conf = if let Some(conf) = &cli.conf {
+                                        let fc = std::fs::read_to_string(&conf)?;
+                                        match serde_json::from_str::<HotConfig>(&fc) {
+                                            Ok(newconf) => Some(newconf),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
 
                                     if add_default {
                                         warn!("adding TUN as default route");
@@ -391,6 +383,18 @@ fn main() -> anyhow::Result<()> {
                                                                 mnt.insert(s, t);
                                                             }
                                                         }
+
+                                                        tx.write(&[0, 0, 0, 0]);
+                                                        for (src, dst) in &newconf.locals {
+                                                            // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
+                                                            let bind = std::net::TcpListener::bind(
+                                                                format!("127.0.0.1:{}", src),
+                                                            )?;
+                                                            let raw = bind.as_raw_fd();
+                                                            tx.write(&src.to_le_bytes()).await?;
+                                                            tx.send_fd(raw).await?;
+                                                        }
+                                                        tx.write(&[0, 0, 0, 0]);
 
                                                         let _ =
                                                             enumerate_links(None, &newconf).await;
@@ -1087,6 +1091,25 @@ async fn watch_config(
                         }
                         info!("ping child");
                         tx.write(&[1u8]).await?;
+                        use tokio_send_fd::SendFd;
+                        let mut listener_fds: HashMap<u32, std::os::fd::RawFd> = HashMap::new();
+                        let mut port_bytes = [0u8; 4];
+                        let mut first = false;
+                        while tx.read(&mut port_bytes).await.ok() == Some(4) {
+                            let port = u32::from_le_bytes(port_bytes);
+                            if port == 0 {
+                                if !first {
+                                    first = true;
+                                    continue;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let fd = tx.recv_fd().await?;
+                            info!("received listener fd for port {}", port);
+                            listener_fds.insert(port, fd);
+                        }
+
                         *prev_conf = Some(cloned);
                     }
                     _ => {
