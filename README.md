@@ -2,7 +2,7 @@
 
 _Support [room](https://matrix.to/#/#nsproxy:schizo.vip) on matrix._
 
-It is
+It is a suite of all of the tools you ever need that revolve around SOCKS5 proxy and linux kernel
 
 1. a compatbility layer from sockets to SOCKS
 2. replacement for `sudo` when you work with network namespaces heavily
@@ -12,6 +12,7 @@ It is
 6. a proxy container for *Podman* or Docker
   - Podman is recommended because it does not run a daemon through systemd which escapes nsproxy
 7. as a better alternative to `/usr/bin/ip` the tool
+8. partial replacement for `curl` with sane defaults and [`gost`](https://github.com/ginuerzh/gost) with first-line support for SOCKS5
 
 It is an identity separation tool like Whonix for the paranoid, but much more practical and delightful to use. 
 
