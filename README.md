@@ -254,3 +254,12 @@ Encapsulation is a failure, a failed feature coming from OOP.
 ### V3.3 Major Fixes
 
 - The virtual DNS by default only responds with a mapped virtual IPV6 address, which is hashed off the domain being requested. This sidesteps all the async/locking/ip-allocation problems with reasonable collision resistance. 
+
+### v3.3.3
+
+- Added command `serve` which opens a SOCKS5 server that just forwards connections right in-place, for punching holes through veth
+- Added command `curl`. The sane `curl` implemenation that works right in this use case.
+
+Duplicating functionality will always NOT be a problem. 
+
+Nsproxy is fully audited by me with the consistent engineering practise. 
