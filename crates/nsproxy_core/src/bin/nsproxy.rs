@@ -16,7 +16,10 @@ use futures::{
     },
     future::join_all,
 };
-use tokio::{io::AsyncWriteExt as TokioWriteExt, time::sleep};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as TokioWriteExt},
+    time::sleep,
+};
 
 use futures_lite::future::block_on;
 use hardware_address::MacAddr;
@@ -162,7 +165,26 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         MainCommand::Serve { port } => {
-            
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                use socks5_impl::protocol::*;
+                use socks5_impl::server::*;
+                warn!("starting socks server on 0.0.0.0:{}", port);
+                let addr = format!("0.0.0.0:{}", port);
+                let server = Server::bind(addr.parse()?, Arc::new(auth::NoAuth)).await?;
+                loop {
+                    let (conn, _) = server.accept().await?;
+                    tokio::spawn(async {
+                        if let Err(err) = handle_socks5_connection(conn).await {
+                            warn!("socks5 connection error: {}", err);
+                        }
+                    });
+                }
+
+                aok!()
+            })?;
         }
         MainCommand::Run {
             src,
@@ -588,7 +610,9 @@ fn main() -> anyhow::Result<()> {
                 ns.enter(CloneFlags::CLONE_NEWNET)?;
                 let nsdata = path.with_extension("json");
                 let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
-                    std::fs::read_to_string(&nsdata).ok().and_then(|content| serde_json::from_str(&content).ok())
+                    std::fs::read_to_string(&nsdata)
+                        .ok()
+                        .and_then(|content| serde_json::from_str(&content).ok())
                 } else {
                     None
                 };
@@ -1091,4 +1115,63 @@ pub fn try_resolve_nsinput(nsi: NsInput) -> Result<Option<ExactNS>> {
         NsInput::Pid(p) => Ok(Some(NSFrom::from_source(p)?)),
         _ => Ok(None),
     }
+}
+
+async fn handle_socks5_connection<S>(
+    conn: socks5_impl::server::IncomingConnection<S>,
+) -> anyhow::Result<()>
+where
+    S: Send + Sync + 'static,
+{
+    use socks5_impl::protocol::*;
+    use socks5_impl::server::*;
+    use tokio::io;
+    use tokio::net::TcpStream;
+
+    let (conn, res) = conn.authenticate().await?;
+
+    match conn.wait_request().await? {
+        ClientConnection::UdpAssociate(associate, _) => {
+            info!("UDP associate not supported");
+            let mut conn = associate
+                .reply(Reply::CommandNotSupported, Address::unspecified())
+                .await?;
+            conn.shutdown().await?;
+        }
+        ClientConnection::Bind(bind, _) => {
+            info!("Bind not supported");
+            let mut conn = bind
+                .reply(Reply::CommandNotSupported, Address::unspecified())
+                .await?;
+            conn.shutdown().await?;
+        }
+        ClientConnection::Connect(connect, addr) => {
+            info!("connect to {}", addr);
+            let target = match &addr {
+                Address::DomainAddress(domain, port) => {
+                    TcpStream::connect((domain.as_str(), *port)).await
+                }
+                Address::SocketAddress(socket_addr) => TcpStream::connect(socket_addr).await,
+            };
+
+            match target {
+                Ok(mut target_stream) => {
+                    let mut conn = connect
+                        .reply(Reply::Succeeded, Address::unspecified())
+                        .await?;
+                    info!("established connection to {}", addr);
+                    io::copy_bidirectional(&mut target_stream, &mut conn).await?;
+                }
+                Err(err) => {
+                    warn!("failed to connect to {}: {}", addr, err);
+                    let mut conn = connect
+                        .reply(Reply::HostUnreachable, Address::unspecified())
+                        .await?;
+                    conn.shutdown().await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
