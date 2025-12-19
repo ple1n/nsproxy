@@ -16,6 +16,7 @@ use futures::{
     },
     future::join_all,
 };
+use reqwest::redirect::Policy;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as TokioWriteExt},
     time::sleep,
@@ -878,6 +879,38 @@ fn main() -> anyhow::Result<()> {
                 let addrs = nl.fetch_all_ip_addrs().await?;
                 for a in addrs {
                     println!("{}", a);
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        MainCommand::Curl { url, proxy } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+
+            rt.block_on(async {
+                let client = if let Some(proxy_addr) = proxy {
+                    let proxy_url = format!("socks5h://{}", proxy_addr);
+                    info!("using proxy: {}", proxy_url);
+                    reqwest::Client::builder()
+                        .proxy(reqwest::Proxy::http(proxy_url)?)
+                        .build()?
+                } else {
+                    reqwest::Client::builder()
+                        .redirect(Policy::default())
+                        .build()?
+                };
+
+                info!("requesting: {}", url);
+                match client.get(url).send().await {
+                    Ok(response) => {
+                        println!("Status: {}", response.status());
+                        match response.text().await {
+                            Ok(body) => println!("{}", body),
+                            Err(e) => warn!("failed to read response body: {}", e),
+                        }
+                    }
+                    Err(e) => warn!("request failed: {:?}", e),
                 }
                 Ok::<(), anyhow::Error>(())
             })?;
