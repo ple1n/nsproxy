@@ -2884,6 +2884,7 @@ dependencies = [
  "pidfd 0.2.4",
  "procfs",
  "rand 0.9.2",
+ "reqwest",
  "rlimit",
  "rtnetlink",
  "serde",

@@ -862,6 +862,14 @@ pub enum MainCommand {
     /// Serve a socks5 proxy server that could be used to escape a container
     Serve {
         port: u32
+    },
+    /// Fire a single HTTP request to a URL
+    Curl {
+        /// URL to request
+        url: String,
+        /// Use socks5 proxy (address:port)
+        #[arg(short, long)]
+        proxy: Option<String>,
     }
 }
 
