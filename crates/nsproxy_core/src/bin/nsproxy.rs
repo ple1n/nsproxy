@@ -282,6 +282,26 @@ fn main() -> anyhow::Result<()> {
                                 tx.send_fd(raw)?;
                                 drop(dev);
 
+                                let initial_conf = if let Some(conf) = &cli.conf {
+                                    let fc = std::fs::read_to_string(&conf)?;
+                                    match serde_json::from_str::<HotConfig>(&fc) {
+                                        Ok(newconf) => Some(newconf),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some(newconf) = initial_conf {
+                                    for (src, dst) in &newconf.locals {
+                                        // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
+                                        let bind = std::net::TcpListener::bind(format!("127.0.0.1:{}", src))?;
+                                        let raw = bind.as_raw_fd();
+                                        tx.write(&src.to_le_bytes())?;
+                                        tx.send_fd(raw)?;
+                                    }
+                                }
+
                                 tx.read(&mut buf)?; // wait for bind mount;
                                 if mnt {
                                     mount_bind_root()?;
@@ -928,18 +948,20 @@ fn main() -> anyhow::Result<()> {
                 let list = format!("0.0.0.0:{}", src);
                 let listener = tokio::net::TcpListener::bind(&list).await?;
                 info!("tcp forward listening on {}", &list);
-                
+
                 loop {
                     let (mut client, _) = listener.accept().await?;
                     let dst_addr = format!("127.0.0.1:{}", dst);
-                    
+
                     tokio::spawn(async move {
                         match tokio::net::TcpStream::connect(&dst_addr).await {
                             Ok(mut server) => {
                                 info!("forwarded connection to {}", dst_addr);
-                                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut server).await {
+                                if let Err(e) =
+                                    tokio::io::copy_bidirectional(&mut client, &mut server).await
+                                {
                                     warn!("forward error: {}", e);
-                                } 
+                                }
                             }
                             Err(e) => {
                                 warn!("failed to connect to {}: {}", dst_addr, e);
