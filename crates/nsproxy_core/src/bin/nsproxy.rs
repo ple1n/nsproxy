@@ -62,7 +62,7 @@ use std::{
     mem::ManuallyDrop,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::{
-        fd::{AsRawFd, IntoRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::{
             fs::{MetadataExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
@@ -1092,7 +1092,7 @@ async fn watch_config(
                         info!("ping child");
                         tx.write(&[1u8]).await?;
                         use tokio_send_fd::SendFd;
-                        let mut listener_fds: HashMap<u32, std::os::fd::RawFd> = HashMap::new();
+                        let mut listener_fds: HashMap<u32, OwnedFd> = HashMap::new();
                         let mut port_bytes = [0u8; 4];
                         let mut first = false;
                         while tx.read(&mut port_bytes).await.ok() == Some(4) {
@@ -1106,7 +1106,7 @@ async fn watch_config(
                                 }
                             }
                             let fd = tx.recv_fd().await?;
-                            listener_fds.insert(port, fd);
+                            listener_fds.insert(port, unsafe { OwnedFd::from_raw_fd(fd) });
                         }
                         info!("received TCP listeners {:?}", listener_fds);
 
