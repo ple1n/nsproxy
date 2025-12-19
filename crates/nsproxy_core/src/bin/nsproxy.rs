@@ -384,7 +384,7 @@ fn main() -> anyhow::Result<()> {
                                                             }
                                                         }
 
-                                                        tx.write(&[0, 0, 0, 0]);
+                                                        tx.write(&[0, 0, 0, 0]).await?;
                                                         for (src, dst) in &newconf.locals {
                                                             // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
                                                             let bind = std::net::TcpListener::bind(
@@ -394,7 +394,7 @@ fn main() -> anyhow::Result<()> {
                                                             tx.write(&src.to_le_bytes()).await?;
                                                             tx.send_fd(raw).await?;
                                                         }
-                                                        tx.write(&[0, 0, 0, 0]);
+                                                        tx.write(&[0, 0, 0, 0]).await?;
 
                                                         let _ =
                                                             enumerate_links(None, &newconf).await;
@@ -1106,9 +1106,9 @@ async fn watch_config(
                                 }
                             }
                             let fd = tx.recv_fd().await?;
-                            info!("received listener fd for port {}", port);
                             listener_fds.insert(port, fd);
                         }
+                        info!("received TCP listeners {:?}", listener_fds);
 
                         *prev_conf = Some(cloned);
                     }
