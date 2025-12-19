@@ -2894,6 +2894,7 @@ dependencies = [
  "socks5-impl",
  "strum",
  "tokio",
+ "tokio-send-fd",
  "toml_edit",
  "tracing",
  "tracing-subscriber",

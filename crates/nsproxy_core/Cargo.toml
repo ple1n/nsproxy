@@ -61,3 +61,4 @@ atty = "0.2.14"
 strum = { version = "0.27.2", features = ["derive"] }
 socks5-impl = { path = "../socks5-impl" }
 reqwest = { version = "0.12.23", features = ["socks"] }
+tokio-send-fd = "0.9.4"
