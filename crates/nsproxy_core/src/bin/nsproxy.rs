@@ -53,26 +53,13 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
-    convert::Infallible,
-    ffi::OsStr,
-    fs::{self, Permissions},
-    future::{pending, ready},
-    io::{ErrorKind, Read, Write},
-    mem::ManuallyDrop,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    os::{
+    collections::{HashMap, HashSet, hash_map::Entry}, convert::Infallible, ffi::OsStr, fs::{self, Permissions}, future::{pending, ready}, io::{ErrorKind, Read, Write}, mem::ManuallyDrop, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::{
             fs::{MetadataExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
         },
-    },
-    path::{Path, PathBuf},
-    process::exit,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
+    }, path::{Path, PathBuf}, pin::Pin, process::exit, str::FromStr, sync::Arc, time::Duration
 };
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -1027,7 +1014,7 @@ async fn watch_config(
             let o = async move {
                 warn!("config hot reload");
 
-                let mut futs = Vec::new();
+                let mut futs: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
                 let conf = conf;
                 let fc = tokio::fs::read_to_string(&conf).await?;
                 match serde_json::from_str::<HotConfig>(&fc) {
@@ -1066,7 +1053,7 @@ async fn watch_config(
                                                         path: path.clone(),
                                                     };
                                                     let ws = warp::serve(f).incoming(wa);
-                                                    futs.push(ws.run());
+                                                    futs.push(Box::pin(ws.run()));
                                                     e.insert(ServerItem { marked: true });
                                                 }
                                                 Entry::Occupied(mut e) => {
@@ -1106,7 +1093,10 @@ async fn watch_config(
                                 }
                             }
                             let fd = tx.recv_fd().await?;
-                            listener_fds.insert(port, unsafe { OwnedFd::from_raw_fd(fd) });
+                            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                            futs.push(Box::pin(async move {
+
+                            }));
                         }
                         info!("received TCP listeners {:?}", listener_fds);
 
