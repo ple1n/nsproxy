@@ -986,6 +986,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn handle_tcp_forward_local(fd: OwnedFd, port: u32, dst_port: u32) {
     let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
+    std_listener.set_nonblocking(true).unwrap();
     match tokio::net::TcpListener::from_std(std_listener) {
         Ok(listener) => loop {
             match listener.accept().await {
@@ -1149,6 +1150,7 @@ async fn watch_config(
                                 }
                             }));
                         }
+                        info!("localhost forward {}", newconf.locals.len());
                         info!("received and spawned TCP listener tasks");
 
                         *prev_conf = Some(cloned);
