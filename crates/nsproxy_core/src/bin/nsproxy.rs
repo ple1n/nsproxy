@@ -53,13 +53,27 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry}, convert::Infallible, ffi::OsStr, fs::{self, Permissions}, future::{pending, ready}, io::{ErrorKind, Read, Write}, mem::ManuallyDrop, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, os::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    convert::Infallible,
+    ffi::OsStr,
+    fs::{self, Permissions},
+    future::{pending, ready},
+    io::{ErrorKind, Read, Write},
+    mem::ManuallyDrop,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::{
             fs::{MetadataExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
         },
-    }, path::{Path, PathBuf}, pin::Pin, process::exit, str::FromStr, sync::Arc, time::Duration
+    },
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::exit,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -372,13 +386,13 @@ fn main() -> anyhow::Result<()> {
                                                         }
 
                                                         tx.write(&[0, 0, 0, 0]).await?;
-                                                        for (src, dst) in &newconf.locals {
+                                                        for (in_port, dst) in &newconf.locals {
                                                             // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
                                                             let bind = std::net::TcpListener::bind(
-                                                                format!("127.0.0.1:{}", src),
+                                                                format!("127.0.0.1:{}", in_port),
                                                             )?;
                                                             let raw = bind.as_raw_fd();
-                                                            tx.write(&src.to_le_bytes()).await?;
+                                                            tx.write(&in_port.to_le_bytes()).await?;
                                                             tx.send_fd(raw).await?;
                                                         }
                                                         tx.write(&[0, 0, 0, 0]).await?;
@@ -970,6 +984,41 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_tcp_forward_local(fd: OwnedFd, port: u32, dst_port: u32) {
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
+    match tokio::net::TcpListener::from_std(std_listener) {
+        Ok(listener) => loop {
+            match listener.accept().await {
+                Ok((mut client, _)) => {
+                    let dst_addr = format!("127.0.0.1:{}", dst_port);
+                    tokio::spawn(async move {
+                        match tokio::net::TcpStream::connect(&dst_addr).await {
+                            Ok(mut server) => {
+                                info!("forwarded connection from port {} to {}", port, dst_addr);
+                                if let Err(e) =
+                                    tokio::io::copy_bidirectional(&mut client, &mut server).await
+                                {
+                                    warn!("forward error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("failed to connect to {}: {}", dst_addr, e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("accept error on port {}: {}", port, e);
+                    break;
+                }
+            }
+        },
+        Err(e) => {
+            warn!("failed to create async listener for port {}: {}", port, e);
+        }
+    }
+}
+
 async fn watch_config(
     mut vdns_rx: mpsc::Receiver<Option<VirtDNSHandle>>,
     conf: Option<PathBuf>,
@@ -1014,7 +1063,7 @@ async fn watch_config(
             let o = async move {
                 warn!("config hot reload");
 
-                let mut futs: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
+                let mut futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
                 let conf = conf;
                 let fc = tokio::fs::read_to_string(&conf).await?;
                 match serde_json::from_str::<HotConfig>(&fc) {
@@ -1079,12 +1128,11 @@ async fn watch_config(
                         info!("ping child");
                         tx.write(&[1u8]).await?;
                         use tokio_send_fd::SendFd;
-                        let mut listener_fds: HashMap<u32, OwnedFd> = HashMap::new();
                         let mut port_bytes = [0u8; 4];
                         let mut first = false;
                         while tx.read(&mut port_bytes).await.ok() == Some(4) {
-                            let port = u32::from_le_bytes(port_bytes);
-                            if port == 0 {
+                            let in_port = u32::from_le_bytes(port_bytes);
+                            if in_port == 0 {
                                 if !first {
                                     first = true;
                                     continue;
@@ -1094,11 +1142,14 @@ async fn watch_config(
                             }
                             let fd = tx.recv_fd().await?;
                             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                            let dst_port = newconf.locals.get(&in_port).copied();
                             futs.push(Box::pin(async move {
-
+                                if let Some(dst_port) = dst_port {
+                                    handle_tcp_forward_local(fd, in_port, dst_port).await;
+                                }
                             }));
                         }
-                        info!("received TCP listeners {:?}", listener_fds);
+                        info!("received and spawned TCP listener tasks");
 
                         *prev_conf = Some(cloned);
                     }
