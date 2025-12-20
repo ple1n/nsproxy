@@ -726,7 +726,7 @@ pub struct HotConfig {
     pub devs: HashMap<String, String>,
     /// Bind mounts
     pub mnt: HashMap<PathBuf, PathBuf>,
-    /// Mapping of localhost in container to localhost outside container
+    /// Mapping of localhost:port in container to localhost:port outside container
     pub locals: HashMap<u32, u32>
 }
 
