@@ -918,7 +918,7 @@ fn main() -> anyhow::Result<()> {
                     let proxy_url = format!("socks5h://{}", proxy_addr);
                     info!("using proxy: {}", proxy_url);
                     reqwest::Client::builder()
-                        .proxy(reqwest::Proxy::http(proxy_url)?)
+                        .proxy(reqwest::Proxy::all(proxy_url)?)
                         .build()?
                 } else {
                     reqwest::Client::builder()
