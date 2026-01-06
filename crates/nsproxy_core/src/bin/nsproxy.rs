@@ -203,6 +203,7 @@ fn main() -> anyhow::Result<()> {
             name,
             profile,
             mnt,
+            mut binds,
         } => {
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -253,6 +254,10 @@ fn main() -> anyhow::Result<()> {
                 warn!(
                     "Not directed to use a new mount namespace. Mounts will operate on root namespace. Use --mnt"
                 );
+            }
+
+            if mnt {
+                binds = true
             }
 
             if dst != NsInput::This {
@@ -371,17 +376,23 @@ fn main() -> anyhow::Result<()> {
                                                                 mnt.remove(&s);
                                                             }
                                                         }
-                                                        for (s, t) in newconf.mnt.clone() {
-                                                            if let Some(current) = mnt.get(&s)
-                                                                && current == &t
-                                                            {
-                                                                // skip
-                                                            } else {
-                                                                let x = mount_bind(&s, &t);
-                                                                if let Err(e) = x {
-                                                                    error!("Bind mount {:?}", &e);
+
+                                                        if binds {
+                                                            for (s, t) in newconf.mnt.clone() {
+                                                                if let Some(current) = mnt.get(&s)
+                                                                    && current == &t
+                                                                {
+                                                                    // skip
+                                                                } else {
+                                                                    let x = mount_bind(&s, &t);
+                                                                    if let Err(e) = x {
+                                                                        error!(
+                                                                            "Bind mount {:?}",
+                                                                            &e
+                                                                        );
+                                                                    }
+                                                                    mnt.insert(s, t);
                                                                 }
-                                                                mnt.insert(s, t);
                                                             }
                                                         }
 
@@ -392,7 +403,8 @@ fn main() -> anyhow::Result<()> {
                                                                 format!("127.0.0.1:{}", in_port),
                                                             )?;
                                                             let raw = bind.as_raw_fd();
-                                                            tx.write(&in_port.to_le_bytes()).await?;
+                                                            tx.write(&in_port.to_le_bytes())
+                                                                .await?;
                                                             tx.send_fd(raw).await?;
                                                         }
                                                         tx.write(&[0, 0, 0, 0]).await?;
@@ -648,139 +660,8 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     error!("NS data not found at {:?}", nsdata)
                 }
-            } else {
-                // enter through a found process
-                #[derive(Debug)]
-                struct FoundProcess {
-                    cmd: Vec<String>,
-                    args: Cli,
-                    ns: Option<UniqueFile>,
-                    match_port: bool,
-                    score: u32,
-                    pid: i32,
-                    mount: Option<String>,
-                }
-                let mut nsproxy_procs = Vec::new();
-                let mut found = Vec::new();
-                let procs = procfs::process::all_processes()?;
-                for proc in procs {
-                    let proc = proc;
-                    if let Ok(p) = proc {
-                        if let Ok(cmd) = p.cmdline() {
-                            if cmd.get(0).map(|k| k.contains("sproxy")).unwrap_or_default() {
-                                nsproxy_procs.push(p);
-                            }
-                        }
-                    }
-                }
-                for np in nsproxy_procs {
-                    let ns = np.namespaces();
-                    if let Ok(ns) = ns {
-                        let net =
-                            ns.0.get(OsStr::new("net"))
-                                .map(|k| UniqueFile::new(k.identifier, k.device_id));
-
-                        let cmds = np.cmdline()?;
-                        if let Some(exe) = cmds.get(0) {
-                            let path = PathBuf::from(exe);
-                            let file = path.file_name();
-                            if let Some(file) = file {
-                                let file = file.to_string_lossy();
-                                if file == "nsproxy" || file == "sproxy" {
-                                    if list {
-                                        println!(
-                                            "{:?} {:?} {}",
-                                            np.cmdline().unwrap(),
-                                            net,
-                                            np.pid
-                                        );
-                                    }
-                                    let args = Cli::parse_from(&cmds);
-                                    // let envs = np.environ()?;
-                                    // let mount = envs.get(OsStr::new(ENV_NS));
-                                    // let mount = mount.map(|k| k.to_str().unwrap().to_owned());
-                                    let mount = None;
-                                    found.push(FoundProcess {
-                                        cmd: cmds,
-                                        args,
-                                        ns: net,
-                                        match_port: false,
-                                        score: 0,
-                                        pid: np.pid,
-                                        mount,
-                                    });
-                                } else {
-                                    println!(
-                                        "{:?} {:?} filename={}, skipped",
-                                        np.cmdline().unwrap(),
-                                        net,
-                                        file
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for np in found.iter_mut() {
-                    match &np.args.cmd {
-                        MainCommand::Run {
-                            src,
-                            dst,
-                            tun,
-                            veth,
-                            keep,
-                            all,
-                            default,
-                            no_default,
-                            log,
-                            bind: mount,
-                            sargs,
-                            name: name1,
-                            profile,
-                            mnt,
-                        } => {
-                            if *veth {
-                                np.score += 1
-                            }
-                            if let Some(port) = port {
-                                if let Some(p) = &tun.proxy {
-                                    if p.addr.port() == port {
-                                        np.match_port = true;
-                                        np.score += 1;
-                                    }
-                                }
-                            }
-                            if &name == name1 {
-                                np.score += 10;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                warn!("Found {} nsproxy processes", found.len());
-                let max = found.iter().max_by_key(|k| k.score);
-                if let Some(max) = max {
-                    warn!("best match {:?}", max.cmd);
-                    let mut m = None;
-                    let (profile) = match &max.args.cmd {
-                        MainCommand::Run {
-                            profile,
-                            name,
-                            bind: mount,
-                            ..
-                        } => {
-                            m = m.or_else(|| name.as_ref().map(name_to_mount_path));
-                            (profile.clone())
-                        }
-                        _ => (None),
-                    };
-                    let m = m.as_ref().map(|k| k.to_str().unwrap());
-                    shell_prefs.set_nsproxy_env(profile);
-                    shell_prefs.set_ns_env(m);
-                    let ns = NSSource::Pid(max.pid);
-                    ns.enter(CloneFlags::CLONE_NEWNET)?;
-                }
+            } else {    
+                error!("specify a path");
             }
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1291,30 +1172,30 @@ where
         ClientConnection::UdpAssociate(associate, _) => {
             info!("UDP associate not supported");
             let mut conn = associate
-                .reply(Reply::CommandNotSupported, Address::unspecified())
+                .reply(Reply::CommandNotSupported, WireAddress::unspecified())
                 .await?;
             conn.shutdown().await?;
         }
         ClientConnection::Bind(bind, _) => {
             info!("Bind not supported");
             let mut conn = bind
-                .reply(Reply::CommandNotSupported, Address::unspecified())
+                .reply(Reply::CommandNotSupported, WireAddress::unspecified())
                 .await?;
             conn.shutdown().await?;
         }
         ClientConnection::Connect(connect, addr) => {
             info!("connect to {}", addr);
             let target = match &addr {
-                Address::DomainAddress(domain, port) => {
+                WireAddress::DomainAddress(domain, port) => {
                     TcpStream::connect((domain.as_str(), *port)).await
                 }
-                Address::SocketAddress(socket_addr) => TcpStream::connect(socket_addr).await,
+                WireAddress::SocketAddress(socket_addr) => TcpStream::connect(socket_addr).await,
             };
 
             match target {
                 Ok(mut target_stream) => {
                     let mut conn = connect
-                        .reply(Reply::Succeeded, Address::unspecified())
+                        .reply(Reply::Succeeded, WireAddress::unspecified())
                         .await?;
                     info!("established connection to {}", addr);
                     io::copy_bidirectional(&mut target_stream, &mut conn).await?;
@@ -1322,7 +1203,7 @@ where
                 Err(err) => {
                     warn!("failed to connect to {}: {}", addr, err);
                     let mut conn = connect
-                        .reply(Reply::HostUnreachable, Address::unspecified())
+                        .reply(Reply::HostUnreachable, WireAddress::unspecified())
                         .await?;
                     conn.shutdown().await?;
                 }

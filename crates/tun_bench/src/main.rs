@@ -93,14 +93,14 @@ async fn socks_serve() -> Result<()> {
                 ClientConnection::UdpAssociate(associate, _) => {}
                 ClientConnection::Bind(bind, _) => {
                     let mut conn = bind
-                        .reply(Reply::CommandNotSupported, Address::unspecified())
+                        .reply(Reply::CommandNotSupported, WireAddress::unspecified())
                         .await?;
                     conn.shutdown().await?;
                 }
                 ClientConnection::Connect(connect, addr) => {
                     info!("connect {}", addr);
                     let mut conn = connect
-                        .reply(Reply::Succeeded, Address::unspecified())
+                        .reply(Reply::Succeeded, WireAddress::unspecified())
                         .await?;
                     let rep = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345";
                     conn.write_all(rep).await?;

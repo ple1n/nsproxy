@@ -253,15 +253,14 @@ pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
 
 pub fn mount_bind(source: &Path, dst: &Path) -> Result<()> {
     warn!("bind mounting {:?} onto {:?}", source, dst);
-    if dst.exists() {
-        let _ = rm_mount(dst);
+    if !dst.exists() {
+        File::create(dst)?;
     }
-    File::create(dst)?;
     mount(
         Some(source),
         dst,
         None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_PRIVATE,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     )?;
 
