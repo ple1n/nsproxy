@@ -447,6 +447,7 @@ fn main() -> anyhow::Result<()> {
                                     let ns_alive = nsproxy_core::NsAlive {
                                         browser_profile: profile.clone(),
                                         bind_mount: mount.clone(),
+                                        child_pid: Some(child_pid as u32),
                                     };
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
                                     let jsonpath = mount.with_extension("json");
@@ -658,16 +659,6 @@ fn main() -> anyhow::Result<()> {
             shell_prefs.adjust();
 
             if let Some(path) = path {
-                // Check if mount namespace file exists and enter it first
-                let mnt_ns_file = path.with_extension("mnt.ns");
-                if mnt_ns_file.exists() {
-                    let mnt_ns = NSSource::Path(mnt_ns_file.clone());
-                    mnt_ns.enter(CloneFlags::CLONE_NEWNS)?;
-                    info!("Entered mount namespace from {:?}", &mnt_ns_file);
-                }
-
-                let ns = NSSource::Path(path.clone());
-                ns.enter(CloneFlags::CLONE_NEWNET)?;
                 let nsdata = path.with_extension("json");
                 let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
                     std::fs::read_to_string(&nsdata)
@@ -676,7 +667,23 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     None
                 };
+
                 if let Some(ns_alive) = ns_alive {
+                    // Use child_pid if available to enter both namespaces
+                    if let Some(child_pid) = ns_alive.child_pid {
+                        let ns_source = NSSource::Pid(child_pid as i32);
+                        // Enter mount namespace first
+                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
+                        info!("Entered mount namespace from child PID {}", child_pid);
+                        // Then enter network namespace
+                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                        info!("Entered network namespace from child PID {}", child_pid);
+                    } else {
+                        // Fallback to path-based entry for backwards compatibility
+                        let ns = NSSource::Path(path.clone());
+                        ns.enter(CloneFlags::CLONE_NEWNET)?;
+                    }
+                    
                     shell_prefs.set_nsproxy_env(ns_alive.browser_profile);
                     shell_prefs.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
                 } else {
