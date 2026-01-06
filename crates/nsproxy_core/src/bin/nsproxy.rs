@@ -291,6 +291,7 @@ fn main() -> anyhow::Result<()> {
                                 tx.read(&mut buf)?; // wait for bind mount;
                                 if mnt {
                                     mount_bind_root()?;
+                                    tx.write(&[0])?;
                                 }
 
                                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -450,9 +451,22 @@ fn main() -> anyhow::Result<()> {
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
                                     let jsonpath = mount.with_extension("json");
                                     std::fs::write(&jsonpath, json)?;
-                                    warn!("Auxiliary data written to {:?}", &jsonpath)
+                                    warn!("Auxiliary data written to {:?}", &jsonpath);
+                                    tx.write(&[0]);
+
+                                    // Also mount the mnt namespace if it was created
+                                    if mnt {
+                                        let mut buf = [0; 1];
+                                        tx.read(&mut buf);
+                                        // Somehow doesnt work
+                                        // let mnt_path = format!("/proc/{}/ns/mnt", child_pid);
+                                        // let mnt_path = PathBuf::from(mnt_path);
+                                        // let mnt_ns_file = mount.with_extension("mntns");
+
+                                        // let _ = mount_ns(&mnt_path, &mnt_ns_file);
+                                        // warn!("Mount namespace mounted to {:?}", &mnt_ns_file);
+                                    }
                                 }
-                                tx.write(&[0]);
 
                                 let rt = tokio::runtime::Builder::new_multi_thread()
                                     .enable_all()
@@ -644,6 +658,14 @@ fn main() -> anyhow::Result<()> {
             shell_prefs.adjust();
 
             if let Some(path) = path {
+                // Check if mount namespace file exists and enter it first
+                let mnt_ns_file = path.with_extension("mnt.ns");
+                if mnt_ns_file.exists() {
+                    let mnt_ns = NSSource::Path(mnt_ns_file.clone());
+                    mnt_ns.enter(CloneFlags::CLONE_NEWNS)?;
+                    info!("Entered mount namespace from {:?}", &mnt_ns_file);
+                }
+
                 let ns = NSSource::Path(path.clone());
                 ns.enter(CloneFlags::CLONE_NEWNET)?;
                 let nsdata = path.with_extension("json");
@@ -660,7 +682,7 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     error!("NS data not found at {:?}", nsdata)
                 }
-            } else {    
+            } else {
                 error!("specify a path");
             }
 
