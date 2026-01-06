@@ -740,6 +740,7 @@ use clap::{
 pub struct NsAlive {
     pub browser_profile: Option<String>,
     pub bind_mount: PathBuf,
+    pub child_pid: Option<u32>,
 }
 
 /// NSProxy V3
