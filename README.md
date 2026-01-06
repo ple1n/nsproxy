@@ -247,6 +247,10 @@ Stop making modules private. Dependencies Shall hide nothing from me. 80% of for
 
 Encapsulation is a failure, a failed feature coming from OOP.
 
+## Other softwares that have been tested
+
+- sshfs stays in the nsproxy shell, despite automatically detaching from the shell stdio
+
 ### V3.2 Major fixes
 
 - Nsproxy used to have problem with flatpak installs, due to implementation errors in TCP stack, the speed of download diminishes gradually until zero.
