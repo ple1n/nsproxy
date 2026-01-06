@@ -719,6 +719,7 @@ pub macro aok {
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
+    /// NAT by TUN
     pub tun: HashMap<String, Value>,
     /// Map devs from a mac address (or interface name) to an IP address
     /// This commands nsproxy to move the devices into the new namespace
@@ -727,7 +728,7 @@ pub struct HotConfig {
     /// Bind mounts
     pub mnt: HashMap<PathBuf, PathBuf>,
     /// Mapping of localhost:port in container to localhost:port outside container
-    pub locals: HashMap<u32, u32>
+    pub locals: HashMap<u32, u32>,
 }
 
 use clap::{
@@ -738,7 +739,7 @@ use clap::{
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct NsAlive {
     pub browser_profile: Option<String>,
-    pub bind_mount: PathBuf
+    pub bind_mount: PathBuf,
 }
 
 /// NSProxy V3
@@ -807,6 +808,10 @@ pub enum MainCommand {
         /// Use a new mount namespace
         #[arg(short, long)]
         mnt: bool,
+        /// Enable bind mounts even when NOT using a new mount namspace
+        /// Defaults to true when --mnt is enabled, false when --mnt is not enabled.
+        #[arg(long)]
+        binds: bool,
     },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
@@ -863,9 +868,7 @@ pub enum MainCommand {
         pid: Option<u32>,
     },
     /// Serve a socks5 proxy server that could be used to escape a container
-    Serve {
-        port: u32
-    },
+    Serve { port: u32 },
     /// Fire a single HTTP request to a URL
     Curl {
         /// URL to request
@@ -875,10 +878,7 @@ pub enum MainCommand {
         proxy: Option<String>,
     },
     /// TCP forward
-    Forward {
-        src: u32,
-        dst: u32
-    }
+    Forward { src: u32, dst: u32 },
 }
 
 impl std::str::FromStr for NsInput {
