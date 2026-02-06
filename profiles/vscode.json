@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "rootfs": {
+    "mode": "Overlay",
+    "root": "/",
+    "put_old": null,
+    "tmpfs": false
+  },
+  "mounts": [
+    {
+      "source": "@/.config/Code - Insiders",
+      "target": "~/.config/Code - Insiders"
+    },
+    {
+      "source": "/run/user/1000/wayland-0",
+      "target": "@/run/user/1000/wayland-0"
+    },
+    {
+      "source": "/run/user/1000/wayland-1",
+      "target": "@/run/user/1000/wayland-1"
+    },
+    {
+      "source": "/run/user/1000/pipewire-0",
+      "target": "@/run/user/1000/pipewire-0"
+    },
+    {
+      "source": "/run/user/1000/pipewire-0-manager",
+      "target": "@/run/user/1000/pipewire-0-manager"
+    },
+    {
+      "source": "/run/user/1000/pulse",
+      "target": "@/run/user/1000/pulse"
+    },
+    {
+      "source": "/run/user/1000/dconf",
+      "target": "@/run/user/1000/dconf"
+    },
+    {
+      "source": "/run/user/1000/gvfs",
+      "target": "@/run/user/1000/gvfs"
+    },
+    {
+      "source": "/run/user/1000/systemd",
+      "target": "@/run/user/1000/systemd"
+    },
+    {
+      "source": "/run/systemd",
+      "target": "@/run/systemd"
+    },
+    {
+      "source": "@/run",
+      "target": "/run"
+    },
+    {
+      "source": "@/.vscode-insiders/",
+      "target": "~/.vscode-insiders"
+    }
+  ],
+  "chmod": [
+    {
+      "path": "@/run/user/1000",
+      "uid": 1000,
+      "gid": 1000
+    }
+  ],
+  "env": {},
+  "inherit_env": true,
+  "hot": "@/hot.json",
+  "sargs": {
+    "uid": null,
+    "gid": null,
+    "shell": null,
+    "cwd": null,
+    "gids": []
+  }
+}

@@ -24,7 +24,7 @@ use procfs::process::{FDTarget, Process};
 use rtnetlink::SELF_NS_PATH;
 use std::{
     collections::{HashMap, HashSet},
-    env::var,
+    env::{set_current_dir, var},
     ffi::{CStr, CString},
     fs::{
         File, FileType, OpenOptions, create_dir, create_dir_all, read_dir, remove_dir_all,
@@ -50,6 +50,7 @@ use nix::{
     NixPath,
     errno::Errno,
     libc::{AT_FDCWD, MS_PRIVATE, SYS_mount_setattr, c_int},
+    unistd::pivot_root,
 };
 
 use crate::{Paths, PathsBinds, aok};
@@ -267,6 +268,121 @@ pub fn mount_bind(source: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_mount_target(src: &Path, dst: &Path) -> Result<()> {
+    info!("ensure_mount_target: src={:?}, dst={:?}", src, dst);
+    
+    let meta = std::fs::metadata(src).map_err(|e| {
+        anyhow::anyhow!("Failed to stat source {:?}: {}", src, e)
+    })?;
+    
+    info!("  source exists, is_dir={}, is_file={}", meta.is_dir(), meta.is_file());
+    
+    if meta.is_dir() {
+        info!("  creating target directory: {:?}", dst);
+        create_dir_all(dst).map_err(|e| {
+            anyhow::anyhow!("Failed to create target directory {:?}: {}", dst, e)
+        })?;
+    } else {
+        if let Some(parent) = dst.parent() {
+            info!("  checking if parent exists: {:?}", parent);
+            match std::fs::metadata(parent) {
+                Ok(m) => {
+                    info!("  parent exists, is_dir={}", m.is_dir());
+                    // Check what filesystem we're on
+                    match nix::sys::statfs::statfs(parent) {
+                        Ok(fs) => info!("  parent filesystem type: {:?}", fs.filesystem_type()),
+                        Err(e) => info!("  couldn't get parent fs type: {}", e),
+                    }
+                }
+                Err(e) => {
+                    info!("  parent doesn't exist ({}), creating: {:?}", e, parent);
+                    create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!("Failed to create parent directory {:?}: {}", parent, e)
+                    })?;
+                    // Check the created directory
+                    match std::fs::metadata(parent) {
+                        Ok(m) => info!("  created parent, is_dir={}", m.is_dir()),
+                        Err(e) => info!("  created parent but can't stat: {}", e),
+                    }
+                }
+            }
+        } else {
+            info!("  no parent directory for {:?}", dst);
+        }
+        
+        // Check if target already exists
+        match std::fs::metadata(dst) {
+            Ok(m) => {
+                info!("  target already exists! type={:?}, skipping creation", m.file_type());
+                // Target already exists, no need to create it
+            }
+            Err(_) => {
+                info!("  target doesn't exist yet, creating target file: {:?}", dst);
+                File::create(dst).map_err(|e| {
+                    // Additional context about the error
+                    let parent_readable = dst.parent().and_then(|p| std::fs::read_dir(p).ok()).is_some();
+                    anyhow::anyhow!("Failed to create target file {:?}: {} (errno: {:?}, parent_readable: {})", 
+                        dst, e, e.raw_os_error(), parent_readable)
+                })?;
+            }
+        }
+    }
+
+    info!("  ensure_mount_target succeeded");
+    Ok(())
+}
+
+pub fn mount_bind_rw_explicit(source: &Path, dst: &Path, recursive: bool) -> Result<()> {
+    warn!("bind mounting {:?} onto {:?}", source, dst);
+    ensure_mount_target(source, dst).map_err(|e| {
+        anyhow::anyhow!("Failed to ensure mount target for {:?} -> {:?}: {}", source, dst, e)
+    })?;
+    let mut flags = MsFlags::MS_BIND;
+    if recursive {
+        flags |= MsFlags::MS_REC;
+    }
+    mount(Some(source), dst, None::<&str>, flags, None::<&str>).map_err(|e| {
+        anyhow::anyhow!("Failed to bind mount {:?} -> {:?}: {}", source, dst, e)
+    })?;
+
+    Ok(())
+}
+
+pub fn mount_bind_ro_explicit(source: &Path, dst: &Path, recursive: bool) -> Result<()> {
+    mount_bind_rw_explicit(source, dst, recursive)?;
+    let mut flags = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY;
+    if recursive {
+        flags |= MsFlags::MS_REC;
+    }
+    mount(Some(source), dst, None::<&str>, flags, None::<&str>)?;
+
+    Ok(())
+}
+
+pub fn mount_tmpfs(dst: &Path) -> Result<()> {
+    create_dir_all(dst)?;
+    mount(
+        Some("tmpfs"),
+        dst,
+        Some("tmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    )?;
+
+    Ok(())
+}
+
+pub fn pivot_root_into(new_root: &Path, put_old: &Path) -> Result<()> {
+    create_dir_all(new_root)?;
+    create_dir_all(put_old)?;
+    pivot_root(new_root, put_old)?;
+    set_current_dir("/")?;
+    umount2(put_old, MntFlags::MNT_DETACH)?;
+    remove_dir_all(put_old)?;
+
+    Ok(())
+}
+
 pub fn mount_bind_root() -> Result<()> {
     info!("mount root space");
     mount(
@@ -429,18 +545,24 @@ pub fn unshare_user_standalone(
     Ok(())
 }
 
-pub fn clone3<const NEW_NET: bool>(mnt: bool) -> Result<Clone3Result> {
+pub fn clone3<const NEW_NET: bool>(mnt: bool, new_pid: bool) -> Result<Clone3Result> {
     let (x, y) = UnixStream::pair()?;
     let mut pidfd = -1;
     let mut syscall = Clone3::default();
     if NEW_NET {
         syscall.flag_newnet();
     }
+    if new_pid {
+        syscall.flag_newpid();
+    }
     if mnt {
         syscall.flag_newns();
     }
     syscall.flag_pidfd(&mut pidfd);
-    warn!("Clone3 with NEW_NET={}, NEW_NS={}", NEW_NET, mnt);
+    warn!(
+        "Clone3 with NEW_NET={}, NEW_NS={}, NEW_PID={}",
+        NEW_NET, mnt, new_pid
+    );
     match unsafe { syscall.call() }? {
         0 => Ok(Clone3Result::IsChild { tx: x }),
         id => Ok(Clone3Result::Parent {

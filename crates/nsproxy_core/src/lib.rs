@@ -6,20 +6,20 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, create_dir_all};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Ok;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::ensure;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use ipnetwork::Ipv4Network;
@@ -50,7 +50,7 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tracing::level_filters::LevelFilter;
-use tracing::warn;
+use tracing::{info, warn};
 pub use tun2socks5;
 pub mod env;
 pub mod prelude;
@@ -731,6 +731,549 @@ pub struct HotConfig {
     pub locals: HashMap<u32, u32>,
 }
 
+/// Explicit, stable profile config for filesystem isolation and app launch
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProfileConfig {
+    /// Schema version for compatibility checks
+    pub schema: u32,
+    /// Filesystem isolation plan
+    pub rootfs: ProfileRootfs,
+    /// Explicit bind mounts, in order
+    pub mounts: Vec<ProfileMount>,
+    /// Optional chmod operations to apply after mounts
+    #[serde(default)]
+    pub chmod: Vec<ProfileChmod>,
+    /// Environment variables (overrides if inherit_env=true, replaces if false)
+    pub env: HashMap<String, String>,
+    /// Inherit parent environment and apply env as overrides (default: true)
+    #[serde(default = "default_inherit_env")]
+    pub inherit_env: bool,
+    /// Hot config JSON path (frequently changed)
+    pub hot: PathBuf,
+    /// Explicit shell argument overrides
+    #[serde(default)]
+    pub sargs: ShellArgs,
+}
+
+fn default_inherit_env() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProfileRootfs {
+    /// Overlay keeps current root, Pivot swaps root
+    pub mode: RootfsMode,
+    /// Root prefix. For overlay this must be "/"; for pivot this is the new root.
+    pub root: PathBuf,
+    /// Required when mode is Pivot. Must be under root.
+    pub put_old: Option<PathBuf>,
+    /// If true, mount tmpfs at root before constructing
+    pub tmpfs: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum RootfsMode {
+    Overlay,
+    Pivot,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProfileMount {
+    /// Host path
+    pub source: PathBuf,
+    /// Target path inside the container root
+    pub target: PathBuf,
+    /// Mount read-only (default: false)
+    #[serde(default)]
+    pub read_only: bool,
+    /// Mount recursively (default: true)
+    #[serde(default = "default_recursive")]
+    pub recursive: bool,
+}
+
+/// Permission/ownership operation to apply inside the container root
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProfileChmod {
+    /// Target path inside the container root
+    pub path: PathBuf,
+    /// Mode bits (e.g. 0o755)
+    pub mode: Option<u32>,
+    /// Owner uid
+    pub uid: Option<u32>,
+    /// Owner gid
+    pub gid: Option<u32>,
+}
+
+fn default_recursive() -> bool {
+    true
+}
+
+impl ProfileConfig {
+    pub fn load(path: &Path) -> Result<ProfileConfig> {
+        create_dir_all(PERSIST_ROOT)?;
+        let fc = std::fs::read_to_string(path)?;
+        let conf: ProfileConfig = serde_json::from_str(&fc)?;
+        conf.validate()?;
+        Ok(conf)
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.schema > 0, "schema must be > 0");
+        ensure!(
+            self.rootfs.root.is_absolute(),
+            "rootfs.root must be absolute"
+        );
+        match self.rootfs.mode {
+            RootfsMode::Overlay => {
+                ensure!(
+                    self.rootfs.root == PathBuf::from("/"),
+                    "overlay root must be '/'"
+                );
+                ensure!(
+                    self.rootfs.put_old.is_none(),
+                    "overlay must not set put_old"
+                );
+                ensure!(!self.rootfs.tmpfs, "overlay must not set tmpfs");
+            }
+            RootfsMode::Pivot => {
+                let put_old = self
+                    .rootfs
+                    .put_old
+                    .clone()
+                    .ok_or(anyhow!("pivot requires put_old"))?;
+                ensure!(put_old.is_absolute(), "put_old must be absolute");
+                ensure!(
+                    put_old.starts_with(&self.rootfs.root),
+                    "put_old must be under root"
+                );
+            }
+        }
+        if let Some(ref cwd) = self.sargs.cwd {
+            ensure!(cwd.is_absolute(), "sargs.cwd must be absolute");
+        }
+        // Allow @ placeholder in hot path (will be expanded at runtime)
+        if let Some(hot_str) = self.hot.to_str() {
+            ensure!(
+                self.hot.is_absolute() || hot_str.starts_with('@'),
+                "hot must be absolute or use @ placeholder"
+            );
+        } else {
+            ensure!(self.hot.is_absolute(), "hot must be absolute");
+        }
+        for m in &self.mounts {
+            // Allow @ placeholder in source paths
+            if let Some(source_str) = m.source.to_str() {
+                ensure!(
+                    m.source.is_absolute() || source_str.starts_with('@'),
+                    "mount source must be absolute or use @ placeholder"
+                );
+            } else {
+                ensure!(m.source.is_absolute(), "mount source must be absolute");
+            }
+            // Allow ~ prefix and @ placeholder for target paths (will be expanded at runtime)
+            if let Some(target_str) = m.target.to_str() {
+                ensure!(
+                    m.target.is_absolute() || target_str.starts_with("~/") || target_str == "~" || target_str.starts_with('@'),
+                    "mount target must be absolute, start with ~/, or use @ placeholder"
+                );
+            } else {
+                ensure!(m.target.is_absolute(), "mount target must be absolute");
+            }
+        }
+        for c in &self.chmod {
+            if let Some(path_str) = c.path.to_str() {
+                ensure!(
+                    c.path.is_absolute()
+                        || path_str.starts_with("~/")
+                        || path_str == "~"
+                        || path_str.starts_with('@'),
+                    "chmod path must be absolute, start with ~/, or use @ placeholder"
+                );
+            } else {
+                ensure!(c.path.is_absolute(), "chmod path must be absolute");
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand @ placeholder to instance state root (/nsp3/{name})
+    pub fn expand_placeholders(&mut self, instance_root: &Path) {
+        let root_str = instance_root.to_string_lossy();
+        
+        // Expand hot path
+        if let Some(hot_str) = self.hot.to_str() {
+            if hot_str.starts_with('@') {
+                self.hot = PathBuf::from(hot_str.replace('@', &root_str));
+            }
+        }
+        
+        // Expand mount paths
+        for m in &mut self.mounts {
+            if let Some(source_str) = m.source.to_str() {
+                if source_str.starts_with('@') {
+                    m.source = PathBuf::from(source_str.replace('@', &root_str));
+                }
+            }
+            if let Some(target_str) = m.target.to_str() {
+                if target_str.starts_with('@') {
+                    m.target = PathBuf::from(target_str.replace('@', &root_str));
+                }
+            }
+        }
+        
+        // Expand sargs.cwd
+        if let Some(ref cwd) = self.sargs.cwd {
+            if let Some(cwd_str) = cwd.to_str() {
+                if cwd_str.starts_with('@') {
+                    self.sargs.cwd = Some(PathBuf::from(cwd_str.replace('@', &root_str)));
+                }
+            }
+        }
+
+        // Expand chmod paths
+        for c in &mut self.chmod {
+            if let Some(path_str) = c.path.to_str() {
+                if path_str.starts_with('@') {
+                    c.path = PathBuf::from(path_str.replace('@', &root_str));
+                }
+            }
+        }
+    }
+
+    pub fn template(name: &str, hot_path: &Path) -> Result<ProfileConfig> {
+        use nix::unistd::getresuid;
+        use nsproxy_common::UID_HINT_VAR;
+        use std::result::Result::Ok;
+        use uzers::os::unix::UserExt;
+
+        // Detect UID the same way ShellArgs does
+        let uid = if let Ok(id) = std::env::var(UID_HINT_VAR) {
+            id.parse()?
+        } else if let Ok(id) = std::env::var("SUDO_UID") {
+            id.parse()?
+        } else {
+            let res = getresuid()?;
+            if !res.real.is_root() {
+                res.real.as_raw()
+            } else if let Ok(kde) = std::env::var("KDE_SESSION_UID") {
+                kde.parse()?
+            } else {
+                1000 // fallback
+            }
+        };
+
+        let user = uzers::get_user_by_uid(uid)
+            .ok_or_else(|| anyhow!("cannot find user for uid {}", uid))?;
+
+        let shell = user.shell().to_owned();
+        let shell_path = PathBuf::from(shell);
+        let shell_str = shell_path
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid shell path"))?
+            .to_string();
+
+        let gid = user.primary_group_id();
+        let gids: Vec<u32> = user
+            .groups()
+            .unwrap_or_default()
+            .iter()
+            .map(|g| g.gid())
+            .collect();
+
+        Ok(ProfileConfig {
+            schema: 1,
+            rootfs: ProfileRootfs {
+                mode: RootfsMode::Overlay,
+                root: PathBuf::from("/"),
+                put_old: None,
+                tmpfs: false,
+            },
+            mounts: vec![],
+            env: HashMap::new(),
+            inherit_env: true,
+            hot: hot_path.to_path_buf(),
+            sargs: ShellArgs {
+                uid: Some(uid),
+                gid: Some(gid),
+                gids: gids,
+                shell: Some(shell_str),
+                cwd: Some(user.home_dir().to_path_buf()),
+            },
+            chmod: Vec::new()
+        })
+    }
+}
+
+/// Persistent profile storage root
+pub const PERSIST_ROOT: &str = "/nsp3";
+
+/// Runtime state directory (namespace bind mounts and metadata)
+pub const RUNTIME_ROOT: &str = "/run/nsproxy";
+
+/// Global wrapped binaries configuration path
+pub const WRAPPED_BINARIES_CONFIG: &str = "/nsp3/wrapped_binaries.json";
+
+/// Configuration for binaries that must be wrapped for security
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct WrappedBinariesConfig {
+    /// List of absolute paths to binaries that must be wrapped
+    pub binaries: Vec<PathBuf>,
+    /// Cached BLAKE3 hash of nswrap binary
+    pub nswrap_hash: Option<String>,
+}
+
+impl WrappedBinariesConfig {
+    pub fn load() -> Result<Self> {
+        use tracing::{info, warn};
+        let path = Path::new(WRAPPED_BINARIES_CONFIG);
+        if path.exists() {
+            let content = std::fs::read_to_string(path)?;
+            Ok(serde_json::from_str(&content)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        create_dir_all(PERSIST_ROOT)?;
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(WRAPPED_BINARIES_CONFIG, content)?;
+        Ok(())
+    }
+
+    /// Add a binary by name (resolves via which) and save
+    pub fn add_binary(&mut self, name: &str) -> Result<PathBuf> {
+        let resolved_path = which::which(name)?;
+        
+        if self.binaries.contains(&resolved_path) {
+            info!("Binary {:?} already in config", resolved_path);
+            return Ok(resolved_path);
+        }
+        
+        self.binaries.push(resolved_path.clone());
+        self.save()?;
+        info!("Added {:?} to wrapped binaries config", resolved_path);
+        Ok(resolved_path)
+    }
+
+    /// Compute BLAKE3 hash of a file
+    fn compute_file_hash(path: &Path) -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = blake3::Hasher::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    /// Get the expected nswrap hash (from cache or by computing)
+    /// This will compute and cache the hash if not present
+    fn get_or_compute_nswrap_hash(&mut self) -> Result<String> {
+        if let Some(ref hash) = self.nswrap_hash {
+            return Ok(hash.clone());
+        }
+        
+        let nswrap_path = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
+            .join("nswrap");
+        
+        if !nswrap_path.exists() {
+            bail!("nswrap binary not found at {:?}", nswrap_path);
+        }
+        
+        let hash = Self::compute_file_hash(&nswrap_path)?;
+        self.nswrap_hash = Some(hash.clone());
+        self.save()?;
+        Ok(hash)
+    }
+
+    /// Check if all configured binaries are properly wrapped
+    /// Requires cached hash - will not compute it
+    pub fn check_all_wrapped(&self) -> Result<()> {
+        if self.binaries.is_empty() {
+            return Ok(());
+        }
+
+        let expected_hash = self.nswrap_hash.as_ref()
+            .ok_or_else(|| anyhow!("No cached nswrap hash found. Run 'sp wrap' first to initialize."))?;
+        
+        let mut errors = Vec::new();
+
+        for binary_path in &self.binaries {
+            if let Err(e) = self.check_single_wrapped(binary_path, expected_hash) {
+                errors.push(format!("{:?}: {}", binary_path, e));
+            }
+        }
+
+        if !errors.is_empty() {
+            bail!("Wrapped binaries check failed:\n{}", errors.join("\n"));
+        }
+
+        Ok(())
+    }
+
+    /// Check if a single binary is properly wrapped
+    pub fn check_single_wrapped(&self, binary_path: &Path, expected_hash: &str) -> Result<()> {
+        let wrapped_path = binary_path.with_extension("wrapped");
+        
+        if !wrapped_path.exists() {
+            bail!("missing .wrapped file");
+        }
+
+        if !binary_path.exists() {
+            bail!("binary does not exist");
+        }
+
+        // Verify the binary at binary_path has the expected nswrap hash
+        let actual_hash = Self::compute_file_hash(binary_path)?;
+        if actual_hash != expected_hash {
+            bail!("hash mismatch: expected {} but got {}", expected_hash, actual_hash);
+        }
+
+        Ok(())
+    }
+
+    /// Wrap all configured binaries
+    pub fn wrap_all(&mut self) -> Result<()> {
+        if self.binaries.is_empty() {
+            warn!("No binaries configured for wrapping");
+            return Ok(());
+        }
+
+        let nswrap_path = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
+            .join("nswrap");
+        
+        if !nswrap_path.exists() {
+            bail!("nswrap binary not found at {:?}", nswrap_path);
+        }
+
+        // Compute and cache the hash
+        let _ = self.get_or_compute_nswrap_hash()?;
+
+        info!("Wrapping {} binaries...", self.binaries.len());
+        
+        // Clone the list to avoid borrow checker issues
+        let binaries = self.binaries.clone();
+        for binary_path in &binaries {
+            self.wrap_single(binary_path, &nswrap_path)?;
+        }
+
+        info!("All binaries wrapped successfully");
+        Ok(())
+    }
+
+    /// Wrap a single binary
+    fn wrap_single(&mut self, binary_path: &Path, nswrap_path: &Path) -> Result<()> {
+        if !binary_path.exists() {
+            bail!("Binary {:?} does not exist", binary_path);
+        }
+
+        let wrapped_path = binary_path.with_extension("wrapped");
+        
+        if wrapped_path.exists() {
+            // Already wrapped, verify it's correct
+            let expected_hash = self.get_or_compute_nswrap_hash()?;
+            let check_result = self.check_single_wrapped(binary_path, &expected_hash);
+            match check_result {
+                Ok(_) => {
+                    info!("Binary {:?} already properly wrapped", binary_path);
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!("Binary {:?} is wrapped but check failed. Re-wrapping...", binary_path);
+                    // Remove the bad wrapped file and re-wrap
+                    std::fs::remove_file(binary_path)?;
+                    std::fs::rename(&wrapped_path, binary_path)?;
+                }
+            }
+        }
+
+        info!("Wrapping binary: {:?}", binary_path);
+        std::fs::rename(binary_path, &wrapped_path)?;
+        std::fs::copy(nswrap_path, binary_path)?;
+        
+        Ok(())
+    }
+
+    /// Unwrap all configured binaries
+    pub fn unwrap_all(&mut self) -> Result<()> {
+        if self.binaries.is_empty() {
+            warn!("No binaries configured for unwrapping");
+            return Ok(());
+        }
+
+        info!("Unwrapping {} binaries...", self.binaries.len());
+        
+        // Clone the list to avoid borrow checker issues
+        let binaries = self.binaries.clone();
+        for binary_path in &binaries {
+            self.unwrap_single(binary_path)?;
+        }
+
+        // Clear cached hash after unwrapping
+        self.nswrap_hash = None;
+        self.save()?;
+
+        info!("All binaries unwrapped successfully");
+        Ok(())
+    }
+
+    /// Unwrap a single binary
+    fn unwrap_single(&self, binary_path: &Path) -> Result<()> {
+        let wrapped_path = binary_path.with_extension("wrapped");
+        
+        if !wrapped_path.exists() {
+            info!("Binary {:?} not wrapped", binary_path);
+            return Ok(());
+        }
+
+        info!("Unwrapping binary: {:?}", binary_path);
+        
+        if binary_path.exists() {
+            std::fs::remove_file(binary_path)?;
+        }
+        
+        std::fs::rename(&wrapped_path, binary_path)?;
+        
+        Ok(())
+    }
+}
+
+/// Helper functions for consistent path handling
+pub mod state_paths {
+    use super::*;
+    
+    /// Get profile directory for a named profile
+    pub fn profile_dir(name: &str) -> PathBuf {
+        PathBuf::from(PERSIST_ROOT).join(name)
+    }
+    
+    /// Get profile.json path for a named profile
+    pub fn profile_config(name: &str) -> PathBuf {
+        profile_dir(name).join("profile.json")
+    }
+    
+    /// Get hot.json path for a named profile
+    pub fn hot_config(name: &str) -> PathBuf {
+        profile_dir(name).join("hot.json")
+    }
+    
+    /// Get namespace bind mount path
+    pub fn ns_bind_mount(name: &str) -> PathBuf {
+        PathBuf::from(RUNTIME_ROOT).join(format!("{}.ns", name))
+    }
+    
+    /// Get metadata JSON path for a namespace
+    pub fn ns_metadata(name: &str) -> PathBuf {
+        PathBuf::from(RUNTIME_ROOT).join(format!("{}.json", name))
+    }
+    
+    /// Get metadata JSON path from bind mount path
+    pub fn metadata_for_bind(bind_path: &Path) -> PathBuf {
+        bind_path.with_extension("json")
+    }
+}
+
 use clap::{
     Parser, Subcommand, ValueEnum,
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
@@ -814,6 +1357,51 @@ pub enum MainCommand {
         #[arg(long)]
         binds: bool,
     },
+    /// Run for profile isolation
+    #[command(alias = "m")]
+    Make {
+        /// Source network namespace (src=/path OR src=1234)
+        #[arg(long, default_value = "this")]
+        src: NsInput,
+        /// Target network namespace (dst=/path OR dst=1234)
+        #[arg(long, default_value = "new")]
+        dst: NsInput,
+        /// Profile config JSON (stable schema)
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[command(flatten)]
+        tun: IArgs,
+        /// Make veths, with inner IP defaulting to 100.120.0.2/24
+        /// Not supporting more than one veth for now
+        #[arg(short, long)]
+        veth: bool,
+        /// Persist this container, add it to config file
+        #[arg(short, long)]
+        keep: bool,
+        /// Activate other containers too
+        #[arg(short, long)]
+        all: bool,
+        /// Set TUN as default route. This defaults to true for new net ns
+        #[arg(short, long)]
+        default: bool,
+        /// Do not set TUN as default route.
+        #[arg(short, long)]
+        no_default: bool,
+        #[arg(short, long)]
+        log: Option<LevelFilter>,
+        /// Mount namespaces that are created such that you can access them by paths later
+        #[arg(short, long)]
+        bind: Option<PathBuf>,
+        // This can derive profile path as /nsp3/name/various json files
+        /// Instance name (explicit, used for veth names)
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        sargs: ShellArgs,
+        /// Validate configs and paths without executing
+        #[arg(long)]
+        check: bool,
+    },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
@@ -840,17 +1428,21 @@ pub enum MainCommand {
     },
     /// Remove a bind-mount file
     Rm { file: PathBuf },
+    /// Manage wrapped binaries for security (wraps all configured binaries)
     /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
-    /// The wrapper handles such problems
+    /// The wrapper handles such problems by requiring confirmation before executing
     /// Warning. xdg-open takes the binary pointed by within .desktop file, which may differ from the path resolved by $PATH
     /// eg. /usr/share/librewolf/librewolf
     Wrap {
-        /// The executable to hook.
-        #[arg(short, long)]
-        bin: String,
+        /// Unwrap all configured binaries instead of wrapping them
         #[arg(short, long)]
         undo: bool,
+        /// Add a binary to the wrapped binaries config (resolves using which)
+        #[arg(short, long)]
+        add: Option<String>,
     },
+    /// Show wrapped binaries status
+    Wrapped,
     #[command(alias = "c")]
     Clean {
         /// Does a simple removal of default veth
@@ -880,6 +1472,19 @@ pub enum MainCommand {
     },
     /// TCP forward
     Forward { src: u32, dst: u32 },
+    /// Create a new profile from a config template
+    Profile {
+        /// Path to a profile template
+        path: PathBuf,
+        /// Name of profile to create (defaults to config filename stem)
+        name: Option<String>,
+        /// Reset profile by removing existing directory and recreating from scratch
+        #[arg(short, long)]
+        reset: bool,
+        /// Update existing profile config without recreating directories
+        #[arg(short, long)]
+        update: bool,
+    },
 }
 
 impl std::str::FromStr for NsInput {
