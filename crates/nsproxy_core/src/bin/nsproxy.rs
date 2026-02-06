@@ -730,7 +730,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(parent) = hot.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let conf = HotConfig::default();
+                let conf = profile.hot_init.clone().unwrap_or_default();
                 let json = serde_json::to_string_pretty(&conf)?;
                 std::fs::write(&hot, json)?;
             }
@@ -1651,18 +1651,18 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Copy hot config if it exists, otherwise create default
+                // Copy hot config if it exists, otherwise create from hot_init or default
                 info!("Setting up hot config...");
                 if profile.hot.exists() && profile.hot != hot_path {
                     info!("Copying hot config from {:?}", profile.hot);
                     std::fs::copy(&profile.hot, &hot_path)?;
                     warn!("Copied hot config: {:?} -> {:?}", profile.hot, hot_path);
                 } else if !hot_path.exists() {
-                    info!("Creating default hot config");
-                    let hot = HotConfig::default();
+                    info!("Creating hot config from profile.hot_init");
+                    let hot = profile.hot_init.clone().unwrap_or_default();
                     let hot_json = serde_json::to_string_pretty(&hot)?;
                     std::fs::write(&hot_path, hot_json)?;
-                    warn!("Created default hot config: {:?}", hot_path);
+                    warn!("Created hot config: {:?}", hot_path);
                 }
 
                 // Update profile to point to new hot config location
