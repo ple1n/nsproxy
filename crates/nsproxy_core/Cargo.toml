@@ -1,6 +1,6 @@
 [package]
 name = "nsproxy_core"
-version = "3.3.3"
+version = "3.4.0"
 edition = "2024"
 
 [dependencies]
@@ -62,3 +62,4 @@ strum = { version = "0.27.2", features = ["derive"] }
 socks5-impl = { path = "../socks5-impl" }
 reqwest = { version = "0.12.23", features = ["socks"] }
 tokio-send-fd = "0.9.4"
+blake3 = "1.5.1"

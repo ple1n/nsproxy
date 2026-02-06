@@ -268,3 +268,10 @@ Encapsulation is a failure, a failed feature coming from OOP.
 Duplicating functionality will always NOT be a problem. 
 
 Nsproxy is fully audited by me with the consistent engineering practise. 
+
+## 3.4 Instance isolation of applications
+
+This version comes with a major new feature, the overlay mode of instance isolation, where state directories of apps such as vscode are overlaid with instance-specific state storage such as at `/nsp3/vscode1/`.
+
+The example schema [here](./profiles/vscode.json) bans use of DBus, which prevents unintended browser opening and subsequent IP leaks or various identitiy contamination castratrophe, isolates user configs, extensions of vscode-insider instances.
+

@@ -149,6 +149,7 @@ pub fn args_deduce_mount(name: &Option<String>, mount: &Option<PathBuf>) -> Opti
         warn!("Mount path not specified, defaults to {:?}", &path);
         Some(path)
     } else {
+        warn!("If you specify a name there is a default mount path");
         None
     }
 }

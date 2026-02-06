@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     env::{current_dir, var},
     ffi::{CStr, CString, OsString},
     os::unix::{
@@ -13,6 +13,7 @@ use std::{
 use anyhow::{anyhow, bail};
 use nix::unistd::{Gid, execve, getegid, getresuid, setgroups, setresgid, setresuid};
 use nsproxy_common::UID_HINT_VAR;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
@@ -45,7 +46,7 @@ pub struct ShellPrefs {
     env: VecDeque<CString>,
 }
 
-#[derive(clap::Parser, Clone, Debug)]
+#[derive(clap::Parser, Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShellArgs {
     /// Defaults to your currrent log-in user
     #[arg(short, long)]
@@ -81,6 +82,48 @@ impl ShellPrefs {
         if !args.gids.is_empty() {
             self.gids_raw = args.gids.into_iter().collect();
         }
+    }
+    /// Explicit environment with no inheritance
+    pub fn set_env_explicit(&mut self, mut env: HashMap<String, String>) -> Result<()> {
+        // Auto-set HOME if not explicitly provided and we have a uid
+        if !env.contains_key("HOME") && self.uid.is_some() {
+            if let Some(user) = uzers::get_user_by_uid(self.uid.unwrap()) {
+                env.insert("HOME".to_string(), user.home_dir().to_string_lossy().to_string());
+            }
+        }
+        
+        let mut vec: VecDeque<CString> = Default::default();
+        for (k, v) in env {
+            vec.push_back(CString::new(format!("{}={}", k, v))?);
+        }
+        self.env = vec;
+        Ok(())
+    }
+    
+    /// Set environment with inheritance - apply env as overrides to existing environment
+    pub fn set_env_with_inheritance(&mut self, overrides: HashMap<String, String>) -> Result<()> {
+        // Auto-set HOME if not explicitly provided and we have a uid
+        let mut final_overrides = overrides;
+        if !final_overrides.contains_key("HOME") && self.uid.is_some() {
+            if let Some(user) = uzers::get_user_by_uid(self.uid.unwrap()) {
+                final_overrides.insert("HOME".to_string(), user.home_dir().to_string_lossy().to_string());
+            }
+        }
+        
+        // Apply overrides to existing environment
+        for (k, v) in final_overrides {
+            // Remove any existing entry for this key
+            self.env.retain(|env_entry| {
+                if let Ok(s) = env_entry.to_str() {
+                    !s.starts_with(&format!("{}=", k))
+                } else {
+                    true
+                }
+            });
+            // Add the new value
+            self.env.push_back(CString::new(format!("{}={}", k, v))?);
+        }
+        Ok(())
     }
     pub fn set_nsproxy_env(&mut self, browser_profile: Option<String>) {
         warn!(
@@ -173,7 +216,7 @@ impl ShellPrefs {
             self.shell = Some(which::which(name)?);
         }
         if let Some(cmd) = &self.shell {
-            let clone = clone3::<false>(false)?;
+            let clone = clone3::<false>(false, false)?;
             match &clone {
                 Clone3Result::IsChild { tx } => {
                     let cmd = CString::new(cmd.to_str().unwrap())?;
