@@ -750,6 +750,9 @@ pub struct ProfileConfig {
     pub inherit_env: bool,
     /// Hot config JSON path (frequently changed)
     pub hot: PathBuf,
+    /// Initialize hot config with these values if missing
+    #[serde(default)]
+    pub hot_init: Option<HotConfig>,
     /// Explicit shell argument overrides
     #[serde(default)]
     pub sargs: ShellArgs,
@@ -872,7 +875,10 @@ impl ProfileConfig {
             // Allow ~ prefix and @ placeholder for target paths (will be expanded at runtime)
             if let Some(target_str) = m.target.to_str() {
                 ensure!(
-                    m.target.is_absolute() || target_str.starts_with("~/") || target_str == "~" || target_str.starts_with('@'),
+                    m.target.is_absolute()
+                        || target_str.starts_with("~/")
+                        || target_str == "~"
+                        || target_str.starts_with('@'),
                     "mount target must be absolute, start with ~/, or use @ placeholder"
                 );
             } else {
@@ -898,14 +904,14 @@ impl ProfileConfig {
     /// Expand @ placeholder to instance state root (/nsp3/{name})
     pub fn expand_placeholders(&mut self, instance_root: &Path) {
         let root_str = instance_root.to_string_lossy();
-        
+
         // Expand hot path
         if let Some(hot_str) = self.hot.to_str() {
             if hot_str.starts_with('@') {
                 self.hot = PathBuf::from(hot_str.replace('@', &root_str));
             }
         }
-        
+
         // Expand mount paths
         for m in &mut self.mounts {
             if let Some(source_str) = m.source.to_str() {
@@ -919,7 +925,7 @@ impl ProfileConfig {
                 }
             }
         }
-        
+
         // Expand sargs.cwd
         if let Some(ref cwd) = self.sargs.cwd {
             if let Some(cwd_str) = cwd.to_str() {
@@ -936,6 +942,29 @@ impl ProfileConfig {
                     c.path = PathBuf::from(path_str.replace('@', &root_str));
                 }
             }
+        }
+
+        // Expand hot_init.mnt paths
+        if let Some(ref mut hot_init) = self.hot_init {
+            let mut expanded_mnt = HashMap::new();
+            for (s, t) in &hot_init.mnt {
+                let mut new_source = s.clone();
+                let mut new_target = t.clone();
+
+                if let Some(source_str) = s.to_str() {
+                    if source_str.starts_with('@') {
+                        new_source = PathBuf::from(source_str.replace('@', &root_str));
+                    }
+                }
+                if let Some(target_str) = t.to_str() {
+                    if target_str.starts_with('@') {
+                        new_target = PathBuf::from(target_str.replace('@', &root_str));
+                    }
+                }
+
+                expanded_mnt.insert(new_source, new_target);
+            }
+            hot_init.mnt = expanded_mnt;
         }
     }
 
@@ -991,6 +1020,7 @@ impl ProfileConfig {
             env: HashMap::new(),
             inherit_env: true,
             hot: hot_path.to_path_buf(),
+            hot_init: Some(HotConfig::default()),
             sargs: ShellArgs {
                 uid: Some(uid),
                 gid: Some(gid),
@@ -998,7 +1028,7 @@ impl ProfileConfig {
                 shell: Some(shell_str),
                 cwd: Some(user.home_dir().to_path_buf()),
             },
-            chmod: Vec::new()
+            chmod: Vec::new(),
         })
     }
 }
@@ -1043,12 +1073,12 @@ impl WrappedBinariesConfig {
     /// Add a binary by name (resolves via which) and save
     pub fn add_binary(&mut self, name: &str) -> Result<PathBuf> {
         let resolved_path = which::which(name)?;
-        
+
         if self.binaries.contains(&resolved_path) {
             info!("Binary {:?} already in config", resolved_path);
             return Ok(resolved_path);
         }
-        
+
         self.binaries.push(resolved_path.clone());
         self.save()?;
         info!("Added {:?} to wrapped binaries config", resolved_path);
@@ -1069,16 +1099,16 @@ impl WrappedBinariesConfig {
         if let Some(ref hash) = self.nswrap_hash {
             return Ok(hash.clone());
         }
-        
+
         let nswrap_path = std::env::current_exe()?
             .parent()
             .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
             .join("nswrap");
-        
+
         if !nswrap_path.exists() {
             bail!("nswrap binary not found at {:?}", nswrap_path);
         }
-        
+
         let hash = Self::compute_file_hash(&nswrap_path)?;
         self.nswrap_hash = Some(hash.clone());
         self.save()?;
@@ -1092,9 +1122,10 @@ impl WrappedBinariesConfig {
             return Ok(());
         }
 
-        let expected_hash = self.nswrap_hash.as_ref()
-            .ok_or_else(|| anyhow!("No cached nswrap hash found. Run 'sp wrap' first to initialize."))?;
-        
+        let expected_hash = self.nswrap_hash.as_ref().ok_or_else(|| {
+            anyhow!("No cached nswrap hash found. Run 'sp wrap' first to initialize.")
+        })?;
+
         let mut errors = Vec::new();
 
         for binary_path in &self.binaries {
@@ -1113,7 +1144,7 @@ impl WrappedBinariesConfig {
     /// Check if a single binary is properly wrapped
     pub fn check_single_wrapped(&self, binary_path: &Path, expected_hash: &str) -> Result<()> {
         let wrapped_path = binary_path.with_extension("wrapped");
-        
+
         if !wrapped_path.exists() {
             bail!("missing .wrapped file");
         }
@@ -1125,7 +1156,11 @@ impl WrappedBinariesConfig {
         // Verify the binary at binary_path has the expected nswrap hash
         let actual_hash = Self::compute_file_hash(binary_path)?;
         if actual_hash != expected_hash {
-            bail!("hash mismatch: expected {} but got {}", expected_hash, actual_hash);
+            bail!(
+                "hash mismatch: expected {} but got {}",
+                expected_hash,
+                actual_hash
+            );
         }
 
         Ok(())
@@ -1142,7 +1177,7 @@ impl WrappedBinariesConfig {
             .parent()
             .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
             .join("nswrap");
-        
+
         if !nswrap_path.exists() {
             bail!("nswrap binary not found at {:?}", nswrap_path);
         }
@@ -1151,7 +1186,7 @@ impl WrappedBinariesConfig {
         let _ = self.get_or_compute_nswrap_hash()?;
 
         info!("Wrapping {} binaries...", self.binaries.len());
-        
+
         // Clone the list to avoid borrow checker issues
         let binaries = self.binaries.clone();
         for binary_path in &binaries {
@@ -1169,7 +1204,7 @@ impl WrappedBinariesConfig {
         }
 
         let wrapped_path = binary_path.with_extension("wrapped");
-        
+
         if wrapped_path.exists() {
             // Already wrapped, verify it's correct
             let expected_hash = self.get_or_compute_nswrap_hash()?;
@@ -1180,7 +1215,10 @@ impl WrappedBinariesConfig {
                     return Ok(());
                 }
                 Err(_) => {
-                    warn!("Binary {:?} is wrapped but check failed. Re-wrapping...", binary_path);
+                    warn!(
+                        "Binary {:?} is wrapped but check failed. Re-wrapping...",
+                        binary_path
+                    );
                     // Remove the bad wrapped file and re-wrap
                     std::fs::remove_file(binary_path)?;
                     std::fs::rename(&wrapped_path, binary_path)?;
@@ -1191,7 +1229,7 @@ impl WrappedBinariesConfig {
         info!("Wrapping binary: {:?}", binary_path);
         std::fs::rename(binary_path, &wrapped_path)?;
         std::fs::copy(nswrap_path, binary_path)?;
-        
+
         Ok(())
     }
 
@@ -1203,7 +1241,7 @@ impl WrappedBinariesConfig {
         }
 
         info!("Unwrapping {} binaries...", self.binaries.len());
-        
+
         // Clone the list to avoid borrow checker issues
         let binaries = self.binaries.clone();
         for binary_path in &binaries {
@@ -1221,20 +1259,20 @@ impl WrappedBinariesConfig {
     /// Unwrap a single binary
     fn unwrap_single(&self, binary_path: &Path) -> Result<()> {
         let wrapped_path = binary_path.with_extension("wrapped");
-        
+
         if !wrapped_path.exists() {
             info!("Binary {:?} not wrapped", binary_path);
             return Ok(());
         }
 
         info!("Unwrapping binary: {:?}", binary_path);
-        
+
         if binary_path.exists() {
             std::fs::remove_file(binary_path)?;
         }
-        
+
         std::fs::rename(&wrapped_path, binary_path)?;
-        
+
         Ok(())
     }
 }
@@ -1242,32 +1280,32 @@ impl WrappedBinariesConfig {
 /// Helper functions for consistent path handling
 pub mod state_paths {
     use super::*;
-    
+
     /// Get profile directory for a named profile
     pub fn profile_dir(name: &str) -> PathBuf {
         PathBuf::from(PERSIST_ROOT).join(name)
     }
-    
+
     /// Get profile.json path for a named profile
     pub fn profile_config(name: &str) -> PathBuf {
         profile_dir(name).join("profile.json")
     }
-    
+
     /// Get hot.json path for a named profile
     pub fn hot_config(name: &str) -> PathBuf {
         profile_dir(name).join("hot.json")
     }
-    
+
     /// Get namespace bind mount path
     pub fn ns_bind_mount(name: &str) -> PathBuf {
         PathBuf::from(RUNTIME_ROOT).join(format!("{}.ns", name))
     }
-    
+
     /// Get metadata JSON path for a namespace
     pub fn ns_metadata(name: &str) -> PathBuf {
         PathBuf::from(RUNTIME_ROOT).join(format!("{}.json", name))
     }
-    
+
     /// Get metadata JSON path from bind mount path
     pub fn metadata_for_bind(bind_path: &Path) -> PathBuf {
         bind_path.with_extension("json")
