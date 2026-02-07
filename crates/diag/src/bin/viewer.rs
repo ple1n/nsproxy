@@ -244,7 +244,7 @@ fn main() -> eframe::Result<()> {
             });
 
             // Repaint periodically to show updates
-            ctx.request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(500));
         },
     )
 }
