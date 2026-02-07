@@ -756,6 +756,9 @@ pub struct ProfileConfig {
     /// Explicit shell argument overrides
     #[serde(default)]
     pub sargs: ShellArgs,
+    /// Browser profile name for env isolation (set NSPROXY_PROFILE_BROWSER)
+    #[serde(default)]
+    pub browser_profile: Option<String>,
 }
 
 fn default_inherit_env() -> bool {
@@ -1029,6 +1032,7 @@ impl ProfileConfig {
                 cwd: Some(user.home_dir().to_path_buf()),
             },
             chmod: Vec::new(),
+            browser_profile: None,
         })
     }
 }
@@ -1296,9 +1300,21 @@ pub mod state_paths {
         profile_dir(name).join("hot.json")
     }
 
-    /// Get namespace bind mount path
+    /// Get namespace bind mount path (runtime, for ::Run)
     pub fn ns_bind_mount(name: &str) -> PathBuf {
         PathBuf::from(RUNTIME_ROOT).join(format!("{}.ns", name))
+    }
+
+    /// Get namespace bind mount path inside profile instance dir (for ::Make)
+    /// Returns /nsp3/{name}/net
+    pub fn profile_ns_bind(name: &str) -> PathBuf {
+        profile_dir(name).join("net")
+    }
+
+    /// Get namespace metadata JSON path inside profile instance dir (for ::Make)
+    /// Returns /nsp3/{name}/ns_alive.json
+    pub fn profile_ns_meta(name: &str) -> PathBuf {
+        profile_dir(name).join("ns_alive.json")
     }
 
     /// Get metadata JSON path for a namespace
