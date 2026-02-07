@@ -1307,7 +1307,7 @@ pub mod state_paths {
 
     /// Get namespace bind mount path inside profile instance dir (for ::Make)
     /// Returns /nsp3/{name}/net
-    pub fn profile_ns_bind(name: &str) -> PathBuf {
+    pub fn profile_netns_bind(name: &str) -> PathBuf {
         profile_dir(name).join("net")
     }
 
@@ -1547,6 +1547,42 @@ pub enum MainCommand {
         /// Update existing profile config without recreating directories
         #[arg(short, long)]
         update: bool,
+    },
+    /// Create and persist a set of namespaces for a profile.
+    /// A minimal long-lived process keeps the namespaces alive.
+    /// Use `tun` and `veth` subcommands afterwards to attach networking.
+    Up {
+        /// Profile name (resolves to /nsp3/{name})
+        #[arg(long)]
+        profile: String,
+    },
+    /// Attach a TUN device + tun2socks5 proxy to an already-up profile namespace.
+    /// Only one TUN process may exist per profile at a time.
+    Tun {
+        /// Profile name (must have been brought up with `up` first)
+        #[arg(long)]
+        profile: String,
+        #[command(flatten)]
+        tun: IArgs,
+        /// Do not set TUN as default route
+        #[arg(short, long)]
+        no_default: bool,
+        /// Requires explicit flag for no proxying
+        #[arg(long)]
+        no_proxy: bool,
+        #[arg(short, long)]
+        log: Option<LevelFilter>,
+    },
+    /// Create a veth pair between host and an already-up profile namespace.
+    Veth {
+        /// Profile name (must have been brought up with `up` first)
+        #[arg(long)]
+        profile: String,
+        /// Veth pair base name (produces {name}_in and {name}_out)
+        #[arg(long)]
+        veth_name: Option<String>,
+        #[arg(short, long)]
+        log: Option<LevelFilter>,
     },
 }
 
