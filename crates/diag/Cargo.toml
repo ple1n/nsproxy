@@ -13,13 +13,17 @@ flume.workspace = true
 
 [features]
 default = ["egui-client"]
-egui-client = ["dep:eframe", "dep:egui"]
+egui-client = ["dep:eframe", "dep:egui", "dep:egui_extras"]
 
 [dependencies.eframe]
 version = "0.31"
 optional = true
 
 [dependencies.egui]
+version = "0.31"
+optional = true
+
+[dependencies.egui_extras]
 version = "0.31"
 optional = true
 

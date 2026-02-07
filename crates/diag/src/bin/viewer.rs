@@ -10,6 +10,7 @@
 fn main() -> eframe::Result<()> {
     use diag::{diag_sock_path, summary::DiagAccumulator, DiagEvent};
     use eframe::egui;
+    use egui_extras::{Column, TableBuilder};
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
@@ -128,91 +129,117 @@ fn main() -> eframe::Result<()> {
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 let acc = accumulator.lock().unwrap();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new("conn_grid")
-                            .num_columns(8)
-                            .striped(true)
-                            .min_col_width(60.0)
-                            .show(ui, |ui| {
-                                // Header
-                                ui.strong("ID");
-                                ui.strong("Kind");
-                                ui.strong("Src");
-                                ui.strong("Dst / Route");
-                                ui.strong("Dispatch");
-                                ui.strong("Connect Lat");
-                                ui.strong("Duration");
-                                ui.strong("Status");
-                                ui.end_row();
+                let row_height = 18.0;
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto().at_least(60.0))
+                    .column(Column::auto().at_least(80.0))
+                    .column(Column::auto().at_least(120.0))
+                    .column(Column::remainder().at_least(160.0))
+                    .column(Column::auto().at_least(90.0))
+                    .column(Column::auto().at_least(90.0))
+                    .column(Column::auto().at_least(90.0))
+                    .column(Column::auto().at_least(80.0))
+                    .header(row_height, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("ID");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Kind");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Src");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Dst / Route");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Dispatch");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Connect Lat");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Duration");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Status");
+                        });
+                    })
+                    .body(|mut body| {
+                        body.rows(row_height, acc.conn_order.len(), |mut row| {
+                            let conn_id = &acc.conn_order[row.index()];
+                            if let Some(c) = acc.conns.get(conn_id) {
+                                row.col(|ui| {
+                                    ui.label(format!("{}", c.id.0));
+                                });
+                                row.col(|ui| {
+                                    ui.label(&c.kind);
+                                });
+                                row.col(|ui| {
+                                    ui.label(&c.src);
+                                });
+                                row.col(|ui| {
+                                    let dest_label = if c.route.is_empty() {
+                                        c.dst.clone()
+                                    } else {
+                                        c.route.clone()
+                                    };
+                                    ui.label(&dest_label);
+                                });
 
-                                for conn_id in acc.conn_order.iter() {
-                                    if let Some(c) = acc.conns.get(conn_id) {
-                                        ui.label(format!("{}", c.id.0));
-                                        ui.label(&c.kind);
-                                        ui.label(&c.src);
-                                        let dest_label = if c.route.is_empty() {
-                                            c.dst.clone()
+                                row.col(|ui| {
+                                    use diag::summary::format_duration_us;
+                                    let color = if c.dispatch_us > 1000 {
+                                        egui::Color32::RED
+                                    } else if c.dispatch_us > 100 {
+                                        egui::Color32::YELLOW
+                                    } else {
+                                        egui::Color32::GREEN
+                                    };
+                                    ui.colored_label(color, format_duration_us(c.dispatch_us as f64));
+                                });
+
+                                row.col(|ui| {
+                                    if let Some(lat) = c.connect_latency() {
+                                        use diag::summary::format_duration_us;
+                                        let us = lat.as_secs_f64() * 1_000_000.0;
+                                        let color = if us > 500_000.0 {
+                                            egui::Color32::RED
+                                        } else if us > 100_000.0 {
+                                            egui::Color32::YELLOW
                                         } else {
-                                            c.route.clone()
+                                            egui::Color32::GREEN
                                         };
-                                        ui.label(&dest_label);
-
-                                        // Dispatch time (how long this conn blocked the loop)
-                                        {
-                                            use diag::summary::format_duration_us;
-                                            let color = if c.dispatch_us > 1000 {
-                                                egui::Color32::RED
-                                            } else if c.dispatch_us > 100 {
-                                                egui::Color32::YELLOW
-                                            } else {
-                                                egui::Color32::GREEN
-                                            };
-                                            ui.colored_label(
-                                                color,
-                                                format_duration_us(c.dispatch_us as f64),
-                                            );
-                                        }
-
-                                        if let Some(lat) = c.connect_latency() {
-                                            use diag::summary::format_duration_us;
-                                            let us = lat.as_secs_f64() * 1_000_000.0;
-                                            let color = if us > 500_000.0 {
-                                                egui::Color32::RED
-                                            } else if us > 100_000.0 {
-                                                egui::Color32::YELLOW
-                                            } else {
-                                                egui::Color32::GREEN
-                                            };
-                                            ui.colored_label(color, format_duration_us(us));
-                                        } else {
-                                            ui.label("…");
-                                        }
-
-                                        if let Some(dur) = c.total_duration() {
-                                            use diag::summary::format_duration_us;
-                                            let us = dur.as_secs_f64() * 1_000_000.0;
-                                            ui.label(format_duration_us(us));
-                                        } else {
-                                            ui.label("active");
-                                        }
-
-                                        if let Some(ref err) = c.error {
-                                            ui.colored_label(
-                                                egui::Color32::RED,
-                                                format!("{}", &err[..err.len().min(40)]),
-                                            );
-                                        } else if c.finished_ts.is_some() {
-                                            ui.colored_label(egui::Color32::GREEN, "OK");
-                                        } else {
-                                            // nothing
-                                        }
-                                        ui.end_row();
+                                        ui.colored_label(color, format_duration_us(us));
+                                    } else {
+                                        ui.label("…");
                                     }
-                                }
-                            });
+                                });
+
+                                row.col(|ui| {
+                                    if let Some(dur) = c.total_duration() {
+                                        use diag::summary::format_duration_us;
+                                        let us = dur.as_secs_f64() * 1_000_000.0;
+                                        ui.label(format_duration_us(us));
+                                    } else {
+                                        ui.label("active");
+                                    }
+                                });
+
+                                row.col(|ui| {
+                                    if let Some(ref err) = c.error {
+                                        ui.colored_label(
+                                            egui::Color32::RED,
+                                            format!("{}", &err[..err.len().min(40)]),
+                                        );
+                                    } else if c.finished_ts.is_some() {
+                                        ui.colored_label(egui::Color32::GREEN, "OK");
+                                    }
+                                });
+                            }
+                        });
                     });
             });
 
