@@ -82,6 +82,7 @@ use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use tun2socks5::{
     ArgMode, IArgs, VirtDNSChange, aok,
+    diag,
     dns::{TUNResponse, VirtDNSHandle},
     flume,
     ipstack::stream::{IpStackStream, IpStackTcpStream},
@@ -830,9 +831,30 @@ fn main() -> anyhow::Result<()> {
                 shell_prefs.set_env_explicit(env)?;
             }
 
+            // For ::Make, bind mount lives inside instance dir: /nsp3/{name}/net
+            let mount = mount.or_else(|| {
+                name.as_ref().map(|n| {
+                    let p = state_paths::profile_ns_bind(n);
+                    warn!("Mount path defaults to {:?}", &p);
+                    p
+                })
+            });
+
+            // Set browser profile + namespace env vars for the spawned shell
+            shell_prefs.set_nsproxy_env(profile.browser_profile.clone());
+            if let Some(ref m) = mount {
+                shell_prefs.set_ns_env(Some(m.to_str().unwrap()));
+            } else {
+                shell_prefs.set_ns_env(None);
+            }
+
             let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
             iargs.tun_name = Some(tun_name.clone());
             let vname = name.clone().unwrap_or_else(|| "default".to_string());
+
+            // Set diag socket path for tun2socks5 diagnostics
+            iargs.diag_sock = Some(diag::diag_sock_path(&vname));
+
             let v_in = format!("{vname}_in");
             let v_out = format!("{vname}_out");
             let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
@@ -1038,12 +1060,12 @@ fn main() -> anyhow::Result<()> {
                                     mount_ns(&path, &mount)?;
 
                                     let ns_alive = nsproxy_core::NsAlive {
-                                        browser_profile: None,
+                                        browser_profile: profile.browser_profile.clone(),
                                         bind_mount: mount.clone(),
                                         child_pid: Some(child_pid as u32),
                                     };
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
-                                    let jsonpath = state_paths::metadata_for_bind(&mount);
+                                    let jsonpath = state_paths::profile_ns_meta(&vname);
                                     std::fs::write(&jsonpath, json)?;
                                     warn!("Auxiliary data written to {:?}", &jsonpath);
                                 } else {
@@ -1236,8 +1258,21 @@ fn main() -> anyhow::Result<()> {
             shell_prefs.take_args(sargs);
             shell_prefs.adjust();
 
-            if let Some(path) = path {
-                let nsdata = state_paths::metadata_for_bind(&path);
+            // Resolve the bind mount path: --name resolves to /nsp3/{name}/net,
+            // otherwise use the explicit path argument
+            let (resolved_path, nsdata) = if let Some(ref n) = name {
+                let p = state_paths::profile_ns_bind(n);
+                let m = state_paths::profile_ns_meta(n);
+                info!("Resolved profile name {:?} to {:?}", n, &p);
+                (Some(p), m)
+            } else if let Some(ref p) = path {
+                (Some(p.clone()), state_paths::metadata_for_bind(p))
+            } else {
+                error!("specify --name <profile> or a path");
+                (None, PathBuf::new())
+            };
+
+            if let Some(path) = resolved_path {
                 let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
                     std::fs::read_to_string(&nsdata)
                         .ok()
@@ -1268,7 +1303,7 @@ fn main() -> anyhow::Result<()> {
                     error!("NS data not found at {:?}", nsdata)
                 }
             } else {
-                error!("specify a path");
+                error!("specify --name <profile> or a path");
             }
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1632,6 +1667,21 @@ fn main() -> anyhow::Result<()> {
                 // If reset flag is set, remove the entire directory first
                 if reset && target_dir.exists() {
                     warn!("Reset flag enabled - removing existing profile directory");
+
+                    // Remove namespace bind mount if it exists
+                    let ns_bind = state_paths::profile_ns_bind(&clean_name);
+                    if ns_bind.exists() {
+                        warn!("Removing namespace bind mount at {:?}", &ns_bind);
+                        if let Err(e) = rm_mount(&ns_bind) {
+                            warn!("Failed to unmount {:?}: {:?}", &ns_bind, e);
+                        }
+                    }
+                    // Remove sidecar metadata JSON
+                    let ns_meta = state_paths::profile_ns_meta(&clean_name);
+                    if ns_meta.exists() {
+                        std::fs::remove_file(&ns_meta)?;
+                    }
+
                     std::fs::remove_dir_all(&target_dir)?;
                     info!("Removed existing directory");
                 }

@@ -57,7 +57,8 @@ async fn main() -> Result<()> {
             designated: None,
             id: None,
             tun_name: None,
-            debug: false
+            debug: false,
+            diag_sock: None,
         };
 
         let (sx, rx) = futures::channel::mpsc::channel(1);
