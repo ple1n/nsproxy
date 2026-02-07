@@ -28,13 +28,13 @@ use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
 use nix::{
     sched::{CloneFlags, unshare},
-    unistd::{Pid, getresgid, getresuid, chown, Gid, Uid},
+    unistd::{Gid, Pid, Uid, chown, getresgid, getresuid},
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
-    Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, ProfileConfig,
-    ProfileChmod, ProfileMount, RootfsMode, TunMaker,
+    Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, ProfileChmod,
+    ProfileConfig, ProfileMount, RootfsMode, TunMaker,
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     shell::{ShellArgs, ShellPrefs},
     state_paths,
@@ -263,10 +263,25 @@ fn main() -> anyhow::Result<()> {
             profile,
             mnt,
             mut binds,
+            no_proxy,
         } => {
             // Check wrapped binaries wellness before starting
             let wrapped_config = WrappedBinariesConfig::load()?;
             wrapped_config.check_all_wrapped()?;
+
+            // Validate proxy and no_proxy are mutually exclusive
+            let mut iargs = proxy;
+            match (iargs.proxy.is_some(), no_proxy) {
+                (true, true) => {
+                    bail!(
+                        "Cannot specify both --proxy and --no-proxy. They are mutually exclusive."
+                    );
+                }
+                (false, false) => {
+                    bail!("Must specify either --proxy <URL> or --no-proxy explicitly.");
+                }
+                _ => {} // Valid: (true, false) or (false, true)
+            }
 
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -282,7 +297,6 @@ fn main() -> anyhow::Result<()> {
             let ns_moved = [0; 1];
             // Tun2socks runs in SRC ns, connects to the socks5 in it
             // We will get the TUN FD from DST ns
-            let mut iargs = proxy;
             let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
             iargs.tun_name = Some(tun_name.clone());
             let vname = name.clone().unwrap_or("v".to_owned());
@@ -342,9 +356,9 @@ fn main() -> anyhow::Result<()> {
                                 let mut tun = TunMaker::default();
                                 tun.name = tun_name.clone();
                                 tun.mtu = mtu;
-                                let mut state = tun.make()?;
-                                state.sync_basic()?;
-                                let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
+                                let mut tun_state = tun.make()?;
+                                tun_state.sync_basic()?;
+                                let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
                                 let raw = dev.as_raw_fd();
 
                                 info!("send TUN fd");
@@ -385,7 +399,7 @@ fn main() -> anyhow::Result<()> {
 
                                     if add_default {
                                         warn!("adding TUN as default route");
-                                        nl.ip_add_default_route(state.dev_index).await?;
+                                        nl.ip_add_default_route(tun_state.dev_index).await?;
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
@@ -687,10 +701,40 @@ fn main() -> anyhow::Result<()> {
             name,
             sargs,
             check,
+            mut no_proxy,
+            mut no_tun,
         } => {
             // Check wrapped binaries wellness before starting
             let wrapped_config = WrappedBinariesConfig::load()?;
             wrapped_config.check_all_wrapped()?;
+
+            // Validate proxy and no_proxy are mutually exclusive
+            let mut iargs = proxy;
+            let has_tun_config = iargs.proxy.is_some();
+            match (has_tun_config, no_tun) {
+                (true, true) => {
+                    bail!(
+                        "Cannot specify both TUN options and --no-tun. They are mutually exclusive."
+                    );
+                }
+                _ => {}
+            }
+
+            if no_tun {
+                no_proxy = true;
+            }
+
+            match (iargs.proxy.is_some(), no_proxy) {
+                (true, true) => {
+                    bail!(
+                        "Cannot specify both --proxy and --no-proxy. They are mutually exclusive."
+                    );
+                }
+                (false, false) => {
+                    bail!("Must specify either --proxy <URL> or --no-proxy explicitly.");
+                }
+                _ => {} // Valid: (true, false) or (false, true)
+            }
 
             let mtu = 1500;
             let tun_name = "tun2".to_owned();
@@ -786,7 +830,6 @@ fn main() -> anyhow::Result<()> {
                 shell_prefs.set_env_explicit(env)?;
             }
 
-            let mut iargs = proxy;
             let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
             iargs.tun_name = Some(tun_name.clone());
             let vname = name.clone().unwrap_or_else(|| "default".to_string());
@@ -812,17 +855,24 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 enable_ping_all()?;
 
-                                let mut tun = TunMaker::default();
-                                tun.name = tun_name.clone();
-                                tun.mtu = mtu;
-                                let mut state = tun.make()?;
-                                state.sync_basic()?;
-                                let dev = Arc::into_inner(state.fd.unwrap()).unwrap();
-                                let raw = dev.as_raw_fd();
+                                let mut state: Option<TunState> = None;
 
-                                info!("send TUN fd");
-                                tx.send_fd(raw)?;
-                                drop(dev);
+                                if !no_tun {
+                                    let mut tun = TunMaker::default();
+                                    tun.name = tun_name.clone();
+                                    tun.mtu = mtu;
+                                    let tun_state = tun.make()?;
+                                    state = Some(tun_state);
+                                    state.as_mut().unwrap().sync_basic()?;
+                                    let dev = state.as_mut().unwrap().fd.as_ref().unwrap();
+                                    let raw = dev.as_raw_fd();
+
+                                    info!("send TUN fd");
+                                    tx.send_fd(raw)?;
+                                    drop(dev);
+                                } else {
+                                    info!("Skipping TUN creation due to --no-tun flag");
+                                };
 
                                 tx.read(&mut buf)?; // wait for bind mount;
                                 mount_bind_root()?;
@@ -871,8 +921,12 @@ fn main() -> anyhow::Result<()> {
                                     }
 
                                     if add_default {
-                                        warn!("adding TUN as default route");
-                                        nl.ip_add_default_route(state.dev_index).await?;
+                                        if let Some(ref state) = state {
+                                            warn!("adding TUN as default route");
+                                            nl.ip_add_default_route(state.dev_index).await?;
+                                        } else {
+                                            warn!("Skipping default route - no TUN device");
+                                        }
                                     }
                                     if veth {
                                         tx.read(&mut read).await;
@@ -966,9 +1020,14 @@ fn main() -> anyhow::Result<()> {
                                 child_pidfd,
                                 mut tx,
                             } => {
-                                info!("recved fd");
-                                let dev = tx.recv_fd()?;
-                                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
+                                let dev = if !no_tun {
+                                    info!("recved fd");
+                                    let dev = tx.recv_fd()?;
+                                    Some(Arc::new(unsafe { AsyncDevice::from_fd(dev) }?))
+                                } else {
+                                    info!("Skipping TUN fd receive due to --no-tun flag");
+                                    None
+                                };
 
                                 if let Some(mount) = mount {
                                     // Ensure runtime directory exists
@@ -987,10 +1046,10 @@ fn main() -> anyhow::Result<()> {
                                     let jsonpath = state_paths::metadata_for_bind(&mount);
                                     std::fs::write(&jsonpath, json)?;
                                     warn!("Auxiliary data written to {:?}", &jsonpath);
-                                    tx.write(&[0]);
                                 } else {
-                                    warn!("not mounting this namespace");
+                                    warn!("not mounting this /ns/net to any path");
                                 }
+                                tx.write(&[0]);
 
                                 let rt = tokio::runtime::Builder::new_multi_thread()
                                     .enable_all()
@@ -1083,17 +1142,21 @@ fn main() -> anyhow::Result<()> {
                                         warn!("out-ns, watcher exited {:?}", x);
                                     });
 
-                                    tun2socks5::main_entry(
-                                        dev,
-                                        mtu,
-                                        false,
-                                        iargs,
-                                        vdns_sx.clone(),
-                                        st_sx,
-                                    )
-                                    .await?;
-                                    warn!("tun exited");
-                                    let _ = vdns_sx.send(None).await;
+                                    if let Some(dev) = dev {
+                                        tun2socks5::main_entry(
+                                            dev,
+                                            mtu,
+                                            false,
+                                            iargs,
+                                            vdns_sx.clone(),
+                                            st_sx,
+                                        )
+                                        .await?;
+                                        warn!("tun exited");
+                                        let _ = vdns_sx.send(None).await;
+                                    } else {
+                                        info!("TUN not initialized, skipping tun2socks5");
+                                    }
 
                                     std::future::pending::<()>().await;
                                     aok!()

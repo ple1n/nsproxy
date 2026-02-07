@@ -1394,6 +1394,9 @@ pub enum MainCommand {
         /// Defaults to true when --mnt is enabled, false when --mnt is not enabled.
         #[arg(long)]
         binds: bool,
+        /// Requires explicit flag for no proxying
+        #[arg(long)]
+        no_proxy: bool,
     },
     /// Run for profile isolation
     #[command(alias = "m")]
@@ -1439,6 +1442,12 @@ pub enum MainCommand {
         /// Validate configs and paths without executing
         #[arg(long)]
         check: bool,
+        /// Requires explicit flag for no proxying
+        #[arg(long)]
+        no_proxy: bool,
+        /// Requires explicit flag for no TUN device
+        #[arg(long)]
+        no_tun: bool,
     },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
