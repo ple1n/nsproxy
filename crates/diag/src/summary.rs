@@ -192,6 +192,39 @@ impl DiagAccumulator {
                     c.dns_query = Some(query.clone());
                 }
             }
+            DiagEvent::Wait { id, ts } => {
+                let stats = ConnStats {
+                    id: *id,
+                    kind: "Wait".to_string(),
+                    src: String::new(),
+                    dst: String::new(),
+                    route: "acceptor".to_string(),
+                    accept_ts: *ts,
+                    dispatch_us: 0,
+                    connected_ts: None,
+                    finished_ts: None,
+                    error: None,
+                    bytes_up: 0,
+                    bytes_down: 0,
+                    dns_query: None,
+                    dns_response: None,
+                };
+                self.conns.insert(*id, stats);
+                self.conn_order.push_back(*id);
+                while self.conn_order.len() > self.max_conns {
+                    if let Some(old) = self.conn_order.pop_front() {
+                        self.conns.remove(&old);
+                    }
+                }
+            }
+            DiagEvent::WaitEnded { id, ts } => {
+                if let Some(c) = self.conns.get_mut(id) {
+                    c.finished_ts = Some(*ts);
+                    let wait_us = ts.elapsed_since(&c.accept_ts).as_micros() as u64;
+                    c.dispatch_us = wait_us;
+                    c.route = "acceptor: resumed".to_string();
+                }
+            }
         }
     }
 }
