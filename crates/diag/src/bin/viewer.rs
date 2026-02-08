@@ -19,7 +19,13 @@ use std::fs::File;
 use std::os::fd::AsFd;
 
 #[cfg(feature = "egui-client")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "egui-client")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "egui-client")]
+static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "egui-client")]
 fn main() -> eframe::Result<()> {
@@ -56,8 +62,7 @@ fn main() -> eframe::Result<()> {
     let burst_test_state: Arc<Mutex<BurstTestState>> =
         Arc::new(Mutex::new(BurstTestState::default()));
     let selected_conn: Arc<Mutex<Option<diag::ConnId>>> = Arc::new(Mutex::new(None));
-
-    // Spawn a background tokio runtime for reading from the socket
+    let dns_config: Arc<Mutex<String>> = Arc::new(Mutex::new("8.8.8.8:53".to_string()));
     let events_bg = events.clone();
     let acc_bg = accumulator.clone();
     let connected_bg = connected.clone();
@@ -67,6 +72,7 @@ fn main() -> eframe::Result<()> {
     let burst_test_bg = burst_test_state.clone();
     let sock_path_bg = sock_path.clone();
     let ping_rx_bg = ping_rx.clone();
+    let dns_config_bg = dns_config.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -80,13 +86,13 @@ fn main() -> eframe::Result<()> {
             tokio::spawn(async move {
                 while let Ok(req) = ping_rx_bg.recv_async().await {
                     match req {
-                        PingRequest::Single(domain) => {
-                            if let Err(err) = send_dns_ping_async("8.8.8.8:53", domain).await {
+                        PingRequest::Single(domain, dns_addr) => {
+                            if let Err(err) = send_dns_ping_async(&dns_addr, domain).await {
                                 let mut ping = ping_state_bg.lock().unwrap();
                                 ping.last_error = Some(format!("dns ping error: {}", err));
                             }
                         }
-                        PingRequest::BurstTest => {
+                        PingRequest::BurstTest(dns_addr) => {
                             let started = now_epoch_us();
                             {
                                 let mut burst = burst_state_bg.lock().unwrap();
@@ -110,8 +116,9 @@ fn main() -> eframe::Result<()> {
 
                                 let mut tasks = FuturesUnordered::new();
                                 for domain in domains {
+                                    let dns = dns_addr.clone();
                                     tasks.push(async move {
-                                        send_dns_ping_async("8.8.8.8:53", domain).await
+                                        send_dns_ping_async(&dns, domain).await
                                     });
                                 }
 
@@ -157,12 +164,13 @@ fn main() -> eframe::Result<()> {
                             burst.running = false;
                             burst.finished_ts = Some(finished);
                         }
-                        PingRequest::Batch(domains) => {
+                        PingRequest::Batch(domains, dns_addr) => {
                             let batch_started = now_epoch_us();
                             let mut tasks = FuturesUnordered::new();
                             for domain in domains {
+                                let dns = dns_addr.clone();
                                 tasks.push(async move {
-                                    send_dns_ping_async("8.8.8.8:53", domain).await
+                                    send_dns_ping_async(&dns, domain).await
                                 });
                             }
                             let mut errs = 0u64;
@@ -312,9 +320,31 @@ fn main() -> eframe::Result<()> {
 
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("DNS ping (8.8.8.8)").clicked() {
+                    ui.label("DNS Server:");
+                    {
+                        let mut dns_addr = dns_config.lock().unwrap();
+                        ui.text_edit_singleline(&mut *dns_addr);
+                    }
+                    
+                    if ui.button("Random IP").clicked() {
+                        use rand::Rng;
+                        let mut rng = rand::thread_rng();
+                        let ip = format!(
+                            "{}.{}.{}.{}:53",
+                            rng.gen_range(1..=254),
+                            rng.gen_range(0..=255),
+                            rng.gen_range(0..=255),
+                            rng.gen_range(1..=254)
+                        );
+                        *dns_config.lock().unwrap() = ip;
+                    }
+                });
+                
+                ui.horizontal(|ui| {
+                    if ui.button("DNS ping").clicked() {
                         let now_us = now_epoch_us();
                         let domain = format!("ping-{}.diag", now_us);
+                        let dns_addr = dns_config.lock().unwrap().clone();
                         {
                             let mut ping = ping_state.lock().unwrap();
                             ping.last_domain = Some(domain.clone());
@@ -324,13 +354,14 @@ fn main() -> eframe::Result<()> {
                             ping.last_conn_id = None;
                             ping.last_error = None;
                         }
-                        let _ = ping_tx.send(PingRequest::Single(domain));
+                        let _ = ping_tx.send(PingRequest::Single(domain, dns_addr));
                     }
 
                     let burst_running = burst_test_state.lock().unwrap().running;
                     ui.add_enabled_ui(!burst_running, |ui| {
                         if ui.button("Burst Test").on_hover_text("Test burst sizes (10, 100, 1000, 10000) to find >5% failure rate").clicked() {
-                            let _ = ping_tx.send(PingRequest::BurstTest);
+                            let dns_addr = dns_config.lock().unwrap().clone();
+                            let _ = ping_tx.send(PingRequest::BurstTest(dns_addr));
                         }
                     });
 
@@ -340,6 +371,7 @@ fn main() -> eframe::Result<()> {
                         for i in 0..100u64 {
                             domains.push(format!("ping-{}-{}.diag", now_us, i));
                         }
+                        let dns_addr = dns_config.lock().unwrap().clone();
                         {
                             let mut mass = mass_ping_state.lock().unwrap();
                             mass.last_batch = Some(now_us);
@@ -356,7 +388,7 @@ fn main() -> eframe::Result<()> {
                             mass.errors = 0;
                             mass.last_error = None;
                         }
-                        let _ = ping_tx.send(PingRequest::Batch(domains));
+                        let _ = ping_tx.send(PingRequest::Batch(domains, dns_addr));
                     }
 
                     let ping = ping_state.lock().unwrap();
@@ -516,33 +548,33 @@ fn main() -> eframe::Result<()> {
                         .column(Column::auto().at_least(90.0))
                         .column(Column::auto().at_least(80.0))
                         .header(row_height, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("ID");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Kind");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Src");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Dst / Route");
-                        });
-                        header.col(|ui| {
-                            ui.strong("DNS");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Dispatch");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Connect Lat");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Duration");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Status");
-                        });
+                            header.col(|ui| {
+                                ui.strong("ID");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Kind");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Src");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Dst / Route");
+                            });
+                            header.col(|ui| {
+                                ui.strong("DNS");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Dispatch");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Connect Lat");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Duration");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Status");
+                            });
                         })
                         .body(|mut body| {
                             body.rows(row_height, acc.conn_order.len(), |mut row| {
@@ -583,7 +615,9 @@ fn main() -> eframe::Result<()> {
 
                                     row.col(|ui| {
                                         use diag::summary::format_duration_us;
-                                        let color = if c.dispatch_us > 1000 {
+                                        let color = if c.kind == "Wait" {
+                                            egui::Color32::LIGHT_BLUE
+                                        } else if c.dispatch_us > 1000 {
                                             egui::Color32::RED
                                         } else if c.dispatch_us > 100 {
                                             egui::Color32::YELLOW
@@ -689,9 +723,9 @@ struct BurstTestState {
 }
 
 enum PingRequest {
-    Single(String),
-    Batch(Vec<String>),
-    BurstTest,
+    Single(String, String),  // domain, dns_address
+    Batch(Vec<String>, String),  // domains, dns_address
+    BurstTest(String),  // dns_address
 }
 
 fn now_epoch_us() -> u64 {
@@ -731,13 +765,13 @@ fn build_dns_query(domain: &str, id: u16) -> Vec<u8> {
 async fn send_dns_ping_async(target: &str, domain: String) -> anyhow::Result<u64> {
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
-    let id = (now_epoch_us() & 0xFFFF) as u16;
+    let id = (QUERY_ID_COUNTER.fetch_add(1, Ordering::SeqCst) & 0xFFFF) as u16;
     let query = build_dns_query(&domain, id);
     let start = tokio::time::Instant::now();
     let _ = sock.send_to(&query, target).await?;
 
     let mut buf = [0u8; 512];
-    let _ = tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await??;
+    let _ = tokio::time::timeout(Duration::from_millis(20_000), sock.recv_from(&mut buf)).await??;
     let rtt = start.elapsed().as_micros() as u64;
 
     Ok(rtt)

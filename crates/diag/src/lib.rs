@@ -115,6 +115,16 @@ pub enum DiagEvent {
         ts: Timestamp,
         query: String,
     },
+    /// Acceptor loop waiting for new connection (before ip_stack.accept()).
+    Wait {
+        id: ConnId,
+        ts: Timestamp,
+    },
+    /// Wait was terminated and connection accepted.
+    WaitEnded {
+        id: ConnId,
+        ts: Timestamp,
+    },
 }
 
 // ── Server (tun2socks5 side) ─────────────────────────────────────────

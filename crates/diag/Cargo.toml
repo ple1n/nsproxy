@@ -13,6 +13,7 @@ flume.workspace = true
 nsproxy-common = { path = "../common" }
 nix = { version = "0.27.1", features = ["sched"] }
 futures = "0.3.31"
+rand = "0.8"
 
 [features]
 default = ["egui-client"]

@@ -1549,6 +1549,7 @@ dependencies = [
  "futures",
  "nix 0.27.1",
  "nsproxy-common",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
