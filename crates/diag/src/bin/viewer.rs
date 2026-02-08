@@ -310,144 +310,6 @@ fn main() -> eframe::Result<()> {
                 });
             });
 
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let acc = accumulator.lock().unwrap();
-                let selected = *selected_conn.lock().unwrap();
-                let row_height = 18.0;
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto().at_least(60.0))
-                        .column(Column::auto().at_least(80.0))
-                        .column(Column::auto().at_least(120.0))
-                        .column(Column::remainder().at_least(160.0))
-                        .column(Column::remainder().at_least(140.0))
-                        .column(Column::auto().at_least(90.0))
-                        .column(Column::auto().at_least(90.0))
-                        .column(Column::auto().at_least(90.0))
-                        .column(Column::auto().at_least(80.0))
-                        .header(row_height, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("ID");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Kind");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Src");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Dst / Route");
-                        });
-                        header.col(|ui| {
-                            ui.strong("DNS");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Dispatch");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Connect Lat");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Duration");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Status");
-                        });
-                        })
-                        .body(|mut body| {
-                            body.rows(row_height, acc.conn_order.len(), |mut row| {
-                                let conn_id = &acc.conn_order[row.index()];
-                                if let Some(c) = acc.conns.get(conn_id) {
-                                    row.col(|ui| {
-                                        let is_selected = selected == Some(c.id);
-                                        if ui.selectable_label(is_selected, format!("{}", c.id.0)).clicked() {
-                                            *selected_conn.lock().unwrap() = Some(c.id);
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&c.kind);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&c.src);
-                                    });
-                                    row.col(|ui| {
-                                        let dest_label = if c.route.is_empty() {
-                                            c.dst.clone()
-                                        } else {
-                                            c.route.clone()
-                                        };
-                                        ui.label(&dest_label);
-                                    });
-
-                                    row.col(|ui| {
-                                        match (&c.dns_query, &c.dns_response) {
-                                            (Some(q), Some(r)) => {
-                                                ui.label(format!("{} -> {}", q, r));
-                                            }
-                                            (Some(q), None) => {
-                                                ui.label(format!("{} -> …", q));
-                                            }
-                                            _ => {}
-                                        }
-                                    });
-
-                                    row.col(|ui| {
-                                        use diag::summary::format_duration_us;
-                                        let color = if c.dispatch_us > 1000 {
-                                            egui::Color32::RED
-                                        } else if c.dispatch_us > 100 {
-                                            egui::Color32::YELLOW
-                                        } else {
-                                            egui::Color32::GREEN
-                                        };
-                                        ui.colored_label(color, format_duration_us(c.dispatch_us as f64));
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(lat) = c.connect_latency() {
-                                            use diag::summary::format_duration_us;
-                                            let us = lat.as_secs_f64() * 1_000_000.0;
-                                            let color = if us > 500_000.0 {
-                                                egui::Color32::RED
-                                            } else if us > 100_000.0 {
-                                                egui::Color32::YELLOW
-                                            } else {
-                                                egui::Color32::GREEN
-                                            };
-                                            ui.colored_label(color, format_duration_us(us));
-                                        } else {
-                                            ui.label("…");
-                                        }
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(dur) = c.total_duration() {
-                                            use diag::summary::format_duration_us;
-                                            let us = dur.as_secs_f64() * 1_000_000.0;
-                                            ui.label(format_duration_us(us));
-                                        } else {
-                                            ui.label("active");
-                                        }
-                                    });
-
-                                    row.col(|ui| {
-                                        if let Some(ref err) = c.error {
-                                            ui.colored_label(
-                                                egui::Color32::RED,
-                                                format!("{}", &err[..err.len().min(40)]),
-                                            );
-                                        } else if c.finished_ts.is_some() {
-                                            ui.colored_label(egui::Color32::GREEN, "OK");
-                                        }
-                                    });
-                                }
-                            });
-                        });
-                });
-            });
-
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("DNS ping (8.8.8.8)").clicked() {
@@ -634,6 +496,144 @@ fn main() -> eframe::Result<()> {
                 } else {
                     ui.label("Select a connection row to see details");
                 }
+            });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let acc = accumulator.lock().unwrap();
+                let selected = *selected_conn.lock().unwrap();
+                let row_height = 18.0;
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().at_least(60.0))
+                        .column(Column::auto().at_least(80.0))
+                        .column(Column::auto().at_least(120.0))
+                        .column(Column::remainder().at_least(160.0))
+                        .column(Column::remainder().at_least(140.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(80.0))
+                        .header(row_height, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("ID");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Kind");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Src");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Dst / Route");
+                        });
+                        header.col(|ui| {
+                            ui.strong("DNS");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Dispatch");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Connect Lat");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Duration");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Status");
+                        });
+                        })
+                        .body(|mut body| {
+                            body.rows(row_height, acc.conn_order.len(), |mut row| {
+                                let conn_id = &acc.conn_order[row.index()];
+                                if let Some(c) = acc.conns.get(conn_id) {
+                                    row.col(|ui| {
+                                        let is_selected = selected == Some(c.id);
+                                        if ui.selectable_label(is_selected, format!("{}", c.id.0)).clicked() {
+                                            *selected_conn.lock().unwrap() = Some(c.id);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&c.kind);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&c.src);
+                                    });
+                                    row.col(|ui| {
+                                        let dest_label = if c.route.is_empty() {
+                                            c.dst.clone()
+                                        } else {
+                                            c.route.clone()
+                                        };
+                                        ui.label(&dest_label);
+                                    });
+
+                                    row.col(|ui| {
+                                        match (&c.dns_query, &c.dns_response) {
+                                            (Some(q), Some(r)) => {
+                                                ui.label(format!("{} -> {}", q, r));
+                                            }
+                                            (Some(q), None) => {
+                                                ui.label(format!("{} -> …", q));
+                                            }
+                                            _ => {}
+                                        }
+                                    });
+
+                                    row.col(|ui| {
+                                        use diag::summary::format_duration_us;
+                                        let color = if c.dispatch_us > 1000 {
+                                            egui::Color32::RED
+                                        } else if c.dispatch_us > 100 {
+                                            egui::Color32::YELLOW
+                                        } else {
+                                            egui::Color32::GREEN
+                                        };
+                                        ui.colored_label(color, format_duration_us(c.dispatch_us as f64));
+                                    });
+
+                                    row.col(|ui| {
+                                        if let Some(lat) = c.connect_latency() {
+                                            use diag::summary::format_duration_us;
+                                            let us = lat.as_secs_f64() * 1_000_000.0;
+                                            let color = if us > 500_000.0 {
+                                                egui::Color32::RED
+                                            } else if us > 100_000.0 {
+                                                egui::Color32::YELLOW
+                                            } else {
+                                                egui::Color32::GREEN
+                                            };
+                                            ui.colored_label(color, format_duration_us(us));
+                                        } else {
+                                            ui.label("…");
+                                        }
+                                    });
+
+                                    row.col(|ui| {
+                                        if let Some(dur) = c.total_duration() {
+                                            use diag::summary::format_duration_us;
+                                            let us = dur.as_secs_f64() * 1_000_000.0;
+                                            ui.label(format_duration_us(us));
+                                        } else {
+                                            ui.label("active");
+                                        }
+                                    });
+
+                                    row.col(|ui| {
+                                        if let Some(ref err) = c.error {
+                                            ui.colored_label(
+                                                egui::Color32::RED,
+                                                format!("{}", &err[..err.len().min(40)]),
+                                            );
+                                        } else if c.finished_ts.is_some() {
+                                            ui.colored_label(egui::Color32::GREEN, "OK");
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                });
             });
 
             // Repaint periodically to show updates
