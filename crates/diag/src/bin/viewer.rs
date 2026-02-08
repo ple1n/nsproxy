@@ -99,7 +99,7 @@ fn main() -> eframe::Result<()> {
                         }
                         PingRequest::BurstTest(dns_addr) => {
                             let started = now_epoch_us();
-                            {
+                            let max_batch_size = {
                                 let mut burst = burst_state_bg.lock().unwrap();
                                 burst.running = true;
                                 burst.started_ts = Some(started);
@@ -107,9 +107,24 @@ fn main() -> eframe::Result<()> {
                                 burst.results.clear();
                                 burst.threshold_size = None;
                                 burst.last_error = None;
-                            }
+                                burst.max_batch_size
+                            };
 
-                            let test_sizes = vec![10u64, 100, 1000, 10000];
+                            // Generate test sizes on log2 scale up to max_batch_size
+                            let mut test_sizes = Vec::new();
+                            let mut power = 4; // Start at 2^4 = 16
+                            loop {
+                                let size = 1u64 << power; // 2^power
+                                if size > max_batch_size {
+                                    break;
+                                }
+                                test_sizes.push(size);
+                                power += 1;
+                            }
+                            if test_sizes.is_empty() || *test_sizes.last().unwrap() != max_batch_size {
+                                test_sizes.push(max_batch_size);
+                            }
+                            
                             let mut threshold_found = false;
 
                             for size in test_sizes {
@@ -397,7 +412,36 @@ fn main() -> eframe::Result<()> {
 
                     let burst_running = burst_test_state.lock().unwrap().running;
                     ui.add_enabled_ui(!burst_running, |ui| {
-                        if ui.button("Burst Test").on_hover_text("Test burst sizes (10, 100, 1000, 10000) to find >5% failure rate").clicked() {
+                        ui.label("Max batch:");
+                        let mut burst = burst_test_state.lock().unwrap();
+                        let mut log_value = (burst.max_batch_size as f64).log2();
+                        if ui.add(egui::Slider::new(&mut log_value, 4.0..=20.0)
+                            .custom_formatter(|n, _| {
+                                let val = 2_f64.powf(n).round() as u64;
+                                if val >= 1_048_576 {
+                                    format!("{}M", val / 1_048_576)
+                                } else if val >= 1_024 {
+                                    format!("{}k", val / 1_024)
+                                } else {
+                                    format!("{}", val)
+                                }
+                            })
+                            .custom_parser(|s| {
+                                let s = s.trim().to_lowercase();
+                                if let Some(s) = s.strip_suffix('m') {
+                                    s.parse::<f64>().ok().map(|v| (v * 1_048_576.0).log2())
+                                } else if let Some(s) = s.strip_suffix('k') {
+                                    s.parse::<f64>().ok().map(|v| (v * 1_024.0).log2())
+                                } else {
+                                    s.parse::<f64>().ok().map(|v| v.log2())
+                                }
+                            })).changed() {
+                            burst.max_batch_size = 2_f64.powf(log_value).round() as u64;
+                        }
+                        let max_batch = burst.max_batch_size;
+                        drop(burst);
+                        
+                        if ui.button("Burst Test").on_hover_text(format!("Test burst sizes (log scale up to {}) to find >5% failure rate", max_batch)).clicked() {
                             let dns_addr = dns_config.lock().unwrap().clone();
                             let _ = ping_tx.send(PingRequest::BurstTest(dns_addr));
                         }
@@ -801,7 +845,7 @@ struct BurstTestResult {
     latency_us_avg: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BurstTestState {
     running: bool,
     started_ts: Option<u64>,
@@ -809,6 +853,21 @@ struct BurstTestState {
     results: Vec<BurstTestResult>,
     threshold_size: Option<u64>,
     last_error: Option<String>,
+    max_batch_size: u64,
+}
+
+impl Default for BurstTestState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            started_ts: None,
+            finished_ts: None,
+            results: Vec::new(),
+            threshold_size: None,
+            last_error: None,
+            max_batch_size: 65536, // 2^16
+        }
+    }
 }
 
 #[derive(Debug, Default)]
