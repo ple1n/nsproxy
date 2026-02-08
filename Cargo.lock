@@ -1546,6 +1546,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "flume",
+ "futures",
  "nix 0.27.1",
  "nsproxy-common",
  "serde",

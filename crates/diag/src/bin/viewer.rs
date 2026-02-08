@@ -26,13 +26,15 @@ fn main() -> eframe::Result<()> {
     use diag::{diag_sock_path, summary::DiagAccumulator, DiagEvent};
     use eframe::egui;
     use egui_extras::{Column, TableBuilder};
+    use futures::stream::FuturesUnordered;
+    use futures::StreamExt as FuturesStreamExt;
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
-    let (ping_tx, ping_rx) = flume::unbounded::<String>();
+    let (ping_tx, ping_rx) = flume::unbounded::<PingRequest>();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -49,6 +51,9 @@ fn main() -> eframe::Result<()> {
     let connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conn_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ping_state: Arc<Mutex<PingState>> = Arc::new(Mutex::new(PingState::default()));
+    let mass_ping_state: Arc<Mutex<MassPingState>> =
+        Arc::new(Mutex::new(MassPingState::default()));
+    let selected_conn: Arc<Mutex<Option<diag::ConnId>>> = Arc::new(Mutex::new(None));
 
     // Spawn a background tokio runtime for reading from the socket
     let events_bg = events.clone();
@@ -56,6 +61,7 @@ fn main() -> eframe::Result<()> {
     let connected_bg = connected.clone();
     let conn_error_bg = conn_error.clone();
     let ping_bg = ping_state.clone();
+    let mass_ping_bg = mass_ping_state.clone();
     let sock_path_bg = sock_path.clone();
     let ping_rx_bg = ping_rx.clone();
 
@@ -66,11 +72,68 @@ fn main() -> eframe::Result<()> {
             .unwrap();
         rt.block_on(async move {
             let ping_state_bg = ping_bg.clone();
+            let mass_state_bg = mass_ping_bg.clone();
             tokio::spawn(async move {
-                while let Ok(domain) = ping_rx_bg.recv_async().await {
-                    if let Err(err) = send_dns_ping_async("8.8.8.8:53", &domain).await {
-                        let mut ping = ping_state_bg.lock().unwrap();
-                        ping.last_error = Some(format!("dns ping error: {}", err));
+                while let Ok(req) = ping_rx_bg.recv_async().await {
+                    match req {
+                        PingRequest::Single(domain) => {
+                            if let Err(err) = send_dns_ping_async("8.8.8.8:53", domain).await {
+                                let mut ping = ping_state_bg.lock().unwrap();
+                                ping.last_error = Some(format!("dns ping error: {}", err));
+                            }
+                        }
+                        PingRequest::Batch(domains) => {
+                            let batch_started = now_epoch_us();
+                            let mut tasks = FuturesUnordered::new();
+                            for domain in domains {
+                                tasks.push(async move {
+                                    send_dns_ping_async("8.8.8.8:53", domain).await
+                                });
+                            }
+                            let mut errs = 0u64;
+                            let mut done = 0u64;
+                            let mut rtt_sum_us = 0u64;
+                            let mut rtt_min_us = u64::MAX;
+                            let mut rtt_max_us = 0u64;
+                            let mut rtt_samples = 0u64;
+                            while let Some(res) = tasks.next().await {
+                                done += 1;
+                                match res {
+                                    Ok(rtt_us) => {
+                                        rtt_samples += 1;
+                                        rtt_sum_us = rtt_sum_us.saturating_add(rtt_us);
+                                        rtt_min_us = rtt_min_us.min(rtt_us);
+                                        rtt_max_us = rtt_max_us.max(rtt_us);
+                                    }
+                                    Err(_) => {
+                                        errs += 1;
+                                    }
+                                }
+                            }
+                            let batch_finished = now_epoch_us();
+                            let mut mass = mass_state_bg.lock().unwrap();
+                            mass.completed = done;
+                            mass.errors = errs;
+                            mass.in_flight = 0;
+                            mass.finished_ts = Some(batch_finished);
+                            mass.duration_us = Some(batch_finished.saturating_sub(batch_started));
+                            if rtt_samples > 0 {
+                                mass.rtt_avg_us = Some(rtt_sum_us / rtt_samples);
+                                mass.rtt_min_us = Some(rtt_min_us);
+                                mass.rtt_max_us = Some(rtt_max_us);
+                                mass.rtt_samples = rtt_samples;
+                            } else {
+                                mass.rtt_avg_us = None;
+                                mass.rtt_min_us = None;
+                                mass.rtt_max_us = None;
+                                mass.rtt_samples = 0;
+                            }
+                            mass.last_error = if errs > 0 {
+                                Some(format!("{} errors", errs))
+                            } else {
+                                None
+                            };
+                        }
                     }
                 }
             });
@@ -156,37 +219,6 @@ fn main() -> eframe::Result<()> {
                     ui.label(format!("socket: {}", sock_path.display()));
                 });
 
-                ui.horizontal(|ui| {
-                    if ui.button("DNS ping (8.8.8.8)").clicked() {
-                        let now_us = now_epoch_us();
-                        let domain = format!("ping-{}.diag", now_us);
-                        {
-                            let mut ping = ping_state.lock().unwrap();
-                            ping.last_domain = Some(domain.clone());
-                            ping.last_sent_us = Some(now_us);
-                            ping.last_accept_delta_us = None;
-                            ping.last_accept_ts = None;
-                            ping.last_conn_id = None;
-                            ping.last_error = None;
-                        }
-                        let _ = ping_tx.send(domain);
-                    }
-
-                    let ping = ping_state.lock().unwrap();
-                    if let Some(ref domain) = ping.last_domain {
-                        ui.label(format!("last: {}", domain));
-                    }
-                    if let Some(delta) = ping.last_accept_delta_us {
-                        use diag::summary::format_duration_us;
-                        ui.label(format!("accept Δ: {}", format_duration_us(delta as f64)));
-                    } else if ping.last_domain.is_some() {
-                        ui.label("accept Δ: …");
-                    }
-                    if let Some(err) = ping.last_error.as_ref() {
-                        ui.colored_label(egui::Color32::RED, err);
-                    }
-                });
-
                 // Loop stats
                 let acc = accumulator.lock().unwrap();
                 ui.horizontal(|ui| {
@@ -205,6 +237,7 @@ fn main() -> eframe::Result<()> {
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 let acc = accumulator.lock().unwrap();
+                let selected = *selected_conn.lock().unwrap();
                 let row_height = 18.0;
                 TableBuilder::new(ui)
                     .striped(true)
@@ -252,7 +285,10 @@ fn main() -> eframe::Result<()> {
                             let conn_id = &acc.conn_order[row.index()];
                             if let Some(c) = acc.conns.get(conn_id) {
                                 row.col(|ui| {
-                                    ui.label(format!("{}", c.id.0));
+                                    let is_selected = selected == Some(c.id);
+                                    if ui.selectable_label(is_selected, format!("{}", c.id.0)).clicked() {
+                                        *selected_conn.lock().unwrap() = Some(c.id);
+                                    }
                                 });
                                 row.col(|ui| {
                                     ui.label(&c.kind);
@@ -335,6 +371,143 @@ fn main() -> eframe::Result<()> {
                     });
             });
 
+            egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("DNS ping (8.8.8.8)").clicked() {
+                        let now_us = now_epoch_us();
+                        let domain = format!("ping-{}.diag", now_us);
+                        {
+                            let mut ping = ping_state.lock().unwrap();
+                            ping.last_domain = Some(domain.clone());
+                            ping.last_sent_us = Some(now_us);
+                            ping.last_accept_delta_us = None;
+                            ping.last_accept_ts = None;
+                            ping.last_conn_id = None;
+                            ping.last_error = None;
+                        }
+                        let _ = ping_tx.send(PingRequest::Single(domain));
+                    }
+
+                    if ui.button("DNS ping x100").clicked() {
+                        let now_us = now_epoch_us();
+                        let mut domains = Vec::with_capacity(100);
+                        for i in 0..100u64 {
+                            domains.push(format!("ping-{}-{}.diag", now_us, i));
+                        }
+                        {
+                            let mut mass = mass_ping_state.lock().unwrap();
+                            mass.last_batch = Some(now_us);
+                            mass.started_ts = Some(now_us);
+                            mass.finished_ts = None;
+                            mass.duration_us = None;
+                            mass.rtt_avg_us = None;
+                            mass.rtt_min_us = None;
+                            mass.rtt_max_us = None;
+                            mass.rtt_samples = 0;
+                            mass.requested = 100;
+                            mass.in_flight = 100;
+                            mass.completed = 0;
+                            mass.errors = 0;
+                            mass.last_error = None;
+                        }
+                        let _ = ping_tx.send(PingRequest::Batch(domains));
+                    }
+
+                    let ping = ping_state.lock().unwrap();
+                    if let Some(ref domain) = ping.last_domain {
+                        ui.label(format!("last: {}", domain));
+                    }
+                    if let Some(delta) = ping.last_accept_delta_us {
+                        use diag::summary::format_duration_us;
+                        ui.label(format!("accept Δ: {}", format_duration_us(delta as f64)));
+                    } else if ping.last_domain.is_some() {
+                        ui.label("accept Δ: …");
+                    }
+                    if let Some(err) = ping.last_error.as_ref() {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let mass = mass_ping_state.lock().unwrap();
+                    if let Some(ts) = mass.last_batch {
+                        ui.label(format!("batch: {}", ts));
+                    }
+                    ui.label(format!("requested: {}", mass.requested));
+                    ui.label(format!("in_flight: {}", mass.in_flight));
+                    ui.label(format!("completed: {}", mass.completed));
+                    if let Some(dur) = mass.duration_us {
+                        use diag::summary::format_duration_us;
+                        ui.label(format!("duration: {}", format_duration_us(dur as f64)));
+                        if mass.completed > 0 {
+                            let rps = (mass.completed as f64) / (dur as f64 / 1_000_000.0);
+                            ui.label(format!("rate: {:.1}/s", rps));
+                        }
+                    } else if mass.in_flight > 0 {
+                        use diag::summary::format_duration_us;
+                        if let Some(started) = mass.started_ts {
+                            let elapsed = now_epoch_us().saturating_sub(started);
+                            ui.label(format!("elapsed: {}", format_duration_us(elapsed as f64)));
+                        }
+                    }
+                    if let Some(avg) = mass.rtt_avg_us {
+                        use diag::summary::format_duration_us;
+                        let min = mass.rtt_min_us.unwrap_or(avg);
+                        let max = mass.rtt_max_us.unwrap_or(avg);
+                        ui.label(format!(
+                            "rtt avg/min/max: {} / {} / {} (n={})",
+                            format_duration_us(avg as f64),
+                            format_duration_us(min as f64),
+                            format_duration_us(max as f64),
+                            mass.rtt_samples
+                        ));
+                    }
+                    if mass.errors > 0 {
+                        ui.colored_label(egui::Color32::RED, format!("errors: {}", mass.errors));
+                    }
+                    if let Some(err) = mass.last_error.as_ref() {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
+
+                ui.separator();
+                let acc = accumulator.lock().unwrap();
+                let selected = *selected_conn.lock().unwrap();
+                if let Some(id) = selected {
+                    if let Some(c) = acc.conns.get(&id) {
+                        ui.heading(format!("Connection {}", c.id.0));
+                        ui.label(format!("kind: {}", c.kind));
+                        ui.label(format!("src: {}", c.src));
+                        ui.label(format!("dst: {}", c.dst));
+                        if !c.route.is_empty() {
+                            ui.label(format!("route: {}", c.route));
+                        }
+                        ui.label(format!("accept_ts: {}", c.accept_ts.0));
+                        if let Some(ts) = c.connected_ts {
+                            ui.label(format!("connected_ts: {}", ts.0));
+                        }
+                        if let Some(ts) = c.finished_ts {
+                            ui.label(format!("finished_ts: {}", ts.0));
+                        }
+                        ui.label(format!("dispatch_us: {}", c.dispatch_us));
+                        if let Some(ref q) = c.dns_query {
+                            ui.label(format!("dns_query: {}", q));
+                        }
+                        if let Some(ref r) = c.dns_response {
+                            ui.label(format!("dns_response: {}", r));
+                        }
+                        if let Some(ref err) = c.error {
+                            ui.colored_label(egui::Color32::RED, format!("error: {}", err));
+                        }
+                        ui.label(format!("bytes_up: {}  bytes_down: {}", c.bytes_up, c.bytes_down));
+                    } else {
+                        ui.label("Selected connection not found");
+                    }
+                } else {
+                    ui.label("Select a connection row to see details");
+                }
+            });
+
             // Repaint periodically to show updates
             ctx.request_repaint_after(Duration::from_millis(500));
         },
@@ -349,6 +522,28 @@ struct PingState {
     last_accept_ts: Option<u64>,
     last_conn_id: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct MassPingState {
+    last_batch: Option<u64>,
+    started_ts: Option<u64>,
+    finished_ts: Option<u64>,
+    duration_us: Option<u64>,
+    rtt_avg_us: Option<u64>,
+    rtt_min_us: Option<u64>,
+    rtt_max_us: Option<u64>,
+    rtt_samples: u64,
+    requested: u64,
+    in_flight: u64,
+    completed: u64,
+    errors: u64,
+    last_error: Option<String>,
+}
+
+enum PingRequest {
+    Single(String),
+    Batch(Vec<String>),
 }
 
 fn now_epoch_us() -> u64 {
@@ -385,14 +580,19 @@ fn build_dns_query(domain: &str, id: u16) -> Vec<u8> {
     buf
 }
 
-async fn send_dns_ping_async(target: &str, domain: &str) -> anyhow::Result<()> {
+async fn send_dns_ping_async(target: &str, domain: String) -> anyhow::Result<u64> {
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
     let id = (now_epoch_us() & 0xFFFF) as u16;
-    let query = build_dns_query(domain, id);
+    let query = build_dns_query(&domain, id);
+    let start = tokio::time::Instant::now();
     let _ = sock.send_to(&query, target).await?;
 
-    Ok(())
+    let mut buf = [0u8; 512];
+    let _ = tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await??;
+    let rtt = start.elapsed().as_micros() as u64;
+
+    Ok(rtt)
 }
 
 fn enter_instance_namespace(instance_name: &str) -> anyhow::Result<()> {
