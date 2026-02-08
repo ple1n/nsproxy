@@ -78,13 +78,15 @@ fn main() -> eframe::Result<()> {
                                     if let DiagEvent::DnsQuery { id, query, .. } = &event {
                                         if let Some(c) = acc.conns.get(id) {
                                             let mut ping = ping_bg.lock().unwrap();
-                                            if ping.last_domain.as_deref() == Some(query) {
-                                                if let Some(sent_us) = ping.last_sent_us {
-                                                    let accept_us = c.accept_ts.0;
-                                                    ping.last_accept_delta_us =
-                                                        Some(accept_us.saturating_sub(sent_us));
-                                                    ping.last_accept_ts = Some(accept_us);
-                                                    ping.last_conn_id = Some(id.0);
+                                            if let Some(ref last) = ping.last_domain {
+                                                if normalize_domain(last) == normalize_domain(query) {
+                                                    if let Some(sent_us) = ping.last_sent_us {
+                                                        let accept_us = c.accept_ts.0;
+                                                        ping.last_accept_delta_us =
+                                                            Some(accept_us.saturating_sub(sent_us));
+                                                        ping.last_accept_ts = Some(accept_us);
+                                                        ping.last_conn_id = Some(id.0);
+                                                    }
                                                 }
                                             }
                                         }
@@ -158,9 +160,11 @@ fn main() -> eframe::Result<()> {
                             ping.last_conn_id = None;
                             ping.last_error = None;
                         }
+                        let ping_state_bg = ping_state.clone();
                         std::thread::spawn(move || {
                             if let Err(err) = send_dns_ping("8.8.8.8:53", &domain) {
-                                eprintln!("dns ping error: {}", err);
+                                let mut ping = ping_state_bg.lock().unwrap();
+                                ping.last_error = Some(format!("dns ping error: {}", err));
                             }
                         });
                     }
@@ -349,6 +353,10 @@ fn now_epoch_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn build_dns_query(domain: &str, id: u16) -> Vec<u8> {
