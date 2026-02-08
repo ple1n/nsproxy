@@ -28,6 +28,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "egui-client")]
+use std::collections::VecDeque;
+
+#[cfg(feature = "egui-client")]
 fn main() -> eframe::Result<()> {
     use diag::{diag_sock_path, summary::DiagAccumulator, DiagEvent};
     use eframe::egui;
@@ -61,6 +64,8 @@ fn main() -> eframe::Result<()> {
         Arc::new(Mutex::new(MassPingState::default()));
     let burst_test_state: Arc<Mutex<BurstTestState>> =
         Arc::new(Mutex::new(BurstTestState::default()));
+    let burst_test_stats: Arc<Mutex<BurstTestStats>> =
+        Arc::new(Mutex::new(BurstTestStats::new(50)));
     let selected_conn: Arc<Mutex<Option<diag::ConnId>>> = Arc::new(Mutex::new(None));
     let dns_config: Arc<Mutex<String>> = Arc::new(Mutex::new("8.8.8.8:53".to_string()));
     let events_bg = events.clone();
@@ -124,10 +129,20 @@ fn main() -> eframe::Result<()> {
 
                                 let mut errs = 0u64;
                                 let mut done = 0u64;
+                                let mut lat_sum_us = 0u64;
+                                let mut lat_min_us = u64::MAX;
+                                let mut lat_max_us = 0u64;
                                 while let Some(res) = tasks.next().await {
                                     done += 1;
-                                    if res.is_err() {
-                                        errs += 1;
+                                    match res {
+                                        Ok(latency_us) => {
+                                            lat_sum_us = lat_sum_us.saturating_add(latency_us);
+                                            lat_min_us = lat_min_us.min(latency_us);
+                                            lat_max_us = lat_max_us.max(latency_us);
+                                        }
+                                        Err(_) => {
+                                            errs += 1;
+                                        }
                                     }
                                 }
 
@@ -137,12 +152,22 @@ fn main() -> eframe::Result<()> {
                                     0.0
                                 };
 
+                                let successful = done.saturating_sub(errs);
+                                let lat_avg_us = if successful > 0 {
+                                    lat_sum_us / successful
+                                } else {
+                                    0
+                                };
+
                                 let result = BurstTestResult {
                                     size,
                                     requested: size,
                                     completed: done,
                                     errors: errs,
                                     failure_rate,
+                                    latency_us_min: if successful > 0 { lat_min_us } else { 0 },
+                                    latency_us_max: lat_max_us,
+                                    latency_us_avg: lat_avg_us,
                                 };
 
                                 {
@@ -160,9 +185,22 @@ fn main() -> eframe::Result<()> {
                             }
 
                             let finished = now_epoch_us();
-                            let mut burst = burst_state_bg.lock().unwrap();
-                            burst.running = false;
-                            burst.finished_ts = Some(finished);
+                            {
+                                let mut burst = burst_state_bg.lock().unwrap();
+                                burst.running = false;
+                                burst.finished_ts = Some(finished);
+                                
+                                // Update burst statistics
+                                let duration_ms = (finished.saturating_sub(started as u64)) as f64 / 1000.0;
+                                let overall_failure_rate = if !burst.results.is_empty() {
+                                    burst.results.iter().map(|r| r.failure_rate).sum::<f64>() / burst.results.len() as f64
+                                } else {
+                                    0.0
+                                };
+                                let hit_threshold = burst.threshold_size.is_some();
+                            }
+                            
+                            // Stats are updated in the UI thread when displayed
                         }
                         PingRequest::Batch(domains, dns_addr) => {
                             let batch_started = now_epoch_us();
@@ -458,26 +496,57 @@ fn main() -> eframe::Result<()> {
                             ui.label(format!("elapsed: {}", format_duration_us(elapsed as f64)));
                         }
                     } else if !burst.results.is_empty() {
-                        ui.label("Burst test results:");
-                        for result in &burst.results {
-                            let color = if result.failure_rate > 5.0 {
-                                egui::Color32::RED
-                            } else if result.failure_rate > 1.0 {
-                                egui::Color32::YELLOW
-                            } else {
-                                egui::Color32::GREEN
-                            };
-                            ui.colored_label(
-                                color,
-                                format!(
-                                    "n={}: {}/{} ({:.1}% err)",
-                                    result.size,
-                                    result.completed.saturating_sub(result.errors),
-                                    result.requested,
-                                    result.failure_rate
-                                ),
-                            );
+                        // Update stats if we have new results
+                        {
+                            let finished = burst.finished_ts.unwrap_or(0);
+                            let started = burst.started_ts.unwrap_or(0);
+                            let duration_ms = (finished.saturating_sub(started)) as f64 / 1000.0;
+                            let overall_failure_rate = burst.results.iter().map(|r| r.failure_rate).sum::<f64>() / burst.results.len() as f64;
+                            let hit_threshold = burst.threshold_size.is_some();
+                            
+                            let mut stats = burst_test_stats.lock().unwrap();
+                            if stats.test_count < burst.results.len() as u64 {
+                                stats.add_test(overall_failure_rate, duration_ms, hit_threshold);
+                            }
                         }
+                        drop(burst);
+                        
+                        ui.label("Burst test results:");
+                        let burst = burst_test_state.lock().unwrap();
+                        
+                        egui::Grid::new("burst_results_grid")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                // Header
+                                ui.label("Batch");
+                                ui.label("Success/Req");
+                                ui.label("Failure %");
+                                ui.label("Min RTT");
+                                ui.label("Avg RTT");
+                                ui.label("Max RTT");
+                                ui.end_row();
+                                
+                                for result in &burst.results {
+                                    ui.label(format!("n={}", result.size));
+                                    ui.label(format!("{}/{}", result.completed.saturating_sub(result.errors), result.requested));
+                                    
+                                    let color = if result.failure_rate > 5.0 {
+                                        egui::Color32::RED
+                                    } else if result.failure_rate > 1.0 {
+                                        egui::Color32::YELLOW
+                                    } else {
+                                        egui::Color32::GREEN
+                                    };
+                                    ui.colored_label(color, format!("{:.1}%", result.failure_rate));
+                                    
+                                    use diag::summary::format_duration_us;
+                                    ui.label(format_duration_us(result.latency_us_min as f64));
+                                    ui.label(format_duration_us(result.latency_us_avg as f64));
+                                    ui.label(format_duration_us(result.latency_us_max as f64));
+                                    ui.end_row();
+                                }
+                            });
+                        
                         if let Some(threshold) = burst.threshold_size {
                             ui.colored_label(
                                 egui::Color32::RED,
@@ -486,8 +555,25 @@ fn main() -> eframe::Result<()> {
                         } else {
                             ui.colored_label(egui::Color32::GREEN, "✓ All tests passed (<5% failures)");
                         }
-                    }
-                    if let Some(err) = burst.last_error.as_ref() {
+                        
+                        let last_error = burst.last_error.clone();
+                        
+                        // Display statistics
+                        let stats = burst_test_stats.lock().unwrap();
+                        if stats.test_count > 0 {
+                            ui.vertical(|ui| {
+                                ui.label(format!("Total tests: {}", stats.test_count));
+                                ui.label(format!("Avg failure rate: {:.2}%", stats.avg_failure_rate()));
+                                ui.label(format!("Max failure rate: {:.2}%", stats.max_failure_rate));
+                                ui.label(format!("Avg duration: {:.1}ms", stats.avg_duration_ms()));
+                                ui.label(format!("Threshold hits: {}", stats.threshold_hits));
+                            });
+                        }
+                        
+                        if let Some(err) = last_error {
+                            ui.colored_label(egui::Color32::RED, &err);
+                        }
+                    } else if let Some(err) = burst.last_error.as_ref() {
                         ui.colored_label(egui::Color32::RED, err);
                     }
                 });
@@ -710,6 +796,9 @@ struct BurstTestResult {
     completed: u64,
     errors: u64,
     failure_rate: f64,
+    latency_us_min: u64,
+    latency_us_max: u64,
+    latency_us_avg: u64,
 }
 
 #[derive(Debug, Default)]
@@ -720,6 +809,66 @@ struct BurstTestState {
     results: Vec<BurstTestResult>,
     threshold_size: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct BurstTestStats {
+    /// Total number of burst tests completed.
+    pub test_count: u64,
+    /// Rolling window of failure rates from completed tests.
+    pub failure_rates: VecDeque<f64>,
+    /// Rolling window of durations (ms) for completed tests.
+    pub durations_ms: VecDeque<f64>,
+    /// Max failure rate observed.
+    pub max_failure_rate: f64,
+    /// Number of tests that hit the >5% threshold.
+    pub threshold_hits: u64,
+    pub max_window: usize,
+}
+
+impl BurstTestStats {
+    pub fn new(window: usize) -> Self {
+        Self {
+            test_count: 0,
+            failure_rates: VecDeque::with_capacity(window),
+            durations_ms: VecDeque::with_capacity(window),
+            max_failure_rate: 0.0,
+            threshold_hits: 0,
+            max_window: window,
+        }
+    }
+
+    pub fn add_test(&mut self, failure_rate: f64, duration_ms: f64, hit_threshold: bool) {
+        self.test_count += 1;
+        if self.failure_rates.len() >= self.max_window {
+            self.failure_rates.pop_front();
+        }
+        if self.durations_ms.len() >= self.max_window {
+            self.durations_ms.pop_front();
+        }
+        self.failure_rates.push_back(failure_rate);
+        self.durations_ms.push_back(duration_ms);
+        self.max_failure_rate = self.max_failure_rate.max(failure_rate);
+        if hit_threshold {
+            self.threshold_hits += 1;
+        }
+    }
+
+    pub fn avg_failure_rate(&self) -> f64 {
+        if self.failure_rates.is_empty() {
+            0.0
+        } else {
+            self.failure_rates.iter().sum::<f64>() / self.failure_rates.len() as f64
+        }
+    }
+
+    pub fn avg_duration_ms(&self) -> f64 {
+        if self.durations_ms.is_empty() {
+            0.0
+        } else {
+            self.durations_ms.iter().sum::<f64>() / self.durations_ms.len() as f64
+        }
+    }
 }
 
 enum PingRequest {
