@@ -27,6 +27,66 @@ pub mod rpc;
 
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 
+/// Persistent profile storage root
+pub const PERSIST_ROOT: &str = "/nsp3";
+
+/// Runtime state directory (namespace bind mounts and metadata)
+pub const RUNTIME_ROOT: &str = "/run/nsproxy";
+
+/// Helper functions for consistent path handling
+pub mod state_paths {
+    use super::*;
+
+    /// Get profile directory for a named profile
+    pub fn profile_dir(name: &str) -> PathBuf {
+        PathBuf::from(PERSIST_ROOT).join(name)
+    }
+
+    /// Get profile.json path for a named profile
+    pub fn profile_config(name: &str) -> PathBuf {
+        profile_dir(name).join("profile.json")
+    }
+
+    /// Get hot.json path for a named profile
+    pub fn hot_config(name: &str) -> PathBuf {
+        profile_dir(name).join("hot.json")
+    }
+
+    /// Get namespace bind mount path (runtime, for ::Run)
+    pub fn ns_bind_mount(name: &str) -> PathBuf {
+        PathBuf::from(RUNTIME_ROOT).join(format!("{}.ns", name))
+    }
+
+    /// Get namespace bind mount path inside profile instance dir (for ::Make)
+    /// Returns /nsp3/{name}/net
+    pub fn profile_netns_bind(name: &str) -> PathBuf {
+        profile_dir(name).join("net")
+    }
+
+    /// Get namespace metadata JSON path inside profile instance dir (for ::Make)
+    /// Returns /nsp3/{name}/ns_alive.json
+    pub fn profile_ns_meta(name: &str) -> PathBuf {
+        profile_dir(name).join("ns_alive.json")
+    }
+
+    /// Get metadata JSON path for a namespace
+    pub fn ns_metadata(name: &str) -> PathBuf {
+        PathBuf::from(RUNTIME_ROOT).join(format!("{}.json", name))
+    }
+
+    /// Get metadata JSON path from bind mount path
+    pub fn metadata_for_bind(bind_path: &Path) -> PathBuf {
+        bind_path.with_extension("json")
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct NsAlive {
+    pub browser_profile: Option<String>,
+    pub bind_mount: PathBuf,
+    pub child_pid: Option<u32>,
+}
+
 /// Represents an NS anchored to a process, or a file
 /// Equality iff .unique equals
 #[public]
