@@ -16,9 +16,6 @@ use nsproxy_common::{NsAlive, state_paths};
 use std::fs::File;
 
 #[cfg(feature = "egui-client")]
-use std::net::UdpSocket;
-
-#[cfg(feature = "egui-client")]
 use std::os::fd::AsFd;
 
 #[cfg(feature = "egui-client")]
@@ -34,6 +31,8 @@ fn main() -> eframe::Result<()> {
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    let (ping_tx, ping_rx) = flume::unbounded::<String>();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -58,6 +57,7 @@ fn main() -> eframe::Result<()> {
     let conn_error_bg = conn_error.clone();
     let ping_bg = ping_state.clone();
     let sock_path_bg = sock_path.clone();
+    let ping_rx_bg = ping_rx.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -65,6 +65,15 @@ fn main() -> eframe::Result<()> {
             .build()
             .unwrap();
         rt.block_on(async move {
+            let ping_state_bg = ping_bg.clone();
+            tokio::spawn(async move {
+                while let Ok(domain) = ping_rx_bg.recv_async().await {
+                    if let Err(err) = send_dns_ping_async("8.8.8.8:53", &domain).await {
+                        let mut ping = ping_state_bg.lock().unwrap();
+                        ping.last_error = Some(format!("dns ping error: {}", err));
+                    }
+                }
+            });
             loop {
                 match diag::connect(&sock_path_bg).await {
                     Ok(mut stream) => {
@@ -160,13 +169,7 @@ fn main() -> eframe::Result<()> {
                             ping.last_conn_id = None;
                             ping.last_error = None;
                         }
-                        let ping_state_bg = ping_state.clone();
-                        std::thread::spawn(move || {
-                            if let Err(err) = send_dns_ping("8.8.8.8:53", &domain) {
-                                let mut ping = ping_state_bg.lock().unwrap();
-                                ping.last_error = Some(format!("dns ping error: {}", err));
-                            }
-                        });
+                        let _ = ping_tx.send(domain);
                     }
 
                     let ping = ping_state.lock().unwrap();
@@ -382,14 +385,12 @@ fn build_dns_query(domain: &str, id: u16) -> Vec<u8> {
     buf
 }
 
-fn send_dns_ping(target: &str, domain: &str) -> anyhow::Result<()> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_read_timeout(Some(Duration::from_millis(300)))?;
-    sock.set_write_timeout(Some(Duration::from_millis(300)))?;
+async fn send_dns_ping_async(target: &str, domain: &str) -> anyhow::Result<()> {
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
 
     let id = (now_epoch_us() & 0xFFFF) as u16;
     let query = build_dns_query(domain, id);
-    let _ = sock.send_to(&query, target)?;
+    let _ = sock.send_to(&query, target).await?;
 
     Ok(())
 }
