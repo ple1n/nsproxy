@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
-use nix::unistd::{Gid, execve, getegid, getresuid, setgroups, setresgid, setresuid};
+use nix::unistd::{Gid, chdir, execve, getegid, getresuid, setgroups, setresgid, setresuid};
 use nsproxy_common::UID_HINT_VAR;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -221,6 +221,10 @@ impl ShellPrefs {
                 Clone3Result::IsChild { tx } => {
                     let cmd = CString::new(cmd.to_str().unwrap())?;
                     self.drop_privs()?;
+
+                    if let Some(cwd) = &self.cwd {
+                        chdir(cwd)?;
+                    }
 
                     execve(cmd.as_c_str(), &self.args, self.env.make_contiguous());
                 }

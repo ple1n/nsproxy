@@ -1246,29 +1246,29 @@ fn main() -> anyhow::Result<()> {
             }
         }
         /// We are just putting state in proc now, basically. Seems cleaner
-        MainCommand::Enter {
-            list,
-            port,
-            sargs,
-            name,
-            path,
-        } => {
+        MainCommand::Enter { sargs, target } => {
             let mut shell_prefs = ShellPrefs::default();
             shell_prefs.take_args(sargs);
             shell_prefs.adjust();
 
-            // Resolve the bind mount path: --name resolves to /nsp3/{name}/net,
-            // otherwise use the explicit path argument
-            let (resolved_path, nsdata) = if let Some(ref n) = name {
-                let p = state_paths::profile_netns_bind(n);
-                let m = state_paths::profile_ns_meta(n);
-                info!("Resolved profile name {:?} to {:?}", n, &p);
-                (Some(p), m)
-            } else if let Some(ref p) = path {
-                (Some(p.clone()), state_paths::metadata_for_bind(p))
-            } else {
-                error!("specify --name <profile> or a path");
-                (None, PathBuf::new())
+            // Resolve the bind mount path: profile name resolves to /nsp3/{name}/net,
+            // otherwise treat as an explicit path if it starts with /, ./, or ~/
+            let (resolved_path, nsdata) = {
+                let t = &target;
+                if t.starts_with('/') || t.starts_with("./") || t.starts_with("~/") {
+                    let p = if let Some(rest) = t.strip_prefix("~/") {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        PathBuf::from(home).join(rest)
+                    } else {
+                        PathBuf::from(t)
+                    };
+                    (Some(p.clone()), state_paths::metadata_for_bind(&p))
+                } else {
+                    let p = state_paths::profile_netns_bind(t);
+                    let m = state_paths::profile_ns_meta(t);
+                    info!("Resolved profile name {:?} to {:?}", t, &p);
+                    (Some(p), m)
+                }
             };
 
             if let Some(path) = resolved_path {

@@ -7,6 +7,24 @@
 //!   e.g. nsp-diag myprofile
 
 #[cfg(feature = "egui-client")]
+use nix::sched::CloneFlags;
+
+#[cfg(feature = "egui-client")]
+use nsproxy_common::{NsAlive, state_paths};
+
+#[cfg(feature = "egui-client")]
+use std::fs::File;
+
+#[cfg(feature = "egui-client")]
+use std::net::UdpSocket;
+
+#[cfg(feature = "egui-client")]
+use std::os::fd::AsFd;
+
+#[cfg(feature = "egui-client")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "egui-client")]
 fn main() -> eframe::Result<()> {
     use diag::{diag_sock_path, summary::DiagAccumulator, DiagEvent};
     use eframe::egui;
@@ -31,12 +49,14 @@ fn main() -> eframe::Result<()> {
         Arc::new(Mutex::new(DiagAccumulator::new(2000, 500)));
     let connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conn_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let ping_state: Arc<Mutex<PingState>> = Arc::new(Mutex::new(PingState::default()));
 
     // Spawn a background tokio runtime for reading from the socket
     let events_bg = events.clone();
     let acc_bg = accumulator.clone();
     let connected_bg = connected.clone();
     let conn_error_bg = conn_error.clone();
+    let ping_bg = ping_state.clone();
     let sock_path_bg = sock_path.clone();
 
     std::thread::spawn(move || {
@@ -55,6 +75,20 @@ fn main() -> eframe::Result<()> {
                                 Ok(Some(event)) => {
                                     let mut acc = acc_bg.lock().unwrap();
                                     acc.ingest(&event);
+                                    if let DiagEvent::DnsQuery { id, query, .. } = &event {
+                                        if let Some(c) = acc.conns.get(id) {
+                                            let mut ping = ping_bg.lock().unwrap();
+                                            if ping.last_domain.as_deref() == Some(query) {
+                                                if let Some(sent_us) = ping.last_sent_us {
+                                                    let accept_us = c.accept_ts.0;
+                                                    ping.last_accept_delta_us =
+                                                        Some(accept_us.saturating_sub(sent_us));
+                                                    ping.last_accept_ts = Some(accept_us);
+                                                    ping.last_conn_id = Some(id.0);
+                                                }
+                                            }
+                                        }
+                                    }
                                     let mut evts = events_bg.lock().unwrap();
                                     evts.push_back(event);
                                     if evts.len() > 5000 {
@@ -109,6 +143,41 @@ fn main() -> eframe::Result<()> {
                     }
                     ui.separator();
                     ui.label(format!("socket: {}", sock_path.display()));
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("DNS ping (8.8.8.8)").clicked() {
+                        let now_us = now_epoch_us();
+                        let domain = format!("ping-{}.diag", now_us);
+                        {
+                            let mut ping = ping_state.lock().unwrap();
+                            ping.last_domain = Some(domain.clone());
+                            ping.last_sent_us = Some(now_us);
+                            ping.last_accept_delta_us = None;
+                            ping.last_accept_ts = None;
+                            ping.last_conn_id = None;
+                            ping.last_error = None;
+                        }
+                        std::thread::spawn(move || {
+                            if let Err(err) = send_dns_ping("8.8.8.8:53", &domain) {
+                                eprintln!("dns ping error: {}", err);
+                            }
+                        });
+                    }
+
+                    let ping = ping_state.lock().unwrap();
+                    if let Some(ref domain) = ping.last_domain {
+                        ui.label(format!("last: {}", domain));
+                    }
+                    if let Some(delta) = ping.last_accept_delta_us {
+                        use diag::summary::format_duration_us;
+                        ui.label(format!("accept Δ: {}", format_duration_us(delta as f64)));
+                    } else if ping.last_domain.is_some() {
+                        ui.label("accept Δ: …");
+                    }
+                    if let Some(err) = ping.last_error.as_ref() {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
                 });
 
                 // Loop stats
@@ -263,6 +332,88 @@ fn main() -> eframe::Result<()> {
             ctx.request_repaint_after(Duration::from_millis(500));
         },
     )
+}
+
+#[derive(Debug, Default)]
+struct PingState {
+    last_domain: Option<String>,
+    last_sent_us: Option<u64>,
+    last_accept_delta_us: Option<u64>,
+    last_accept_ts: Option<u64>,
+    last_conn_id: Option<u64>,
+    last_error: Option<String>,
+}
+
+fn now_epoch_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn build_dns_query(domain: &str, id: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&id.to_be_bytes());
+    buf.extend_from_slice(&0x0100u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+
+    let name = domain.trim_end_matches('.');
+    for label in name.split('.') {
+        let len = label.len().min(63);
+        buf.push(len as u8);
+        buf.extend_from_slice(&label.as_bytes()[..len]);
+    }
+    buf.push(0);
+
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+
+    buf
+}
+
+fn send_dns_ping(target: &str, domain: &str) -> anyhow::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_read_timeout(Some(Duration::from_millis(300)))?;
+    sock.set_write_timeout(Some(Duration::from_millis(300)))?;
+
+    let id = (now_epoch_us() & 0xFFFF) as u16;
+    let query = build_dns_query(domain, id);
+    let _ = sock.send_to(&query, target)?;
+
+    Ok(())
+}
+
+fn enter_instance_namespace(instance_name: &str) -> anyhow::Result<()> {
+    let ns_path = state_paths::profile_netns_bind(instance_name);
+    let ns_meta = state_paths::profile_ns_meta(instance_name);
+
+    let ns_alive: Option<NsAlive> = if ns_meta.exists() {
+        std::fs::read_to_string(&ns_meta)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+    } else {
+        None
+    };
+
+    if let Some(ns_alive) = ns_alive {
+        if let Some(child_pid) = ns_alive.child_pid {
+            let mnt_path = format!("/proc/{}/ns/mnt", child_pid);
+            let net_path = format!("/proc/{}/ns/net", child_pid);
+            let mnt = File::open(mnt_path)?;
+            nix::sched::setns(mnt.as_fd(), CloneFlags::CLONE_NEWNS)?;
+            let net = File::open(net_path)?;
+            nix::sched::setns(net.as_fd(), CloneFlags::CLONE_NEWNET)?;
+            return Ok(());
+        }
+    }
+
+    let net = File::open(ns_path)?;
+    nix::sched::setns(net.as_fd(), CloneFlags::CLONE_NEWNET)?;
+
+    Ok(())
 }
 
 #[cfg(not(feature = "egui-client"))]
