@@ -1967,11 +1967,13 @@ fn main() -> anyhow::Result<()> {
                             nl.up_lo().await?;
 
                             // Set txqueuelen for TUN device to handle bursty traffic
+                            let txqueuelen = 500_000u32; // 
+                            warn!("setting TUN txqueuelen to {} for high throughput", txqueuelen);
                             nl.link()
                                 .set(
                                     LinkMessageBuilder::<LinkUnspec>::default()
                                         .index(tun_state.dev_index)
-                                        .append_extra_attribute(LinkAttribute::TxQueueLen(10000))
+                                        .append_extra_attribute(LinkAttribute::TxQueueLen(txqueuelen))
                                         .build()
                                 )
                                 .execute()
