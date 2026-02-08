@@ -1966,6 +1966,17 @@ fn main() -> anyhow::Result<()> {
                             let nl = tokio_netlink_conn()?;
                             nl.up_lo().await?;
 
+                            // Set txqueuelen for TUN device to handle bursty traffic
+                            nl.link()
+                                .set(
+                                    LinkMessageBuilder::<LinkUnspec>::default()
+                                        .index(tun_state.dev_index)
+                                        .append_extra_attribute(LinkAttribute::TxQueueLen(10000))
+                                        .build()
+                                )
+                                .execute()
+                                .await?;
+
                             let add_default = !no_default;
                             if add_default {
                                 warn!("adding TUN as default route");
