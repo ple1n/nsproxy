@@ -26,7 +26,8 @@ pub struct ConnStats {
     pub error: Option<String>,
     pub bytes_up: u64,
     pub bytes_down: u64,
-    pub dns_domain: Option<String>,
+    pub dns_query: Option<String>,
+    pub dns_response: Option<String>,
 }
 
 impl ConnStats {
@@ -142,7 +143,8 @@ impl DiagAccumulator {
                     error: None,
                     bytes_up: 0,
                     bytes_down: 0,
-                    dns_domain: None,
+                    dns_query: None,
+                    dns_response: None,
                 };
                 self.conns.insert(*id, stats);
                 self.conn_order.push_back(*id);
@@ -177,9 +179,17 @@ impl DiagAccumulator {
                 }
                 self.loop_stats.push(*dispatch_us);
             }
-            DiagEvent::DnsResolved { id, domain, .. } => {
+            DiagEvent::DnsResolved { id, domain, result, .. } => {
                 if let Some(c) = self.conns.get_mut(id) {
-                    c.dns_domain = Some(domain.clone());
+                    if c.dns_query.is_none() {
+                        c.dns_query = Some(domain.clone());
+                    }
+                    c.dns_response = Some(result.clone());
+                }
+            }
+            DiagEvent::DnsQuery { id, query, .. } => {
+                if let Some(c) = self.conns.get_mut(id) {
+                    c.dns_query = Some(query.clone());
                 }
             }
         }

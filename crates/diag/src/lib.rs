@@ -109,6 +109,12 @@ pub enum DiagEvent {
         domain: String,
         result: String,
     },
+    /// DNS query received (raw UDP handled by VirtDNS).
+    DnsQuery {
+        id: ConnId,
+        ts: Timestamp,
+        query: String,
+    },
 }
 
 // ── Server (tun2socks5 side) ─────────────────────────────────────────

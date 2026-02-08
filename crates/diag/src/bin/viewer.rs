@@ -137,6 +137,7 @@ fn main() -> eframe::Result<()> {
                     .column(Column::auto().at_least(80.0))
                     .column(Column::auto().at_least(120.0))
                     .column(Column::remainder().at_least(160.0))
+                    .column(Column::remainder().at_least(140.0))
                     .column(Column::auto().at_least(90.0))
                     .column(Column::auto().at_least(90.0))
                     .column(Column::auto().at_least(90.0))
@@ -153,6 +154,9 @@ fn main() -> eframe::Result<()> {
                         });
                         header.col(|ui| {
                             ui.strong("Dst / Route");
+                        });
+                        header.col(|ui| {
+                            ui.strong("DNS");
                         });
                         header.col(|ui| {
                             ui.strong("Dispatch");
@@ -187,6 +191,18 @@ fn main() -> eframe::Result<()> {
                                         c.route.clone()
                                     };
                                     ui.label(&dest_label);
+                                });
+
+                                row.col(|ui| {
+                                    match (&c.dns_query, &c.dns_response) {
+                                        (Some(q), Some(r)) => {
+                                            ui.label(format!("{} -> {}", q, r));
+                                        }
+                                        (Some(q), None) => {
+                                            ui.label(format!("{} -> …", q));
+                                        }
+                                        _ => {}
+                                    }
                                 });
 
                                 row.col(|ui| {

@@ -1910,10 +1910,20 @@ fn main() -> anyhow::Result<()> {
 
             let diag_path = diag::diag_sock_path(&profile);
             if diag_path.exists() {
-                bail!(
-                    "tun appears to be running (diag socket exists): {:?}",
-                    diag_path
-                );
+                match std::os::unix::net::UnixStream::connect(&diag_path) {
+                    Ok(_) => {
+                        bail!(
+                            "tun appears to be running (diag socket accepts connections): {:?}",
+                            diag_path
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "diag socket probe failed ({}), proceeding with startup: {:?}",
+                            e, diag_path
+                        );
+                    }
+                }
             }
             iargs.diag_sock = Some(diag_path);
 
