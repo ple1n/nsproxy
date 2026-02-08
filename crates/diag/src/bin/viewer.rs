@@ -53,6 +53,8 @@ fn main() -> eframe::Result<()> {
     let ping_state: Arc<Mutex<PingState>> = Arc::new(Mutex::new(PingState::default()));
     let mass_ping_state: Arc<Mutex<MassPingState>> =
         Arc::new(Mutex::new(MassPingState::default()));
+    let burst_test_state: Arc<Mutex<BurstTestState>> =
+        Arc::new(Mutex::new(BurstTestState::default()));
     let selected_conn: Arc<Mutex<Option<diag::ConnId>>> = Arc::new(Mutex::new(None));
 
     // Spawn a background tokio runtime for reading from the socket
@@ -62,6 +64,7 @@ fn main() -> eframe::Result<()> {
     let conn_error_bg = conn_error.clone();
     let ping_bg = ping_state.clone();
     let mass_ping_bg = mass_ping_state.clone();
+    let burst_test_bg = burst_test_state.clone();
     let sock_path_bg = sock_path.clone();
     let ping_rx_bg = ping_rx.clone();
 
@@ -73,6 +76,7 @@ fn main() -> eframe::Result<()> {
         rt.block_on(async move {
             let ping_state_bg = ping_bg.clone();
             let mass_state_bg = mass_ping_bg.clone();
+            let burst_state_bg = burst_test_bg.clone();
             tokio::spawn(async move {
                 while let Ok(req) = ping_rx_bg.recv_async().await {
                     match req {
@@ -81,6 +85,77 @@ fn main() -> eframe::Result<()> {
                                 let mut ping = ping_state_bg.lock().unwrap();
                                 ping.last_error = Some(format!("dns ping error: {}", err));
                             }
+                        }
+                        PingRequest::BurstTest => {
+                            let started = now_epoch_us();
+                            {
+                                let mut burst = burst_state_bg.lock().unwrap();
+                                burst.running = true;
+                                burst.started_ts = Some(started);
+                                burst.finished_ts = None;
+                                burst.results.clear();
+                                burst.threshold_size = None;
+                                burst.last_error = None;
+                            }
+
+                            let test_sizes = vec![10u64, 100, 1000, 10000];
+                            let mut threshold_found = false;
+
+                            for size in test_sizes {
+                                let now_us = now_epoch_us();
+                                let mut domains = Vec::with_capacity(size as usize);
+                                for i in 0..size {
+                                    domains.push(format!("burst-{}-{}.diag", now_us, i));
+                                }
+
+                                let mut tasks = FuturesUnordered::new();
+                                for domain in domains {
+                                    tasks.push(async move {
+                                        send_dns_ping_async("8.8.8.8:53", domain).await
+                                    });
+                                }
+
+                                let mut errs = 0u64;
+                                let mut done = 0u64;
+                                while let Some(res) = tasks.next().await {
+                                    done += 1;
+                                    if res.is_err() {
+                                        errs += 1;
+                                    }
+                                }
+
+                                let failure_rate = if done > 0 {
+                                    (errs as f64) / (done as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                let result = BurstTestResult {
+                                    size,
+                                    requested: size,
+                                    completed: done,
+                                    errors: errs,
+                                    failure_rate,
+                                };
+
+                                {
+                                    let mut burst = burst_state_bg.lock().unwrap();
+                                    burst.results.push(result.clone());
+                                    if !threshold_found && failure_rate > 5.0 {
+                                        burst.threshold_size = Some(size);
+                                        threshold_found = true;
+                                    }
+                                }
+
+                                if threshold_found {
+                                    break;
+                                }
+                            }
+
+                            let finished = now_epoch_us();
+                            let mut burst = burst_state_bg.lock().unwrap();
+                            burst.running = false;
+                            burst.finished_ts = Some(finished);
                         }
                         PingRequest::Batch(domains) => {
                             let batch_started = now_epoch_us();
@@ -390,6 +465,13 @@ fn main() -> eframe::Result<()> {
                         let _ = ping_tx.send(PingRequest::Single(domain));
                     }
 
+                    let burst_running = burst_test_state.lock().unwrap().running;
+                    ui.add_enabled_ui(!burst_running, |ui| {
+                        if ui.button("Burst Test").on_hover_text("Test burst sizes (10, 100, 1000, 10000) to find >5% failure rate").clicked() {
+                            let _ = ping_tx.send(PingRequest::BurstTest);
+                        }
+                    });
+
                     if ui.button("DNS ping x100").clicked() {
                         let now_us = now_epoch_us();
                         let mut domains = Vec::with_capacity(100);
@@ -472,6 +554,50 @@ fn main() -> eframe::Result<()> {
                     }
                 });
 
+                ui.horizontal(|ui| {
+                    let burst = burst_test_state.lock().unwrap();
+                    if burst.running {
+                        ui.label("⏳ Burst test running...");
+                        if let Some(started) = burst.started_ts {
+                            let elapsed = now_epoch_us().saturating_sub(started);
+                            use diag::summary::format_duration_us;
+                            ui.label(format!("elapsed: {}", format_duration_us(elapsed as f64)));
+                        }
+                    } else if !burst.results.is_empty() {
+                        ui.label("Burst test results:");
+                        for result in &burst.results {
+                            let color = if result.failure_rate > 5.0 {
+                                egui::Color32::RED
+                            } else if result.failure_rate > 1.0 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::GREEN
+                            };
+                            ui.colored_label(
+                                color,
+                                format!(
+                                    "n={}: {}/{} ({:.1}% err)",
+                                    result.size,
+                                    result.completed.saturating_sub(result.errors),
+                                    result.requested,
+                                    result.failure_rate
+                                ),
+                            );
+                        }
+                        if let Some(threshold) = burst.threshold_size {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("⚠ Threshold: >5% failures at n={}", threshold),
+                            );
+                        } else {
+                            ui.colored_label(egui::Color32::GREEN, "✓ All tests passed (<5% failures)");
+                        }
+                    }
+                    if let Some(err) = burst.last_error.as_ref() {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
+
                 ui.separator();
                 let acc = accumulator.lock().unwrap();
                 let selected = *selected_conn.lock().unwrap();
@@ -543,9 +669,29 @@ struct MassPingState {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct BurstTestResult {
+    size: u64,
+    requested: u64,
+    completed: u64,
+    errors: u64,
+    failure_rate: f64,
+}
+
+#[derive(Debug, Default)]
+struct BurstTestState {
+    running: bool,
+    started_ts: Option<u64>,
+    finished_ts: Option<u64>,
+    results: Vec<BurstTestResult>,
+    threshold_size: Option<u64>,
+    last_error: Option<String>,
+}
+
 enum PingRequest {
     Single(String),
     Batch(Vec<String>),
+    BurstTest,
 }
 
 fn now_epoch_us() -> u64 {
