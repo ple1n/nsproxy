@@ -1516,6 +1516,22 @@ pub enum MainCommand {
         #[arg(short, long)]
         log: Option<LevelFilter>,
     },
+    /// Operations about basis network namespace, ie. the namespace where your system boots with
+    Basis {
+        #[command(subcommand)]
+        cmd: BasisCommand,
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum BasisCommand {
+    /// Mount the basis network namespace
+    Mount {},
+    /// Enter the basis network namespace
+    Enter {
+        #[command(flatten)]
+        sargs: ShellArgs,
+    },
 }
 
 impl std::str::FromStr for NsInput {
