@@ -1520,8 +1520,29 @@ pub enum MainCommand {
     Basis {
         #[command(subcommand)]
         cmd: BasisCommand,
-    }
+    },
+    /// Uplink by which you connect to freedom
+    Uplink {
+        #[command(subcommand)]
+        kind: UplinkTypes,
+    },
 }
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum UplinkTypes {
+    Clash,
+    Geph
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ClashOps {
+    ProfileAdd {
+        path: Option<PathBuf>,
+    },
+    Status,
+}
+
+pub mod uplink;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum BasisCommand {
