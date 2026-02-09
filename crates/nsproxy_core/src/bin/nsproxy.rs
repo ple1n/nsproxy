@@ -33,8 +33,8 @@ use nix::{
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
-    Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds, ProfileChmod,
-    ProfileConfig, ProfileMount, RootfsMode, TunMaker,
+    BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
+    ProfileChmod, ProfileConfig, ProfileMount, RootfsMode, TunMaker,
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     shell::{ShellArgs, ShellPrefs},
     state_paths,
@@ -2237,6 +2237,64 @@ fn main() -> anyhow::Result<()> {
                 aok!()
             })?;
         }
+        MainCommand::Basis { cmd } => match cmd {
+            BasisCommand::Mount {} => {
+                let source = PathBuf::from("/proc/self/ns/net");
+                let bind_mount = state_paths::profile_netns_bind("basis");
+                if let Some(parent) = bind_mount.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                mount_ns(&source, &bind_mount)?;
+                info!("Basis netns mounted at {:?}", bind_mount);
+            }
+            BasisCommand::Enter { sargs } => {
+                let mut shell_prefs = ShellPrefs::default();
+                shell_prefs.take_args(sargs);
+                shell_prefs.adjust();
+
+                let bind_mount = state_paths::profile_netns_bind("basis");
+                let nsdata = state_paths::profile_ns_meta("basis");
+
+                let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
+                    std::fs::read_to_string(&nsdata)
+                        .ok()
+                        .and_then(|content| serde_json::from_str(&content).ok())
+                } else {
+                    None
+                };
+
+                if let Some(ns_alive) = ns_alive {
+                    if let Some(child_pid) = ns_alive.child_pid {
+                        let ns_source = NSSource::Pid(child_pid as i32);
+                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
+                        info!("Entered mount namespace from child PID {}", child_pid);
+                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                        info!("Entered network namespace from child PID {}", child_pid);
+                    } else {
+                        let ns = NSSource::Path(bind_mount.clone());
+                        ns.enter(CloneFlags::CLONE_NEWNET)?;
+                    }
+
+                    shell_prefs.set_nsproxy_env(ns_alive.browser_profile);
+                    shell_prefs.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
+                } else {
+                    let ns = NSSource::Path(bind_mount.clone());
+                    ns.enter(CloneFlags::CLONE_NEWNET)?;
+                    shell_prefs.set_ns_env(Some(&bind_mount.to_string_lossy()));
+                }
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+
+                rt.block_on(async {
+                    let rx = shell_prefs.spawn()?;
+                    rx.wait_for_child().await?;
+
+                    aok!()
+                })?;
+            }
+        },
         _ => unimplemented!(),
     }
 
