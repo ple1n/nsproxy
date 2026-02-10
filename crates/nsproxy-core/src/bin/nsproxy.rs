@@ -2325,7 +2325,7 @@ fn main() -> anyhow::Result<()> {
                         .build()?;
 
                     rt.block_on(async {
-                        clash_profile.resolve_domains().await
+                        clash_profile.resolve_domains(None).await
                     })?;
 
                     println!("\n✓ Profile '{}' is ready to use", profile_name);
