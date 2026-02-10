@@ -24,7 +24,7 @@
 //! // 1. Create a UplinkHub with custom routing logic
 //! let routing = RoutingBuilder::new()
 //!     .add_rule(|ctx| ctx.target_domain == Some("blocked.com".to_string()),
-//!              RoutingDecision::Proxy(ProxyID::ClashName("primary".into())))
+//!              RoutingDecision::Proxy { target: WireAddress::DomainAddress("blocked.com".into(), 443), id: ProxyID::ClashName("primary".into()) })
 //!     .build();
 //!
 //! let mut hub = UplinkHub::with_routing(routing);
@@ -32,7 +32,7 @@
 //! // 2. Add proxies to the hub
 //! hub.add_proxy(
 //!     ProxyID::ClashName("primary".into()),
-//!     UplinkProxy::Trojan(trojan_proxy)
+//!     UplinkProxy::Clash(trojan_proxy)
 //! );
 //!
 //! // 3. Use the hub in main_entry
@@ -60,9 +60,15 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
+use tun2socks5::dns::{VDNSRES, TUNResponse, VirtDNSAsync, VirtDNSHandle};
 use tun2socks5::ArgProxy;
+use tracing::warn;
 
 use crate::state_paths;
+
+/// Maximum number of concurrent virtual DNS entries (mirrors tun2socks5 default)
+const POOL_SIZE: usize = 65_535;
+const DNS_PORT: u16 = 53;
 
 // IPs are not ever deleted here.
 // Because its expected sometimes DNS servers pollute the records with junk
@@ -463,24 +469,16 @@ pub enum RoutingProtocol {
     Udp,
 }
 
-/// Result of routing decision — modeled after tun2socks5's TUNResponse
-/// with additional uplink proxy variants
+/// Result of routing decision — always carries a concrete target when proxying
 #[derive(Clone, Debug)]
 pub enum RoutingDecision {
-    /// Domain needs proxying through the UplinkHub's default proxy
-    ProxiedHost(String),
     /// Warning: the connection is made by TUN process, which exists in SRC NS
     NATByTUN(SocketAddr),
     /// Direct connection to the given address
     Direct(SocketAddr),
-    /// Serve files from this path
-    Files(PathBuf),
-    /// When the user has properly configured routing
-    Unreachable,
-    /// Route through a specific proxy identified in the UplinkHub
-    Proxy(ProxyID),
-    /// Route through a specific old-style proxy (SOCKS4/5/HTTP) with a target address
-    SpecifiedProxy(WireAddress, ArgProxy),
+    /// Route through a specific proxy identified in the UplinkHub, including full target info
+    Proxy { target: WireAddress, id: ProxyID },
+    Drop,
 }
 
 /// Type alias for the routing decision function
@@ -494,13 +492,16 @@ pub struct UplinkHub {
 }
 
 pub enum UplinkProxy {
-    Trojan(clash::TrojanProxy),
+    Clash(clash::TrojanProxy),
     Remote(ArgProxy),
+    File(PathBuf),
 }
 
 #[derive(Hash, Debug, Clone, PartialEq, Eq)]
 pub enum ProxyID {
     ClashName(String),
+    Remote(SocketAddr),
+    File(PathBuf),
 }
 
 impl UplinkHub {
@@ -593,6 +594,10 @@ pub trait UdpHandler: Send + Sync + 'static {
 /// Converts a proxy instance into a unified stream type
 pub mod proxy_adapters {
     use super::*;
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, BufStream};
+    use tokio::net::TcpStream;
+    use tokio_rustls::client::TlsStream;
+    use socks5_impl::client;
 
     /// Adapter for Trojan proxies
     pub struct TrojanAdapter;
@@ -600,26 +605,136 @@ pub mod proxy_adapters {
     /// Adapter for SOCKS5/4/HTTP proxies
     pub struct RemoteAdapter;
 
+    struct TrojanStream {
+        inner: TlsStream<TcpStream>,
+        info: String,
+    }
+
+    struct RemoteStream {
+        inner: BufStream<TcpStream>,
+        info: String,
+    }
+
+    impl ProxyStream for TrojanStream {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl ProxyStream for RemoteStream {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl AsyncRead for TrojanStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TrojanStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncRead for RemoteStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for RemoteStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     impl TrojanAdapter {
         /// Create a stream for a Trojan proxy connection
         pub async fn connect(
-            _proxy: &clash::TrojanProxy,
-            _target_host: &str,
-            _target_port: u16,
-            _resolved_ip: std::net::IpAddr,
+            proxy: &clash::TrojanProxy,
+            target_host: &str,
+            target_port: u16,
+            resolved_ip: std::net::IpAddr,
         ) -> anyhow::Result<Box<dyn ProxyStream>> {
-            todo!("Implement Trojan stream creation using resolved IP")
+            let stream = proxy.connect(resolved_ip, target_host, target_port).await?;
+            Ok(Box::new(TrojanStream {
+                inner: stream,
+                info: format!("trojan://{}:{}", proxy.server, proxy.port),
+            }))
         }
     }
 
     impl RemoteAdapter {
         /// Create a stream for a remote SOCKS/HTTP proxy connection
         pub async fn connect(
-            _proxy: &ArgProxy,
-            _target_host: &str,
-            _target_port: u16,
+            proxy: &ArgProxy,
+            target_host: &str,
+            target_port: u16,
         ) -> anyhow::Result<Box<dyn ProxyStream>> {
-            todo!("Implement remote proxy stream creation")
+            use tun2socks5::ProxyType;
+
+            match proxy.proxy_type {
+                ProxyType::Socks5 => {
+                    let tcp = TcpStream::connect(proxy.addr).await?;
+                    let mut stream = BufStream::new(tcp);
+                    let dest = WireAddress::DomainAddress(target_host.to_string(), target_port);
+                    client::connect(&mut stream, dest, proxy.credentials.clone()).await?;
+                    Ok(Box::new(RemoteStream {
+                        inner: stream,
+                        info: format!("socks5://{}", proxy.addr),
+                    }))
+                }
+                ProxyType::Socks4 | ProxyType::Http => {
+                    anyhow::bail!("proxy type {:?} not yet supported", proxy.proxy_type)
+                }
+            }
         }
     }
 }
@@ -698,45 +813,442 @@ pub async fn main_entry(
     device: ipstack::TUNDev,
     mtu: u16,
     packet_info: bool,
-    mut dns_sx: tokio::sync::mpsc::Sender<Option<tun2socks5::dns::VirtDNSHandle>>,
+    mut dns_sx: tokio::sync::mpsc::Sender<Option<VirtDNSHandle>>,
     st_sx: flume::Sender<(PathBuf, ipstack::stream::IpStackTcpStream)>,
     hub: Arc<UplinkHub>,
+    diag_sock: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use ipstack::{IpStackConfig, stream::IpStackStream};
-    use tun2socks5::dns::VirtDNSAsync as VirtDNS;
-    use tracing::{info, warn, error};
+    use tracing::warn;
     use std::time::Duration;
     use ipstack::stream::tcp::TcpConfig;
+    use diag::{DiagServer, DiagEvent, StreamKind, Timestamp, next_conn_id};
+    use std::time::Instant;
 
     // Phase 1: Initialize diagnostic infrastructure
-    todo!("Initialize DiagServer for diagnostics if configured");
+    let diag = if let Some(sock) = diag_sock.as_ref() {
+        match DiagServer::start(sock.as_path()).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("diag server failed to start: {e}");
+                DiagServer::noop()
+            }
+        }
+    } else {
+        DiagServer::noop()
+    };
 
-    // Phase 2: Initialize DNS system
-    todo!("Initialize VirtDNS with configured resolvers");
+    // Phase 2: Initialize DNS system (virtual DNS only, same as tun2socks5 default)
+    let vdns = VirtDNSAsync::default(POOL_SIZE)?;
+    let vh = vdns.handle.clone();
 
     // Phase 3: Hand off DNS handle
-    todo!("Send DNS handle to caller");
+    let _ = dns_sx.send(Some(vh.clone())).await;
 
     // Phase 4: Initialize IpStack
-    todo!("Create IpStack with configured MTU and packet settings");
+    let conf = IpStackConfig {
+        mtu,
+        packet_information: packet_info,
+        udp_timeout: Duration::from_secs(20),
+        tcp_config: Arc::new(TcpConfig::default()),
+    };
+    let mut ip_stack = ipstack::IpStack::new(conf, device);
 
     // Phase 5: Main connection loop
-    // loop {
-    //   - Accept incoming connection
-    //   - Extract source/destination info
-    //   - Build RoutingContext
-    //   - Call hub.route(&context) to get RoutingDecision
-    //   - Handle routing decision:
-    //     * RoutingDecision::ProxiedHost(domain) -> proxy the domain through hub's proxy
-    //     * RoutingDecision::Proxy(proxy_id) -> get proxy from hub and create stream
-    //     * RoutingDecision::Direct(addr) -> direct connection (NAT)
-    //     * RoutingDecision::NATByTUN(addr) -> NAT by TUN process
-    //     * RoutingDecision::Files(path) -> serve files
-    //     * RoutingDecision::Unreachable -> drop
-    //     * RoutingDecision::SpecifiedProxy(addr, proxy) -> use specified proxy
-    //   - Spawn handler task for the connection
-    // }
-    todo!("Implement main connection loop with routing");
+    loop {
+        let wait_id = next_conn_id();
+        diag.emit(DiagEvent::Wait { id: wait_id, ts: Timestamp::now() });
+
+        let ip_stack_stream = ip_stack.accept().await?;
+        diag.emit(DiagEvent::WaitEnded { id: wait_id, ts: Timestamp::now() });
+
+        let conn_id = next_conn_id();
+        let body_start = Instant::now();
+
+        match ip_stack_stream {
+            IpStackStream::Tcp(tcp) => {
+                diag.emit(DiagEvent::Accept {
+                    id: conn_id,
+                    ts: Timestamp::now(),
+                    kind: StreamKind::Tcp,
+                    src: tcp.local_addr().to_string(),
+                    dst: tcp.peer_addr().to_string(),
+                });
+
+                let vh = vh.clone();
+                let hub = hub.clone();
+                let stream_sx = st_sx.clone();
+                let diagc = diag.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_tcp_connection(tcp, vh, hub, stream_sx, diagc, conn_id).await {
+                        warn!("tcp handling error: {e:?}");
+                    }
+                });
+            }
+            IpStackStream::Udp(udp) => {
+                diag.emit(DiagEvent::Accept {
+                    id: conn_id,
+                    ts: Timestamp::now(),
+                    kind: StreamKind::Udp,
+                    src: udp.local_addr().to_string(),
+                    dst: udp.peer_addr().to_string(),
+                });
+
+                let vh = vh.clone();
+                let hub = hub.clone();
+                let diagc = diag.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_udp_connection(udp, vh, hub, diagc, conn_id).await {
+                        warn!("udp handling error: {e:?}");
+                    }
+                });
+            }
+        }
+
+        diag.emit(DiagEvent::Dispatched {
+            id: conn_id,
+            dispatch_us: body_start.elapsed().as_micros() as u64,
+        });
+    }
+}
+
+async fn resolve_proxy_ip(host: &str) -> anyhow::Result<IpAddr> {
+    let mut iter = tokio::net::lookup_host((host, 0)).await?;
+    iter.next()
+        .map(|sock| sock.ip())
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve proxy host {host}"))
+}
+
+fn wire_to_host_port(addr: &WireAddress) -> (String, u16) {
+    match addr {
+        WireAddress::SocketAddress(sock) => (sock.ip().to_string(), sock.port()),
+        WireAddress::DomainAddress(host, port) => (host.clone(), *port),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DnsOutcome {
+    target_domain: Option<String>,
+    decision: Option<RoutingDecision>,
+}
+
+fn preprocess_vdns(vh: &VirtDNSHandle, dest: SocketAddr) -> DnsOutcome {
+    use tun2socks5::dns::{VDNSRES, TUNResponse};
+
+    match vh.process(dest) {
+        VDNSRES::SpecialHandling(TUNResponse::ProxiedHost(host)) => DnsOutcome {
+            target_domain: Some(host),
+            decision: None,
+        },
+        VDNSRES::SpecialHandling(TUNResponse::NATByTUN(sock)) => DnsOutcome {
+            target_domain: None,
+            decision: Some(RoutingDecision::NATByTUN(sock)),
+        },
+        VDNSRES::SpecialHandling(TUNResponse::Direct(sock)) => DnsOutcome {
+            target_domain: None,
+            decision: Some(RoutingDecision::Direct(sock)),
+        },
+        VDNSRES::SpecialHandling(TUNResponse::Files(path)) => DnsOutcome {
+            target_domain: None,
+            decision: Some(RoutingDecision::Proxy {
+                target: WireAddress::SocketAddress(dest),
+                id: ProxyID::File(path),
+            }),
+        },
+        VDNSRES::SpecialHandling(TUNResponse::Unreachable) => DnsOutcome {
+            target_domain: None,
+            decision: Some(RoutingDecision::Drop),
+        },
+        VDNSRES::SpecialHandling(TUNResponse::SpecifiedProxy(addr, proxy)) => {
+            let id = ProxyID::Remote(proxy.addr);
+            DnsOutcome {
+                target_domain: None,
+                decision: Some(RoutingDecision::Proxy { target: addr, id }),
+            }
+        }
+        VDNSRES::NormalProxying => DnsOutcome {
+            target_domain: None,
+            decision: None,
+        },
+        VDNSRES::ERR => DnsOutcome {
+            target_domain: None,
+            decision: Some(RoutingDecision::Drop),
+        },
+    }
+}
+
+async fn handle_tcp_connection(
+    tcp: ipstack::stream::IpStackTcpStream,
+    vh: VirtDNSHandle,
+    hub: Arc<UplinkHub>,
+    stream_sx: flume::Sender<(PathBuf, ipstack::stream::IpStackTcpStream)>,
+    diag: diag::DiagServer,
+    conn_id: diag::ConnId,
+) -> anyhow::Result<()> {
+    let dest = tcp.peer_addr();
+    let src = tcp.local_addr();
+    let dns = preprocess_vdns(&vh, dest);
+
+    let decision = dns.decision.unwrap_or_else(|| {
+        let ctx = RoutingContext {
+            target_domain: dns.target_domain.clone(),
+            target_ip: dest.ip(),
+            target_port: dest.port(),
+            source_ip: src.ip(),
+            protocol: RoutingProtocol::Tcp,
+        };
+        hub.route(&ctx)
+    });
+
+    let route_event = match &decision {
+        RoutingDecision::Direct(addr) => diag::ConnRoute::Direct { dest: addr.to_string() },
+        RoutingDecision::NATByTUN(addr) => diag::ConnRoute::Nat { dest: addr.to_string() },
+        RoutingDecision::Proxy { id: ProxyID::File(path), .. } => diag::ConnRoute::FileServe { root: path.to_string_lossy().to_string() },
+        RoutingDecision::Proxy { target, id } => {
+            diag::ConnRoute::Proxied { dest: format!("{:?} -> {:?}", id, target) }
+        }
+        RoutingDecision::Drop => diag::ConnRoute::Unreachable,
+    };
+
+    diag.emit(diag::DiagEvent::Route {
+        id: conn_id,
+        ts: diag::Timestamp::now(),
+        route: route_event,
+    });
+
+    match decision {
+        RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+            let res = handle_tcp_nat(tcp, addr).await;
+            match res {
+                Ok((up, down)) => {
+                    diag.emit(diag::DiagEvent::Finished {
+                        id: conn_id,
+                        ts: diag::Timestamp::now(),
+                        error: None,
+                        bytes_up: up,
+                        bytes_down: down,
+                    });
+                }
+                Err(e) => {
+                    diag.emit(diag::DiagEvent::Finished {
+                        id: conn_id,
+                        ts: diag::Timestamp::now(),
+                        error: Some(format!("{e:?}")),
+                        bytes_up: 0,
+                        bytes_down: 0,
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        RoutingDecision::Proxy { target, id } => {
+            match hub.get_proxy(&id) {
+                Some(UplinkProxy::File(path)) => {
+                    let _ = stream_sx.send_async((path.clone(), tcp)).await;
+                }
+                Some(_) => {
+                    let res = handle_tcp_via_proxy(tcp, hub, id.clone(), target.clone(), diag.clone(), conn_id).await;
+                    if let Err(e) = &res {
+                        diag.emit(diag::DiagEvent::Finished {
+                            id: conn_id,
+                            ts: diag::Timestamp::now(),
+                            error: Some(format!("{e:?}")),
+                            bytes_up: 0,
+                            bytes_down: 0,
+                        });
+                    }
+                    res?;
+                }
+                None => {
+                    warn!("proxy {:?} not found for {}", id, dest);
+                    diag.emit(diag::DiagEvent::Finished {
+                        id: conn_id,
+                        ts: diag::Timestamp::now(),
+                        error: Some("proxy not found".into()),
+                        bytes_up: 0,
+                        bytes_down: 0,
+                    });
+                }
+            }
+        }
+        RoutingDecision::Drop => {
+            warn!("tcp unreachable for {}", dest);
+            diag.emit(diag::DiagEvent::Finished {
+                id: conn_id,
+                ts: diag::Timestamp::now(),
+                error: None,
+                bytes_up: 0,
+                bytes_down: 0,
+            });
+        }
+    }
 
     Ok(())
+}
+
+async fn select_proxy<'a>(hub: &'a UplinkHub, id: &'a ProxyID) -> anyhow::Result<&'a UplinkProxy> {
+    hub.get_proxy(id)
+        .ok_or_else(|| anyhow::anyhow!("proxy {:?} not found", id))
+}
+
+async fn handle_tcp_via_proxy(
+    mut tcp: ipstack::stream::IpStackTcpStream,
+    hub: Arc<UplinkHub>,
+    id: ProxyID,
+    target: WireAddress,
+    diag: diag::DiagServer,
+    conn_id: diag::ConnId,
+) -> anyhow::Result<()> {
+    use proxy_adapters::{RemoteAdapter, TrojanAdapter};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (target_host, target_port) = wire_to_host_port(&target);
+
+    let stream: Box<dyn ProxyStream> = {
+        let proxy = select_proxy(&hub, &id).await?;
+        match proxy {
+            UplinkProxy::Clash(t) => {
+                let ip = resolve_proxy_ip(&t.server).await?;
+                TrojanAdapter::connect(t, &target_host, target_port, ip).await?
+            }
+            UplinkProxy::Remote(arg) => {
+                RemoteAdapter::connect(arg, &target_host, target_port).await?
+            }
+            UplinkProxy::File(path) => {
+                anyhow::bail!("file proxy {:?} cannot proxy tcp", path)
+            }
+        }
+    };
+
+    let mut proxy_stream = stream;
+    let (mut t_rx, mut t_tx) = tokio::io::split(tcp);
+    let (mut p_rx, mut p_tx) = tokio::io::split(proxy_stream);
+
+    diag.emit(diag::DiagEvent::Connected { id: conn_id, ts: diag::Timestamp::now() });
+
+    let res = tokio::try_join!(
+        async {
+            let copied = tokio::io::copy(&mut t_rx, &mut p_tx).await?;
+            p_tx.shutdown().await?;
+            anyhow::Ok(copied)
+        },
+        async {
+            let copied = tokio::io::copy(&mut p_rx, &mut t_tx).await?;
+            t_tx.shutdown().await?;
+            anyhow::Ok(copied)
+        }
+    );
+    match res {
+        Ok((up, down)) => {
+            diag.emit(diag::DiagEvent::Finished {
+                id: conn_id,
+                ts: diag::Timestamp::now(),
+                error: None,
+                bytes_up: up,
+                bytes_down: down,
+            });
+        }
+        Err(e) => {
+            diag.emit(diag::DiagEvent::Finished {
+                id: conn_id,
+                ts: diag::Timestamp::now(),
+                error: Some(format!("{e:?}")),
+                bytes_up: 0,
+                bytes_down: 0,
+            });
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_udp_connection(
+    mut udp: ipstack::stream::IpStackUdpStream,
+    vh: VirtDNSHandle,
+    hub: Arc<UplinkHub>,
+    diag: diag::DiagServer,
+    conn_id: diag::ConnId,
+) -> anyhow::Result<()> {
+    let dest = udp.peer_addr();
+    let src = udp.local_addr();
+    let dns = preprocess_vdns(&vh, dest);
+    let decision = dns.decision.unwrap_or_else(|| {
+        let ctx = RoutingContext {
+            target_domain: dns.target_domain.clone(),
+            target_ip: dest.ip(),
+            target_port: dest.port(),
+            source_ip: src.ip(),
+            protocol: RoutingProtocol::Udp,
+        };
+        hub.route(&ctx)
+    });
+
+    let route_event = match &decision {
+        RoutingDecision::Direct(addr) => diag::ConnRoute::Direct { dest: addr.to_string() },
+        RoutingDecision::NATByTUN(addr) => diag::ConnRoute::Nat { dest: addr.to_string() },
+        RoutingDecision::Proxy { id: ProxyID::File(path), .. } => diag::ConnRoute::FileServe { root: path.to_string_lossy().to_string() },
+        RoutingDecision::Proxy { target, id } => diag::ConnRoute::Proxied { dest: format!("{:?} -> {:?}", id, target) },
+        RoutingDecision::Drop => diag::ConnRoute::Unreachable,
+    };
+
+    diag.emit(diag::DiagEvent::Route {
+        id: conn_id,
+        ts: diag::Timestamp::now(),
+        route: route_event,
+    });
+
+    match decision {
+        RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+            let res = handle_udp_nat(udp, addr).await;
+            match res {
+                Ok((up, down)) => {
+                    diag.emit(diag::DiagEvent::Finished {
+                        id: conn_id,
+                        ts: diag::Timestamp::now(),
+                        error: None,
+                        bytes_up: up,
+                        bytes_down: down,
+                    });
+                }
+                Err(e) => {
+                    diag.emit(diag::DiagEvent::Finished {
+                        id: conn_id,
+                        ts: diag::Timestamp::now(),
+                        error: Some(format!("{e:?}")),
+                        bytes_up: 0,
+                        bytes_down: 0,
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        RoutingDecision::Drop => {
+            diag.emit(diag::DiagEvent::Finished {
+                id: conn_id,
+                ts: diag::Timestamp::now(),
+                error: None,
+                bytes_up: 0,
+                bytes_down: 0,
+            });
+        }
+        RoutingDecision::Proxy { id: ProxyID::File(_), .. } => {
+            warn!("udp file serving unsupported for {}", dest);
+        }
+        RoutingDecision::Proxy { id, .. } => {
+            warn!("udp proxying not implemented for {:?}, dropping {}", id, dest);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_tcp_nat(mut tcp_stack: ipstack::stream::IpStackTcpStream, server_addr: SocketAddr) -> anyhow::Result<(u64, u64)> {
+    let mut server = tokio::net::TcpStream::connect(server_addr).await?;
+    let res = tokio::io::copy_bidirectional(&mut tcp_stack, &mut server).await?;
+    Ok(res)
+}
+
+async fn handle_udp_nat(mut udp_stack: ipstack::stream::IpStackUdpStream, server_addr: SocketAddr) -> anyhow::Result<(u64, u64)> {
+    let mut udp_server = udp_stream::UdpStream::connect(server_addr).await?;
+    let res = tokio::io::copy_bidirectional(&mut udp_server, &mut udp_stack).await?;
+    Ok(res)
 }
