@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use tun2socks5::dns::{VDNSRES, TUNResponse, VirtDNSAsync, VirtDNSHandle};
 use tun2socks5::ArgProxy;
-use tracing::warn;
+use tracing::{warn, info};
 
 use crate::state_paths;
 
@@ -139,6 +139,109 @@ impl ProfileSolved {
             .context("Failed to serialize ProfileSolved")?;
         std::fs::write(path, content)
             .context(format!("Failed to write solved.json to {:?}", path))
+    }
+}
+
+/// SOCKS5-based DNS resolver for routing DNS queries through proxies
+pub mod socks5_dns {
+    use super::*;
+    use socks5_impl::client::{create_udp_client, SocksUdpClient};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use trust_dns_proto::op::{Message, Query};
+    use trust_dns_proto::rr::{Name, RecordType};
+    use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+    /// DNS query through SOCKS5 UDP
+    pub async fn query_via_socks5(
+        proxy_addr: SocketAddr,
+        dns_server: &str,
+        domain: &str,
+        timeout: Duration,
+    ) -> Result<Vec<IpAddr>> {
+        info!("Querying {} via SOCKS5 proxy {} through DNS {}", domain, proxy_addr, dns_server);
+
+        // Create SOCKS5 UDP client
+        let mut client = create_udp_client(proxy_addr, None)
+            .await
+            .context("Failed to create SOCKS5 UDP client")?;
+
+        // Build DNS query
+        let name = Name::from_ascii(domain)
+            .context("Invalid domain name")?;
+        let mut query = Query::query(name, RecordType::A);
+        query.set_query_type(RecordType::A);
+
+        let mut msg = Message::new();
+        msg.add_query(query);
+        msg.set_id(rand::random());
+        msg.set_recursion_desired(true);
+
+        let query_bytes = msg.to_vec()
+            .context("Failed to serialize DNS query")?;
+
+        // Parse DNS server address
+        let dns_addr: WireAddress = if let Ok(ip) = dns_server.parse::<IpAddr>() {
+            WireAddress::SocketAddress(SocketAddr::new(ip, 53))
+        } else {
+            WireAddress::DomainAddress(dns_server.to_string(), 53)
+        };
+
+        // Send DNS query through SOCKS5
+        client.send_to(&query_bytes, dns_addr)
+            .await
+            .context("Failed to send DNS query")?;
+
+        // Receive response
+        let mut buf = Vec::with_capacity(512);
+        let (_len, _from) = tokio::time::timeout(
+            timeout,
+            client.recv_from(timeout, &mut buf)
+        )
+        .await
+        .context("DNS query timeout")??;
+
+        // Parse DNS response
+        let response = Message::from_bytes(&buf)
+            .context("Failed to parse DNS response")?;
+
+        let mut ips = Vec::new();
+        for answer in response.answers() {
+            if let Some(data) = answer.data() {
+                if let Some(ip) = data.ip_addr() {
+                    ips.push(ip);
+                }
+            }
+        }
+
+        if ips.is_empty() {
+            anyhow::bail!("No IP addresses found for {}", domain);
+        }
+
+        info!("Resolved {} to {} addresses via SOCKS5", domain, ips.len());
+        Ok(ips)
+    }
+
+    /// Resolve using any available SOCKS5 proxy from hub
+    pub async fn resolve_via_hub(
+        hub: &UplinkHub,
+        dns_server: &str,
+        domain: &str,
+        timeout: Duration,
+    ) -> Result<Vec<IpAddr>> {
+        // Try to find a SOCKS5 proxy in the hub
+        for (id, proxy) in hub.all_proxies() {
+            if let UplinkProxy::Remote(arg_proxy) = proxy {
+                match query_via_socks5(arg_proxy.addr, dns_server, domain, timeout).await {
+                    Ok(ips) => return Ok(ips),
+                    Err(e) => {
+                        warn!("Failed to resolve {} via proxy {:?}: {}", domain, id, e);
+                        continue;
+                    }
+                }
+            }
+        }
+        anyhow::bail!("No working SOCKS5 proxy found in hub for DNS resolution")
     }
 }
 
@@ -355,9 +458,139 @@ pub mod clash {
             domains
         }
 
-        /// Resolve all domains using two-tier DNS resolution
+        /// Resolve all domains using two-tier DNS resolution through available proxies
         /// Returns a ProfileSolved with all resolved addresses
-        pub async fn resolve_domains(&self) -> Result<ProfileSolved> {
+        ///
+        /// This function tethers the bootstrapping process to UplinkHub when available, utilizing all
+        /// proxy resources. DNS queries are sent through SOCKS5 UDP bindings when proxies are present.
+        /// If no hub is provided, falls back to direct DNS resolution for initial setup.
+        pub async fn resolve_domains(&self, hub: Option<&UplinkHub>) -> Result<ProfileSolved> {
+            use std::time::Duration;
+
+            let solved_path = state_paths::uplink_profile_solved("clash", &self.name);
+
+            // Try to load existing ProfileSolved from state file first
+            if let Ok(solved) = ProfileSolved::load_from_file(&solved_path) {
+                info!("Loaded existing ProfileSolved from {:?}", solved_path);
+                // Check if all required domains are already resolved
+                if solved.all_resolved(&self.all_domains()) {
+                    info!("All domains already resolved, using cached data");
+                    return Ok(solved);
+                }
+                info!("Some domains missing, will re-resolve");
+            }
+
+            // If hub is available, use proxy-based DNS. Otherwise, fall back to direct DNS.
+            if let Some(hub) = hub {
+                self.resolve_domains_via_hub(hub, &solved_path).await
+            } else {
+                self.resolve_domains_direct(&solved_path).await
+            }
+        }
+
+        /// Resolve domains through UplinkHub proxies (preferred method when proxies are available)
+        async fn resolve_domains_via_hub(&self, hub: &UplinkHub, solved_path: &PathBuf) -> Result<ProfileSolved> {
+            use std::time::Duration;
+
+            let mut solved = ProfileSolved::new();
+            let timeout = Duration::from_secs(5);
+
+            println!("Bootstrapping DNS through UplinkHub proxies");
+            println!("  Bootstrap DNS servers: {}", self.bootstrap_nameservers.len());
+            println!("  Main DNS servers: {}", self.main_nameservers.len());
+
+            // Step 1: Resolve main nameserver hostnames via bootstrap DNS through SOCKS5
+            println!("\nResolving main nameserver hostnames via SOCKS5...");
+            for ns in &self.main_nameservers {
+                if let Ok(url) = url::Url::parse(ns) {
+                    if let Some(host) = url.host_str() {
+                        if host.parse::<IpAddr>().is_err() {
+                            // Use any bootstrap DNS server through available SOCKS5 proxies
+                            let mut resolved = false;
+                            for bootstrap_dns in &self.bootstrap_nameservers {
+                                match super::socks5_dns::resolve_via_hub(
+                                    hub,
+                                    bootstrap_dns,
+                                    host,
+                                    timeout
+                                ).await {
+                                    Ok(ips) => {
+                                        let ip_set: BTreeSet<IpAddr> = ips.into_iter().collect();
+                                        println!("  ✓ {} -> {} IPs (via {} through proxy)", host, ip_set.len(), bootstrap_dns);
+                                        solved.add_resolution(host.to_string(), ip_set);
+                                        resolved = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to resolve {} via {}: {}", host, bootstrap_dns, e);
+                                        continue;
+                                    }
+                                }
+                            }
+                            if !resolved {
+                                println!("  ⚠ {} -> ERROR: Could not resolve through any bootstrap server", host);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 2: Resolve proxy server domains via main DNS through SOCKS5
+            println!("\nResolving proxy server domains via SOCKS5...");
+            for domain in &self.proxy_domains {
+                let mut resolved = false;
+
+                // Extract main DNS server hosts
+                for ns in &self.main_nameservers {
+                    let dns_host = if let Ok(url) = url::Url::parse(ns) {
+                        url.host_str().map(|s| s.to_string()).unwrap_or_else(|| ns.clone())
+                    } else {
+                        ns.clone()
+                    };
+
+                    // Use resolved IP if available, otherwise use the host directly
+                    let dns_server = if let Ok(ip) = dns_host.parse::<IpAddr>() {
+                        ip.to_string()
+                    } else if let Some(ips) = solved.get_latest_ips(&dns_host) {
+                        ips.iter().next().map(|ip| ip.to_string()).unwrap_or(dns_host.clone())
+                    } else {
+                        dns_host.clone()
+                    };
+
+                    match super::socks5_dns::resolve_via_hub(
+                        hub,
+                        &dns_server,
+                        domain,
+                        timeout
+                    ).await {
+                        Ok(ips) => {
+                            let ip_set: BTreeSet<IpAddr> = ips.into_iter().collect();
+                            println!("  ✓ {} -> {} IPs (via {} through proxy)", domain, ip_set.len(), dns_server);
+                            solved.add_resolution(domain.clone(), ip_set);
+                            resolved = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Failed to resolve {} via {}: {}", domain, dns_server, e);
+                            continue;
+                        }
+                    }
+                }
+
+                if !resolved {
+                    println!("  ⚠ {} -> ERROR: Could not resolve through any main server", domain);
+                }
+            }
+
+            // Save to disk
+            solved.save_to_file(solved_path)?;
+            println!("\n✓ Resolved addresses saved to {:?}", solved_path);
+
+            Ok(solved)
+        }
+
+        /// Resolve domains directly (fallback for initial setup when no proxies are available)
+        async fn resolve_domains_direct(&self, solved_path: &PathBuf) -> Result<ProfileSolved> {
             let mut solved = ProfileSolved::new();
 
             // Extract main nameserver hosts for two-tier configuration
@@ -376,7 +609,7 @@ pub mod clash {
                 })
                 .collect();
 
-            // Build two-tier bootstrapper
+            // Build two-tier bootstrapper (direct DNS)
             let bootstrap_config = BootstrapConfig::with_bootstrap_and_main(
                 self.bootstrap_nameservers.iter().map(|s| s.as_str()).collect(),
                 main_nameserver_hosts.iter().map(|s| s.as_str()).collect(),
@@ -384,7 +617,7 @@ pub mod clash {
 
             let bootstrapper = Bootstrapper::new(bootstrap_config)?;
 
-            println!("Two-tier DNS bootstrapper created");
+            println!("Two-tier DNS bootstrapper created (direct resolution)");
             println!("  Bootstrap tier: {} nameservers", self.bootstrap_nameservers.len());
             println!("  Main tier: {} nameservers", self.main_nameservers.len());
 
@@ -425,8 +658,7 @@ pub mod clash {
             }
 
             // Save to disk
-            let solved_path = state_paths::uplink_profile_solved("clash", &self.name);
-            solved.save_to_file(&solved_path)?;
+            solved.save_to_file(solved_path)?;
             println!("\n✓ Resolved addresses saved to {:?}", solved_path);
 
             Ok(solved)
@@ -492,7 +724,7 @@ pub struct UplinkHub {
 }
 
 pub enum UplinkProxy {
-    Clash(clash::TrojanProxy),
+    Trojan(clash::TrojanProxy),
     Remote(ArgProxy),
     File(PathBuf),
 }
@@ -814,6 +1046,7 @@ pub async fn main_entry(
     mtu: u16,
     packet_info: bool,
     mut dns_sx: tokio::sync::mpsc::Sender<Option<VirtDNSHandle>>,
+    // Streams designated for static file serving
     st_sx: flume::Sender<(PathBuf, ipstack::stream::IpStackTcpStream)>,
     hub: Arc<UplinkHub>,
     diag_sock: Option<PathBuf>,
@@ -1107,7 +1340,7 @@ async fn handle_tcp_via_proxy(
     let stream: Box<dyn ProxyStream> = {
         let proxy = select_proxy(&hub, &id).await?;
         match proxy {
-            UplinkProxy::Clash(t) => {
+            UplinkProxy::Trojan(t) => {
                 let ip = resolve_proxy_ip(&t.server).await?;
                 TrojanAdapter::connect(t, &target_host, target_port, ip).await?
             }
