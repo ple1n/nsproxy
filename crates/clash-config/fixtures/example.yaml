@@ -1,0 +1,234 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+external-controller: '127.0.0.1:9090'
+dns:
+    enable: false
+    ipv6: true
+    default-nameserver: [2.3.3.4, 8.8.8.8]
+    enhanced-mode: fake-ip
+    fake-ip-range: 198.18.0.1/16
+    use-hosts: true
+    nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query']
+    fallback: ['https://doh.dns.sb/dns-query', 'https://dns.cloudflare.com/dns-query', 'https://dns.twnic.tw/dns-query', 'tls://8.8.4.4:853']
+    fallback-filter: { geoip: true, ipcidr: [240.0.0.0/4, 0.0.0.0/32] }
+proxies:
+    - { name: test1, type: trojan, server: example-server-hk-01.example.com, port: 53401, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 01', type: trojan, server: example-server-hk-01.example.com, port: 53401, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 02', type: trojan, server: example-server-hk-02.example.com, port: 53402, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 03', type: trojan, server: example-server-hk-03.example.com, port: 53403, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 04', type: trojan, server: example-server-hk-04.example.com, port: 53404, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 05', type: trojan, server: example-server-hk-05.example.com, port: 53405, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 06', type: trojan, server: example-server-hk-06.example.com, port: 53406, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 07', type: trojan, server: example-server-hk-07.example.com, port: 53407, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 08', type: trojan, server: example-server-hk-08.example.com, port: 53408, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 09', type: trojan, server: example-server-hk-09.example.com, port: 53409, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 10', type: trojan, server: example-server-hk-10.example.com, port: 53410, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 11', type: trojan, server: example-server-hk-11.example.com, port: 53411, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 12', type: trojan, server: example-server-hk-12.example.com, port: 53412, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 13', type: trojan, server: example-server-hk-13.example.com, port: 53413, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 14', type: trojan, server: example-server-hk-14.example.com, port: 53414, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 15', type: trojan, server: example-server-hk-15.example.com, port: 53415, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 16', type: trojan, server: example-server-hk-16.example.com, port: 53416, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 19', type: trojan, server: example-server-hk-19.example.com, port: 53419, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '香港 20', type: trojan, server: example-server-hk-20.example.com, port: 53420, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 04', type: trojan, server: example-server-tw-04.example.com, port: 53424, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 05', type: trojan, server: example-server-tw-05.example.com, port: 53425, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 06', type: trojan, server: example-server-tw-06.example.com, port: 53426, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 07', type: trojan, server: example-server-tw-07.example.com, port: 53427, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 08', type: trojan, server: example-server-tw-08.example.com, port: 53428, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 09', type: trojan, server: example-server-tw-09.example.com, port: 53429, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '台湾 10', type: trojan, server: example-server-tw-10.example.com, port: 53430, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 01', type: trojan, server: example-server-sg-01.example.com, port: 53431, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 02', type: trojan, server: example-server-sg-02.example.com, port: 53432, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 03', type: trojan, server: example-server-sg-03.example.com, port: 53433, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 06', type: trojan, server: example-server-sg-06.example.com, port: 53436, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 07', type: trojan, server: example-server-sg-07.example.com, port: 53437, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 08', type: trojan, server: example-server-sg-08.example.com, port: 53438, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 09', type: trojan, server: example-server-sg-09.example.com, port: 53439, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '新加坡 10', type: trojan, server: example-server-sg-10.example.com, port: 53440, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 01', type: trojan, server: example-server-jp-01.example.com, port: 53441, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 02', type: trojan, server: example-server-jp-02.example.com, port: 53442, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 03', type: trojan, server: example-server-jp-03.example.com, port: 53443, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 04', type: trojan, server: example-server-jp-04.example.com, port: 53444, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 05', type: trojan, server: example-server-jp-05.example.com, port: 53445, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 06', type: trojan, server: example-server-jp-06.example.com, port: 53446, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 07', type: trojan, server: example-server-jp-07.example.com, port: 53447, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '日本 10', type: trojan, server: example-server-jp-10.example.com, port: 53450, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 01', type: trojan, server: example-server-us-01.example.com, port: 53451, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 02', type: trojan, server: example-server-us-02.example.com, port: 53452, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 03', type: trojan, server: example-server-us-03.example.com, port: 53453, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 04', type: trojan, server: example-server-us-04.example.com, port: 53454, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 05', type: trojan, server: example-server-us-05.example.com, port: 53455, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 06', type: trojan, server: example-server-us-06.example.com, port: 53456, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 07', type: trojan, server: example-server-us-07.example.com, port: 53457, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 08', type: trojan, server: example-server-us-08.example.com, port: 53458, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 09', type: trojan, server: example-server-us-09.example.com, port: 53459, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '美国 10', type: trojan, server: example-server-us-10.example.com, port: 53460, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '马来西亚 01', type: trojan, server: example-server-my-01.example.com, port: 53466, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '马来西亚 02', type: trojan, server: example-server-my-02.example.com, port: 53467, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '马来西亚 03', type: trojan, server: example-server-my-03.example.com, port: 53468, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '马来西亚 04', type: trojan, server: example-server-my-04.example.com, port: 53469, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '马来西亚 05', type: trojan, server: example-server-my-05.example.com, port: 53470, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '土耳其 01', type: trojan, server: example-server-tr-01.example.com, port: 53496, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: '阿根廷 01', type: trojan, server: example-server-ar-01.example.com, port: 53498, password: REDACTED, udp: true, skip-cert-verify: true }
+    - { name: 'SS-台湾 02', type: ss, server: example-ss-tw-02.example.com, port: 50024, cipher: aes-128-gcm, password: REDACTED, udp: true }
+    - { name: 'SS-台湾 03', type: ss, server: example-ss-tw-03.example.com, port: 50025, cipher: aes-128-gcm, password: REDACTED, udp: true }
+proxy-groups:
+    - { name: test, type: select, proxies: [自动选择, 故障转移, 最新网址example.net, '剩余流量：100 GB', '距离下次重置剩余：12 天', 套餐到期：2026-02-1, '香港 01', '香港 02', '香港 03', '香港 04', '香港 05', '香港 06', '香港 07', '香港 08', '香港 09', '香港 10', '香港 11', '香港 12', '香港 13', '香港 14', '香港 15', '香港 16', '香港 17', '香港 18', '香港 19', '香港 20', '台湾 01', '台湾 02', '台湾 03', '台湾 04', '台湾 05', '台湾 06', '台湾 07', '台湾 08', '台湾 09', '台湾 10', '新加坡 01', '新加坡 02', '新加坡 03', '新加坡 04', '新加坡 05', '新加坡 06', '新加坡 07', '新加坡 08', '新加坡 09', '新加坡 10', '日本 01', '日本 02', '日本 03', '日本 04', '日本 05', '日本 06', '日本 07', '日本 08', '日本 09', '日本 10', '美国 01', '美国 02', '美国 03', '美国 04', '美国 05', '美国 06', '美国 07', '美国 08', '美国 09', '美国 10', '马来西亚 01', '马来西亚 02', '马来西亚 03', '马来西亚 04', '马来西亚 05', '土耳其 01', '阿根廷 01', 'SS-台湾 01', 'SS-台湾 02', 'SS-台湾 03'] }
+    - { name: 自动选择, type: url-test, proxies: [最新网址example.net, '剩余流量：100 GB', '距离下次重置剩余：12 天', 套餐到期：2026-02-1, '香港 01', '香港 02', '香港 03', '香港 04', '香港 05', '香港 06', '香港 07', '香港 08', '香港 09', '香港 10', '香港 11', '香港 12', '香港 13', '香港 14', '香港 15', '香港 16', '香港 17', '香港 18', '香港 19', '香港 20', '台湾 01', '台湾 02', '台湾 03', '台湾 04', '台湾 05', '台湾 06', '台湾 07', '台湾 08', '台湾 09', '台湾 10', '新加坡 01', '新加坡 02', '新加坡 03', '新加坡 04', '新加坡 05', '新加坡 06', '新加坡 07', '新加坡 08', '新加坡 09', '新加坡 10', '日本 01', '日本 02', '日本 03', '日本 04', '日本 05', '日本 06', '日本 07', '日本 08', '日本 09', '日本 10', '美国 01', '美国 02', '美国 03', '美国 04', '美国 05', '美国 06', '美国 07', '美国 08', '美国 09', '美国 10', '马来西亚 01', '马来西亚 02', '马来西亚 03', '马来西亚 04', '马来西亚 05', '土耳其 01', '阿根廷 01', 'SS-台湾 01', 'SS-台湾 02', 'SS-台湾 03'], url: 'http://www.gstatic.com/generate_204', interval: 86400 }
+    - { name: 故障转移, type: fallback, proxies: [最新网址example.net, '剩余流量：100 GB', '距离下次重置剩余：12 天', 套餐到期：2026-02-1, '香港 01', '香港 02', '香港 03', '香港 04', '香港 05', '香港 06', '香港 07', '香港 08', '香港 09', '香港 10', '香港 11', '香港 12', '香港 13', '香港 14', '香港 15', '香港 16', '香港 17', '香港 18', '香港 19', '香港 20', '台湾 01', '台湾 02', '台湾 03', '台湾 04', '台湾 05', '台湾 06', '台湾 07', '台湾 08', '台湾 09', '台湾 10', '新加坡 01', '新加坡 02', '新加坡 03', '新加坡 04', '新加坡 05', '新加坡 06', '新加坡 07', '新加坡 08', '新加坡 09', '新加坡 10', '日本 01', '日本 02', '日本 03', '日本 04', '日本 05', '日本 06', '日本 07', '日本 08', '日本 09', '日本 10', '美国 01', '美国 02', '美国 03', '美国 04', '美国 05', '美国 06', '美国 07', '美国 08', '美国 09', '美国 10', '马来西亚 01', '马来西亚 02', '马来西亚 03', '马来西亚 04', '马来西亚 05', '土耳其 01', '阿根廷 01', 'SS-台湾 01', 'SS-台湾 02', 'SS-台湾 03'], url: 'http://www.gstatic.com/generate_204', interval: 7200 }
+rules:
+    - 'DOMAIN-SUFFIX,mzstatic.com,DIRECT'
+    - 'DOMAIN-SUFFIX,itunes.apple.com,DIRECT'
+    - 'DOMAIN-SUFFIX,hxcdn.net,DIRECT'
+    - 'DOMAIN-SUFFIX,iciba.com,DIRECT'
+    - 'DOMAIN-SUFFIX,ifeng.com,DIRECT'
+    - 'DOMAIN-SUFFIX,ifengimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,ipip.net,DIRECT'
+    - 'DOMAIN-SUFFIX,iqiyi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,jd.com,DIRECT'
+    - 'DOMAIN-SUFFIX,jianshu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,knewone.com,DIRECT'
+    - 'DOMAIN-SUFFIX,le.com,DIRECT'
+    - 'DOMAIN-SUFFIX,lecloud.com,DIRECT'
+    - 'DOMAIN-SUFFIX,lemicp.com,DIRECT'
+    - 'DOMAIN-SUFFIX,licdn.com,DIRECT'
+    - 'DOMAIN-SUFFIX,luoo.net,DIRECT'
+    - 'DOMAIN-SUFFIX,meituan.com,DIRECT'
+    - 'DOMAIN-SUFFIX,meituan.net,DIRECT'
+    - 'DOMAIN-SUFFIX,mi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,miaopai.com,DIRECT'
+    - 'DOMAIN-SUFFIX,microsoft.com,DIRECT'
+    - 'DOMAIN-SUFFIX,microsoftonline.com,DIRECT'
+    - 'DOMAIN-SUFFIX,miui.com,DIRECT'
+    - 'DOMAIN-SUFFIX,miwifi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,mob.com,DIRECT'
+    - 'DOMAIN-SUFFIX,netease.com,DIRECT'
+    - 'DOMAIN-SUFFIX,office.com,DIRECT'
+    - 'DOMAIN-SUFFIX,office365.com,DIRECT'
+    - 'DOMAIN-KEYWORD,officecdn,DIRECT'
+    - 'DOMAIN-SUFFIX,oschina.net,DIRECT'
+    - 'DOMAIN-SUFFIX,ppsimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,pstatp.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qcloud.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qdaily.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qdmm.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qhimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qhres.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qidian.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qihucdn.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qiniu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,zhihu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,zhimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,zimuzu.tv,DIRECT'
+    - 'DOMAIN-SUFFIX,zoho.com,DIRECT'
+    - 'DOMAIN-KEYWORD,amazon,'
+    - 'DOMAIN-KEYWORD,google,'
+    - 'DOMAIN-KEYWORD,gmail,'
+    - 'DOMAIN-KEYWORD,youtube,'
+    - 'DOMAIN-KEYWORD,facebook,'
+    - 'DOMAIN-SUFFIX,fb.me,'
+    - 'DOMAIN-SUFFIX,fbcdn.net,'
+    - 'DOMAIN-KEYWORD,twitter,'
+    - 'DOMAIN-KEYWORD,instagram,'
+    - 'DOMAIN-KEYWORD,dropbox,'
+    - 'DOMAIN-SUFFIX,mmstat.com,REJECT'
+    - 'DOMAIN-KEYWORD,mopub,REJECT'
+    - 'DOMAIN-KEYWORD,omgmta,REJECT'
+    - 'DOMAIN-KEYWORD,openx,REJECT'
+    - 'DOMAIN-KEYWORD,partnerad,REJECT'
+    - 'DOMAIN-KEYWORD,pingfore,REJECT'
+    - 'DOMAIN-KEYWORD,supersonicads,REJECT'
+    - 'DOMAIN-KEYWORD,uedas,REJECT'
+    - 'DOMAIN-KEYWORD,umeng,REJECT'
+    - 'DOMAIN-KEYWORD,usage,REJECT'
+    - 'DOMAIN-SUFFIX,vungle.com,REJECT'
+    - 'DOMAIN-KEYWORD,wlmonitor,REJECT'
+    - 'DOMAIN-KEYWORD,zjtoolbar,REJECT'
+    - 'DOMAIN-SUFFIX,9to5mac.com,'
+    - 'DOMAIN-SUFFIX,abpchina.org,'
+    - 'DOMAIN-SUFFIX,adblockplus.org,'
+    - 'DOMAIN-SUFFIX,adobe.com,'
+    - 'DOMAIN-SUFFIX,akamaized.net,'
+    - 'DOMAIN-SUFFIX,alfredapp.com,'
+    - 'DOMAIN-SUFFIX,amplitude.com,'
+    - 'DOMAIN-SUFFIX,ampproject.org,'
+    - 'DOMAIN-SUFFIX,android.com,'
+    - 'DOMAIN-SUFFIX,angularjs.org,'
+    - 'DOMAIN-SUFFIX,aolcdn.com,'
+    - 'DOMAIN-SUFFIX,apkpure.com,'
+    - 'DOMAIN-SUFFIX,appledaily.com,'
+    - 'DOMAIN-SUFFIX,appshopper.com,'
+    - 'DOMAIN-SUFFIX,appspot.com,'
+    - 'DOMAIN-SUFFIX,arcgis.com,'
+    - 'DOMAIN-SUFFIX,archive.org,'
+    - 'DOMAIN-SUFFIX,armorgames.com,'
+    - 'DOMAIN-SUFFIX,aspnetcdn.com,'
+    - 'DOMAIN-SUFFIX,att.com,'
+    - 'DOMAIN-SUFFIX,awsstatic.com,'
+    - 'DOMAIN-SUFFIX,azureedge.net,'
+    - 'DOMAIN-SUFFIX,azurewebsites.net,'
+    - 'DOMAIN-SUFFIX,bing.com,'
+    - 'DOMAIN-SUFFIX,bintray.com,'
+    - 'DOMAIN-SUFFIX,bit.com,'
+    - 'DOMAIN-SUFFIX,bit.ly,'
+    - 'DOMAIN-SUFFIX,bitbucket.org,'
+    - 'DOMAIN-SUFFIX,bjango.com,'
+    - 'DOMAIN-SUFFIX,bkrtx.com,'
+    - 'DOMAIN-SUFFIX,blog.com,'
+    - 'DOMAIN-SUFFIX,blogcdn.com,'
+    - 'DOMAIN-SUFFIX,blogger.com,'
+    - 'DOMAIN-SUFFIX,blogsmithmedia.com,'
+    - 'DOMAIN-SUFFIX,blogspot.com,'
+    - 'DOMAIN-SUFFIX,blogspot.hk,'
+    - 'DOMAIN-SUFFIX,bloomberg.com,'
+    - 'DOMAIN-SUFFIX,box.com,'
+    - 'DOMAIN-SUFFIX,box.net,'
+    - 'DOMAIN-SUFFIX,cachefly.net,'
+    - 'DOMAIN-SUFFIX,chromium.org,'
+    - 'DOMAIN-SUFFIX,cl.ly,'
+    - 'DOMAIN-SUFFIX,cloudflare.com,'
+    - 'DOMAIN-SUFFIX,cloudfront.net,'
+    - 'DOMAIN-SUFFIX,cloudmagic.com,'
+    - 'DOMAIN-SUFFIX,cmail19.com,'
+    - 'DOMAIN-SUFFIX,cnet.com,'
+    - 'DOMAIN-SUFFIX,cocoapods.org,'
+    - 'DOMAIN-SUFFIX,comodoca.com,'
+    - 'DOMAIN-SUFFIX,crashlytics.com,'
+    - 'DOMAIN-SUFFIX,culturedcode.com,'
+    - 'DOMAIN-SUFFIX,d.pr,'
+    - 'DOMAIN-SUFFIX,danilo.to,'
+    - 'DOMAIN-SUFFIX,dayone.me,'
+    - 'DOMAIN-SUFFIX,db.tt,'
+    - 'DOMAIN-SUFFIX,deskconnect.com,'
+    - 'DOMAIN-SUFFIX,disq.us,'
+    - 'DOMAIN-SUFFIX,disqus.com,'
+    - 'DOMAIN-SUFFIX,disquscdn.com,'
+    - 'DOMAIN-SUFFIX,dnsimple.com,'
+    - 'DOMAIN-SUFFIX,docker.com,'
+    - 'DOMAIN-SUFFIX,dribbble.com,'
+    - 'DOMAIN-SUFFIX,droplr.com,'
+    - 'DOMAIN-SUFFIX,duckduckgo.com,'
+    - 'DOMAIN-SUFFIX,dueapp.com,'
+    - 'DOMAIN-SUFFIX,dytt8.net,'
+    - 'DOMAIN-SUFFIX,edgecastcdn.net,'
+    - 'DOMAIN-SUFFIX,edgekey.net,'
+    - 'DOMAIN-SUFFIX,edgesuite.net,'
+    - 'DOMAIN,injections.adguard.org,DIRECT'
+    - 'DOMAIN,local.adguard.org,DIRECT'
+    - 'DOMAIN-SUFFIX,local,DIRECT'
+    - 'IP-CIDR,127.0.0.0/8,DIRECT'
+    - 'IP-CIDR,172.16.0.0/12,DIRECT'
+    - 'IP-CIDR,192.168.0.0/16,DIRECT'
+    - 'IP-CIDR,10.0.0.0/8,DIRECT'
+    - 'IP-CIDR,17.0.0.0/8,DIRECT'
+    - 'IP-CIDR,100.64.0.0/10,DIRECT'
+    - 'IP-CIDR,224.0.0.0/4,DIRECT'
+    - 'IP-CIDR6,fe80::/10,DIRECT'
+    - 'DOMAIN-SUFFIX,cn,DIRECT'
+    - 'DOMAIN-KEYWORD,-cn,DIRECT'
+    - 'GEOIP,CN,DIRECT'
+    - 'MATCH,'

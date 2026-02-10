@@ -4,6 +4,11 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+repository = "https://github.com/ple1n/nsproxy"
+
 [profile.dev]
 panic = "abort"
 opt-level = 0       # No optimizations → fastest compile

@@ -78,6 +78,30 @@ pub mod state_paths {
     pub fn metadata_for_bind(bind_path: &Path) -> PathBuf {
         bind_path.with_extension("json")
     }
+
+    /// Get uplink root directory for a specific kind (e.g., "clash", "geph")
+    /// Returns /nsp3/uplink/{kind}
+    pub fn uplink_dir(kind: &str) -> PathBuf {
+        PathBuf::from(PERSIST_ROOT).join("uplink").join(kind)
+    }
+
+    /// Get uplink profile directory for a specific kind and profile name
+    /// Returns /nsp3/uplink/{kind}/{profile}
+    pub fn uplink_profile_dir(kind: &str, profile: &str) -> PathBuf {
+        uplink_dir(kind).join(profile)
+    }
+
+    /// Get resolved addresses JSON path for an uplink profile
+    /// Returns /nsp3/uplink/{kind}/{profile}/solved.json
+    pub fn uplink_profile_solved(kind: &str, profile: &str) -> PathBuf {
+        uplink_profile_dir(kind, profile).join("solved.json")
+    }
+
+    /// Get config file path for an uplink profile
+    /// Returns /nsp3/uplink/{kind}/{profile}/config.yaml
+    pub fn uplink_profile_config(kind: &str, profile: &str) -> PathBuf {
+        uplink_profile_dir(kind, profile).join("config.yaml")
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]

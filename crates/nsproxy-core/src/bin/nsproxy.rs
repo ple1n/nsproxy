@@ -80,6 +80,7 @@ use std::{
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use owo_colors::OwoColorize;
 use tun2socks5::{
     ArgMode, IArgs, VirtDNSChange, aok, diag,
     dns::{TUNResponse, VirtDNSHandle},
@@ -1876,6 +1877,7 @@ fn main() -> anyhow::Result<()> {
             no_default,
             no_proxy,
             log,
+            clash,
         } => {
             let wrapped_config = WrappedBinariesConfig::load()?;
             wrapped_config.check_all_wrapped()?;
@@ -2293,6 +2295,232 @@ fn main() -> anyhow::Result<()> {
 
                     aok!()
                 })?;
+            }
+        },
+        MainCommand::Uplink { kind } => match kind {
+            UplinkTypes::Clash { cmd } => match cmd {
+                ClashOps::ProfileAdd { name, path } => {
+                    let profile_name = name.as_deref().unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("default")
+                    });
+
+                    println!("Importing Clash profile '{}'...", profile_name);
+                    println!("  Config: {:?}", path);
+
+                    let clash_profile = nsproxy_core::uplink::clash::ClashProfile::import(
+                        profile_name,
+                        &path,
+                    )?;
+
+                    println!("\n✓ Profile imported");
+                    println!("  Bootstrap nameservers: {}", clash_profile.bootstrap_nameservers.len());
+                    println!("  Main nameservers: {}", clash_profile.main_nameservers.len());
+                    println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
+
+                    println!("\nResolving all domains...");
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+
+                    rt.block_on(async {
+                        clash_profile.resolve_domains().await
+                    })?;
+
+                    println!("\n✓ Profile '{}' is ready to use", profile_name);
+                }
+                ClashOps::Status => {
+                    let uplink_dir = state_paths::uplink_dir("clash");
+                    if !uplink_dir.exists() {
+                        println!("No Clash profiles found");
+                        return Ok(());
+                    }
+
+                    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().is_dir())
+                        .collect();
+
+                    if profiles.is_empty() {
+                        println!("No Clash profiles found");
+                        return Ok(());
+                    }
+
+                    println!("Clash Profiles:");
+                    for entry in profiles {
+                        let profile_name = entry.file_name().to_string_lossy().to_string();
+                        let config_path = state_paths::uplink_profile_config("clash", &profile_name);
+                        let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
+
+                        println!("\n  Profile: {}", profile_name);
+                        println!("    Config: {:?} {}", config_path,
+                            if config_path.exists() { "✓" } else { "✗" });
+
+                        if solved_path.exists() {
+                            match nsproxy_core::uplink::ProfileSolved::load_from_file(&solved_path) {
+                                Ok(solved) => {
+                                    println!("    Resolved: {} domains", solved.domains.len());
+                                    for (domain, resolutions) in &solved.domains {
+                                        if let Some((_, response)) = resolutions.iter().last() {
+                                            println!("      {} -> {} IPs", domain, response.ips.len());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("    Resolved: error loading - {}", e);
+                                }
+                            }
+                        } else {
+                            println!("    Resolved: not yet resolved");
+                        }
+                    }
+                }
+                ClashOps::ProfileExplain { path } => {
+                    use anyhow::Context;
+                    use clash_config::Config;
+
+                    println!("{}", "Clash Profile Analysis".bold().bright_cyan());
+                    println!();
+                    println!("  {}: {}", "Config".dimmed(), path.display());
+                    println!();
+
+                    if !path.exists() {
+                        bail!("Config file does not exist: {:?}", path);
+                    }
+
+                    // Load and parse the config
+                    let config = Config::try_from(path.clone())
+                        .context("Failed to parse Clash YAML config")?;
+
+                    println!("{}", "Two-Tier DNS".bold());
+                    println!();
+                    println!("  {} {} {} {}",
+                        "Bootstrap".cyan().bold(),
+                        "->".dimmed(),
+                        "Main".cyan().bold(),
+                        "->".dimmed());
+                    println!("  {} resolves {} resolves {}",
+                        "IP nameservers".dimmed(),
+                        "main tier".dimmed(),
+                        "proxy domains".dimmed());
+                    println!();
+
+                    let max_show = 3;
+                    println!("  {} ({} total)", "Bootstrap Tier".cyan(), config.dns.default_nameserver.len());
+                    for ns in config.dns.default_nameserver.iter().take(max_show) {
+                        println!("    {}", ns);
+                    }
+                    if config.dns.default_nameserver.len() > max_show {
+                        println!("    {} ...", format!("+{} more", config.dns.default_nameserver.len() - max_show).dimmed());
+                    }
+
+                    println!();
+                    println!("  {} ({} total)", "Main Tier".cyan(), config.dns.nameserver.len());
+                    for ns in config.dns.nameserver.iter().take(max_show) {
+                        println!("    {}", ns);
+                    }
+                    if config.dns.nameserver.len() > max_show {
+                        println!("    {} ...", format!("+{} more", config.dns.nameserver.len() - max_show).dimmed());
+                    }
+
+                    // Extract proxy information
+                    let proxies = config.proxy.as_ref()
+                        .context("No proxies found in Clash config")?;
+
+                    let mut trojan_count = 0;
+                    let mut other_count = 0;
+                    let mut proxy_domains = Vec::new();
+
+                    for proxy in proxies {
+                        let proxy_type = proxy.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+
+                        if proxy_type == "trojan" {
+                            trojan_count += 1;
+                            if let Some(server) = proxy.get("server").and_then(|v| v.as_str()) {
+                                proxy_domains.push(server.to_string());
+                            }
+                        } else {
+                            other_count += 1;
+                        }
+                    }
+
+                    println!();
+                    println!("{}", "Proxies".bold());
+                    println!();
+                    println!("  {}  {}", "Total".dimmed(), proxies.len());
+                    if trojan_count > 0 {
+                        println!("  {}  {} {}", "Trojan".dimmed(), trojan_count, "(supported)".green());
+                    } else {
+                        println!("  {}  {} {}", "Trojan".dimmed(), trojan_count, "(none found)".yellow());
+                    }
+                    if other_count > 0 {
+                        println!("  {}  {} {}", "Other".dimmed(), other_count, "(not supported)".yellow());
+                    }
+
+                    if !proxy_domains.is_empty() {
+                        println!();
+                        println!("  {}", "Proxy Servers".cyan());
+                        for domain in proxy_domains.iter().take(max_show) {
+                            println!("    {}", domain);
+                        }
+                        if proxy_domains.len() > max_show {
+                            println!("    {} ...", format!("+{} more", proxy_domains.len() - max_show).dimmed());
+                        }
+                    }
+
+                    // Validate profile
+                    println!();
+                    println!("{}", "Validation".bold());
+                    println!();
+                    let mut valid = true;
+
+                    if config.dns.default_nameserver.is_empty() {
+                        println!("  {} No bootstrap nameservers", "[x]".red().bold());
+                        valid = false;
+                    } else {
+                        // Check that bootstrap nameservers are IPs
+                        let mut all_ips = true;
+                        for ns in &config.dns.default_nameserver {
+                            if ns.parse::<std::net::IpAddr>().is_err() {
+                                println!("  {} Bootstrap must be IP, not hostname: {}", "[!]".yellow().bold(), ns);
+                                all_ips = false;
+                            }
+                        }
+                        if all_ips {
+                            println!("  {} Bootstrap nameservers are IPs", "[✓]".green().bold());
+                        } else {
+                            valid = false;
+                        }
+                    }
+
+                    if config.dns.nameserver.is_empty() {
+                        println!("  {} No main nameservers", "[x]".red().bold());
+                        valid = false;
+                    } else {
+                        println!("  {} Main nameservers ({})", "[✓]".green().bold(), config.dns.nameserver.len());
+                    }
+
+                    if trojan_count == 0 {
+                        println!("  {} No Trojan proxies (only type supported)", "[!]".yellow().bold());
+                        valid = false;
+                    } else {
+                        println!("  {} Trojan proxies ({})", "[✓]".green().bold(), trojan_count);
+                    }
+
+                    println!();
+                    if valid {
+                        println!("  {} {}", "Status:".bold(), "VALID".green());
+                    } else {
+                        println!("  {} {}", "Status:".bold(), "ERRORS".red());
+                    }
+                    println!();
+                }
+            },
+            UplinkTypes::Geph => {
+                bail!("Geph uplink not yet implemented");
             }
         },
         _ => unimplemented!(),

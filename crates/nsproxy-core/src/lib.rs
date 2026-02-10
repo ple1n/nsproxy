@@ -1504,6 +1504,9 @@ pub enum MainCommand {
         no_proxy: bool,
         #[arg(short, long)]
         log: Option<LevelFilter>,
+        /// Use Clash uplink profile for all TUN connections
+        #[arg(long)]
+        clash: Option<String>,
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {
@@ -1530,16 +1533,30 @@ pub enum MainCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum UplinkTypes {
-    Clash,
-    Geph
+    Clash {
+        #[command(subcommand)]
+        cmd: ClashOps,
+    },
+    Geph,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ClashOps {
+    /// Import a Clash profile from a YAML config file
     ProfileAdd {
-        path: Option<PathBuf>,
+        /// Name for this profile (defaults to config filename)
+        #[arg(long)]
+        name: Option<String>,
+        /// Path to Clash YAML config file
+        path: PathBuf,
     },
+    /// Show status of imported Clash profiles
     Status,
+    /// Analyze a Clash profile and explain the two-tier DNS bootstrap process
+    ProfileExplain {
+        /// Path to Clash YAML config file
+        path: PathBuf,
+    },
 }
 
 pub mod uplink;
