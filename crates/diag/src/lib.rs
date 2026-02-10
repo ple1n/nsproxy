@@ -64,6 +64,8 @@ pub enum ConnRoute {
     Dns { query: String, strategy: String },
     /// File serving.
     FileServe { root: String },
+    /// Connection dropped/blocked by routing policy.
+    Unreachable,
 }
 
 /// A single diagnostic event emitted by tun2socks5.
