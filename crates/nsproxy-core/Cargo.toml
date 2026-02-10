@@ -1,5 +1,5 @@
 [package]
-name = "nsproxy_core"
+name = "nsproxy-core"
 version = "3.4.0"
 edition = "2024"
 
@@ -64,3 +64,34 @@ reqwest = { version = "0.12.23", features = ["socks"] }
 tokio-send-fd = "0.9.4"
 blake3 = "1.5.1"
 diag = { path = "../diag" }
+clash-bootstrap = { path = "../clash-bootstrap" }
+clash-config = { path = "../clash-config" }
+trojan-proto = { path = "../trojan-proto" }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["std", "ring"] }
+webpki-roots = "0.26"
+sha2 = "0.10"
+hex = "0.4"
+bytes = "1"
+url = "2.5"
+owo-colors = "3.5.0"
+# Integrated from tun2socks5
+async-recursion = "1.0"
+async-trait = "0.1"
+base64 = "0.21"
+digest_auth = "0.3"
+httparse = "1.8"
+trust-dns-proto = "0.23"
+udp-stream = { version = "0.0", default-features = false }
+unicase = "2.7"
+id_alloc = { path = "../id_alloc" }
+quick_cache = "0.6.3"
+concurrent-map = "5.0.37"
+crossbeam = "0.8.4"
+bimap = { version = "0.6.3", features = ["serde"] }
+twox-hash = { version = "=2.1.2", features = ["xxhash3_128"] }
+ipstack.workspace = true
+flume.workspace = true
+tun-rs.workspace = true
+thiserror = "1.0"
+ctrlc2 = { version = "3.5", features = ["tokio", "termination"] }

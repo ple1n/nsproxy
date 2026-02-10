@@ -1,0 +1,22 @@
+[package]
+name = "clash-config"
+repository = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+description = "Configuration parser for clash-rs"
+
+[dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utils
+educe = "0.6"
+
+[dev-dependencies]
+# Testing
+tokio = { version = "1", features = ["rt", "macros"] }
