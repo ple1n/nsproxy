@@ -332,6 +332,7 @@ use tun2socks5::tun_rs::DeviceBuilder;
 use utils::MapExt;
 
 use crate::shell::ShellArgs;
+use nsproxy_common::routing::ProxyNym;
 use crate::utils::dump_as_json;
 use crate::utils::dump_as_toml;
 
@@ -1094,11 +1095,27 @@ impl WrappedBinariesConfig {
 
     /// Get the expected nswrap hash (from cache or by computing)
     /// This will compute and cache the hash if not present
-    fn get_or_compute_nswrap_hash(&mut self) -> Result<String> {
+    pub fn get_or_compute_nswrap_hash(&mut self) -> Result<String> {
         if let Some(ref hash) = self.nswrap_hash {
             return Ok(hash.clone());
         }
 
+        let nswrap_path = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
+            .join("nswrap");
+
+        if !nswrap_path.exists() {
+            bail!("nswrap binary not found at {:?}", nswrap_path);
+        }
+
+        let hash = Self::compute_file_hash(&nswrap_path)?;
+        self.nswrap_hash = Some(hash.clone());
+        self.save()?;
+        Ok(hash)
+    }
+
+    pub fn update_nswrap_hash(&mut self) -> Result<String> {
         let nswrap_path = std::env::current_exe()?
             .parent()
             .ok_or_else(|| anyhow!("Cannot get parent directory of current exe"))?
@@ -1288,6 +1305,8 @@ use clap::{
 pub struct Cli {
     #[arg(short, long)]
     pub conf: Option<PathBuf>,
+    #[arg(short, long)]
+    pub no_wrap_check: bool,
     #[command(subcommand)]
     pub cmd: MainCommand,
 }
@@ -1527,17 +1546,27 @@ pub enum MainCommand {
     /// Uplink by which you connect to freedom
     Uplink {
         #[command(subcommand)]
-        kind: UplinkTypes,
+        kind: UplinkCommand,
     },
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum UplinkTypes {
+pub enum UplinkCommand {
     Clash {
         #[command(subcommand)]
         cmd: ClashOps,
     },
     Geph,
+    Instance {
+        name: ProxyNym,
+        #[command(subcommand)]
+        cmd: UplinkInstanceCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum UplinkInstanceCommand {
+    Test,
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -6,10 +6,19 @@ To release a new version
 gh release create v2.1.0 ./release/*
 ```
 
+for debugging
+
+```sh
+./testing_install.sh
+. env.fish # loads ./install to $PATH
+```
+
 # What could be added
 
 - pivot_root, wip
 - automatic retries of proxy connection at nsproxy's side, which suits the case where the software does not handle connection failures well in poor network condition
+- whitelist for proxy bypass
+- handle leaks in basis ns
 
 # Method
 

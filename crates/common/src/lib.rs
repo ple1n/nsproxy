@@ -24,6 +24,7 @@ use owo_colors::OwoColorize;
 use serde::{de::Visitor, Deserialize, Serialize};
 
 pub mod rpc;
+pub mod routing;
 
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 
@@ -83,6 +84,12 @@ pub mod state_paths {
     /// Returns /nsp3/uplink/{kind}
     pub fn uplink_dir(kind: &str) -> PathBuf {
         PathBuf::from(PERSIST_ROOT).join("uplink").join(kind)
+    }
+
+    /// Get uplink root directory
+    /// Returns /nsp3/uplink
+    pub fn uplink_root() -> PathBuf {
+        PathBuf::from(PERSIST_ROOT).join("uplink")
     }
 
     /// Get uplink profile directory for a specific kind and profile name
@@ -423,6 +430,23 @@ pub fn cached_stat<'k>(ca: &'k mut VaCache, path: NMnt) -> Result<&'k stat> {
         }
     })
 }
+
+
+pub use anyhow::Ok as aok;
+
+pub fn log_err<T, E, F>(op: F) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+    E: Display,
+{
+    let result = op();
+    if let Err(ref err) = result {
+        tracing::error!("{err}");
+    }
+    result
+}
+
+
 
 #[test]
 fn test_f() {

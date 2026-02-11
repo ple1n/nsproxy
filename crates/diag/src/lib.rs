@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::Result;
+use nsproxy_common::routing::RoutingDecision;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -51,23 +52,6 @@ pub enum StreamKind {
     Udp,
 }
 
-/// How a connection is being handled.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ConnRoute {
-    /// Routed through the SOCKS5/HTTP proxy.
-    Proxied { dest: String },
-    /// NAT'd directly by the TUN device.
-    Nat { dest: String },
-    /// Direct connection (no proxy configured).
-    Direct { dest: String },
-    /// DNS query (handled, over-tcp, or direct).
-    Dns { query: String, strategy: String },
-    /// File serving.
-    FileServe { root: String },
-    /// Connection dropped/blocked by routing policy.
-    Unreachable,
-}
-
 /// A single diagnostic event emitted by tun2socks5.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiagEvent {
@@ -89,7 +73,7 @@ pub enum DiagEvent {
     Route {
         id: ConnId,
         ts: Timestamp,
-        route: ConnRoute,
+        route: RoutingDecision,
     },
     /// Connection to the proxy/remote server established.
     Connected {
