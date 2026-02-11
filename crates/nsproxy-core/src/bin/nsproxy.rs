@@ -204,6 +204,18 @@ fn apply_profile_chmod(root: &Path, chmods: &[ProfileChmod]) -> Result<()> {
     Ok(())
 }
 
+/// Load all saved proxies and build an UplinkHub with all available proxies
+fn load_saved_uplink_hub() -> Result<nsproxy_core::uplink::UplinkHub> {
+    let mut hub = nsproxy_core::uplink::UplinkHub::new();
+    let count = hub.load_saved_proxies()?;
+
+    if count == 0 {
+        bail!("No saved proxies found. Import a profile first with 'sp uplink clash profile-add'.");
+    }
+
+    Ok(hub)
+}
+
 fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     // DEBUG is annoying because its filled with TCP retransmission logs
@@ -267,8 +279,10 @@ fn main() -> anyhow::Result<()> {
             no_proxy,
         } => {
             // Check wrapped binaries wellness before starting
-            let wrapped_config = WrappedBinariesConfig::load()?;
-            wrapped_config.check_all_wrapped()?;
+            if !cli.no_wrap_check {
+                let wrapped_config = WrappedBinariesConfig::load()?;
+                wrapped_config.check_all_wrapped()?;
+            }
 
             // Validate proxy and no_proxy are mutually exclusive
             let mut iargs = proxy;
@@ -1385,7 +1399,7 @@ fn main() -> anyhow::Result<()> {
         }
         MainCommand::Wrap { undo, add } => {
             let mut config = WrappedBinariesConfig::load()?;
-
+            config.update_nswrap_hash()?;
             if let Some(name) = add {
                 if undo {
                     info!("not supported");
@@ -2298,7 +2312,7 @@ fn main() -> anyhow::Result<()> {
             }
         },
         MainCommand::Uplink { kind } => match kind {
-            UplinkTypes::Clash { cmd } => match cmd {
+            UplinkCommand::Clash { cmd } => match cmd {
                 ClashOps::ProfileAdd { name, path } => {
                     let profile_name = name.as_deref().unwrap_or_else(|| {
                         path.file_stem()
@@ -2519,8 +2533,161 @@ fn main() -> anyhow::Result<()> {
                     println!();
                 }
             },
-            UplinkTypes::Geph => {
+            UplinkCommand::Geph => {
                 bail!("Geph uplink not yet implemented");
+            }
+            UplinkCommand::Instance { name, cmd } => {
+                match cmd {
+                    UplinkInstanceCommand::Test => {
+                        use owo_colors::OwoColorize;
+                        use nsproxy_core::uplink::clash::ClashProfile;
+                        use std::time::Duration;
+
+                        println!("{}", "Proxy Instance Test".bold().bright_cyan());
+                        println!();
+                        println!("  Instance: {}", name.to_string().cyan());
+                        println!();
+
+                        // Load all Clash profiles and build UplinkHub
+                        let uplink_dir = state_paths::uplink_dir("clash");
+                        if !uplink_dir.exists() {
+                            bail!("No Clash profiles found. Import a profile first with 'sp uplink clash profile-add'.");
+                        }
+
+                        let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry.path().is_dir())
+                            .collect();
+
+                        if profiles.is_empty() {
+                            bail!("No Clash profiles found.");
+                        }
+
+                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
+
+                        println!("Loading Clash profiles...");
+                        let count = hub.load_clash_proxies()?;
+                        println!("  Loaded {} proxies", count);
+                        println!();
+
+                        // Look up the proxy by nym
+                        let (proxy_id, proxy) = hub.get_proxy_by_nym(&name)
+                            .ok_or_else(|| anyhow!("Proxy with nym '{}' not found", name))?;
+
+                        println!("Found proxy: {:?}", proxy_id);
+                        println!();
+
+                        // Run tests based on proxy type
+                        match proxy {
+                            nsproxy_core::uplink::UplinkProxy::Trojan(trojan) => {
+                                println!("{}", "Trojan Proxy Tests".bold());
+                                println!("  Server: {}", trojan.server);
+                                println!("  Port: {}", trojan.port);
+                                println!();
+
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()?;
+
+                                rt.block_on(async {
+                                    // Get resolved IPs
+                                    let uplink_dir = state_paths::uplink_dir("clash");
+                                    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
+                                        .filter_map(Result::ok)
+                                        .filter(|entry| entry.path().is_dir())
+                                        .collect();
+
+                                    let mut server_ip = None;
+                                    for entry in profiles {
+                                        let profile_name = entry.file_name().to_string_lossy().to_string();
+                                        let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
+                                        if solved_path.exists() {
+                                            if let Ok(solved) = nsproxy_core::uplink::ProfileSolved::load_from_file(&solved_path) {
+                                                if let Some(ips) = solved.get_latest_ips(&trojan.server) {
+                                                    server_ip = ips.iter().next().copied();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let server_ip = server_ip.ok_or_else(|| anyhow!("No resolved IP for {}", trojan.server))?;
+
+                                    // TCP Test: Connect to ip.me via Trojan
+                                    println!("{}  Testing TCP connectivity...", "[•]".cyan());
+                                    match trojan.connect(server_ip, "ip.me", 80).await {
+                                        Ok(conn) => {
+                                            match conn {
+                                                nsproxy_core::uplink::clash::TrojanConnection::TcpConnect(mut stream, _) => {
+                                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                                    
+                                                    let request = "GET / HTTP/1.1\r\nHost: ip.me\r\nConnection: close\r\n\r\n";
+                                                    if let Err(e) = stream.write_all(request.as_bytes()).await {
+                                                        println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                                    } else {
+                                                        let mut response = String::new();
+                                                        match tokio::time::timeout(
+                                                            Duration::from_secs(10),
+                                                            stream.read_to_string(&mut response)
+                                                        ).await {
+                                                            Ok(Ok(_)) => {
+                                                                if response.contains("200 OK") || !response.is_empty() {
+                                                                    println!("{}  TCP test passed (ip.me responded)", "[✓]".green().bold());
+                                                                } else {
+                                                                    println!("{}  TCP test failed: invalid response", "[✗]".red().bold());
+                                                                }
+                                                            }
+                                                            Ok(Err(e)) => {
+                                                                println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                                            }
+                                                            Err(_) => {
+                                                                println!("{}  TCP test failed: timeout", "[✗]".red().bold());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    println!("{}  TCP test failed: wrong connection type", "[✗]".red().bold());
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                        }
+                                    }
+
+                                    // UDP Test: DNS resolution via Trojan
+                                    println!("{}  Testing UDP connectivity...", "[•]".cyan());
+                                    match trojan.connect_udp(server_ip, "1.1.1.1", 53).await {
+                                        Ok(conn) => {
+                                            match conn {
+                                                nsproxy_core::uplink::clash::TrojanConnection::UdpAssociate(_, _) => {
+                                                    // Successfully created UDP tunnel
+                                                    // Full DNS query test would require implementing the tunnel protocol
+                                                    println!("{}  UDP tunnel established (Trojan supports UDP)", "[✓]".green().bold());
+                                                    println!("    Trojan UDP ASSOCIATE command successful");
+                                                }
+                                                _ => {
+                                                    println!("{}  UDP test failed: wrong connection type", "[✗]".red().bold());
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
+                                        }
+                                    }
+
+                                    println!();
+                                    println!("{}", "Test complete".bold());
+                                    Ok::<(), anyhow::Error>(())
+                                })?;
+                            }
+                            _ => {
+                                bail!("Proxy type not yet supported for testing");
+                            }
+                        }
+                    }
+                }
             }
         },
         _ => unimplemented!(),

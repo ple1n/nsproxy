@@ -1,0 +1,14 @@
+[package]
+name = "nsproxy-ui"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui = "0.33.3"
+eframe = "0.33.3"
+tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "sync", "signal", "time"] }
+tracing = "0.1.44"
+nsproxy-common = { version = "0.1.0", path = "../common" }
+flume = "0.11.1"
+egui_extras = "0.33"
