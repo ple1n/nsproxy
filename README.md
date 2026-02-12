@@ -275,6 +275,17 @@ This version comes with a major new feature, the overlay mode of instance isolat
 
 The example schema [here](./profiles/vscode.json) bans use of DBus, which prevents unintended browser opening and subsequent IP leaks or various identitiy contamination castratrophe, isolates user configs, extensions of vscode-insider instances.
 
+## 3.5 Updates
+
+Current recommmended workflow 
+
+```bash
+sp profile profile.json container1
+sp up --profile container1
+sp tun --profile container1 -p socks5://127.0.0.1:9909
+sp enter container1
+```
+
 ## Operational philosophy
 
 - Perfection
@@ -283,3 +294,4 @@ The example schema [here](./profiles/vscode.json) bans use of DBus, which preven
 - Prefer stable kernel syscall interface over bash-scripts, which is the reason for this tool
 - Prefer a single monolithic program over multiple distinct projects. 
 - No Unix philosophy
+
