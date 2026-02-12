@@ -1,5 +1,29 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use egui_json_tree::{JsonTree, DefaultExpand};
+use serde_json::Value;
+use std::collections::HashMap;
+
+const HOTCONFIG_EXAMPLE: &str = r#"{
+    "hot_reload": true,
+    "settings": {
+        "max_connections": 8,
+        "timeout_seconds": 30
+    }
+}"#;
+
+const PROFILE_JSON_EXAMPLE: &str = r#"[
+    {
+        "name": "office",
+        "status": "stopped",
+        "proxies": []
+    },
+    {
+        "name": "guest",
+        "status": "running",
+        "proxies": ["proxy-1.local:8001"]
+    }
+]"#;
 
 #[derive(Clone, Default)]
 struct Profile {
@@ -34,6 +58,21 @@ enum RightTab {
     Processes,
     Diagnostics,
     Dns,
+    Hotconfig,
+    ProfileEditor,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Scope {
+    Global,
+    Profile(String),
+}
+
+struct ScopeUiState {
+    hotconfig_text: String,
+    profile_json_text: String,
+    hotconfig_saved: bool,
+    profile_saved: bool,
 }
 
 struct App {
@@ -42,6 +81,9 @@ struct App {
     right_tab: RightTab,
     proxies: Vec<Proxy>,
     hovered_proxy: Option<usize>,
+    // per-scope UI state keyed by Scope
+    current_scope: Scope,
+    scope_states: HashMap<Scope, ScopeUiState>,
 }
 
 impl Default for App {
@@ -72,7 +114,32 @@ impl Default for App {
             Profile { name: "dev".into(), status: "stopped".into(), proxies: vec![], instantiated: false },
         ];
 
-        Self { profiles, selected: Selected::Global, right_tab: RightTab::Proxies, proxies, hovered_proxy: None }
+        let hotconfig_text = HOTCONFIG_EXAMPLE.to_owned();
+        let profile_json_text = PROFILE_JSON_EXAMPLE.to_owned();
+
+        let mut scope_states = HashMap::new();
+        // default global scope
+        scope_states.insert(
+            Scope::Global,
+            ScopeUiState {
+                hotconfig_text: hotconfig_text.clone(),
+                profile_json_text: profile_json_text.clone(),
+                hotconfig_saved: false,
+                profile_saved: false,
+            },
+        );
+
+        // pre-populate per-profile scope states (use profile name)
+        for p in &profiles {
+            scope_states.entry(Scope::Profile(p.name.clone())).or_insert_with(|| ScopeUiState {
+                hotconfig_text: hotconfig_text.clone(),
+                profile_json_text: profile_json_text.clone(),
+                hotconfig_saved: false,
+                profile_saved: false,
+            });
+        }
+
+        Self { profiles, selected: Selected::Global, right_tab: RightTab::Proxies, proxies, hovered_proxy: None, current_scope: Scope::Global, scope_states }
     }
 }
 
@@ -92,6 +159,13 @@ impl eframe::App for App {
             let global_status_color = egui::Color32::from_rgb(100, 150, 240);
             if sidebar_box(ui, "Global Configuration", "Apply proxy configuration globally", global_selected, global_status_color).clicked() {
                 self.selected = Selected::Global;
+                self.current_scope = Scope::Global;
+                self.scope_states.entry(Scope::Global).or_insert_with(|| ScopeUiState {
+                    hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                    profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                    hotconfig_saved: false,
+                    profile_saved: false,
+                });
             }
 
             ui.add_space(8.0);
@@ -104,6 +178,15 @@ impl eframe::App for App {
                 let status_color = if profile.instantiated { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
                 if sidebar_box(ui, &profile.name, &profile.status, is_selected, status_color).clicked() {
                     self.selected = Selected::Profile(i);
+                    // map profile selection to a profile-name Scope for per-scope UI state
+                    let scope_key = Scope::Profile(profile.name.clone());
+                    self.current_scope = scope_key.clone();
+                    self.scope_states.entry(scope_key).or_insert_with(|| ScopeUiState {
+                        hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                        profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                        hotconfig_saved: false,
+                        profile_saved: false,
+                    });
                 }
                 ui.add_space(6.0);
             }
@@ -123,6 +206,12 @@ impl eframe::App for App {
                 }
                 if ui.selectable_label(self.right_tab == RightTab::Dns, "DNS").clicked() {
                     self.right_tab = RightTab::Dns;
+                }
+                if ui.selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig").clicked() {
+                    self.right_tab = RightTab::Hotconfig;
+                }
+                if ui.selectable_label(self.right_tab == RightTab::ProfileEditor, "Profile").clicked() {
+                    self.right_tab = RightTab::ProfileEditor;
                 }
             });
 
@@ -289,6 +378,83 @@ impl eframe::App for App {
                 RightTab::Dns => {
                     ui.heading("DNS");
                     ui.label("DNS settings are not implemented yet (placeholder).");
+                }
+
+                RightTab::Hotconfig => {
+                            // get or create the scope UI state
+                            let key = self.current_scope.clone();
+                            let state = self.scope_states.entry(key.clone()).or_insert_with(|| ScopeUiState {
+                                hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                                profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                                hotconfig_saved: false,
+                                profile_saved: false,
+                            });
+
+                    ui.horizontal(|ui| {
+                        ui.heading("Hotconfig");
+                        ui.add_space(8.0);
+                        if ui.button("Reload").clicked() {
+                            state.hotconfig_text = HOTCONFIG_EXAMPLE.to_owned();
+                            state.hotconfig_saved = false;
+                        }
+                        if ui.button("Save").clicked() {
+                            state.hotconfig_saved = true; // in-memory only
+                        }
+                        if state.hotconfig_saved {
+                            ui.add_space(8.0);
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Saved in memory");
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    // Render JSON tree (if parsing fails, show raw string)
+                    let json_value: Value = match serde_json::from_str(&state.hotconfig_text) {
+                        Ok(v) => v,
+                        Err(_) => Value::String(state.hotconfig_text.clone()),
+                    };
+                    let id = match &key {
+                        Scope::Global => format!("hotconfig-global"),
+                        Scope::Profile(name) => format!("hotconfig-profile-{}", name),
+                    };
+                    JsonTree::new(id, &json_value).default_expand(DefaultExpand::All).show(ui);
+                }
+
+                RightTab::ProfileEditor => {
+                    let key = self.current_scope.clone();
+                    let state = self.scope_states.entry(key.clone()).or_insert_with(|| ScopeUiState {
+                        hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                        profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                        hotconfig_saved: false,
+                        profile_saved: false,
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.heading("Profile JSON");
+                        ui.add_space(8.0);
+                        if ui.button("Reload").clicked() {
+                            state.profile_json_text = PROFILE_JSON_EXAMPLE.to_owned();
+                            state.profile_saved = false;
+                        }
+                        if ui.button("Save").clicked() {
+                            state.profile_saved = true;
+                        }
+                        if state.profile_saved {
+                            ui.add_space(8.0);
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, "Saved in memory");
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    let json_value: Value = match serde_json::from_str(&state.profile_json_text) {
+                        Ok(v) => v,
+                        Err(_) => Value::String(state.profile_json_text.clone()),
+                    };
+                    let id = match &key {
+                        Scope::Global => format!("profile-global"),
+                        Scope::Profile(name) => format!("profile-{}", name),
+                    };
+                    JsonTree::new(id, &json_value).default_expand(DefaultExpand::All).show(ui);
+                
                 }
             }
         });
