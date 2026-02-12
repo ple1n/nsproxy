@@ -1572,17 +1572,16 @@ pub enum UplinkInstanceCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub enum ClashOps {
     /// Import or override clash configs for a profile
-    ProfileAdd {
-        /// Name of target profile (defaults to config filename)
-        #[arg(long)]
-        name: Option<String>,
+    ConfigAdd {
+        /// Name of target profile
+        name: String,
         /// Path to Clash YAML config file
         path: PathBuf,
     },
     /// Show status of imported Clash profiles
     Status,
     /// Analyze a Clash profile and explain the two-tier DNS bootstrap process
-    ProfileExplain {
+    ConfigExplain {
         /// Path to Clash YAML config file
         path: PathBuf,
     },
