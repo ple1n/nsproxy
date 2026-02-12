@@ -64,7 +64,6 @@ reqwest = { version = "0.12.23", features = ["socks"] }
 tokio-send-fd = "0.9.4"
 blake3 = "1.5.1"
 diag = { path = "../diag" }
-clash-bootstrap = { path = "../clash-bootstrap" }
 clash-config = { path = "../clash-config" }
 trojan-proto = { path = "../trojan-proto" }
 tokio-rustls = "0.26"

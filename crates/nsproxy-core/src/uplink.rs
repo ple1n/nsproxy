@@ -163,7 +163,7 @@ pub mod proxy_dns {
     /// DNS query through a generic proxy connection (UDP or TCP)
     pub async fn query_via_proxy(
         connection: &mut ProxyConnection,
-        dns_server: &str,
+        dns_server: &WireAddress,
         domain: &str,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
@@ -185,12 +185,7 @@ pub mod proxy_dns {
 
         let query_bytes = msg.to_vec().context("Failed to serialize DNS query")?;
 
-        // Parse DNS server address
-        let dns_addr: WireAddress = if let Ok(ip) = dns_server.parse::<IpAddr>() {
-            WireAddress::SocketAddress(SocketAddr::new(ip, 53))
-        } else {
-            WireAddress::DomainAddress(dns_server.to_string(), 53)
-        };
+        let dns_addr = dns_server.clone();
 
         // Send DNS query and receive response based on connection type
         let response_bytes = if connection.is_datagram() {
@@ -359,6 +354,14 @@ impl UplinkHub {
             clash: None,
             stats: HashMap::new(),
         }
+    }
+
+    /// Hydrate hub from persisted state in one entrypoint:
+    /// - loads centralized Clash state (`/nsp3/uplink/clash.json`)
+    /// - loads all saved proxies that can be materialized from that state
+    pub fn hydrate_from_persisted(&mut self) -> Result<usize> {
+        let _ = self.load_clash_state()?;
+        self.load_saved_proxies()
     }
 
     /// Load centralized Clash state from /nsp3/clash.json when not yet present.
