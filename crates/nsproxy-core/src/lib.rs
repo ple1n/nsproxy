@@ -1571,9 +1571,9 @@ pub enum UplinkInstanceCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ClashOps {
-    /// Import a Clash profile from a YAML config file
+    /// Import or override clash configs for a profile
     ProfileAdd {
-        /// Name for this profile (defaults to config filename)
+        /// Name of target profile (defaults to config filename)
         #[arg(long)]
         name: Option<String>,
         /// Path to Clash YAML config file

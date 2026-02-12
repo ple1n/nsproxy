@@ -599,7 +599,7 @@ pub mod clash {
                 .collect();
 
             if proxy_domains.is_empty() {
-                anyhow::bail!("No proxy server domains found in config");
+                anyhow::bail!("No proxy servers found in config");
             }
 
             let profile_dir = state_paths::uplink_profile_dir("clash", profile_name);
