@@ -126,20 +126,27 @@ impl ProfileSolved {
 
     /// Load from a JSON file
     pub fn load_from_file(path: &PathBuf) -> Result<Self> {
+        info!("Loading resolved addresses from {:?}", path);
         let content = std::fs::read_to_string(path)
             .context(format!("Failed to read solved.json from {:?}", path))?;
+        info!("Read {} bytes from {:?}", content.len(), path);
         serde_json::from_str(&content).context("Failed to parse solved.json")
     }
 
     /// Save to a JSON file
     pub fn save_to_file(&self, path: &PathBuf) -> Result<()> {
+        info!("Saving resolved addresses to {:?}", path);
         let parent = path.parent().ok_or_else(|| anyhow::anyhow!(
             "Invalid solved.json path: {:?}",
             path
         ))?;
+        info!("Ensuring parent directory exists: {:?}", parent);
         std::fs::create_dir_all(parent).context("Failed to create uplink profile directory")?;
         let content = serde_json::to_string_pretty(self).context("Failed to serialize ProfileSolved")?;
-        std::fs::write(path, content).context(format!("Failed to write solved.json to {:?}", path))
+        let bytes = content.len();
+        std::fs::write(path, content).context(format!("Failed to write solved.json to {:?}", path))?;
+        info!("Wrote {} bytes to {:?}", bytes, path);
+        Ok(())
     }
 }
 
@@ -605,9 +612,22 @@ pub mod clash {
             let profile_dir = state_paths::uplink_profile_dir("clash", profile_name);
             let dest_config = state_paths::uplink_profile_config("clash", profile_name);
 
+            info!("Importing Clash profile '{}' into {:?}", profile_name, profile_dir);
+            info!("Ensuring profile directory exists: {:?}", profile_dir);
             std::fs::create_dir_all(&profile_dir)
                 .context("Failed to create clash profile directory")?;
-            std::fs::copy(yaml_path, &dest_config).context("Failed to copy config file")?;
+
+            // Avoid copying file onto itself when caller already provided the state config path
+            let skip_copy = match (yaml_path.canonicalize(), dest_config.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => yaml_path == &dest_config,
+            };
+            if skip_copy {
+                info!("Source and destination identical; skipping config copy for {:?}", yaml_path);
+            } else {
+                info!("Copying config {:?} -> {:?}", yaml_path, dest_config);
+                std::fs::copy(yaml_path, &dest_config).context("Failed to copy config file")?;
+            }
 
             Ok(Self {
                 name: profile_name.to_string(),
@@ -1040,6 +1060,12 @@ impl UplinkHub {
             let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
 
             if !config_path.exists() || !solved_path.exists() {
+                warn!(
+                    "Skipping profile {}: missing config ({}) or solved ({})",
+                    profile_name,
+                    config_path.exists(),
+                    solved_path.exists()
+                );
                 continue;
             }
 
