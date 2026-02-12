@@ -2317,12 +2317,8 @@ fn main() -> anyhow::Result<()> {
         },
         MainCommand::Uplink { kind } => match kind {
             UplinkCommand::Clash { cmd } => match cmd {
-                ClashOps::ProfileAdd { name, path } => {
-                    let profile_name = name.as_deref().unwrap_or_else(|| {
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("default")
-                    });
+                ClashOps::ConfigAdd { name, path } => {
+                    let profile_name = &name;
 
                     println!("Importing Clash profile '{}'...", profile_name);
                     println!("  Config: {:?}", path);
@@ -2336,15 +2332,6 @@ fn main() -> anyhow::Result<()> {
                     println!("  Bootstrap nameservers: {}", clash_profile.bootstrap_nameservers.len());
                     println!("  Main nameservers: {}", clash_profile.main_nameservers.len());
                     println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
-
-                    println!("\nResolving all domains...");
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-
-                    rt.block_on(async {
-                        clash_profile.resolve_domains(None).await
-                    })?;
 
                     println!("\n✓ Profile '{}' is ready to use", profile_name);
                 }
@@ -2394,7 +2381,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                ClashOps::ProfileExplain { path } => {
+                ClashOps::ConfigExplain { path } => {
                     use anyhow::Context;
                     use clash_config::Config;
 
