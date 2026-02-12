@@ -546,6 +546,7 @@ fn main() -> anyhow::Result<()> {
                                     };
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
                                     let jsonpath = state_paths::metadata_for_bind(&mount);
+                                    info!("Writing NS metadata to {:?} ({} bytes)", &jsonpath, json.len());
                                     std::fs::write(&jsonpath, json)?;
                                     warn!("Auxiliary data written to {:?}", &jsonpath);
                                     tx.write(&[0]);
@@ -1080,6 +1081,7 @@ fn main() -> anyhow::Result<()> {
                                     };
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
                                     let jsonpath = state_paths::profile_ns_meta(&vname);
+                                    info!("Writing NS metadata to {:?} ({} bytes)", &jsonpath, json.len());
                                     std::fs::write(&jsonpath, json)?;
                                     warn!("Auxiliary data written to {:?}", &jsonpath);
                                 } else {
@@ -1829,6 +1831,7 @@ fn main() -> anyhow::Result<()> {
 
             let ns_meta = state_paths::profile_ns_meta(&profile);
             if ns_meta.exists() {
+                info!("Reading NS metadata from {:?}", &ns_meta);
                 if let Ok(content) = std::fs::read_to_string(&ns_meta) {
                     if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
                         if let Some(pid) = ns_alive.child_pid {
@@ -1868,6 +1871,7 @@ fn main() -> anyhow::Result<()> {
                             child_pid: Some(child_pid as u32),
                         };
                         let json = serde_json::to_string_pretty(&ns_alive)?;
+                        info!("Writing NS metadata to {:?} ({} bytes)", &ns_meta, json.len());
                         std::fs::write(&ns_meta, json)?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
