@@ -4540,7 +4540,6 @@ dependencies = [
  "bytes 1.10.1",
  "capctl",
  "clap",
- "clash-bootstrap",
  "clash-config",
  "clone3",
  "concurrent-map",

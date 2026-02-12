@@ -2408,7 +2408,11 @@ fn main() -> anyhow::Result<()> {
                         .build()?;
 
                     rt.block_on(async {
-                        let mut state = nsproxy_core::uplink::clash::ClashState::load_or_default()?;
+                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
+                        let initial_proxy_count = hub.hydrate_from_persisted()?;
+                        println!("Hydrated uplink state ({} proxies available)", initial_proxy_count);
+
+                        let mut state = hub.load_clash_state()?.clone();
                         for entry in profiles {
                             let profile_name = entry.file_name().to_string_lossy().to_string();
                             let config_path = state_paths::uplink_profile_config("clash", &profile_name);
@@ -2419,9 +2423,27 @@ fn main() -> anyhow::Result<()> {
 
                             println!("Resolving profile: {}", profile_name);
                             let profile = ClashProfile::load_file(&profile_name, &config_path)?;
-                            match profile.solve_file(&mut state, None).await {
-                                Ok(domains) => {
-                                    println!("  Resolved {} domains", domains.len());
+                            let unresolved_before = profile
+                                .proxy_domains
+                                .iter()
+                                .filter(|domain| state.get_latest_proxy_ips(domain).is_none())
+                                .count();
+
+                            println!(
+                                "  Unresolved proxy domains before resolve: {}",
+                                unresolved_before
+                            );
+
+                            match profile.solve_file(&mut state, Some(&hub)).await {
+                                Ok(report) => {
+                                    println!("  Resolved {} domains", report.solved.domains.len());
+                                    println!("  Path metrics:");
+                                    println!("    cache_hits: {}", report.metrics.cache_hits);
+                                    println!("    proxy_tier2: {}", report.metrics.resolved_proxy_tier2);
+                                    println!("    proxy_tier1: {}", report.metrics.resolved_proxy_tier1);
+                                    println!("    direct_tier2: {}", report.metrics.resolved_direct_tier2);
+                                    println!("    direct_tier1: {}", report.metrics.resolved_direct_tier1);
+                                    println!("    unresolved: {}", report.metrics.unresolved);
                                 }
                                 Err(e) => {
                                     println!("  Failed to resolve {}: {}", profile_name, e);
@@ -2429,9 +2451,11 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Load newly resolved proxies into a temporary hub to report count
+                        hub.set_clash_state(state)?;
+
+                        // Rehydrate to reflect latest state-backed proxy availability
                         let mut hub = nsproxy_core::uplink::UplinkHub::new();
-                        let count = hub.load_clash_proxies()?;
+                        let count = hub.hydrate_from_persisted()?;
                         println!("Loaded {} proxies from resolved profiles", count);
 
                         Ok::<(), anyhow::Error>(())
