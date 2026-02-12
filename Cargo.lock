@@ -2259,6 +2259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_json_tree"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "235458e8aa8e72fe5177842c8f162270a2eb887fdc66d39c25e4e3cdaa7262af"
+dependencies = [
+ "egui 0.33.3",
+ "serde_json",
+]
+
+[[package]]
 name = "either"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4602,8 +4612,11 @@ dependencies = [
  "eframe 0.33.3",
  "egui 0.33.3",
  "egui_extras 0.33.3",
+ "egui_json_tree",
  "flume",
  "nsproxy-common",
+ "nsproxy-core",
+ "serde_json",
  "tokio",
  "tracing",
 ]

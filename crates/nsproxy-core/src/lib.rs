@@ -576,7 +576,7 @@ pub struct VethConf {
     pub dst_ip4: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NSID {
     PID(i32),
     Path(PathBuf),
