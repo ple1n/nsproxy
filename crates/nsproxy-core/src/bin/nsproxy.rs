@@ -2323,7 +2323,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Importing Clash profile '{}'...", profile_name);
                     println!("  Config: {:?}", path);
 
-                    let clash_profile = nsproxy_core::uplink::clash::ClashProfile::import(
+                    let clash_profile = nsproxy_core::uplink::clash::ClashProfile::load_file(
                         profile_name,
                         &path,
                     )?;
@@ -2353,33 +2353,84 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     println!("Clash Profiles:");
-                    for entry in profiles {
-                        let profile_name = entry.file_name().to_string_lossy().to_string();
-                        let config_path = state_paths::uplink_profile_config("clash", &profile_name);
-                        let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
 
-                        println!("\n  Profile: {}", profile_name);
-                        println!("    Config: {:?} {}", config_path,
-                            if config_path.exists() { "✓" } else { "✗" });
-
-                        if solved_path.exists() {
-                            match nsproxy_core::uplink::ProfileSolved::load_from_file(&solved_path) {
-                                Ok(solved) => {
-                                    println!("    Resolved: {} domains", solved.domains.len());
-                                    for (domain, resolutions) in &solved.domains {
-                                        if let Some((_, response)) = resolutions.iter().last() {
-                                            println!("      {} -> {} IPs", domain, response.ips.len());
-                                        }
+                    // Load and display a few proxy nym mappings (ProxyID -> ProxyNym)
+                    {
+                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
+                        match hub.load_clash_proxies() {
+                            Ok(count) => {
+                                println!("  Loaded {} proxy entries across profiles", count);
+                                let max_show = 5usize;
+                                println!("  Proxy nyms (first {}):", max_show);
+                                for (i, id) in hub.all_proxies().keys().take(max_show).enumerate() {
+                                    if let Some(nym) = hub.get_nym(id) {
+                                        println!("    {}: {:?} => {:?}", i + 1, id, nym);
+                                    } else {
+                                        println!("    {}: {:?} => <no nym>", i + 1, id);
                                     }
                                 }
-                                Err(e) => {
-                                    println!("    Resolved: error loading - {}", e);
-                                }
                             }
-                        } else {
-                            println!("    Resolved: not yet resolved");
+                            Err(e) => {
+                                println!("  Warning: failed to load proxies: {}", e);
+                            }
                         }
                     }
+
+                }
+                ClashOps::Resolve => {
+                    use nsproxy_core::uplink::clash::ClashProfile;
+
+                    println!("Resolving Clash profiles and updating resolved state...");
+
+                    let uplink_dir = state_paths::uplink_dir("clash");
+                    if !uplink_dir.exists() {
+                        println!("No Clash profiles found");
+                        return Ok(());
+                    }
+
+                    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().is_dir())
+                        .collect();
+
+                    if profiles.is_empty() {
+                        println!("No Clash profiles found");
+                        return Ok(());
+                    }
+
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?;
+
+                    rt.block_on(async {
+                        let mut state = nsproxy_core::uplink::clash::ClashState::load_or_default()?;
+                        for entry in profiles {
+                            let profile_name = entry.file_name().to_string_lossy().to_string();
+                            let config_path = state_paths::uplink_profile_config("clash", &profile_name);
+                            if !config_path.exists() {
+                                println!("Skipping {}: config missing", profile_name);
+                                continue;
+                            }
+
+                            println!("Resolving profile: {}", profile_name);
+                            let profile = ClashProfile::load_file(&profile_name, &config_path)?;
+                            match profile.solve_file(&mut state, None).await {
+                                Ok(domains) => {
+                                    println!("  Resolved {} domains", domains.len());
+                                }
+                                Err(e) => {
+                                    println!("  Failed to resolve {}: {}", profile_name, e);
+                                }
+                            }
+                        }
+
+                        // Load newly resolved proxies into a temporary hub to report count
+                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
+                        let count = hub.load_clash_proxies()?;
+                        println!("Loaded {} proxies from resolved profiles", count);
+
+                        Ok::<(), anyhow::Error>(())
+                    })?;
                 }
                 ClashOps::ConfigExplain { path } => {
                     use anyhow::Context;
@@ -2572,8 +2623,8 @@ fn main() -> anyhow::Result<()> {
                         match proxy {
                             nsproxy_core::uplink::UplinkProxy::Trojan(trojan) => {
                                 println!("{}", "Trojan Proxy Tests".bold());
-                                println!("  Server: {}", trojan.server);
-                                println!("  Port: {}", trojan.port);
+                                println!("  Server: {}", trojan.server_name);
+                                println!("  Port: {}", trojan.server_addr.port());
                                 println!();
 
                                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -2581,28 +2632,12 @@ fn main() -> anyhow::Result<()> {
                                     .build()?;
 
                                 rt.block_on(async {
-                                    // Get resolved IPs
-                                    let uplink_dir = state_paths::uplink_dir("clash");
-                                    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
-                                        .filter_map(Result::ok)
-                                        .filter(|entry| entry.path().is_dir())
-                                        .collect();
-
-                                    let mut server_ip = None;
-                                    for entry in profiles {
-                                        let profile_name = entry.file_name().to_string_lossy().to_string();
-                                        let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
-                                        if solved_path.exists() {
-                                            if let Ok(solved) = nsproxy_core::uplink::ProfileSolved::load_from_file(&solved_path) {
-                                                if let Some(ips) = solved.get_latest_ips(&trojan.server) {
-                                                    server_ip = ips.iter().next().copied();
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    let server_ip = server_ip.ok_or_else(|| anyhow!("No resolved IP for {}", trojan.server))?;
+                                    // Get resolved IP from centralized clash.json state
+                                    let state = nsproxy_core::uplink::clash::ClashState::load_or_default()?;
+                                    let server_ip = state
+                                        .get_latest_proxy_ips(&trojan.server_name)
+                                        .and_then(|ips| ips.iter().next().copied())
+                                        .ok_or_else(|| anyhow!("No resolved IP for {}", trojan.server_name))?;
 
                                     // TCP Test: Connect to ip.me via Trojan
                                     println!("{}  Testing TCP connectivity...", "[•]".cyan());
