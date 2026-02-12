@@ -54,7 +54,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -293,630 +293,7 @@ pub mod proxy_dns {
     }
 }
 
-pub mod clash {
-    use super::*;
-    use bytes::BytesMut;
-    use clash_bootstrap::{Bootstrapper, config::BootstrapConfig};
-    use clash_config::Config;
-    use rustls::pki_types::ServerName;
-    use sha2::{Digest, Sha224};
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpStream;
-    use tokio_rustls::TlsConnector;
-    use trojan_proto::{AddressRef, HostRef, write_request_header};
-
-    /// Clash-specific profile information
-    #[derive(Debug, Clone)]
-    pub struct ClashProfile {
-        pub name: String,
-        pub bootstrap_nameservers: Vec<String>,
-        pub main_nameservers: Vec<String>,
-        pub proxy_domains: Vec<String>,
-    }
-
-    /// Trojan proxy configuration
-    #[derive(Debug, Clone)]
-    pub struct TrojanProxy {
-        pub name: String,
-        pub server: String,
-        pub port: u16,
-        pub password: String,
-    }
-
-    /// Supported Trojan commands for stream setup
-    #[derive(Clone, Copy, Debug)]
-    pub enum TrojanCommand {
-        /// TCP CONNECT (0x01)
-        TcpConnect,
-        /// UDP ASSOCIATE (0x03)
-        UdpAssociate,
-    }
-
-    impl TrojanCommand {
-        fn as_code(self) -> u8 {
-            match self {
-                TrojanCommand::TcpConnect => 0x01,
-                TrojanCommand::UdpAssociate => 0x03,
-            }
-        }
-    }
-
-    /// After the Trojan handshake succeeds, the connection may become:
-    ///
-    /// - TcpConnect: Standard TCP proxying through Trojan
-    /// - UdpAssociate: UDP tunneling over TCP+TLS through Trojan
-    #[derive(Debug)]
-    pub enum TrojanConnection {
-        /// TCP connection through Trojan (CONNECT command)
-        TcpConnect(TrojanTcpStream, WireAddress),
-        /// UDP tunnel through Trojan (UDP ASSOCIATE command)
-        UdpAssociate(TrojanUdpTunnel, WireAddress),
-    }
-
-    /// Wrapper for a TCP connection through Trojan proxy
-    #[derive(Debug)]
-    pub struct TrojanTcpStream(tokio_rustls::client::TlsStream<TcpStream>);
-
-    /// Wrapper for UDP tunneling through Trojan proxy (UDP packets over TCP+TLS)
-    #[derive(Debug)]
-    pub struct TrojanUdpTunnel(tokio_rustls::client::TlsStream<TcpStream>);
-
-    impl TrojanTcpStream {
-        /// Get the inner TLS stream
-        pub fn into_inner(self) -> tokio_rustls::client::TlsStream<TcpStream> {
-            self.0
-        }
-
-        /// Get a reference to the inner TLS stream
-        pub fn inner(&self) -> &tokio_rustls::client::TlsStream<TcpStream> {
-            &self.0
-        }
-
-        /// Get a mutable reference to the inner TLS stream
-        pub fn inner_mut(&mut self) -> &mut tokio_rustls::client::TlsStream<TcpStream> {
-            &mut self.0
-        }
-    }
-
-    impl TrojanUdpTunnel {
-        /// Get the inner TLS stream
-        pub fn into_inner(self) -> tokio_rustls::client::TlsStream<TcpStream> {
-            self.0
-        }
-
-        /// Get a reference to the inner TLS stream
-        pub fn inner(&self) -> &tokio_rustls::client::TlsStream<TcpStream> {
-            &self.0
-        }
-
-        /// Get a mutable reference to the inner TLS stream
-        pub fn inner_mut(&mut self) -> &mut tokio_rustls::client::TlsStream<TcpStream> {
-            &mut self.0
-        }
-    }
-
-    // Implement AsyncRead/AsyncWrite for TrojanTcpStream
-    impl tokio::io::AsyncRead for TrojanTcpStream {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
-        }
-    }
-
-    impl tokio::io::AsyncWrite for TrojanTcpStream {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
-        }
-    }
-
-    // Implement AsyncRead/AsyncWrite for TrojanUdpTunnel
-    impl tokio::io::AsyncRead for TrojanUdpTunnel {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
-        }
-    }
-
-    impl tokio::io::AsyncWrite for TrojanUdpTunnel {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
-        }
-    }
-
-    impl TrojanProxy {
-        /// Create a SHA-224 hash of the password (as used by Trojan protocol)
-        pub fn hash_password(password: &str) -> String {
-            let mut hasher = Sha224::new();
-            hasher.update(password.as_bytes());
-            hex::encode(hasher.finalize())
-        }
-
-        /// Create a Trojan TCP connection (CONNECT)
-        pub async fn connect(
-            &self,
-            server_ip: std::net::IpAddr,
-            target_host: &str,
-            target_port: u16,
-        ) -> Result<TrojanConnection> {
-            let target = WireAddress::DomainAddress(target_host.to_string(), target_port);
-            let stream = self
-                .connect_with_command(
-                    server_ip,
-                    target_host,
-                    target_port,
-                    TrojanCommand::TcpConnect,
-                )
-                .await?;
-            Ok(TrojanConnection::TcpConnect(
-                TrojanTcpStream(stream),
-                target,
-            ))
-        }
-
-        /// Create a Trojan UDP tunnel (UDP ASSOCIATE)
-        ///
-        /// Note: This returns a TCP+TLS stream that tunnels UDP packets.
-        /// This is how Trojan protocol handles UDP - it tunnels UDP datagrams
-        /// over a TLS-encrypted TCP connection.
-        pub async fn connect_udp(
-            &self,
-            server_ip: std::net::IpAddr,
-            target_host: &str,
-            target_port: u16,
-        ) -> Result<TrojanConnection> {
-            let target = WireAddress::DomainAddress(target_host.to_string(), target_port);
-            let stream = self
-                .connect_with_command(
-                    server_ip,
-                    target_host,
-                    target_port,
-                    TrojanCommand::UdpAssociate,
-                )
-                .await?;
-            Ok(TrojanConnection::UdpAssociate(
-                TrojanUdpTunnel(stream),
-                target,
-            ))
-        }
-
-        /// Create a TLS-wrapped Trojan connection using a specific command
-        async fn connect_with_command(
-            &self,
-            server_ip: std::net::IpAddr,
-            target_host: &str,
-            target_port: u16,
-            command: TrojanCommand,
-        ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-            // TCP connect using resolved IP
-            let server_addr = SocketAddr::new(server_ip, self.port);
-            let tcp_stream = TcpStream::connect(server_addr)
-                .await
-                .context(format!("Failed to connect to {}", server_addr))?;
-
-            // TLS handshake
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            let tls_connector = TlsConnector::from(Arc::new(tls_config));
-            let server_name =
-                ServerName::try_from(self.server.clone()).context("Invalid server name for TLS")?;
-
-            let mut tls_stream = tls_connector
-                .connect(server_name, tcp_stream)
-                .await
-                .context("TLS handshake failed")?;
-
-            // Write Trojan protocol header
-            let password_hash = Self::hash_password(&self.password);
-            let mut buf = BytesMut::new();
-
-            let address = AddressRef {
-                host: HostRef::Domain(target_host.as_bytes()),
-                port: target_port,
-            };
-
-            // Write the Trojan protocol request header (CONNECT = 0x01, UDP ASSOCIATE = 0x03)
-            write_request_header(
-                &mut buf,
-                password_hash.as_bytes(),
-                command.as_code(),
-                &address,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to write Trojan request header: {:?}", e))?;
-
-            tls_stream
-                .write_all(&buf)
-                .await
-                .context("Failed to write Trojan header")?;
-
-            Ok(tls_stream)
-        }
-    }
-
-    impl ClashProfile {
-        /// Import a Clash profile from a YAML file
-        pub fn import(profile_name: &str, yaml_path: &PathBuf) -> Result<Self> {
-            let config =
-                Config::try_from(yaml_path.clone()).context("Failed to parse Clash YAML config")?;
-
-            let bootstrap_nameservers = config.dns.default_nameserver.clone();
-            let main_nameservers = config.dns.nameserver.clone();
-
-            let proxies = config
-                .proxy
-                .as_ref()
-                .context("No proxies found in Clash config")?;
-
-            let proxy_domains: Vec<String> = proxies
-                .iter()
-                .filter_map(|proxy| {
-                    proxy
-                        .get("server")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-
-            if proxy_domains.is_empty() {
-                anyhow::bail!("No proxy servers found in config");
-            }
-
-            let profile_dir = state_paths::uplink_profile_dir("clash", profile_name);
-            let dest_config = state_paths::uplink_profile_config("clash", profile_name);
-
-            info!("Importing Clash profile '{}' into {:?}", profile_name, profile_dir);
-            info!("Ensuring profile directory exists: {:?}", profile_dir);
-            std::fs::create_dir_all(&profile_dir)
-                .context("Failed to create clash profile directory")?;
-
-            // Avoid copying file onto itself when caller already provided the state config path
-            let skip_copy = match (yaml_path.canonicalize(), dest_config.canonicalize()) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => yaml_path == &dest_config,
-            };
-            if skip_copy {
-                info!("Source and destination identical; skipping config copy for {:?}", yaml_path);
-            } else {
-                info!("Copying config {:?} -> {:?}", yaml_path, dest_config);
-                std::fs::copy(yaml_path, &dest_config).context("Failed to copy config file")?;
-            }
-
-            Ok(Self {
-                name: profile_name.to_string(),
-                bootstrap_nameservers,
-                main_nameservers,
-                proxy_domains,
-            })
-        }
-
-        /// Load Trojan proxies from the config file
-        pub fn load_trojan_proxies(&self) -> Result<Vec<TrojanProxy>> {
-            let config_path = state_paths::uplink_profile_config("clash", &self.name);
-            let config = Config::try_from(config_path).context("Failed to load Clash config")?;
-
-            let proxies = config.proxy.as_ref().context("No proxies in config")?;
-
-            let mut trojan_proxies = Vec::new();
-            for proxy in proxies {
-                let proxy_type = proxy.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                if proxy_type != "trojan" {
-                    continue;
-                }
-
-                let name = proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let server = proxy
-                    .get("server")
-                    .and_then(|v| v.as_str())
-                    .context("No server in trojan proxy")?
-                    .to_string();
-
-                let port = proxy
-                    .get("port")
-                    .context("No port in trojan proxy")
-                    .and_then(|v| {
-                        if let Some(port) = v.as_u64() {
-                            Ok(port as u16)
-                        } else if let Some(port) = v.as_str() {
-                            port.parse::<u16>().context("Invalid port string")
-                        } else {
-                            anyhow::bail!("Invalid port type")
-                        }
-                    })?;
-
-                let password = proxy
-                    .get("password")
-                    .and_then(|v| v.as_str())
-                    .context("No password in trojan proxy")?
-                    .to_string();
-
-                trojan_proxies.push(TrojanProxy {
-                    name,
-                    server,
-                    port,
-                    password,
-                });
-            }
-
-            if trojan_proxies.is_empty() {
-                anyhow::bail!("No trojan proxies found in config");
-            }
-
-            Ok(trojan_proxies)
-        }
-
-        /// Get all domains that need to be resolved (both nameservers and proxies)
-        pub fn all_domains(&self) -> Vec<String> {
-            let mut domains = Vec::new();
-
-            for ns in &self.main_nameservers {
-                if let Ok(url) = url::Url::parse(ns) {
-                    if let Some(host) = url.host_str() {
-                        if !host.parse::<IpAddr>().is_ok() {
-                            domains.push(host.to_string());
-                        }
-                    }
-                }
-            }
-
-            domains.extend(self.proxy_domains.clone());
-            domains
-        }
-
-        /// Resolve all domains using two-tier DNS resolution through available proxies
-        /// Returns a ProfileSolved with all resolved addresses
-        ///
-        /// This function tethers the bootstrapping process to UplinkHub when available, utilizing all
-        /// proxy resources. DNS queries are sent through SOCKS5 UDP bindings when proxies are present.
-        /// If no hub is provided, falls back to direct DNS resolution for initial setup.
-        pub async fn resolve_domains(&self, hub: Option<&UplinkHub>) -> Result<ProfileSolved> {
-            use std::time::Duration;
-
-            let solved_path = state_paths::uplink_profile_solved("clash", &self.name);
-
-            // Try to load existing ProfileSolved from state file first
-            if let Ok(solved) = ProfileSolved::load_from_file(&solved_path) {
-                info!("Loaded existing ProfileSolved from {:?}", solved_path);
-                // Check if all required domains are already resolved
-                if solved.all_resolved(&self.all_domains()) {
-                    info!("All domains already resolved, using cached data");
-                    return Ok(solved);
-                }
-                info!("Some domains missing, will re-resolve");
-            }
-
-            // If hub is available, use proxy-based DNS. Otherwise, fall back to direct DNS.
-            if let Some(hub) = hub {
-                self.resolve_domains_via_hub(hub, &solved_path).await
-            } else {
-                self.resolve_domains_direct(&solved_path).await
-            }
-        }
-
-        /// Resolve domains through UplinkHub proxies (preferred method when proxies are available)
-        async fn resolve_domains_via_hub(
-            &self,
-            hub: &UplinkHub,
-            solved_path: &PathBuf,
-        ) -> Result<ProfileSolved> {
-            use std::time::Duration;
-
-            let mut solved = ProfileSolved::new();
-            let timeout = Duration::from_secs(5);
-
-            info!("Bootstrapping DNS through UplinkHub proxies");
-            info!("  Bootstrap DNS servers: {}", self.bootstrap_nameservers.len());
-            info!("  Main DNS servers: {}", self.main_nameservers.len());
-
-            // Step 1: Resolve main nameserver hostnames via bootstrap DNS through proxies
-            info!("Resolving main nameserver hostnames via proxy connections...");
-            for ns in &self.main_nameservers {
-                if let Ok(url) = url::Url::parse(ns) {
-                    if let Some(host) = url.host_str() {
-                        if host.parse::<IpAddr>().is_err() {
-                            // Use any bootstrap DNS server through available proxies
-                            let mut resolved = false;
-                            for bootstrap_dns in &self.bootstrap_nameservers {
-                                // Note: Actual implementation requires creating a ProxyConnection
-                                // This is a placeholder showing the intent - caller must provide connection
-                                warn!(
-                                    "DNS resolution via hub requires ProxyConnection - not yet implemented: {} via {}",
-                                    host, bootstrap_dns
-                                );
-                                // TODO: Create ProxyConnection and call proxy_dns::query_via_proxy
-                            }
-                            if !resolved {
-                                warn!(
-                                    "Could not resolve {} via any bootstrap server",
-                                    host
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Step 2: Resolve proxy server domains via main DNS through proxies
-            info!("Resolving proxy server domains via proxy connections...");
-            for domain in &self.proxy_domains {
-                let mut resolved = false;
-
-                // Extract main DNS server hosts
-                for ns in &self.main_nameservers {
-                    let dns_host = if let Ok(url) = url::Url::parse(ns) {
-                        url.host_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| ns.clone())
-                    } else {
-                        ns.clone()
-                    };
-
-                    // Use resolved IP if available, otherwise use the host directly
-                    let dns_server = if let Ok(ip) = dns_host.parse::<IpAddr>() {
-                        ip.to_string()
-                    } else if let Some(ips) = solved.get_latest_ips(&dns_host) {
-                        ips.iter()
-                            .next()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or(dns_host.clone())
-                    } else {
-                        dns_host.clone()
-                    };
-
-                    // Note: Actual implementation requires creating a ProxyConnection
-                    // This is a placeholder showing the intent - caller must provide connection
-                    warn!(
-                        "DNS resolution via hub requires ProxyConnection - not yet implemented: {} via {}",
-                        domain, dns_server
-                    );
-                    // TODO: Create ProxyConnection and call proxy_dns::query_via_proxy
-                }
-
-                if !resolved {
-                    warn!("Could not resolve {} via main servers", domain);
-                }
-            }
-
-            // Save to disk
-            solved.save_to_file(solved_path)?;
-            info!("Resolved addresses saved to {:?}", solved_path);
-
-            Ok(solved)
-        }
-
-        /// Resolve domains directly (fallback for initial setup when no proxies are available)
-        async fn resolve_domains_direct(&self, solved_path: &PathBuf) -> Result<ProfileSolved> {
-            let mut solved = ProfileSolved::new();
-
-            // Extract main nameserver hosts for two-tier configuration
-            let main_nameserver_hosts: Vec<String> = self
-                .main_nameservers
-                .iter()
-                .map(|ns| {
-                    if let Ok(url) = url::Url::parse(ns) {
-                        if let Some(host) = url.host_str() {
-                            if let Some(port) = url.port() {
-                                return format!("{}:{}", host, port);
-                            }
-                            return host.to_string();
-                        }
-                    }
-                    ns.clone()
-                })
-                .collect();
-
-            // Build two-tier bootstrapper (direct DNS)
-            let bootstrap_config = BootstrapConfig::with_bootstrap_and_main(
-                self.bootstrap_nameservers
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect(),
-                main_nameserver_hosts.iter().map(|s| s.as_str()).collect(),
-            )?;
-
-            let bootstrapper = Bootstrapper::new(bootstrap_config)?;
-
-            info!("Two-tier DNS bootstrapper created (direct resolution)");
-            info!("  Bootstrap tier: {} nameservers", self.bootstrap_nameservers.len());
-            info!("  Main tier: {} nameservers", self.main_nameservers.len());
-
-            // Step 1: Resolve main nameserver hostnames via bootstrap tier
-            info!("Resolving main nameserver hostnames...");
-            for ns in &self.main_nameservers {
-                if let Ok(url) = url::Url::parse(ns) {
-                    if let Some(host) = url.host_str() {
-                        if host.parse::<IpAddr>().is_err() {
-                            match bootstrapper.resolve_all(host).await {
-                                Ok(ips) => {
-                                    let ip_set: BTreeSet<IpAddr> = ips.into_iter().collect();
-                                    info!("Resolved {} -> {} IPs", host, ip_set.len());
-                                    solved.add_resolution(host.to_string(), ip_set);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to resolve {}: {}", host, e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Step 2: Resolve proxy server domains via main tier
-            info!("Resolving proxy server domains...");
-            for domain in &self.proxy_domains {
-                match bootstrapper.resolve_all(domain).await {
-                    Ok(ips) => {
-                        let ip_set: BTreeSet<IpAddr> = ips.into_iter().collect();
-                        info!("Resolved {} -> {} IPs", domain, ip_set.len());
-                        solved.add_resolution(domain.clone(), ip_set);
-                    }
-                    Err(e) => {
-                        warn!("Failed to resolve {}: {}", domain, e);
-                    }
-                }
-            }
-
-            // Save to disk
-            solved.save_to_file(solved_path)?;
-            info!("Resolved addresses saved to {:?}", solved_path);
-
-            Ok(solved)
-        }
-    }
-}
+pub mod clash;
 
 // All uplink data is kept at /nsp3/uplink
 
@@ -941,8 +318,17 @@ pub struct UplinkHub {
     proxies: HashMap<ProxyID, UplinkProxy>,
     routing_fn: RoutingFunction,
     proxy_nym: BiHashMap<ProxyID, ProxyNym>,
+    /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
+    clash: Option<clash::ClashState>,
+    stats: HashMap<ProxyID, LinkStats>
 }
 
+pub struct LinkStats {
+    latency: Duration,
+    latency_checked: Instant
+}
+
+/// All proxies here should be immediately connectable without further resolution dependent on other state
 pub enum UplinkProxy {
     Trojan(clash::TrojanProxy),
     Geph,
@@ -959,6 +345,8 @@ impl UplinkHub {
                 RoutingDecision::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
             }),
             proxy_nym: BiHashMap::new(),
+            clash: None,
+            stats: HashMap::new(),
         }
     }
 
@@ -968,7 +356,24 @@ impl UplinkHub {
             proxies: HashMap::new(),
             routing_fn,
             proxy_nym: BiHashMap::new(),
+            clash: None,
+            stats: HashMap::new(),
         }
+    }
+
+    /// Load centralized Clash state from /nsp3/clash.json when not yet present.
+    pub fn load_clash_state(&mut self) -> Result<&clash::ClashState> {
+        if self.clash.is_none() {
+            self.clash = Some(clash::ClashState::load_or_default()?);
+        }
+        Ok(self.clash.as_ref().expect("clash state must exist"))
+    }
+
+    /// Replace in-memory Clash state and persist it to /nsp3/clash.json.
+    pub fn set_clash_state(&mut self, state: clash::ClashState) -> Result<()> {
+        state.save_atomic()?;
+        self.clash = Some(state);
+        Ok(())
     }
 
     /// Add a proxy to the hub
@@ -1042,6 +447,8 @@ impl UplinkHub {
     /// This incrementally updates the hub's state with all available proxies
     pub fn load_clash_proxies(&mut self) -> Result<usize> {
         use crate::state_paths;
+
+        let state_proxies = self.load_clash_state()?.proxies.clone();
         
         let uplink_dir = state_paths::uplink_dir("clash");
         if !uplink_dir.exists() {
@@ -1057,28 +464,35 @@ impl UplinkHub {
         for entry in profiles {
             let profile_name = entry.file_name().to_string_lossy().to_string();
             let config_path = state_paths::uplink_profile_config("clash", &profile_name);
-            let solved_path = state_paths::uplink_profile_solved("clash", &profile_name);
 
-            if !config_path.exists() || !solved_path.exists() {
+            if !config_path.exists() {
                 warn!(
-                    "Skipping profile {}: missing config ({}) or solved ({})",
+                    "Skipping profile {}: missing config ({})",
                     profile_name,
-                    config_path.exists(),
-                    solved_path.exists()
+                    config_path.exists()
                 );
                 continue;
             }
 
-            let profile = clash::ClashProfile::import(&profile_name, &config_path)?;
-            let solved = ProfileSolved::load_from_file(&solved_path)?;
+            let profile = clash::ClashProfile::load_file(&profile_name, &config_path)?;
 
-            // Load proxies and add to hub
-            let trojan_proxies = profile.load_trojan_proxies()?;
-            for trojan_proxy in trojan_proxies {
-                // Verify that we have resolved IPs for this proxy's server
-                if solved.get_latest_ips(&trojan_proxy.server).is_some() {
-                    let id = ProxyID::ClashName(trojan_proxy.name.clone());
-                    self.add_proxy(id, UplinkProxy::Trojan(trojan_proxy));
+            // Load proxies (config entries) and add runtime proxies to hub when resolved
+            let trojan_configs = profile.load_trojan_proxies()?;
+            for cfg in trojan_configs {
+                let resolved_ip = state_proxies
+                    .get(&cfg.server)
+                    .and_then(|responses| responses.last_key_value())
+                    .and_then(|(_, response)| response.ips.iter().next().copied());
+
+                if let Some(ip) = resolved_ip {
+                    let runtime = clash::TrojanProxy {
+                        name: cfg.name.clone(),
+                        server_addr: SocketAddr::new(ip, cfg.port),
+                        server_name: cfg.server.clone(),
+                        password: cfg.password.clone(),
+                    };
+                    let id = ProxyID::ClashName(cfg.name.clone());
+                    self.add_proxy(id, UplinkProxy::Trojan(runtime));
                     count += 1;
                 }
             }
@@ -1416,13 +830,13 @@ pub mod proxy_adapters {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
                     Ok(ProxyConnection::Tcp(Box::new(TrojanTcpConn {
                         inner: stream,
-                        info: format!("trojan://{}:{}", proxy.server, proxy.port),
+                        info: format!("trojan://{}:{}", proxy.server_name, proxy.server_addr.port()),
                     })))
                 }
                 clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
                     Ok(ProxyConnection::Udp(Box::new(TrojanUdpConn {
                         inner: tunnel,
-                        info: format!("trojan+udp://{}:{}", proxy.server, proxy.port),
+                        info: format!("trojan+udp://{}:{}", proxy.server_name, proxy.server_addr.port()),
                     })))
                 }
             }
@@ -1844,7 +1258,8 @@ async fn handle_tcp_via_proxy(
         let proxy = select_proxy(&hub, &id).await?;
         match proxy {
             UplinkProxy::Trojan(t) => {
-                let ip = resolve_proxy_ip(&t.server).await?;
+                // runtime proxies already carry a resolved `server_addr`
+                let ip = t.server_addr.ip();
                 TrojanAdapter::connect(t, &target_host, target_port, ip).await?
             }
             UplinkProxy::Remote(arg) => {

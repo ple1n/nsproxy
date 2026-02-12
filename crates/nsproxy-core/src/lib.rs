@@ -1585,6 +1585,9 @@ pub enum ClashOps {
         /// Path to Clash YAML config file
         path: PathBuf,
     },
+    /// Resolve proxies that do not have a known IP
+    /// Regular upkeeping
+    Resolve
 }
 
 pub mod uplink;
