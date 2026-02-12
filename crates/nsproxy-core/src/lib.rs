@@ -56,6 +56,7 @@ pub use tun2socks5;
 pub mod env;
 pub mod prelude;
 pub mod shell;
+pub mod state_blueprint;
 pub mod sys;
 pub mod utils;
 
@@ -1039,9 +1040,6 @@ impl ProfileConfig {
     }
 }
 
-/// Global wrapped binaries configuration path
-pub const WRAPPED_BINARIES_CONFIG: &str = "/nsp3/wrapped_binaries.json";
-
 /// Configuration for binaries that must be wrapped for security
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct WrappedBinariesConfig {
@@ -1052,22 +1050,16 @@ pub struct WrappedBinariesConfig {
 }
 
 impl WrappedBinariesConfig {
+    pub fn path() -> PathBuf {
+        <Self as state_blueprint::PersistentState>::path()
+    }
+
     pub fn load() -> Result<Self> {
-        use tracing::{info, warn};
-        let path = Path::new(WRAPPED_BINARIES_CONFIG);
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
+        <Self as state_blueprint::PersistentState>::load_or_default()
     }
 
     pub fn save(&self) -> Result<()> {
-        create_dir_all(PERSIST_ROOT)?;
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(WRAPPED_BINARIES_CONFIG, content)?;
-        Ok(())
+        <Self as state_blueprint::PersistentState>::save_atomic(self)
     }
 
     /// Add a binary by name (resolves via which) and save
@@ -1290,6 +1282,14 @@ impl WrappedBinariesConfig {
         std::fs::rename(&wrapped_path, binary_path)?;
 
         Ok(())
+    }
+}
+
+impl state_blueprint::PersistentState for WrappedBinariesConfig {
+    const STATE_NAME: &'static str = "wrapped_binaries";
+
+    fn path() -> PathBuf {
+        state_paths::wrapped_binaries_config()
     }
 }
 
@@ -1548,6 +1548,8 @@ pub enum MainCommand {
         #[command(subcommand)]
         kind: UplinkCommand,
     },
+    /// Print a typed blueprint tree for global state paths
+    StateTree,
 }
 
 #[derive(Debug, Clone, Subcommand)]

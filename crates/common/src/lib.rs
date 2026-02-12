@@ -98,16 +98,22 @@ pub mod state_paths {
         uplink_dir(kind).join(profile)
     }
 
-    /// Get resolved addresses JSON path for an uplink profile
-    /// Returns /nsp3/uplink/{kind}/{profile}/solved.json
-    pub fn uplink_profile_solved(kind: &str, profile: &str) -> PathBuf {
-        uplink_profile_dir(kind, profile).join("solved.json")
-    }
-
     /// Get config file path for an uplink profile
     /// Returns /nsp3/uplink/{kind}/{profile}/config.yaml
     pub fn uplink_profile_config(kind: &str, profile: &str) -> PathBuf {
         uplink_profile_dir(kind, profile).join("config.yaml")
+    }
+
+    /// Global wrapped binaries config path
+    /// Returns /nsp3/wrapped_binaries.json
+    pub fn wrapped_binaries_config() -> PathBuf {
+        PathBuf::from(PERSIST_ROOT).join("wrapped_binaries.json")
+    }
+
+    /// Centralized Clash state path
+    /// Returns /nsp3/uplink/clash.json
+    pub fn uplink_clash_state() -> PathBuf {
+        uplink_root().join("clash.json")
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::state_blueprint::PersistentState;
 use bytes::BytesMut;
 use clash_bootstrap::{Bootstrapper, config::BootstrapConfig};
 use clash_config::Config;
@@ -471,31 +472,15 @@ pub struct ClashState {
 
 impl ClashState {
     pub fn path() -> PathBuf {
-        state_paths::uplink_root().join("clash.json")
+        <Self as PersistentState>::path()
     }
 
     pub fn load_or_default() -> Result<Self> {
-        let path = Self::path();
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .context(format!("Failed to read clash.json from {:?}", path))?;
-            let st: ClashState = serde_json::from_str(&content).context("Failed to parse clash.json")?;
-            Ok(st)
-        } else {
-            Ok(ClashState::default())
-        }
+        <Self as PersistentState>::load_or_default()
     }
 
     pub fn save_atomic(&self) -> Result<()> {
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create uplink root dir")?;
-        }
-        let tmp = path.with_extension("tmp");
-        let content = serde_json::to_string_pretty(self).context("Failed to serialize ClashState")?;
-        std::fs::write(&tmp, content).context("Failed to write temp clash.json")?;
-        std::fs::rename(&tmp, &path).context("Failed to rename clash.json temp file")?;
-        Ok(())
+        <Self as PersistentState>::save_atomic(self)
     }
 
     /// Return parsed IPs for a cached host if not expired
@@ -625,5 +610,13 @@ impl ClashState {
         }
 
         Ok(solved)
+    }
+}
+
+impl PersistentState for ClashState {
+    const STATE_NAME: &'static str = "clash";
+
+    fn path() -> PathBuf {
+        state_paths::uplink_clash_state()
     }
 }
