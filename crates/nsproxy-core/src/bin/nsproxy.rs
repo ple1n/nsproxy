@@ -1423,10 +1423,11 @@ fn main() -> anyhow::Result<()> {
         }
         MainCommand::Wrapped => {
             let config = WrappedBinariesConfig::load()?;
+            let wrapped_config_path = state_paths::wrapped_binaries_config();
 
             println!("Wrapped Binaries Configuration");
             println!("================================");
-            println!("Config file: {}", WRAPPED_BINARIES_CONFIG);
+            println!("Config file: {}", wrapped_config_path.display());
             println!();
 
             if config.binaries.is_empty() {
@@ -1434,7 +1435,7 @@ fn main() -> anyhow::Result<()> {
                 println!();
                 println!(
                     "Edit {} to add binaries (absolute paths).",
-                    WRAPPED_BINARIES_CONFIG
+                    wrapped_config_path.display()
                 );
                 return Ok(());
             }
@@ -2315,6 +2316,10 @@ fn main() -> anyhow::Result<()> {
                 })?;
             }
         },
+        MainCommand::StateTree => {
+            let tree = nsproxy_core::state_blueprint::global_state_tree();
+            println!("{}", tree.render_tree());
+        }
         MainCommand::Uplink { kind } => match kind {
             UplinkCommand::Clash { cmd } => match cmd {
                 ClashOps::ConfigAdd { name, path } => {
