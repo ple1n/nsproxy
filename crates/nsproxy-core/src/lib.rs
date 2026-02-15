@@ -1436,7 +1436,7 @@ pub enum MainCommand {
     /// TCP forward
     Forward { src: u32, dst: u32 },
     /// Create a new profile from a config template
-    Profile {
+    Template {
         /// Path to a profile template
         path: PathBuf,
         /// Name of profile to create (defaults to config filename stem)
