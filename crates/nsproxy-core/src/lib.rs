@@ -1424,7 +1424,7 @@ pub enum MainCommand {
         pid: Option<u32>,
     },
     /// Serve a socks5 proxy server that could be used to escape a container
-    Serve { port: u32 },
+    Socks5 { port: u32 },
     /// Fire a single HTTP request to a URL
     Curl {
         /// URL to request
@@ -1458,7 +1458,7 @@ pub enum MainCommand {
     },
     /// Attach a TUN device + tun2socks5 proxy to an already-up profile namespace.
     /// Only one TUN process may exist per profile at a time.
-    Tun {
+    Serve {
         /// Profile name (must have been brought up with `up` first)
         #[arg(long)]
         profile: String,
