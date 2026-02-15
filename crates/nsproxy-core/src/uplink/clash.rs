@@ -492,9 +492,12 @@ impl ClashProfile {
         hub: Option<&UplinkHub>,
         cancel: Option<&AtomicBool>,
         direct_only: bool,
+        refresh: bool,
     ) -> Result<ResolveProfileReport> {
         state.prepare_tier2_dns_via_tier1(self, cancel).await?;
-        state.resolve_profile(self, hub, cancel, direct_only).await
+        state
+            .resolve_profile(self, hub, cancel, direct_only, refresh)
+            .await
     }
 }
 
@@ -824,8 +827,6 @@ impl ClashState {
         }
     }
 
-
-
     fn parse_nameserver(raw: &str) -> Result<(DNSHost, DNSEndpoint)> {
         if let Ok(url) = url::Url::parse(raw) {
             let host = url
@@ -1010,13 +1011,11 @@ impl ClashState {
             .context("Failed to serialize DNS query for DoH")?;
 
         info!(
-            "dns_query_start domain={} proxied=false resolver={} protocol={} url={}",
+            "dns_doh domain={} proxied=false resolver={} url={}",
             query,
             Self::resolver_brief(resolver),
-            Self::protocol_label(&endpoint.proto),
             url
         );
-        info!("dns_query_send_bytes protocol=dns_over_https bytes={}", payload.len());
 
         let client = reqwest::Client::builder().build()?;
 
@@ -1030,7 +1029,10 @@ impl ClashState {
         let response = match tokio::time::timeout(timeout, send_future).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                warn!("dns_query_send_error protocol=dns_over_https url={} error={}", url, e);
+                warn!(
+                    "dns_query_send_error protocol=dns_over_https url={} error={}",
+                    url, e
+                );
                 return Err(anyhow::anyhow!("dns_over_https send {}: {}", url, e));
             }
             Err(e) => {
@@ -1038,7 +1040,11 @@ impl ClashState {
                     "dns_query_send_timeout protocol=dns_over_https url={} error={}",
                     url, e
                 );
-                return Err(anyhow::anyhow!("dns_over_https send timeout {}: {}", url, e));
+                return Err(anyhow::anyhow!(
+                    "dns_over_https send timeout {}: {}",
+                    url,
+                    e
+                ));
             }
         };
 
@@ -1053,33 +1059,47 @@ impl ClashState {
                 response.status(),
                 url
             );
-            anyhow::bail!("dns_over_https http status={} url={}", response.status(), url);
+            anyhow::bail!(
+                "dns_over_https http status={} url={}",
+                response.status(),
+                url
+            );
         }
 
         let response_bytes = match tokio::time::timeout(timeout, response.bytes()).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
-                warn!("dns_query_read_error protocol=dns_over_https url={} error={}", url, e);
+                warn!(
+                    "doh url={} error={}",
+                    url, e
+                );
                 return Err(anyhow::anyhow!("dns_over_https read {}: {}", url, e));
             }
             Err(e) => {
                 warn!(
-                    "dns_query_read_timeout protocol=dns_over_https url={} error={}",
+                    "doh url={} error={}",
                     url, e
                 );
-                return Err(anyhow::anyhow!("dns_over_https read timeout {}: {}", url, e));
+                return Err(anyhow::anyhow!(
+                    "doh read timeout {}: {}",
+                    url,
+                    e
+                ));
             }
         };
 
         info!(
-            "dns_query_read_bytes protocol=dns_over_https bytes={}",
+            "doh response bytes={}",
             response_bytes.len()
         );
 
         let response = match Message::from_bytes(response_bytes.as_ref()) {
             Ok(msg) => msg,
             Err(e) => {
-                warn!("dns_query_parse_error protocol=dns_over_https url={} error={}", url, e);
+                warn!(
+                    "doh url={} error={}",
+                    url, e
+                );
                 return Err(anyhow::anyhow!("dns_over_https parse {}: {}", url, e));
             }
         };
@@ -1094,16 +1114,11 @@ impl ClashState {
         }
 
         info!(
-            "dns_query_answers domain={} protocol=dns_over_https answer_count={}",
+            "doh domain={} answer_count={}",
             query,
             ips.len()
         );
         if ips.is_empty() {
-            warn!(
-                "dns_query_no_ip domain={} protocol=dns_over_https url={}",
-                query,
-                url
-            );
             anyhow::bail!("No IP addresses found for {} via DoH", query);
         }
 
@@ -1127,8 +1142,17 @@ impl ClashState {
                     .context("Invalid TLS server name for DNS endpoint")?
                     .to_owned(),
             ),
-            DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => ServerName::IpAddress(sock.ip().into()),
+            DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => {
+                ServerName::IpAddress(sock.ip().into())
+            }
         };
+
+        info!(
+            "DoT domain={} proxied=false resolver={} protocol={}",
+            query,
+            Self::resolver_brief(resolver),
+            Self::protocol_label(&endpoint.proto)
+        );
 
         let mut conn = NoProxyAdapter::connect_tls(tls_server_name, dns_server_sock).await?;
         match &mut conn {
@@ -1146,13 +1170,6 @@ impl ClashState {
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
         use super::proxy_adapters::NoProxyAdapter;
-
-        info!(
-            "dns_query_start domain={} proxied=false resolver={} protocol={}",
-            query,
-            Self::resolver_brief(resolver),
-            Self::protocol_label(&endpoint.proto)
-        );
 
         let protocol = endpoint.proto.clone();
 
@@ -1183,8 +1200,12 @@ impl ClashState {
             (DNSProtocol::TCP, super::proxy_adapters::ProxyConnection::Tcp(stream)) => {
                 super::proxy_dns::query_via_tcp(stream.as_mut(), &dns_server, query, timeout).await
             }
-            (DNSProtocol::UDP, _) => anyhow::bail!("Expected UDP-capable resolver for DNS over UDP"),
-            (DNSProtocol::TCP, _) => anyhow::bail!("Expected TCP-capable resolver for DNS over TCP"),
+            (DNSProtocol::UDP, _) => {
+                anyhow::bail!("Expected UDP-capable resolver for DNS over UDP")
+            }
+            (DNSProtocol::TCP, _) => {
+                anyhow::bail!("Expected TCP-capable resolver for DNS over TCP")
+            }
             (DNSProtocol::TLS | DNSProtocol::HTTPS(_), _) => {
                 unreachable!("TLS/HTTPS handled before transport query")
             }
@@ -1209,9 +1230,13 @@ impl ClashState {
                     let resolved_ip = trojan.server_addr.ip();
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
-                            let mut conn =
-                                TrojanAdapter::connect_udp(trojan, &dns_host, endpoint.port, resolved_ip)
-                                    .await?;
+                            let mut conn = TrojanAdapter::connect_udp(
+                                trojan,
+                                &dns_host,
+                                endpoint.port,
+                                resolved_ip,
+                            )
+                            .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
                                     super::proxy_dns::query_via_udp(
@@ -1222,13 +1247,19 @@ impl ClashState {
                                     )
                                     .await
                                 }
-                                _ => anyhow::bail!("Expected UDP-capable resolver for DNS over UDP"),
+                                _ => {
+                                    anyhow::bail!("Expected UDP-capable resolver for DNS over UDP")
+                                }
                             }
                         }
                         DNSProtocol::TCP => {
-                            let mut conn =
-                                TrojanAdapter::connect_tcp(trojan, &dns_host, endpoint.port, resolved_ip)
-                                    .await?;
+                            let mut conn = TrojanAdapter::connect_tcp(
+                                trojan,
+                                &dns_host,
+                                endpoint.port,
+                                resolved_ip,
+                            )
+                            .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {
                                     super::proxy_dns::query_via_tcp(
@@ -1239,7 +1270,9 @@ impl ClashState {
                                     )
                                     .await
                                 }
-                                _ => anyhow::bail!("Expected TCP-capable resolver for DNS over TCP"),
+                                _ => {
+                                    anyhow::bail!("Expected TCP-capable resolver for DNS over TCP")
+                                }
                             }
                         }
                         DNSProtocol::TLS | DNSProtocol::HTTPS(_) => anyhow::bail!(
@@ -1264,7 +1297,9 @@ impl ClashState {
                                     )
                                     .await
                                 }
-                                _ => anyhow::bail!("Expected UDP-capable resolver for DNS over UDP"),
+                                _ => {
+                                    anyhow::bail!("Expected UDP-capable resolver for DNS over UDP")
+                                }
                             }
                         }
                         DNSProtocol::TCP => {
@@ -1280,7 +1315,9 @@ impl ClashState {
                                     )
                                     .await
                                 }
-                                _ => anyhow::bail!("Expected TCP-capable resolver for DNS over TCP"),
+                                _ => {
+                                    anyhow::bail!("Expected TCP-capable resolver for DNS over TCP")
+                                }
                             }
                         }
                         DNSProtocol::TLS | DNSProtocol::HTTPS(_) => anyhow::bail!(
@@ -1432,10 +1469,7 @@ impl ClashState {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "DNS resolution failed for '{}'",
-            domain
-        ))
+        Err(anyhow::anyhow!("DNS resolution failed for '{}'", domain))
     }
 
     async fn query_dns_via_tier1_no_proxy_endpoint(
@@ -1512,7 +1546,10 @@ impl ClashState {
                 }
             }
         }
-        Err(anyhow::anyhow!("All direct DNS queries failed for {}", domain))
+        Err(anyhow::anyhow!(
+            "All direct DNS queries failed for {}",
+            domain
+        ))
     }
 
     async fn resolve_domain_direct_tier1(&self, domain: &str) -> Result<BTreeSet<IpAddr>> {
@@ -1542,7 +1579,10 @@ impl ClashState {
                 }
             }
         }
-        Err(anyhow::anyhow!("All direct DNS queries failed for {}", domain))
+        Err(anyhow::anyhow!(
+            "All direct DNS queries failed for {}",
+            domain
+        ))
     }
 
     async fn attempt_path(
@@ -1604,9 +1644,11 @@ impl ClashState {
         direct_only: bool,
         solved: &mut ProfileSolved,
         metrics: &mut ResolutionMetrics,
+        refresh: bool,
     ) {
-        if let Some(cached) = self.cached_for_target(target, domain) {
+        if !refresh && let Some(cached) = self.cached_for_target(target, domain) {
             metrics.cache_hits += 1;
+            info!("domain {} has been cached, not resolving", domain);
             solved.add_resolution(domain.to_string(), cached);
             return;
         }
@@ -1616,7 +1658,10 @@ impl ClashState {
                 .map(|flag| flag.load(Ordering::Relaxed))
                 .unwrap_or(false)
             {
-                warn!("Interrupt observed while resolving {}; stopping path attempts", domain);
+                warn!(
+                    "Interrupt observed while resolving {}; stopping path attempts",
+                    domain
+                );
                 return;
             }
 
@@ -1821,6 +1866,7 @@ impl ClashState {
         hub: Option<&UplinkHub>,
         cancel: Option<&AtomicBool>,
         direct_only: bool,
+        refresh: bool,
     ) -> Result<ResolveProfileReport> {
         info!(
             "resolver_ready tier1_nameserver_count={} tier2_nameserver_count={}",
@@ -1837,9 +1883,7 @@ impl ClashState {
                 .map(|flag| flag.load(Ordering::Relaxed))
                 .unwrap_or(false)
             {
-                warn!(
-                    "Interrupt observed during profile resolve; stopping before next entry"
-                );
+                warn!("Interrupt observed during profile resolve; stopping before next entry");
                 break;
             }
 
@@ -1851,6 +1895,7 @@ impl ClashState {
                 direct_only,
                 &mut solved,
                 &mut metrics,
+                refresh,
             )
             .await;
         }
@@ -1859,6 +1904,54 @@ impl ClashState {
         if let Err(e) = self.save_atomic() {
             warn!("Failed to persist ClashState: {}", e);
         }
+
+        Ok(ResolveProfileReport { solved, metrics })
+    }
+
+    /// Resolve exactly one user-supplied domain using proxy-domain path policy.
+    ///
+    /// This does not persist state and does not mutate the caller's `ClashState`.
+    pub async fn resolve_one_domain_no_store(
+        &self,
+        domain: &str,
+        hub: Option<&UplinkHub>,
+        cancel: Option<&AtomicBool>,
+        direct_only: bool,
+    ) -> Result<ResolveProfileReport> {
+        let mut working = self.clone();
+
+        info!(
+            "resolver_ready tier1_nameserver_count={} tier2_nameserver_count={}",
+            working.tier1_nameservers.len(),
+            working.tier2_nameservers.len()
+        );
+
+        let mut solved = ProfileSolved::new();
+        let mut metrics = ResolutionMetrics::default();
+
+        if cancel
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            warn!(
+                "resolve_one_domain_cancelled domain={} before start=true",
+                domain
+            );
+            return Ok(ResolveProfileReport { solved, metrics });
+        }
+
+        working
+            .resolve_target_domain(
+                ResolutionTargetKind::ProxyDomain,
+                domain,
+                hub,
+                cancel,
+                direct_only,
+                &mut solved,
+                &mut metrics,
+                true,
+            )
+            .await;
 
         Ok(ResolveProfileReport { solved, metrics })
     }

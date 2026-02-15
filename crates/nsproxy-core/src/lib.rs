@@ -1681,6 +1681,8 @@ pub enum ClashOps {
     Resolve {
         #[arg(long)]
         direct: bool,
+        #[arg(long)]
+        refresh: bool,
     },
     /// Test the DNS resolution for one host
     TestResolve {
