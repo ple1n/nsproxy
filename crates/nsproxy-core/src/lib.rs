@@ -153,6 +153,7 @@ mod tests {
     use super::*;
     use ipnetwork::{IpNetwork, Ipv4Network};
     use std::net::Ipv4Addr;
+    use std::path::PathBuf;
 
     #[test]
     fn test_find_vacant_ipv4() {
@@ -163,6 +164,105 @@ mod tests {
         dbg!(vacant);
         dbg!(veth_addr_for(vacant, 2, true));
         dbg!(veth_addr_for(vacant, 2, false));
+    }
+
+    #[test]
+    fn test_hotconfig_expand_placeholders_at_and_tilde() {
+        let instance_root = PathBuf::from("/nsp3/test-profile");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME must be set for expansion tests");
+
+        let mut hot = HotConfig::default();
+        hot.mnt.insert(PathBuf::from("@/src"), PathBuf::from("~/dst"));
+        hot.mnt.insert(PathBuf::from("~"), PathBuf::from("@/target"));
+
+        hot.expand_placeholders(&instance_root);
+
+        assert!(hot
+            .mnt
+            .contains_key(&instance_root.join("src")));
+        assert_eq!(
+            hot.mnt.get(&instance_root.join("src")).cloned(),
+            Some(home.join("dst"))
+        );
+
+        assert!(hot.mnt.contains_key(&home));
+        assert_eq!(
+            hot.mnt.get(&home).cloned(),
+            Some(instance_root.join("target"))
+        );
+    }
+
+    #[test]
+    fn test_profileconfig_expand_placeholders_including_hot_init() {
+        let instance_root = PathBuf::from("/nsp3/profileA");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME must be set for expansion tests");
+
+        let mut profile = ProfileConfig {
+            schema: 1,
+            rootfs: ProfileRootfs {
+                mode: RootfsMode::Overlay,
+                root: PathBuf::from("/"),
+                put_old: None,
+                tmpfs: false,
+            },
+            mounts: vec![ProfileMount {
+                source: PathBuf::from("@/mnt-src"),
+                target: PathBuf::from("@/mnt-dst"),
+                read_only: false,
+                recursive: true,
+            }],
+            chmod: vec![ProfileChmod {
+                path: PathBuf::from("@/chmod-target"),
+                mode: Some(0o755),
+                uid: None,
+                gid: None,
+            }],
+            env: HashMap::new(),
+            inherit_env: true,
+            hot: PathBuf::from("@/hot.json"),
+            hot_init: Some(HotConfig {
+                dns: HashMap::new(),
+                tun: HashMap::new(),
+                devs: HashMap::new(),
+                mnt: {
+                    let mut m = HashMap::new();
+                    m.insert(PathBuf::from("@/hot-src"), PathBuf::from("~/hot-dst"));
+                    m.insert(PathBuf::from("~"), PathBuf::from("@/hot-target"));
+                    m
+                },
+                locals: HashMap::new(),
+            }),
+            sargs: shell::ShellArgs {
+                uid: None,
+                gid: None,
+                gids: Vec::new(),
+                shell: None,
+                cwd: Some(PathBuf::from("@/cwd")),
+            },
+            browser_profile: None,
+        };
+
+        profile.expand_placeholders(&instance_root);
+
+        assert_eq!(profile.hot, instance_root.join("hot.json"));
+        assert_eq!(profile.mounts[0].source, instance_root.join("mnt-src"));
+        assert_eq!(profile.mounts[0].target, instance_root.join("mnt-dst"));
+        assert_eq!(profile.chmod[0].path, instance_root.join("chmod-target"));
+        assert_eq!(profile.sargs.cwd, Some(instance_root.join("cwd")));
+
+        let hot_init = profile.hot_init.as_ref().expect("hot_init should exist");
+        assert_eq!(
+            hot_init.mnt.get(&instance_root.join("hot-src")).cloned(),
+            Some(home.join("hot-dst"))
+        );
+        assert_eq!(
+            hot_init.mnt.get(&home).cloned(),
+            Some(instance_root.join("hot-target"))
+        );
     }
 }
 
@@ -734,6 +834,45 @@ pub struct HotConfig {
     pub locals: HashMap<u32, u32>,
 }
 
+fn expand_at_and_tilde(path: &Path, instance_root: &Path) -> PathBuf {
+    let Some(path_str) = path.to_str() else {
+        return path.to_path_buf();
+    };
+
+    if path_str.starts_with('@') {
+        let root_str = instance_root.to_string_lossy();
+        return PathBuf::from(path_str.replace('@', &root_str));
+    }
+
+    if path_str == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+        return path.to_path_buf();
+    }
+
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+impl HotConfig {
+    pub fn expand_placeholders(&mut self, instance_root: &Path) {
+        let mut expanded_mnt = HashMap::new();
+        for (source, target) in &self.mnt {
+            expanded_mnt.insert(
+                expand_at_and_tilde(source, instance_root),
+                expand_at_and_tilde(target, instance_root),
+            );
+        }
+        self.mnt = expanded_mnt;
+    }
+}
+
 /// Explicit, stable profile config for filesystem isolation and app launch
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProfileConfig {
@@ -950,27 +1089,9 @@ impl ProfileConfig {
             }
         }
 
-        // Expand hot_init.mnt paths
+        // Expand hot_init paths
         if let Some(ref mut hot_init) = self.hot_init {
-            let mut expanded_mnt = HashMap::new();
-            for (s, t) in &hot_init.mnt {
-                let mut new_source = s.clone();
-                let mut new_target = t.clone();
-
-                if let Some(source_str) = s.to_str() {
-                    if source_str.starts_with('@') {
-                        new_source = PathBuf::from(source_str.replace('@', &root_str));
-                    }
-                }
-                if let Some(target_str) = t.to_str() {
-                    if target_str.starts_with('@') {
-                        new_target = PathBuf::from(target_str.replace('@', &root_str));
-                    }
-                }
-
-                expanded_mnt.insert(new_source, new_target);
-            }
-            hot_init.mnt = expanded_mnt;
+            hot_init.expand_placeholders(instance_root);
         }
     }
 
