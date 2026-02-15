@@ -8,6 +8,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{LazyLock, RwLock};
@@ -24,8 +25,8 @@ use nix::{libc::pid_t, unistd::getpid};
 use owo_colors::OwoColorize;
 use serde::{de::Visitor, Deserialize, Serialize};
 
-pub mod rpc;
 pub mod routing;
+pub mod rpc;
 
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 
@@ -456,7 +457,6 @@ pub fn cached_stat<'k>(ca: &'k mut VaCache, path: NMnt) -> Result<&'k stat> {
     })
 }
 
-
 pub use anyhow::Ok as aok;
 
 pub fn log_err<T, E, F>(op: F) -> Result<T, E>
@@ -471,8 +471,6 @@ where
     result
 }
 
-
-
 #[test]
 fn test_f() {
     let rx = nix::sys::stat::stat("./nonexist");
@@ -484,4 +482,14 @@ fn test_f() {
 
 pub macro forever() {
     ::std::future::pending::<()>()
+}
+
+pub enum DNSHost {
+    Tier1(SocketAddr),
+    Tier2Domain {
+        domain: String,
+        /// Must be Some, unless this is passed to proxies capable of DNS resolution
+        socket: Option<SocketAddr>,
+    },
+    Tier2IP(SocketAddr)
 }

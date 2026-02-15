@@ -1820,17 +1820,33 @@ fn main() -> anyhow::Result<()> {
                     println!("Importing Clash profile '{}'...", profile_name);
                     println!("  Config: {:?}", path);
 
+                    let mut hub = nsproxy_core::uplink::UplinkHub::new();
+                    let _ = hub.hydrate_from_persisted()?;
+                    let mut clash_state = hub.load_clash_state()?.clone();
+
                     let clash_profile = nsproxy_core::uplink::clash::ClashProfile::load_file(
                         profile_name,
                         &path,
                     )?;
 
+                    let append_report = clash_state.append_profile(&clash_profile)?;
+                    hub.set_clash_state(clash_state)?;
+
                     println!("\n✓ Profile imported");
                     println!("  Bootstrap nameservers: {}", clash_profile.bootstrap_nameservers.len());
                     println!("  Main nameservers: {}", clash_profile.main_nameservers.len());
                     println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
+                    println!(
+                        "  Appended tier1 nameservers: {}",
+                        append_report.added_tier1_nameservers
+                    );
+                    println!(
+                        "  Appended tier2 nameservers: {}",
+                        append_report.added_tier2_nameservers
+                    );
 
                     println!("\n✓ Profile '{}' is ready to use", profile_name);
+
                 }
                 ClashOps::Status => {
                     let uplink_dir = state_paths::uplink_dir("clash");
@@ -2058,16 +2074,28 @@ fn main() -> anyhow::Result<()> {
                         println!("  {} No bootstrap nameservers", "[x]".red().bold());
                         valid = false;
                     } else {
-                        // Check that bootstrap nameservers are IPs
-                        let mut all_ips = true;
+                        // Check that bootstrap nameservers are valid endpoint entries (URL/IP/socket/domain)
+                        let mut all_valid = true;
                         for ns in &config.dns.default_nameserver {
-                            if ns.parse::<std::net::IpAddr>().is_err() {
-                                println!("  {} Bootstrap must be IP, not hostname: {}", "[!]".yellow().bold(), ns);
-                                all_ips = false;
+                            let valid_entry = url::Url::parse(ns).is_ok()
+                                || ns.parse::<std::net::SocketAddr>().is_ok()
+                                || ns.parse::<std::net::IpAddr>().is_ok()
+                                || url::Host::parse(ns).is_ok();
+
+                            if !valid_entry {
+                                println!(
+                                    "  {} Invalid bootstrap nameserver entry: {}",
+                                    "[!]".yellow().bold(),
+                                    ns
+                                );
+                                all_valid = false;
                             }
                         }
-                        if all_ips {
-                            println!("  {} Bootstrap nameservers are IPs", "[✓]".green().bold());
+                        if all_valid {
+                            println!(
+                                "  {} Bootstrap nameservers are valid endpoint entries",
+                                "[✓]".green().bold()
+                            );
                         } else {
                             valid = false;
                         }
@@ -2077,7 +2105,31 @@ fn main() -> anyhow::Result<()> {
                         println!("  {} No main nameservers", "[x]".red().bold());
                         valid = false;
                     } else {
-                        println!("  {} Main nameservers ({})", "[✓]".green().bold(), config.dns.nameserver.len());
+                        let mut all_valid = true;
+                        for ns in &config.dns.nameserver {
+                            let valid_entry = url::Url::parse(ns).is_ok()
+                                || ns.parse::<std::net::SocketAddr>().is_ok()
+                                || ns.parse::<std::net::IpAddr>().is_ok()
+                                || url::Host::parse(ns).is_ok();
+                            if !valid_entry {
+                                println!(
+                                    "  {} Invalid main nameserver entry: {}",
+                                    "[!]".yellow().bold(),
+                                    ns
+                                );
+                                all_valid = false;
+                            }
+                        }
+
+                        if all_valid {
+                            println!(
+                                "  {} Main nameservers ({})",
+                                "[✓]".green().bold(),
+                                config.dns.nameserver.len()
+                            );
+                        } else {
+                            valid = false;
+                        }
                     }
 
                     if trojan_count == 0 {
