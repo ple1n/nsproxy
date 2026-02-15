@@ -1010,7 +1010,7 @@ pub mod proxy_adapters {
     /// - ALPN set to `["h2"]` for HTTP/2 (required for DoH)
     static NO_SNI_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
         std::sync::LazyLock::new(|| {
-            let _ = super::ensure_rustls_crypto_provider();
+            super::ensure_rustls_crypto_provider().unwrap();
 
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1020,8 +1020,7 @@ pub mod proxy_adapters {
                 .with_no_client_auth();
 
             config.enable_sni = false;
-            
-            config.alpn_protocols = vec![b"h2".to_vec()];
+            config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
 
             Arc::new(config)
         });
@@ -1059,10 +1058,7 @@ pub mod proxy_adapters {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
@@ -1113,7 +1109,7 @@ pub mod proxy_adapters {
     pub struct TrojanAdapter;
 
     impl TrojanAdapter {
-        /// Create a Trojan connection 
+        /// Create a Trojan connection
         pub async fn connect_tcp(
             proxy: &clash::TrojanProxy,
             target_host: &str,
@@ -1124,7 +1120,9 @@ pub mod proxy_adapters {
                 "Preparing Trojan connection to {}:{} via {} ({})",
                 target_host, target_port, proxy.server_name, resolved_ip
             );
-            let conn = proxy.connect_tcp(resolved_ip, target_host, target_port).await?;
+            let conn = proxy
+                .connect_tcp(resolved_ip, target_host, target_port)
+                .await?;
             match conn {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
                     Ok(ProxyConnection::Tcp(Box::new(TrojanTcpConn {
@@ -1136,7 +1134,7 @@ pub mod proxy_adapters {
                         ),
                     })))
                 }
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
 
@@ -1155,17 +1153,17 @@ pub mod proxy_adapters {
                 .connect_udp(resolved_ip, target_host, target_port)
                 .await?;
             match conn {
-                clash::TrojanConnection::UdpAssociate(tunnel, _target) => Ok(ProxyConnection::Udp(
-                    Box::new(TrojanUdpConn {
+                clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
+                    Ok(ProxyConnection::Udp(Box::new(TrojanUdpConn {
                         inner: tunnel,
                         info: format!(
                             "trojan+udp://{}:{}",
                             proxy.server_name,
                             proxy.server_addr.port()
                         ),
-                    }),
-                )),
-                _ => unreachable!()
+                    })))
+                }
+                _ => unreachable!(),
             }
         }
     }
@@ -1252,9 +1250,11 @@ pub mod proxy_adapters {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-            let tls_config = rustls::ClientConfig::builder()
+            let mut tls_config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
+            tls_config.enable_sni = false;
+            tls_config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
 
             let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
