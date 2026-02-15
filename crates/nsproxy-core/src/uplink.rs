@@ -1000,30 +1000,105 @@ pub mod proxy_adapters {
     }
 
     // ==============================================================================
-    // TLS over TcpLike (no-SNI, trust-dns equivalent)
+    // TLS over TcpLike (clash-rs style)
     // ==============================================================================
 
-    /// TLS client config with SNI disabled and h2 ALPN.
-    /// Equivalent to trust-dns-resolver's `CLIENT_CONFIG`:
-    /// - Mozilla root CA store (`webpki_roots`)
-    /// - SNI disabled (`enable_sni = false`) to prevent ISP blocking by SNI name
-    /// - ALPN set to `["h2"]` for HTTP/2 (required for DoH)
-    static NO_SNI_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
+    /// Global root certificate store (clash-rs style).
+    /// Loaded once and reused for all TLS connections.
+    static GLOBAL_ROOT_STORE: std::sync::LazyLock<Arc<rustls::RootCertStore>> =
+        std::sync::LazyLock::new(|| {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(root_store)
+        });
+
+    /// TLS client config matching clash-rs behavior:
+    /// - Mozilla root CA store (`webpki_roots`) loaded globally
+    /// - SNI enabled (default) for proper certificate verification
+    /// - ALPN set to `["h2"]` for HTTP/2 (DoH standard)
+    static TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
         std::sync::LazyLock::new(|| {
             super::ensure_rustls_crypto_provider().unwrap();
 
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
             let mut config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
+                .with_root_certificates((*GLOBAL_ROOT_STORE).clone())
                 .with_no_client_auth();
 
-            config.enable_sni = false;
-            config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
+            config.alpn_protocols = vec!["h2".into()];
 
             Arc::new(config)
         });
+
+    /// Custom certificate verifier that allows IP addresses as server names.
+    ///
+    /// This is needed because standard WebPKI verification doesn't support IP
+    /// addresses in server names (returns UnsupportedNameType). When that error
+    /// occurs, this verifier allows the connection to proceed while still
+    /// performing all other certificate validation.
+    ///
+    /// Matches clash-rs's NoHostnameTlsVerifier implementation.
+    #[derive(Debug)]
+    struct NoHostnameTlsVerifier(Arc<rustls::client::WebPkiServerVerifier>);
+
+    impl NoHostnameTlsVerifier {
+        fn new() -> Self {
+            Self(
+                rustls::client::WebPkiServerVerifier::builder(GLOBAL_ROOT_STORE.clone())
+                    .build()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for NoHostnameTlsVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            ocsp_response: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            match self.0.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ) {
+                Err(rustls::Error::UnsupportedNameType) => {
+                    warn!(
+                        "Skipping TLS cert name verification for server name: {:?}",
+                        server_name
+                    );
+                    Ok(rustls::client::danger::ServerCertVerified::assertion())
+                }
+                other => other,
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.0.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            self.0.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.supported_verify_schemes()
+        }
+    }
 
     /// TLS-over-TcpLike stream wrapper.
     /// The inner stream is a `TlsStream` over a boxed `TcpLike`,
@@ -1070,34 +1145,96 @@ pub mod proxy_adapters {
         }
     }
 
-    /// Wrap any `TcpLike` stream in TLS with SNI disabled (trust-dns equivalent).
+    /// Wrap any `TcpLike` stream in TLS using clash-rs style configuration.
     ///
-    /// Uses the shared `NO_SNI_TLS_CONFIG` which has:
-    /// - SNI disabled (prevents ISP blocking by server name)
+    /// Uses the shared `TLS_CONFIG` which matches clash-rs behavior:
+    /// - SNI enabled for proper certificate verification
     /// - h2 ALPN (required for DoH over HTTP/2)
-    /// - Mozilla root CA store
+    /// - Mozilla root CA store (loaded globally)
+    /// - Custom verifier for IP literals (like clash-rs)
     ///
-    /// The `hostname` is still used for certificate verification, just not
-    /// sent in the TLS ClientHello SNI extension.
-    pub async fn wrap_tls_no_sni(
+    /// When hostname is an IP address, uses NoHostnameTlsVerifier to allow
+    /// the connection (standard PKI doesn't support IP addresses in certs).
+    ///
+    /// This provides perfect functional equivalence with clash-rs TLS handshake.
+    pub async fn wrap_tls_for_doh(
         stream: Box<dyn TcpLike>,
         hostname: ServerName<'static>,
         info_prefix: &str,
     ) -> anyhow::Result<Box<dyn TcpLike>> {
-        info!("TLS conn at {:?}", hostname);
+        info!("TLS handshake with {:?}", hostname);
 
-        let connector = TlsConnector::from(NO_SNI_TLS_CONFIG.clone());
+        // Check if hostname is an IP address by trying to parse it
+        match &hostname {
+            ServerName::DnsName(dns) => {
+                return wrap_tls_default(stream, hostname, info_prefix).await;
+            }
+            ServerName::IpAddress(ip) => {
+                return wrap_tls_with_custom_verifier(stream, hostname, info_prefix).await;
+            }
+            _ => {
+                return wrap_tls_default(stream, hostname, info_prefix).await;
+            }
+        };
+    }
+
+    /// TLS handshake with default configuration (standard PKI verification)
+    async fn wrap_tls_default(
+        stream: Box<dyn TcpLike>,
+        hostname: ServerName<'static>,
+        info_prefix: &str,
+    ) -> anyhow::Result<Box<dyn TcpLike>> {
+        let mut conf = TLS_CONFIG.clone();
+        let connector = TlsConnector::from(conf);
 
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(10),
             connector.connect(hostname.clone(), stream),
         )
         .await
-        .context("Timeout during no-SNI TLS handshake")??;
+        .context("Timeout during TLS handshake")??;
 
         Ok(Box::new(TlsOverTcpLikeConn {
             inner: tls_stream,
-            info: format!("{}+tls-nosni", info_prefix),
+            info: format!("{}+tls", info_prefix),
+        }))
+    }
+
+    /// TLS handshake with custom verifier for IP addresses
+    async fn wrap_tls_with_custom_verifier(
+        stream: Box<dyn TcpLike>,
+        hostname: ServerName<'static>,
+        info_prefix: &str,
+    ) -> anyhow::Result<Box<dyn TcpLike>> {
+        warn!(
+            "Hostname {:?} is an IP address; using custom TLS verifier to allow connection",
+            hostname
+        );
+
+        super::ensure_rustls_crypto_provider()?;
+
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates((*GLOBAL_ROOT_STORE).clone())
+            .with_no_client_auth();
+
+        tls_config.alpn_protocols = vec!["h2".into()];
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoHostnameTlsVerifier::new()));
+        tls_config.enable_sni = true;
+
+        let connector = TlsConnector::from(Arc::new(tls_config));
+
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect(hostname.clone(), stream),
+        )
+        .await
+        .context("Timeout during TLS handshake with custom verifier")??;
+
+        Ok(Box::new(TlsOverTcpLikeConn {
+            inner: tls_stream,
+            info: format!("{}+tls", info_prefix),
         }))
     }
 
