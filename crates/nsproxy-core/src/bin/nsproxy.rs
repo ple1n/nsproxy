@@ -4,9 +4,10 @@ use capctl::prctl;
 /// This binary will at most spawn 2 processes (including itself)
 /// It's intended to be minimal, which can be used later in higher order composition such as in GUI
 use clap::{
-    Parser, Subcommand, ValueEnum,
+    CommandFactory, Parser, Subcommand, ValueEnum,
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
 };
+use clap_complete::{generate, shells::Fish};
 use futures::stream::TryStreamExt;
 use futures::{
     AsyncWriteExt, SinkExt, StreamExt,
@@ -850,6 +851,31 @@ fn main() -> anyhow::Result<()> {
             sproxyf.set_file_name("nswrap");
             let fd = dstdir.join(sproxyf.file_name().unwrap());
             overwrite(&sproxyf, &fd)?;
+
+        }
+        MainCommand::Completions { fish } => {
+            if fish {
+                if let Some(home) = std::env::var_os("HOME") {
+                    let dir = PathBuf::from(home)
+                        .join(".config")
+                        .join("fish")
+                        .join("completions");
+                    std::fs::create_dir_all(&dir)?;
+
+                    for bin_name in ["sp", "nsp", "nsproxy"] {
+                        let mut cmd = Cli::command();
+                        let mut buf = Vec::new();
+                        generate(Fish, &mut cmd, bin_name, &mut buf);
+                        let path = dir.join(format!("{}.fish", bin_name));
+                        std::fs::write(&path, &buf)?;
+                        warn!("Installed fish completion: {:?}", path);
+                    }
+                } else {
+                    warn!("HOME is not set; skipping fish completion install");
+                }
+            } else {
+                warn!("No completion target specified; use --fish");
+            }
         }
         MainCommand::Clean { veth } => {
             if veth {
