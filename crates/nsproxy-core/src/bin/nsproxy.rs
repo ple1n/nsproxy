@@ -1041,7 +1041,7 @@ fn main() -> anyhow::Result<()> {
                 aok!()
             })?;
         }
-        MainCommand::Profile {
+        MainCommand::Template {
             path,
             name,
             reset,
