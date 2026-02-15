@@ -23,22 +23,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("✗ Failed to resolve example.com: {}", e),
     }
 
-    // Resolve your proxy server domain
-    match bootstrapper.resolve("proxy.example.com").await {
-        Ok(addr) => println!("✓ Resolved proxy server -> {}", addr),
-        Err(e) => println!("✗ Failed to resolve proxy server: {}", e),
-    }
-
-    // Resolve multiple addresses
-    match bootstrapper.resolve_all("google.com").await {
-        Ok(addrs) => {
-            println!("✓ Resolved google.com to {} addresses:", addrs.len());
-            for addr in addrs {
-                println!("  - {}", addr);
-            }
-        }
-        Err(e) => println!("✗ Failed to resolve google.com: {}", e),
-    }
-
     Ok(())
 }

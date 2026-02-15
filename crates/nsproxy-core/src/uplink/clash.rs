@@ -985,6 +985,12 @@ impl ClashState {
         query: &str,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
+        use super::proxy_adapters::{wrap_tls_no_sni, NoProxyAdapter};
+        use rustls::pki_types::{ServerName, DnsName};
+        use h2::client;
+        use http::{Request, Method};
+        use bytes::Bytes;
+
         let authority = match resolver {
             DNSHost::Tier2Domain { domain, .. } => domain.clone(),
             DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => sock.ip().to_string(),
@@ -998,8 +1004,7 @@ impl ClashState {
             format!("/{doh_path}")
         };
 
-        let url = format!("https://{}:{}{}", authority, endpoint.port, path);
-
+        // Build DNS query message
         let name = Name::from_ascii(query).context("Invalid domain name")?;
         let dns_query = Query::query(name, RecordType::A);
         let mut msg = Message::new();
@@ -1011,98 +1016,116 @@ impl ClashState {
             .context("Failed to serialize DNS query for DoH")?;
 
         info!(
-            "dns_doh domain={} proxied=false resolver={} url={}",
+            "dns_doh domain={} proxied=false resolver={} authority={} path={}",
             query,
             Self::resolver_brief(resolver),
-            url
+            authority,
+            path
         );
 
-        let client = reqwest::Client::builder().build()?;
+        // Establish TCP connection to resolver
+        let dns_server_sock = Self::direct_socket_addr(resolver, endpoint.port)?;
+        let tcp_conn = NoProxyAdapter::connect_tcp(dns_server_sock).await?;
 
-        let send_future = client
-            .post(&url)
+        let tcp_stream = match tcp_conn {
+            super::proxy_adapters::ProxyConnection::Tcp(stream) => stream,
+            _ => anyhow::bail!("Expected TCP connection for DoH"),
+        };
+
+        // Determine TLS server name
+        let tls_server_name = match resolver {
+            DNSHost::Tier2Domain { domain, .. } => ServerName::DnsName(
+                DnsName::try_from(domain.as_str())
+                    .context("Invalid TLS server name for DoH")?
+                    .to_owned(),
+            ),
+            DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => {
+                ServerName::IpAddress(sock.ip().into())
+            }
+        };
+
+        // Wrap in no-SNI TLS (trust-dns equivalent: SNI disabled, h2 ALPN)
+        let tls_stream = wrap_tls_no_sni(tcp_stream, tls_server_name, "doh").await?;
+
+        // Perform HTTP/2 handshake
+        let (mut client, h2_conn) =
+            tokio::time::timeout(timeout, client::handshake(tls_stream))
+                .await
+                .context("Timeout during HTTP/2 handshake")?
+                .context("HTTP/2 handshake failed")?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = h2_conn.await {
+                warn!("HTTP/2 connection error: {}", e);
+            }
+        });
+
+        // Wait for client to be ready
+        let mut client = client
+            .ready()
+            .await
+            .context("HTTP/2 client not ready")?;
+
+        // Build HTTP/2 request
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("host", authority)
             .header("accept", "application/dns-message")
             .header("content-type", "application/dns-message")
-            .body(payload)
-            .send();
+            .header("content-length", payload.len())
+            .body(())
+            .context("Failed to build HTTP/2 request")?;
 
-        let response = match tokio::time::timeout(timeout, send_future).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                warn!(
-                    "dns_query_send_error protocol=dns_over_https url={} error={}",
-                    url, e
-                );
-                return Err(anyhow::anyhow!("dns_over_https send {}: {}", url, e));
-            }
-            Err(e) => {
-                warn!(
-                    "dns_query_send_timeout protocol=dns_over_https url={} error={}",
-                    url, e
-                );
-                return Err(anyhow::anyhow!(
-                    "dns_over_https send timeout {}: {}",
-                    url,
-                    e
-                ));
-            }
-        };
+        // Send request
+        let (response_future, mut send_stream) = client
+            .send_request(request, false)
+            .context("Failed to send HTTP/2 request")?;
 
+        // Send body
+        send_stream
+            .send_data(Bytes::from(payload), true)
+            .context("Failed to send request body")?;
+
+        // Wait for response
+        let response = tokio::time::timeout(timeout, response_future)
+            .await
+            .context("Timeout waiting for DoH response")?
+            .context("Failed to receive HTTP/2 response")?;
+
+        let status = response.status();
         info!(
-            "dns_query_response_status protocol=dns_over_https status={} url={}",
-            response.status(),
-            url
+            "dns_query_response_status protocol=dns_over_https status={}",
+            status
         );
-        if !response.status().is_success() {
+
+        if !status.is_success() {
             warn!(
-                "dns_query_http_error protocol=dns_over_https status={} url={}",
-                response.status(),
-                url
+                "dns_query_http_error protocol=dns_over_https status={}",
+                status
             );
-            anyhow::bail!(
-                "dns_over_https http status={} url={}",
-                response.status(),
-                url
-            );
+            anyhow::bail!("dns_over_https http status={}", status);
         }
 
-        let response_bytes = match tokio::time::timeout(timeout, response.bytes()).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(e)) => {
-                warn!(
-                    "doh url={} error={}",
-                    url, e
-                );
-                return Err(anyhow::anyhow!("dns_over_https read {}: {}", url, e));
-            }
-            Err(e) => {
-                warn!(
-                    "doh url={} error={}",
-                    url, e
-                );
-                return Err(anyhow::anyhow!(
-                    "doh read timeout {}: {}",
-                    url,
-                    e
-                ));
-            }
-        };
+        // Get response body
+        let mut body = response.into_body();
+        let mut response_bytes = Vec::new();
 
-        info!(
-            "doh response bytes={}",
-            response_bytes.len()
-        );
+        while let Some(chunk) = tokio::time::timeout(timeout, body.data())
+            .await
+            .context("Timeout reading response data")?
+        {
+            let chunk = chunk.context("Failed to read response chunk")?;
+            response_bytes.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
 
-        let response = match Message::from_bytes(response_bytes.as_ref()) {
-            Ok(msg) => msg,
-            Err(e) => {
-                warn!(
-                    "doh url={} error={}",
-                    url, e
-                );
-                return Err(anyhow::anyhow!("dns_over_https parse {}: {}", url, e));
-            }
-        };
+        info!("doh response bytes={}", response_bytes.len());
+
+        // Parse DNS response
+        let response =
+            Message::from_bytes(&response_bytes).context("Failed to parse DNS response")?;
 
         let mut ips = Vec::new();
         for answer in response.answers() {
@@ -1113,11 +1136,7 @@ impl ClashState {
             }
         }
 
-        info!(
-            "doh domain={} answer_count={}",
-            query,
-            ips.len()
-        );
+        info!("doh domain={} answer_count={}", query, ips.len());
         if ips.is_empty() {
             anyhow::bail!("No IP addresses found for {} via DoH", query);
         }
