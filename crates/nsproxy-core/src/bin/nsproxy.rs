@@ -1921,7 +1921,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                ClashOps::Resolve { direct } => {
+                ClashOps::Resolve { direct, refresh } => {
                     use nsproxy_core::uplink::clash::ClashProfile;
 
                     println!("Resolving Clash profiles and updating resolved state...");
@@ -1994,6 +1994,7 @@ fn main() -> anyhow::Result<()> {
                                     Some(&hub),
                                     Some(cancel_flag.as_ref()),
                                     direct,
+                                    refresh,
                                 )
                                 .await
                             {
@@ -2039,6 +2040,47 @@ fn main() -> anyhow::Result<()> {
                     if interrupted {
                         exit(130);
                     }
+                }
+                ClashOps::TestResolve { direct, query } => {
+                    println!("Testing single domain resolution: {}", query);
+
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?;
+
+                    rt.block_on(async {
+                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
+                        let proxy_count = hub.hydrate_from_persisted()?;
+                        println!("Hydrated uplink state ({} proxies available)", proxy_count);
+
+                        let state = hub.load_clash_state()?.clone();
+                        let report = state
+                            .resolve_one_domain_no_store(&query, Some(&hub), None, direct)
+                            .await?;
+
+                        if let Some(ips) = report.solved.get_latest_ips(&query) {
+                            let ips_joined = ips
+                                .iter()
+                                .map(std::string::ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            println!("resolved domain={} ip_count={} ips={}", query, ips.len(), ips_joined);
+                        } else {
+                            println!("resolved domain={} ip_count=0 ips=", query);
+                        }
+
+                        println!(
+                            "metrics cache_hits={} proxied_tier2={} proxied_tier1={} direct_tier2={} direct_tier1={} unresolved={}",
+                            report.metrics.cache_hits,
+                            report.metrics.resolved_proxy_tier2,
+                            report.metrics.resolved_proxy_tier1,
+                            report.metrics.resolved_direct_tier2,
+                            report.metrics.resolved_direct_tier1,
+                            report.metrics.unresolved
+                        );
+
+                        Ok::<(), anyhow::Error>(())
+                    })?;
                 }
                 ClashOps::ConfigExplain { path } => {
                     use anyhow::Context;
