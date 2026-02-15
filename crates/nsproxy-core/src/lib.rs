@@ -834,40 +834,95 @@ pub struct HotConfig {
     pub locals: HashMap<u32, u32>,
 }
 
-fn expand_at_and_tilde(path: &Path, instance_root: &Path) -> PathBuf {
-    let Some(path_str) = path.to_str() else {
-        return path.to_path_buf();
-    };
+#[derive(Clone, Debug, Default)]
+pub struct PathExpansionState {
+    instance_root: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
 
-    if path_str.starts_with('@') {
-        let root_str = instance_root.to_string_lossy();
-        return PathBuf::from(path_str.replace('@', &root_str));
-    }
-
-    if path_str == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-        return path.to_path_buf();
-    }
-
-    if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
+impl PathExpansionState {
+    pub fn for_instance(instance_root: &Path) -> Self {
+        Self {
+            instance_root: Some(instance_root.to_path_buf()),
+            home: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
 
-    path.to_path_buf()
+    pub fn without_instance() -> Self {
+        Self {
+            instance_root: None,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+
+    pub fn is_instance_variable(path: &Path) -> bool {
+        let Some(path_str) = path.to_str() else {
+            return false;
+        };
+        path_str == "@" || path_str.starts_with("@/") || path_str.starts_with('@')
+    }
+
+    pub fn is_home_variable(path: &Path) -> bool {
+        let Some(path_str) = path.to_str() else {
+            return false;
+        };
+        path_str == "~" || path_str.starts_with("~/")
+    }
+
+    pub fn expand(&self, path: &Path) -> PathBuf {
+        let Some(path_str) = path.to_str() else {
+            return path.to_path_buf();
+        };
+
+        if path_str == "~" {
+            if let Some(home) = &self.home {
+                return home.clone();
+            }
+            return path.to_path_buf();
+        }
+
+        if let Some(rest) = path_str.strip_prefix("~/") {
+            if let Some(home) = &self.home {
+                return home.join(rest);
+            }
+            return path.to_path_buf();
+        }
+
+        if let Some(root) = &self.instance_root {
+            if path_str == "@" {
+                return root.clone();
+            }
+
+            if let Some(rest) = path_str.strip_prefix("@/") {
+                return root.join(rest);
+            }
+
+            if path_str.starts_with('@') {
+                let root_str = root.to_string_lossy();
+                return PathBuf::from(path_str.replace('@', &root_str));
+            }
+        }
+
+        path.to_path_buf()
+    }
+}
+
+fn is_absolute_or_variable(path: &Path, allow_home: bool, allow_instance: bool) -> bool {
+    path.is_absolute()
+        || (allow_home && PathExpansionState::is_home_variable(path))
+        || (allow_instance && PathExpansionState::is_instance_variable(path))
 }
 
 impl HotConfig {
     pub fn expand_placeholders(&mut self, instance_root: &Path) {
+        let vars = PathExpansionState::for_instance(instance_root);
+        self.expand_with(&vars);
+    }
+
+    pub fn expand_with(&mut self, vars: &PathExpansionState) {
         let mut expanded_mnt = HashMap::new();
         for (source, target) in &self.mnt {
-            expanded_mnt.insert(
-                expand_at_and_tilde(source, instance_root),
-                expand_at_and_tilde(target, instance_root),
-            );
+            expanded_mnt.insert(vars.expand(source), vars.expand(target));
         }
         self.mnt = expanded_mnt;
     }
@@ -998,100 +1053,54 @@ impl ProfileConfig {
         if let Some(ref cwd) = self.sargs.cwd {
             ensure!(cwd.is_absolute(), "sargs.cwd must be absolute");
         }
-        // Allow @ placeholder in hot path (will be expanded at runtime)
-        if let Some(hot_str) = self.hot.to_str() {
-            ensure!(
-                self.hot.is_absolute() || hot_str.starts_with('@'),
-                "hot must be absolute or use @ placeholder"
-            );
-        } else {
-            ensure!(self.hot.is_absolute(), "hot must be absolute");
-        }
+        ensure!(
+            is_absolute_or_variable(&self.hot, true, true),
+            "hot must be absolute or use ~/@ placeholder"
+        );
         for m in &self.mounts {
-            // Allow @ placeholder in source paths
-            if let Some(source_str) = m.source.to_str() {
-                ensure!(
-                    m.source.is_absolute() || source_str.starts_with('@'),
-                    "mount source must be absolute or use @ placeholder"
-                );
-            } else {
-                ensure!(m.source.is_absolute(), "mount source must be absolute");
-            }
-            // Allow ~ prefix and @ placeholder for target paths (will be expanded at runtime)
-            if let Some(target_str) = m.target.to_str() {
-                ensure!(
-                    m.target.is_absolute()
-                        || target_str.starts_with("~/")
-                        || target_str == "~"
-                        || target_str.starts_with('@'),
-                    "mount target must be absolute, start with ~/, or use @ placeholder"
-                );
-            } else {
-                ensure!(m.target.is_absolute(), "mount target must be absolute");
-            }
+            ensure!(
+                is_absolute_or_variable(&m.source, true, true),
+                "mount source must be absolute or use ~/@ placeholder"
+            );
+            ensure!(
+                is_absolute_or_variable(&m.target, true, true),
+                "mount target must be absolute or use ~/@ placeholder"
+            );
         }
         for c in &self.chmod {
-            if let Some(path_str) = c.path.to_str() {
-                ensure!(
-                    c.path.is_absolute()
-                        || path_str.starts_with("~/")
-                        || path_str == "~"
-                        || path_str.starts_with('@'),
-                    "chmod path must be absolute, start with ~/, or use @ placeholder"
-                );
-            } else {
-                ensure!(c.path.is_absolute(), "chmod path must be absolute");
-            }
+            ensure!(
+                is_absolute_or_variable(&c.path, true, true),
+                "chmod path must be absolute or use ~/@ placeholder"
+            );
         }
         Ok(())
     }
 
-    /// Expand @ placeholder to instance state root (/nsp3/{name})
+    /// Expand path variables to concrete paths.
+    ///
+    /// Supported variables:
+    /// - `@` for instance state root (/nsp3/{name})
+    /// - `~` for HOME
     pub fn expand_placeholders(&mut self, instance_root: &Path) {
-        let root_str = instance_root.to_string_lossy();
+        let vars = PathExpansionState::for_instance(instance_root);
 
-        // Expand hot path
-        if let Some(hot_str) = self.hot.to_str() {
-            if hot_str.starts_with('@') {
-                self.hot = PathBuf::from(hot_str.replace('@', &root_str));
-            }
-        }
+        self.hot = vars.expand(&self.hot);
 
-        // Expand mount paths
         for m in &mut self.mounts {
-            if let Some(source_str) = m.source.to_str() {
-                if source_str.starts_with('@') {
-                    m.source = PathBuf::from(source_str.replace('@', &root_str));
-                }
-            }
-            if let Some(target_str) = m.target.to_str() {
-                if target_str.starts_with('@') {
-                    m.target = PathBuf::from(target_str.replace('@', &root_str));
-                }
-            }
+            m.source = vars.expand(&m.source);
+            m.target = vars.expand(&m.target);
         }
 
-        // Expand sargs.cwd
-        if let Some(ref cwd) = self.sargs.cwd {
-            if let Some(cwd_str) = cwd.to_str() {
-                if cwd_str.starts_with('@') {
-                    self.sargs.cwd = Some(PathBuf::from(cwd_str.replace('@', &root_str)));
-                }
-            }
+        if let Some(cwd) = &self.sargs.cwd {
+            self.sargs.cwd = Some(vars.expand(cwd));
         }
 
-        // Expand chmod paths
         for c in &mut self.chmod {
-            if let Some(path_str) = c.path.to_str() {
-                if path_str.starts_with('@') {
-                    c.path = PathBuf::from(path_str.replace('@', &root_str));
-                }
-            }
+            c.path = vars.expand(&c.path);
         }
 
-        // Expand hot_init paths
         if let Some(ref mut hot_init) = self.hot_init {
-            hot_init.expand_placeholders(instance_root);
+            hot_init.expand_with(&vars);
         }
     }
 

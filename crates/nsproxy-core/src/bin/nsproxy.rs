@@ -150,32 +150,17 @@ struct AssignedIps {
     vin: Ipv4Addr,
 }
 
-fn expand_tilde(path: &Path) -> PathBuf {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                let mut result = PathBuf::from(home);
-                result.push(&path_str[2..]);
-                return result;
-            }
-        } else if path_str == "~" {
-            if let Some(home) = std::env::var_os("HOME") {
-                return PathBuf::from(home);
-            }
-        }
-    }
-    path.to_path_buf()
-}
-
 fn apply_profile_mounts(root: &Path, mounts: &[ProfileMount]) -> Result<()> {
+    let vars = PathExpansionState::without_instance();
     for m in mounts {
-        let expanded_target = expand_tilde(&m.target);
+        let expanded_source = vars.expand(&m.source);
+        let expanded_target = vars.expand(&m.target);
         let rel = expanded_target.strip_prefix("/").unwrap();
         let target = root.join(rel);
         if m.read_only {
-            mount_bind_ro_explicit(&m.source, &target, m.recursive)?;
+            mount_bind_ro_explicit(&expanded_source, &target, m.recursive)?;
         } else {
-            mount_bind_rw_explicit(&m.source, &target, m.recursive)?;
+            mount_bind_rw_explicit(&expanded_source, &target, m.recursive)?;
         }
     }
 
@@ -183,8 +168,9 @@ fn apply_profile_mounts(root: &Path, mounts: &[ProfileMount]) -> Result<()> {
 }
 
 fn apply_profile_chmod(root: &Path, chmods: &[ProfileChmod]) -> Result<()> {
+    let vars = PathExpansionState::without_instance();
     for c in chmods {
-        let expanded_path = expand_tilde(&c.path);
+        let expanded_path = vars.expand(&c.path);
         let rel = expanded_path.strip_prefix("/").unwrap();
         let target = root.join(rel);
 
@@ -754,13 +740,9 @@ fn main() -> anyhow::Result<()> {
             // otherwise treat as an explicit path if it starts with /, ./, or ~/
             let (resolved_path, nsdata) = {
                 let t = &target;
-                if t.starts_with('/') || t.starts_with("./") || t.starts_with("~/") {
-                    let p = if let Some(rest) = t.strip_prefix("~/") {
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        PathBuf::from(home).join(rest)
-                    } else {
-                        PathBuf::from(t)
-                    };
+                if t.starts_with('/') || t.starts_with("./") || t.starts_with("~/") || t == "~" {
+                    let vars = PathExpansionState::without_instance();
+                    let p = vars.expand(Path::new(t));
                     (Some(p.clone()), state_paths::metadata_for_bind(&p))
                 } else {
                     let p = state_paths::profile_netns_bind(t);
