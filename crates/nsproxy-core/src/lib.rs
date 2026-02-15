@@ -174,14 +174,14 @@ mod tests {
             .expect("HOME must be set for expansion tests");
 
         let mut hot = HotConfig::default();
-        hot.mnt.insert(PathBuf::from("@/src"), PathBuf::from("~/dst"));
-        hot.mnt.insert(PathBuf::from("~"), PathBuf::from("@/target"));
+        hot.mnt
+            .insert(PathBuf::from("@/src"), PathBuf::from("~/dst"));
+        hot.mnt
+            .insert(PathBuf::from("~"), PathBuf::from("@/target"));
 
         hot.expand_placeholders(&instance_root);
 
-        assert!(hot
-            .mnt
-            .contains_key(&instance_root.join("src")));
+        assert!(hot.mnt.contains_key(&instance_root.join("src")));
         assert_eq!(
             hot.mnt.get(&instance_root.join("src")).cloned(),
             Some(home.join("dst"))
@@ -433,9 +433,9 @@ use tun2socks5::tun_rs::DeviceBuilder;
 use utils::MapExt;
 
 use crate::shell::ShellArgs;
-use nsproxy_common::routing::ProxyNym;
 use crate::utils::dump_as_json;
 use crate::utils::dump_as_toml;
+use nsproxy_common::routing::ProxyNym;
 
 impl NetlinkOps for Handle {
     async fn fetch_routing_table(&self) -> Result<RoutingTable> {
@@ -1435,6 +1435,9 @@ use clap::{
 pub struct Cli {
     #[arg(short, long)]
     pub conf: Option<PathBuf>,
+    /// State root, defaults to /nsp3
+    #[arg(short, long)]
+    pub root: Option<PathBuf>,
     #[arg(short, long)]
     pub no_wrap_check: bool,
     #[command(subcommand)]
@@ -1453,6 +1456,7 @@ pub enum NsInput {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum MainCommand {
+    /// Deprecated
     /// Set up some containers
     #[command(alias = "r")]
     Run {
@@ -1668,7 +1672,7 @@ pub enum ClashOps {
     },
     /// Resolve proxies that do not have a known IP
     /// Regular upkeeping
-    Resolve
+    Resolve,
 }
 
 pub mod uplink;
