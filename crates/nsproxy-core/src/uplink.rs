@@ -53,13 +53,15 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use bimap::BiHashMap;
-use nsproxy_common::routing::{ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol};
+use nsproxy_common::routing::{
+    ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
+};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use tracing::{info, warn};
@@ -71,6 +73,31 @@ use crate::state_paths;
 /// Maximum number of concurrent virtual DNS entries (mirrors tun2socks5 default)
 const POOL_SIZE: usize = 65_535;
 const DNS_PORT: u16 = 53;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn ensure_rustls_crypto_provider() -> Result<()> {
+    static TLS_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
+
+    if TLS_PROVIDER_INIT.get().is_some() || rustls::crypto::CryptoProvider::get_default().is_some()
+    {
+        let _ = TLS_PROVIDER_INIT.set(());
+        return Ok(());
+    }
+
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => {
+            let _ = TLS_PROVIDER_INIT.set(());
+            Ok(())
+        }
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => {
+            let _ = TLS_PROVIDER_INIT.set(());
+            Ok(())
+        }
+        Err(_) => anyhow::bail!(
+            "Failed to initialize rustls CryptoProvider; call CryptoProvider::install_default() before TLS use"
+        ),
+    }
+}
 
 // IPs are not ever deleted here.
 // Because its expected sometimes DNS servers pollute the records with junk
@@ -136,15 +163,16 @@ impl ProfileSolved {
     /// Save to a JSON file
     pub fn save_to_file(&self, path: &PathBuf) -> Result<()> {
         info!("Saving resolved addresses to {:?}", path);
-        let parent = path.parent().ok_or_else(|| anyhow::anyhow!(
-            "Invalid solved.json path: {:?}",
-            path
-        ))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid solved.json path: {:?}", path))?;
         info!("Ensuring parent directory exists: {:?}", parent);
         std::fs::create_dir_all(parent).context("Failed to create uplink profile directory")?;
-        let content = serde_json::to_string_pretty(self).context("Failed to serialize ProfileSolved")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize ProfileSolved")?;
         let bytes = content.len();
-        std::fs::write(path, content).context(format!("Failed to write solved.json to {:?}", path))?;
+        std::fs::write(path, content)
+            .context(format!("Failed to write solved.json to {:?}", path))?;
         info!("Wrote {} bytes to {:?}", bytes, path);
         Ok(())
     }
@@ -152,28 +180,15 @@ impl ProfileSolved {
 
 /// Generic DNS resolver for routing DNS queries through any proxy connection
 pub mod proxy_dns {
+    use super::proxy_adapters::{TcpLike, UdpLike};
     use super::*;
-    use super::proxy_adapters::{ProxyConnection, ProxyUdpTunnel, ProxyTcpStream};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use trust_dns_proto::op::{Message, Query};
     use trust_dns_proto::rr::{Name, RecordType};
     use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
 
-    /// DNS query through a generic proxy connection (UDP or TCP)
-    pub async fn query_via_proxy(
-        connection: &mut ProxyConnection,
-        dns_server: &WireAddress,
-        domain: &str,
-        timeout: Duration,
-    ) -> Result<Vec<IpAddr>> {
-        info!(
-            "Querying {} via proxy {} through DNS {}",
-            domain,
-            connection.info(),
-            dns_server
-        );
-
+    fn build_dns_query(domain: &str) -> Result<Vec<u8>> {
         // Build DNS query
         let name = Name::from_ascii(domain).context("Invalid domain name")?;
         let query = Query::query(name, RecordType::A);
@@ -183,21 +198,13 @@ pub mod proxy_dns {
         msg.set_id(rand::random());
         msg.set_recursion_desired(true);
 
-        let query_bytes = msg.to_vec().context("Failed to serialize DNS query")?;
+        msg.to_vec().context("Failed to serialize DNS query")
+    }
 
-        let dns_addr = dns_server.clone();
-
-        // Send DNS query and receive response based on connection type
-        let response_bytes = if connection.is_datagram() {
-            // UDP DNS query
-            query_udp(connection, &query_bytes, dns_addr, timeout).await?
-        } else {
-            // TCP DNS query (with 2-byte length prefix)
-            query_tcp(connection, &query_bytes, dns_addr, timeout).await?
-        };
-
+    fn parse_dns_response(response_bytes: &[u8], domain: &str) -> Result<Vec<IpAddr>> {
         // Parse DNS response
-        let response = Message::from_bytes(&response_bytes).context("Failed to parse DNS response")?;
+        let response =
+            Message::from_bytes(response_bytes).context("Failed to parse DNS response")?;
 
         let mut ips = Vec::new();
         for answer in response.answers() {
@@ -212,24 +219,28 @@ pub mod proxy_dns {
             anyhow::bail!("No IP addresses found for {}", domain);
         }
 
-        info!("Resolved {} to {} addresses via {}", domain, ips.len(), connection.info());
         Ok(ips)
     }
 
-    /// Perform UDP-based DNS query
-    async fn query_udp(
-        connection: &mut ProxyConnection,
-        query_bytes: &[u8],
-        dns_addr: WireAddress,
+    /// DNS query over any UDP-like tunnel.
+    pub async fn query_via_udp(
+        tunnel: &mut (impl UdpLike + ?Sized),
+        dns_server: &WireAddress,
+        domain: &str,
         timeout: Duration,
-    ) -> Result<Vec<u8>> {
-        let tunnel = connection
-            .as_udp_mut()
-            .context("Expected UDP connection for datagram query")?;
+    ) -> Result<Vec<IpAddr>> {
+        info!(
+            "Querying {} via {} through DNS {}",
+            domain,
+            tunnel.info(),
+            dns_server
+        );
+
+        let query_bytes = build_dns_query(domain)?;
 
         // Send DNS query
         tunnel
-            .send_to(query_bytes, dns_addr)
+            .send_to(&query_bytes, dns_server.clone())
             .await
             .context("Failed to send DNS query via UDP")?;
 
@@ -238,26 +249,37 @@ pub mod proxy_dns {
             .await
             .context("DNS query timeout")??;
 
-        
-        Ok(packet.data)
+        let ips = parse_dns_response(&packet.data, domain)?;
+        info!(
+            "Resolved {} to {} addresses via {}",
+            domain,
+            ips.len(),
+            tunnel.info()
+        );
+        Ok(ips)
     }
 
-    /// Perform TCP-based DNS query (RFC 1035 - 2-byte length prefix)
-    async fn query_tcp(
-        connection: &mut ProxyConnection,
-        query_bytes: &[u8],
-        _dns_addr: WireAddress,
+    /// DNS query over any TCP-like stream (RFC 1035 - 2-byte length prefix).
+    pub async fn query_via_tcp(
+        stream: &mut (impl TcpLike + ?Sized),
+        dns_server: &WireAddress,
+        domain: &str,
         timeout: Duration,
-    ) -> Result<Vec<u8>> {
-        let stream = connection
-            .as_tcp_mut()
-            .context("Expected TCP connection for stream query")?;
+    ) -> Result<Vec<IpAddr>> {
+        info!(
+            "Querying {} via {} through DNS {}",
+            domain,
+            stream.info(),
+            dns_server
+        );
+
+        let query_bytes = build_dns_query(domain)?;
 
         // DNS over TCP: send length prefix (2 bytes) + query
         let len = query_bytes.len() as u16;
         let mut buf = Vec::with_capacity(2 + query_bytes.len());
         buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(query_bytes);
+        buf.extend_from_slice(&query_bytes);
 
         tokio::time::timeout(timeout, stream.write_all(&buf))
             .await
@@ -284,7 +306,14 @@ pub mod proxy_dns {
             .context("Timeout reading DNS response data")?
             .context("Failed to read DNS response data")?;
 
-        Ok(response_buf)
+        let ips = parse_dns_response(&response_buf, domain)?;
+        info!(
+            "Resolved {} to {} addresses via {}",
+            domain,
+            ips.len(),
+            stream.info()
+        );
+        Ok(ips)
     }
 }
 
@@ -315,12 +344,12 @@ pub struct UplinkHub {
     proxy_nym: BiHashMap<ProxyID, ProxyNym>,
     /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
     clash: Option<clash::ClashState>,
-    stats: HashMap<ProxyID, LinkStats>
+    stats: HashMap<ProxyID, LinkStats>,
 }
 
 pub struct LinkStats {
     latency: Duration,
-    latency_checked: Instant
+    latency_checked: Instant,
 }
 
 /// All proxies here should be immediately connectable without further resolution dependent on other state
@@ -438,7 +467,10 @@ impl UplinkHub {
                     count += self.load_clash_proxies()?;
                 }
                 _ => {
-                    info!("Skipping unknown uplink kind '{}'; no loader registered", kind);
+                    info!(
+                        "Skipping unknown uplink kind '{}'; no loader registered",
+                        kind
+                    );
                 }
             }
         }
@@ -452,7 +484,7 @@ impl UplinkHub {
         use crate::state_paths;
 
         let state_proxies = self.load_clash_state()?.proxies.clone();
-        
+
         let uplink_dir = state_paths::uplink_dir("clash");
         if !uplink_dir.exists() {
             return Ok(0);
@@ -550,12 +582,16 @@ pub trait UdpHandler: Send + Sync + 'static {
 /// Kernel-style connection interface that supports both streaming and datagram operations
 pub mod proxy_adapters {
     use super::*;
+    use anyhow::Context as AnyhowContext;
     use bytes::{Buf, BufMut, BytesMut};
+    use rustls::pki_types::ServerName;
     use socks5_impl::client;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpStream, UdpSocket};
+    use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
 
     /// UDP packet for datagram operations
@@ -565,14 +601,14 @@ pub mod proxy_adapters {
         pub dst_addr: WireAddress,
     }
 
-    /// Trait for TCP proxy streams (unified interface for Trojan, SOCKS5, etc.)
-    pub trait ProxyTcpStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    /// Trait for TCP proxy streams (unified interface for Trojan, SOCKS5, unproxy, etc.)
+    pub trait TcpLike: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         fn info(&self) -> &str;
     }
 
-    /// Trait for UDP proxy tunnels (unified interface for Trojan, SOCKS5, etc.)
+    /// Trait for UDP proxy tunnels (unified interface for Trojan, SOCKS5, unproxy, etc)
     #[async_trait::async_trait]
-    pub trait ProxyUdpTunnel: Send + Sync {
+    pub trait UdpLike: Send + Sync {
         async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize>;
         async fn recv_from(&mut self) -> std::io::Result<UdpPacket>;
         fn info(&self) -> &str;
@@ -581,9 +617,9 @@ pub mod proxy_adapters {
     /// Unified connection type that can handle both TCP streams and UDP tunnels
     pub enum ProxyConnection {
         /// TCP stream connection (Trojan, SOCKS5, etc.)
-        Tcp(Box<dyn ProxyTcpStream>),
+        Tcp(Box<dyn TcpLike>),
         /// UDP tunnel (Trojan, SOCKS5, etc.)
-        Udp(Box<dyn ProxyUdpTunnel>),
+        Udp(Box<dyn UdpLike>),
     }
 
     impl ProxyConnection {
@@ -601,7 +637,7 @@ pub mod proxy_adapters {
         }
 
         /// Convert to mutable UDP tunnel reference
-        pub fn as_udp_mut(&mut self) -> Option<&mut dyn ProxyUdpTunnel> {
+        pub fn as_udp_mut(&mut self) -> Option<&mut dyn UdpLike> {
             match self {
                 ProxyConnection::Udp(tunnel) => Some(tunnel.as_mut()),
                 _ => None,
@@ -609,7 +645,7 @@ pub mod proxy_adapters {
         }
 
         /// Convert to mutable TCP stream reference
-        pub fn as_tcp_mut(&mut self) -> Option<&mut dyn ProxyTcpStream> {
+        pub fn as_tcp_mut(&mut self) -> Option<&mut dyn TcpLike> {
             match self {
                 ProxyConnection::Tcp(stream) => Some(stream.as_mut()),
                 _ => None,
@@ -627,7 +663,7 @@ pub mod proxy_adapters {
         info: String,
     }
 
-    impl ProxyTcpStream for TrojanTcpConn {
+    impl TcpLike for TrojanTcpConn {
         fn info(&self) -> &str {
             &self.info
         }
@@ -671,7 +707,7 @@ pub mod proxy_adapters {
     }
 
     #[async_trait::async_trait]
-    impl ProxyUdpTunnel for TrojanUdpConn {
+    impl UdpLike for TrojanUdpConn {
         /// Send a UDP packet through the tunnel
         /// Format: [SOCKS_ADDR][LENGTH:u16][CRLF][DATA]
         async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize> {
@@ -776,7 +812,7 @@ pub mod proxy_adapters {
         info: String,
     }
 
-    impl ProxyTcpStream for Socks5TcpConn {
+    impl TcpLike for Socks5TcpConn {
         fn info(&self) -> &str {
             &self.info
         }
@@ -813,6 +849,139 @@ pub mod proxy_adapters {
         }
     }
 
+    /// Direct TCP connection wrapper (no proxy)
+    struct DirectTcpConn {
+        inner: TcpStream,
+        info: String,
+    }
+
+    impl TcpLike for DirectTcpConn {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl AsyncRead for DirectTcpConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DirectTcpConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Direct TLS connection wrapper (no proxy)
+    struct DirectTlsConn {
+        inner: TlsStream<TcpStream>,
+        info: String,
+    }
+
+    impl TcpLike for DirectTlsConn {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl AsyncRead for DirectTlsConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DirectTlsConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Direct UDP tunnel wrapper (no proxy)
+    struct DirectUdpConn {
+        socket: UdpSocket,
+        info: String,
+    }
+
+    async fn resolve_wire_address(dst: &WireAddress) -> std::io::Result<SocketAddr> {
+        match dst {
+            WireAddress::SocketAddress(sock) => Ok(*sock),
+            WireAddress::DomainAddress(host, port) => {
+                warn!(
+                    "Using direct tokio DNS resolve via lookup_host for {}:{}",
+                    host, port
+                );
+                let mut iter = tokio::net::lookup_host((host.as_str(), *port)).await?;
+                iter.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("No IP found for {}:{}", host, port),
+                    )
+                })
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UdpLike for DirectUdpConn {
+        async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize> {
+            let dst_sock = resolve_wire_address(&dst).await?;
+            self.socket.send_to(data, dst_sock).await
+        }
+
+        async fn recv_from(&mut self) -> std::io::Result<UdpPacket> {
+            let mut buf = vec![0u8; 4096];
+            let (n, src) = self.socket.recv_from(&mut buf).await?;
+            buf.truncate(n);
+            Ok(UdpPacket {
+                data: buf,
+                dst_addr: WireAddress::SocketAddress(src),
+            })
+        }
+
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
     // ==============================================================================
     // Adapters
     // ==============================================================================
@@ -828,18 +997,30 @@ pub mod proxy_adapters {
             target_port: u16,
             resolved_ip: std::net::IpAddr,
         ) -> anyhow::Result<ProxyConnection> {
+            info!(
+                "Preparing Trojan connection to {}:{} via {} ({})",
+                target_host, target_port, proxy.server_name, resolved_ip
+            );
             let conn = proxy.connect(resolved_ip, target_host, target_port).await?;
             match conn {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
                     Ok(ProxyConnection::Tcp(Box::new(TrojanTcpConn {
                         inner: stream,
-                        info: format!("trojan://{}:{}", proxy.server_name, proxy.server_addr.port()),
+                        info: format!(
+                            "trojan://{}:{}",
+                            proxy.server_name,
+                            proxy.server_addr.port()
+                        ),
                     })))
                 }
                 clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
                     Ok(ProxyConnection::Udp(Box::new(TrojanUdpConn {
                         inner: tunnel,
-                        info: format!("trojan+udp://{}:{}", proxy.server_name, proxy.server_addr.port()),
+                        info: format!(
+                            "trojan+udp://{}:{}",
+                            proxy.server_name,
+                            proxy.server_addr.port()
+                        ),
                     })))
                 }
             }
@@ -860,7 +1041,10 @@ pub mod proxy_adapters {
 
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
-                    let tcp = TcpStream::connect(proxy.addr).await?;
+                    info!("Opening SOCKS5 TCP connection to proxy {}", proxy.addr);
+                    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                        .await
+                        .context("Timeout connecting to SOCKS5 proxy")??;
                     let mut stream = BufStream::new(tcp);
                     let dest = WireAddress::DomainAddress(target_host.to_string(), target_port);
                     client::connect(&mut stream, dest, proxy.credentials.clone()).await?;
@@ -876,10 +1060,97 @@ pub mod proxy_adapters {
         }
     }
 
+    /// Adapter for creating direct (no-proxy) connections
+    pub struct NoProxyAdapter;
+
+    impl NoProxyAdapter {
+        pub async fn connect_tcp(target: SocketAddr) -> anyhow::Result<ProxyConnection> {
+            info!("Opening direct TCP connection to {}", target);
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+                .await
+                .context("Timeout connecting direct TCP target")??;
+            Ok(ProxyConnection::Tcp(Box::new(DirectTcpConn {
+                inner: stream,
+                info: format!("direct+tcp://{}", target),
+            })))
+        }
+
+        pub async fn connect_udp(target: SocketAddr) -> anyhow::Result<ProxyConnection> {
+            let bind_addr = if target.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            info!(
+                "Opening direct UDP socket for target {} (bind {})",
+                target, bind_addr
+            );
+            let socket = UdpSocket::bind(bind_addr).await?;
+            Ok(ProxyConnection::Udp(Box::new(DirectUdpConn {
+                socket,
+                info: format!("direct+udp://{}", target),
+            })))
+        }
+
+        pub async fn connect_tls(
+            hostname: ServerName<'static>,
+            target: SocketAddr,
+        ) -> anyhow::Result<ProxyConnection> {
+            info!(
+                "Opening direct TLS connection to {:?} ({})",
+                &hostname, target
+            );
+            let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+                .await
+                .context("Timeout connecting direct TLS target")??;
+
+            ensure_rustls_crypto_provider()?;
+
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            let tls_connector = TlsConnector::from(Arc::new(tls_config));
+
+            info!("Starting direct TLS handshake with {}", target);
+            let tls_stream = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tls_connector.connect(hostname.clone(), tcp_stream),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!(
+                        "Direct TLS handshake failed for {} ({:?}): {}",
+                        target, hostname, e
+                    );
+                    return Err(e).context("Direct TLS handshake failed");
+                }
+                Err(e) => {
+                    warn!(
+                        "Timeout during direct TLS handshake for {} ({:?}): {}",
+                        target, hostname, e
+                    );
+                    return Err(anyhow::Error::new(e))
+                        .context("Timeout during direct TLS handshake");
+                }
+            };
+
+            Ok(ProxyConnection::Tcp(Box::new(DirectTlsConn {
+                inner: tls_stream,
+                info: format!("direct+tls://{}", target),
+            })))
+        }
+    }
+
     // Backward compatibility with ProxyStream trait
-    impl<T: ProxyTcpStream + ?Sized + 'static> ProxyStream for T {
+    impl<T: TcpLike + ?Sized + 'static> ProxyStream for T {
         fn info(&self) -> &str {
-            ProxyTcpStream::info(self)
+            TcpLike::info(self)
         }
     }
 }
@@ -1070,6 +1341,10 @@ pub async fn main_entry(
 }
 
 async fn resolve_proxy_ip(host: &str) -> anyhow::Result<IpAddr> {
+    warn!(
+        "Using direct tokio DNS resolve via lookup_host for proxy host {}",
+        host
+    );
     let mut iter = tokio::net::lookup_host((host, 0)).await?;
     iter.next()
         .map(|sock| sock.ip())
@@ -1410,7 +1685,11 @@ async fn handle_tcp_nat(
     mut tcp_stack: ipstack::stream::IpStackTcpStream,
     server_addr: SocketAddr,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut server = tokio::net::TcpStream::connect(server_addr).await?;
+    info!("Opening direct TCP NAT connection to {}", server_addr);
+    let mut server =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(server_addr))
+            .await
+            .context("Timeout connecting direct TCP NAT target")??;
     let res = tokio::io::copy_bidirectional(&mut tcp_stack, &mut server).await?;
     Ok(res)
 }
@@ -1419,6 +1698,7 @@ async fn handle_udp_nat(
     mut udp_stack: ipstack::stream::IpStackUdpStream,
     server_addr: SocketAddr,
 ) -> anyhow::Result<(u64, u64)> {
+    info!("Opening direct UDP NAT connection to {}", server_addr);
     let mut udp_server = udp_stream::UdpStream::connect(server_addr).await?;
     let res = tokio::io::copy_bidirectional(&mut udp_server, &mut udp_stack).await?;
     Ok(res)

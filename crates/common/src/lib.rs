@@ -484,6 +484,7 @@ pub macro forever() {
     ::std::future::pending::<()>()
 }
 
+#[derive(Debug, Clone)]
 pub enum DNSHost {
     Tier1(SocketAddr),
     Tier2Domain {
