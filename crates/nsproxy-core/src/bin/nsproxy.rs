@@ -75,7 +75,10 @@ use std::{
     pin::Pin,
     process::exit,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{select, sync};
@@ -1833,8 +1836,8 @@ fn main() -> anyhow::Result<()> {
                     hub.set_clash_state(clash_state)?;
 
                     println!("\n✓ Profile imported");
-                    println!("  Bootstrap nameservers: {}", clash_profile.bootstrap_nameservers.len());
-                    println!("  Main nameservers: {}", clash_profile.main_nameservers.len());
+                    println!("  Tier1 nameservers: {}", clash_profile.tier1_nameservers.len());
+                    println!("  Tier2 nameservers: {}", clash_profile.tier2_nameservers.len());
                     println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
                     println!(
                         "  Appended tier1 nameservers: {}",
@@ -1915,13 +1918,28 @@ fn main() -> anyhow::Result<()> {
                         .enable_all()
                         .build()?;
 
-                    rt.block_on(async {
+                    let interrupted = rt.block_on(async {
                         let mut hub = nsproxy_core::uplink::UplinkHub::new();
                         let initial_proxy_count = hub.hydrate_from_persisted()?;
                         println!("Hydrated uplink state ({} proxies available)", initial_proxy_count);
 
                         let mut state = hub.load_clash_state()?.clone();
+                        let cancel_flag = Arc::new(AtomicBool::new(false));
+                        let cancel_task_flag = Arc::clone(&cancel_flag);
+                        tokio::spawn(async move {
+                            if tokio::signal::ctrl_c().await.is_ok() {
+                                cancel_task_flag.store(true, Ordering::SeqCst);
+                            }
+                        });
+                        let mut interrupted = false;
+
                         for entry in profiles {
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
+                                interrupted = true;
+                                break;
+                            }
+
                             let profile_name = entry.file_name().to_string_lossy().to_string();
                             let config_path = state_paths::uplink_profile_config("clash", &profile_name);
                             if !config_path.exists() {
@@ -1942,7 +1960,10 @@ fn main() -> anyhow::Result<()> {
                                 unresolved_before
                             );
 
-                            match profile.solve_file(&mut state, Some(&hub)).await {
+                            match profile
+                                .solve_file(&mut state, Some(&hub), Some(cancel_flag.as_ref()))
+                                .await
+                            {
                                 Ok(report) => {
                                     println!("  Resolved {} domains", report.solved.domains.len());
                                     println!("  Path metrics:");
@@ -1957,17 +1978,32 @@ fn main() -> anyhow::Result<()> {
                                     println!("  Failed to resolve {}: {}", profile_name, e);
                                 }
                             }
+
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
+                                interrupted = true;
+                                break;
+                            }
                         }
 
                         hub.set_clash_state(state)?;
+
+                        if interrupted {
+                            println!("Saved partial resolved state. Exiting due to interrupt.");
+                            return Ok::<bool, anyhow::Error>(true);
+                        }
 
                         // Rehydrate to reflect latest state-backed proxy availability
                         let mut hub = nsproxy_core::uplink::UplinkHub::new();
                         let count = hub.hydrate_from_persisted()?;
                         println!("Loaded {} proxies from resolved profiles", count);
 
-                        Ok::<(), anyhow::Error>(())
+                        Ok::<bool, anyhow::Error>(false)
                     })?;
+
+                    if interrupted {
+                        exit(130);
+                    }
                 }
                 ClashOps::ConfigExplain { path } => {
                     use anyhow::Context;
