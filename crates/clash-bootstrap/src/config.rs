@@ -63,8 +63,6 @@ impl BootstrapConfig {
     pub fn defaults() -> Self {
         let default_servers = vec![
             NameServer::new("8.8.8.8", DEFAULT_DNS_PORT).unwrap(),
-            NameServer::new("8.8.4.4", DEFAULT_DNS_PORT).unwrap(),
-            NameServer::new("1.1.1.1", DEFAULT_DNS_PORT).unwrap(),
             NameServer::new("1.0.0.1", DEFAULT_DNS_PORT).unwrap(),
         ];
         Self {

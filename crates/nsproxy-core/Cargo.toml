@@ -68,13 +68,15 @@ diag = { path = "../diag" }
 clash-config = { path = "../clash-config" }
 trojan-proto = { path = "../trojan-proto" }
 tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["std", "ring"] }
+rustls = { version = "0.23", features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 sha2 = "0.10"
 hex = "0.4"
 bytes = "1"
 url = "2.5"
 owo-colors = "3.5.0"
+h2 = "0.4"
+http = "1.2"
 # Integrated from tun2socks5
 async-recursion = "1.0"
 async-trait = "0.1"

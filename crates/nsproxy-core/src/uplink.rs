@@ -1000,6 +1000,112 @@ pub mod proxy_adapters {
     }
 
     // ==============================================================================
+    // TLS over TcpLike (no-SNI, trust-dns equivalent)
+    // ==============================================================================
+
+    /// TLS client config with SNI disabled and h2 ALPN.
+    /// Equivalent to trust-dns-resolver's `CLIENT_CONFIG`:
+    /// - Mozilla root CA store (`webpki_roots`)
+    /// - SNI disabled (`enable_sni = false`) to prevent ISP blocking by SNI name
+    /// - ALPN set to `["h2"]` for HTTP/2 (required for DoH)
+    static NO_SNI_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
+        std::sync::LazyLock::new(|| {
+            let _ = super::ensure_rustls_crypto_provider();
+
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            config.enable_sni = false;
+            
+            config.alpn_protocols = vec![b"h2".to_vec()];
+
+            Arc::new(config)
+        });
+
+    /// TLS-over-TcpLike stream wrapper.
+    /// The inner stream is a `TlsStream` over a boxed `TcpLike`,
+    /// so it works with any underlying transport (Trojan, SOCKS5, direct, etc.)
+    struct TlsOverTcpLikeConn {
+        inner: TlsStream<Box<dyn TcpLike>>,
+        info: String,
+    }
+
+    impl TcpLike for TlsOverTcpLikeConn {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl AsyncRead for TlsOverTcpLikeConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TlsOverTcpLikeConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Wrap any `TcpLike` stream in TLS with SNI disabled (trust-dns equivalent).
+    ///
+    /// Uses the shared `NO_SNI_TLS_CONFIG` which has:
+    /// - SNI disabled (prevents ISP blocking by server name)
+    /// - h2 ALPN (required for DoH over HTTP/2)
+    /// - Mozilla root CA store
+    ///
+    /// The `hostname` is still used for certificate verification, just not
+    /// sent in the TLS ClientHello SNI extension.
+    pub async fn wrap_tls_no_sni(
+        stream: Box<dyn TcpLike>,
+        hostname: ServerName<'static>,
+        info_prefix: &str,
+    ) -> anyhow::Result<Box<dyn TcpLike>> {
+        info!("TLS conn at {:?}", hostname);
+
+        let connector = TlsConnector::from(NO_SNI_TLS_CONFIG.clone());
+
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect(hostname.clone(), stream),
+        )
+        .await
+        .context("Timeout during no-SNI TLS handshake")??;
+
+        Ok(Box::new(TlsOverTcpLikeConn {
+            inner: tls_stream,
+            info: format!("{}+tls-nosni", info_prefix),
+        }))
+    }
+
+    // ==============================================================================
     // Adapters
     // ==============================================================================
 
