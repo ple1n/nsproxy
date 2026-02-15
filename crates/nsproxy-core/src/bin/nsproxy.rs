@@ -1302,8 +1302,6 @@ fn main() -> anyhow::Result<()> {
                 info!("Location: {:?}", target_dir);
                 info!("Config: {:?}", profile_path);
                 info!("Hot config: {:?}", new_profile.hot);
-                info!("");
-                info!("Use with: sp make --name {}", clean_name);
             }
         }
         MainCommand::Up { profile } => {
