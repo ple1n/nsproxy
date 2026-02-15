@@ -10,6 +10,7 @@ use std::hash::Hash;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{LazyLock, RwLock};
 use std::{borrow::Cow, os::fd::AsRawFd, path::PathBuf};
 
 use anyhow::ensure;
@@ -38,9 +39,27 @@ pub const RUNTIME_ROOT: &str = "/run/nsproxy";
 pub mod state_paths {
     use super::*;
 
+    static PERSIST_ROOT_STATE: LazyLock<RwLock<PathBuf>> =
+        LazyLock::new(|| RwLock::new(PathBuf::from(PERSIST_ROOT)));
+
+    /// Current persistent root for profile state.
+    pub fn persist_root() -> PathBuf {
+        PERSIST_ROOT_STATE
+            .read()
+            .expect("persist root lock poisoned")
+            .clone()
+    }
+
+    /// Override persistent root for the current process.
+    pub fn set_persist_root(root: impl Into<PathBuf>) {
+        *PERSIST_ROOT_STATE
+            .write()
+            .expect("persist root lock poisoned") = root.into();
+    }
+
     /// Get profile directory for a named profile
     pub fn profile_dir(name: &str) -> PathBuf {
-        PathBuf::from(PERSIST_ROOT).join(name)
+        persist_root().join(name)
     }
 
     /// Get profile.json path for a named profile
@@ -83,13 +102,13 @@ pub mod state_paths {
     /// Get uplink root directory for a specific kind (e.g., "clash", "geph")
     /// Returns /nsp3/uplink/{kind}
     pub fn uplink_dir(kind: &str) -> PathBuf {
-        PathBuf::from(PERSIST_ROOT).join("uplink").join(kind)
+        persist_root().join("uplink").join(kind)
     }
 
     /// Get uplink root directory
     /// Returns /nsp3/uplink
     pub fn uplink_root() -> PathBuf {
-        PathBuf::from(PERSIST_ROOT).join("uplink")
+        persist_root().join("uplink")
     }
 
     /// Get uplink profile directory for a specific kind and profile name
@@ -107,7 +126,7 @@ pub mod state_paths {
     /// Global wrapped binaries config path
     /// Returns /nsp3/wrapped_binaries.json
     pub fn wrapped_binaries_config() -> PathBuf {
-        PathBuf::from(PERSIST_ROOT).join("wrapped_binaries.json")
+        persist_root().join("wrapped_binaries.json")
     }
 
     /// Centralized Clash state path

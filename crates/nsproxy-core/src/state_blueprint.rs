@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{PERSIST_ROOT, RUNTIME_ROOT, state_paths};
+use crate::{RUNTIME_ROOT, state_paths};
 
 /// Standard persistence contract for global JSON state structs.
 pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
@@ -108,7 +108,7 @@ impl StateNode {
 pub fn global_state_tree() -> StateNode {
     StateNode::branch(
         "nsp3",
-        PathBuf::from(PERSIST_ROOT),
+        state_paths::persist_root(),
         vec![
             StateNode::leaf(
                 "wrapped_binaries",

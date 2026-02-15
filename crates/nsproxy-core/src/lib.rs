@@ -1013,7 +1013,7 @@ fn default_recursive() -> bool {
 
 impl ProfileConfig {
     pub fn load(path: &Path) -> Result<ProfileConfig> {
-        create_dir_all(PERSIST_ROOT)?;
+        create_dir_all(state_paths::persist_root())?;
         let fc = std::fs::read_to_string(path)?;
         let conf: ProfileConfig = serde_json::from_str(&fc)?;
         conf.validate()?;
