@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
     rl::Resource::NOFILE.set(hard, hard)?;
 
     match cli.cmd {
-        MainCommand::Serve { port } => {
+        MainCommand::Socks5 { port } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -1372,7 +1372,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        MainCommand::Tun {
+        MainCommand::Serve {
             profile,
             tun: proxy,
             no_default,
