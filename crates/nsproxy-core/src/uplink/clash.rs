@@ -1,25 +1,26 @@
 use super::*;
 use crate::state_blueprint::PersistentState;
+use anyhow::Context;
 use bytes::BytesMut;
 use clash_config::Config;
 use rustls::pki_types::ServerName;
-use anyhow::Context;
 use sha2::{Digest, Sha224};
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use tokio::io::ReadBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::ReadBuf;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio_rustls::TlsConnector;
+use trojan_proto::{AddressRef, HostRef, write_request_header};
 use trust_dns_proto::op::{Message, Query};
 use trust_dns_proto::rr::{Name, RecordType};
 use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
-use trojan_proto::{AddressRef, HostRef, write_request_header};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 // Shorter alias for the commonly used TLS stream type
 type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
@@ -27,9 +28,9 @@ type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 #[derive(Debug, Clone)]
 pub struct ClashProfile {
     pub name: String,
-    pub bootstrap_nameservers: Vec<String>,
-    pub main_nameservers: Vec<String>,
-    pub proxy_domains: Vec<String>,
+    pub bootstrap_nameservers: HashSet<String>,
+    pub main_nameservers: HashSet<String>,
+    pub proxy_domains: HashSet<String>,
 }
 
 /// Trojan proxy configuration as read from Clash config
@@ -145,10 +146,7 @@ impl tokio::io::AsyncWrite for TrojanTcpStream {
         Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.0).poll_flush(cx)
     }
 
@@ -180,10 +178,7 @@ impl tokio::io::AsyncWrite for TrojanUdpTunnel {
         Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.0).poll_flush(cx)
     }
 
@@ -274,8 +269,8 @@ impl TrojanProxy {
             .with_no_client_auth();
 
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
-        let server_name =
-            ServerName::try_from(self.server_name.clone()).context("Invalid server name for TLS")?;
+        let server_name = ServerName::try_from(self.server_name.clone())
+            .context("Invalid server name for TLS")?;
 
         let mut tls_stream = tls_connector
             .connect(server_name, tcp_stream)
@@ -315,15 +310,17 @@ impl ClashProfile {
         let config =
             Config::try_from(yaml_path.clone()).context("Failed to parse Clash YAML config")?;
 
-        let bootstrap_nameservers = config.dns.default_nameserver.clone();
-        let main_nameservers = config.dns.nameserver.clone();
-
+        let bootstrap_nameservers: HashSet<String> =
+            config.dns.default_nameserver.iter().cloned().collect();
+        let mut main_nameservers: HashSet<String> =
+            config.dns.nameserver.iter().cloned().collect();
+        main_nameservers.extend(config.dns.fallback.iter().cloned());
         let proxies = config
             .proxy
             .as_ref()
             .context("No proxies found in Clash config")?;
 
-        let proxy_domains: Vec<String> = proxies
+        let proxy_domains: HashSet<String> = proxies
             .iter()
             .filter_map(|proxy| {
                 proxy
@@ -340,7 +337,10 @@ impl ClashProfile {
         let profile_dir = state_paths::uplink_profile_dir("clash", profile_name);
         let dest_config = state_paths::uplink_profile_config("clash", profile_name);
 
-        info!("Importing Clash profile '{}' into {:?}", profile_name, profile_dir);
+        info!(
+            "Importing Clash profile '{}' into {:?}",
+            profile_name, profile_dir
+        );
         info!("Ensuring profile directory exists: {:?}", profile_dir);
         std::fs::create_dir_all(&profile_dir)
             .context("Failed to create clash profile directory")?;
@@ -351,7 +351,10 @@ impl ClashProfile {
             _ => yaml_path == &dest_config,
         };
         if skip_copy {
-            info!("Source and destination identical; skipping config copy for {:?}", yaml_path);
+            info!(
+                "Source and destination identical; skipping config copy for {:?}",
+                yaml_path
+            );
         } else {
             info!("Copying config {:?} -> {:?}", yaml_path, dest_config);
             std::fs::copy(yaml_path, &dest_config).context("Failed to copy config file")?;
@@ -428,28 +431,39 @@ impl ClashProfile {
 
     /// Get all domains that need to be resolved (both nameservers and proxies)
     pub fn all_domains(&self) -> Vec<String> {
-        let mut domains = Vec::new();
+        let mut domains: HashSet<String> = HashSet::new();
 
-        for ns in &self.main_nameservers {
-            if let Ok(url) = url::Url::parse(ns) {
-                if let Some(host) = url.host_str() {
-                    if !host.parse::<IpAddr>().is_ok() {
-                        domains.push(host.to_string());
+        for ns in self
+            .bootstrap_nameservers
+            .iter()
+            .chain(self.main_nameservers.iter())
+        {
+            if let Ok(address) = ClashState::parse_nameserver(ns) {
+                match address {
+                    WireAddress::SocketAddress(_) => {}
+                    WireAddress::DomainAddress(host, _) => {
+                        if host.parse::<IpAddr>().is_err() {
+                            domains.insert(host);
+                        }
                     }
                 }
             }
         }
 
-        domains.extend(self.proxy_domains.clone());
-        domains
+        domains.extend(self.proxy_domains.iter().cloned());
+        domains.into_iter().collect()
     }
 
     /// Solve profile using provided `ClashState` and optional `UplinkHub`.
     /// Returns a structured report with domains and path metrics.
-    pub async fn solve_file(&self, state: &mut ClashState, hub: Option<&UplinkHub>) -> Result<ResolveProfileReport> {
+    pub async fn solve_file(
+        &self,
+        state: &mut ClashState,
+        hub: Option<&UplinkHub>,
+    ) -> Result<ResolveProfileReport> {
+        state.prepare_tier2_dns_via_tier1(self).await?;
         state.resolve_profile(self, hub).await
     }
-
 }
 
 // ============================================================================
@@ -517,6 +531,12 @@ pub struct ResolveProfileReport {
     pub metrics: ResolutionMetrics,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendProfileReport {
+    pub added_tier1_nameservers: usize,
+    pub added_tier2_nameservers: usize,
+}
+
 enum PathAttempt {
     Resolved(BTreeSet<IpAddr>),
     Skipped,
@@ -527,10 +547,24 @@ enum PathAttempt {
 #[serde(default)]
 pub struct ClashState {
     pub schema_version: u32,
-    pub tier1_nameservers: Vec<WireAddress>, // direct IP/domain nameservers
-    pub tier2_nameservers: Vec<WireAddress>, 
+    pub tier1_nameservers: BTreeMap<SocketAddr, DNSEndpoints>, // direct IP/domain nameservers
+    /// Host -> available endpoints
+    pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
     pub tier2_cache: DomainsSolved,
-    pub proxies: DomainsSolved
+    pub proxies: DomainsSolved,
+}
+
+pub type DNSEndpoints = BTreeSet<DNSEndpoint>;
+
+pub struct DNSEndpoint {
+    proto: DNSProtocol,
+    port: u16
+}
+
+pub enum DNSProtocol {
+    TLS,
+    UDP,
+    TCP
 }
 
 impl ClashState {
@@ -546,6 +580,30 @@ impl ClashState {
         <Self as PersistentState>::save_atomic(self)
     }
 
+    /// Append profile tier nameservers into centralized clash state.
+    /// Existing nameservers are preserved and not duplicated.
+    pub fn append_profile(&mut self, profile: &ClashProfile) -> Result<AppendProfileReport> {
+        let mut report = AppendProfileReport::default();
+
+        let tier1 = Self::parse_nameserver_list(&profile.bootstrap_nameservers)
+            .context("Failed to parse tier1 nameservers")?;
+        for nameserver in tier1 {
+            if self.tier1_nameservers.insert(nameserver) {
+                report.added_tier1_nameservers += 1;
+            }
+        }
+
+        let tier2 = Self::parse_nameserver_list(&profile.main_nameservers)
+            .context("Failed to parse tier2 nameservers")?;
+        for nameserver in tier2 {
+            if self.tier2_nameservers.insert(nameserver) {
+                report.added_tier2_nameservers += 1;
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Return the newest cached tier2 nameserver-host resolution.
     pub fn get_latest_ips(&self, host: &str) -> Option<&BTreeSet<IpAddr>> {
         self.tier2_cache
@@ -556,7 +614,10 @@ impl ClashState {
 
     /// Update tier2 nameserver-host cache.
     pub fn update_cache(&mut self, host: &str, ips: BTreeSet<IpAddr>) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         self.tier2_cache
             .entry(host.to_string())
             .or_insert_with(BTreeMap::new)
@@ -565,7 +626,10 @@ impl ClashState {
 
     /// Store latest resolved proxy-domain IPs in the centralized clash state.
     pub fn add_proxy_resolution(&mut self, domain: &str, ips: BTreeSet<IpAddr>) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         self.proxies
             .entry(domain.to_string())
             .or_insert_with(BTreeMap::new)
@@ -580,7 +644,11 @@ impl ClashState {
             .map(|(_, response)| &response.ips)
     }
 
-    fn cached_for_target(&self, target: ResolutionTargetKind, domain: &str) -> Option<BTreeSet<IpAddr>> {
+    fn cached_for_target(
+        &self,
+        target: ResolutionTargetKind,
+        domain: &str,
+    ) -> Option<BTreeSet<IpAddr>> {
         let map = match target {
             ResolutionTargetKind::ProxyDomain => &self.proxies,
             ResolutionTargetKind::Tier2DnsDomain => &self.tier2_cache,
@@ -603,12 +671,24 @@ impl ClashState {
         }
     }
 
+    fn nameserver_url_default_port(scheme: &str) -> Option<u16> {
+        match scheme {
+            "https" => Some(443),
+            "http" => Some(80),
+            "tls" => Some(853),
+            "udp" | "tcp" | "dns" => Some(53),
+            _ => None,
+        }
+    }
+
     fn parse_nameserver(raw: &str) -> Result<WireAddress> {
         if let Ok(url) = url::Url::parse(raw) {
             let host = url
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("URL nameserver missing host: {}", raw))?;
-            let port = url.port_or_known_default().unwrap_or(53);
+            let port = url.port().or_else(|| {
+                url.port_or_known_default().or_else(|| Self::nameserver_url_default_port(url.scheme()))
+            }).unwrap_or(53);
             if let Ok(ip) = host.parse::<IpAddr>() {
                 return Ok(WireAddress::SocketAddress(SocketAddr::new(ip, port)));
             }
@@ -626,14 +706,14 @@ impl ClashState {
         Ok(WireAddress::DomainAddress(raw.to_string(), 53))
     }
 
-    fn parse_nameserver_list(values: &[String]) -> Result<Vec<WireAddress>> {
-        values
-            .iter()
-            .map(|s| Self::parse_nameserver(s))
-            .collect()
+    fn parse_nameserver_list<'a, I>(values: I) -> Result<BTreeSet<WireAddress>>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        values.into_iter().map(|s| Self::parse_nameserver(s)).collect()
     }
 
-    fn nameserver_query_hosts(nameservers: &[WireAddress]) -> Vec<String> {
+    fn nameserver_query_hosts(nameservers: &BTreeSet<WireAddress>) -> Vec<String> {
         nameservers
             .iter()
             .map(|ns| match ns {
@@ -644,9 +724,9 @@ impl ClashState {
     }
 
     fn has_proxy_resolvers(hub: &UplinkHub) -> bool {
-        hub.all_proxies().values().any(|proxy| {
-            matches!(proxy, UplinkProxy::Trojan(_) | UplinkProxy::Remote(_))
-        })
+        hub.all_proxies()
+            .values()
+            .any(|proxy| matches!(proxy, UplinkProxy::Trojan(_) | UplinkProxy::Remote(_)))
     }
 
     fn wire_host_port(wire: &WireAddress) -> (String, u16) {
@@ -682,7 +762,8 @@ impl ClashState {
     }
 
     fn parse_dns_response(response_bytes: &[u8], domain: &str) -> Result<Vec<IpAddr>> {
-        let response = Message::from_bytes(response_bytes).context("Failed to parse DNS response")?;
+        let response =
+            Message::from_bytes(response_bytes).context("Failed to parse DNS response")?;
         let mut ips = Vec::new();
 
         for answer in response.answers() {
@@ -705,7 +786,11 @@ impl ClashState {
         query_bytes: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
-        let bind_addr = if nameserver.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind_addr = if nameserver.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let socket = UdpSocket::bind(bind_addr)
             .await
             .context("Failed to bind UDP socket for DNS query")?;
@@ -760,7 +845,11 @@ impl ClashState {
         Ok(response)
     }
 
-    async fn query_dns_direct(nameserver: &WireAddress, domain: &str, timeout: Duration) -> Result<Vec<IpAddr>> {
+    async fn query_dns_direct(
+        nameserver: &WireAddress,
+        domain: &str,
+        timeout: Duration,
+    ) -> Result<Vec<IpAddr>> {
         let query_bytes = Self::build_dns_query(domain)?;
         let nameserver_addr = Self::resolve_wire_socket_addr(nameserver).await?;
 
@@ -769,17 +858,79 @@ impl ClashState {
             Err(udp_err) => {
                 warn!(
                     "UDP DNS query failed via {} for {}: {}; trying TCP",
-                    nameserver,
-                    domain,
-                    udp_err
+                    nameserver, domain, udp_err
                 );
-                let response = Self::query_dns_direct_tcp(nameserver_addr, &query_bytes, timeout).await?;
+                let response =
+                    Self::query_dns_direct_tcp(nameserver_addr, &query_bytes, timeout).await?;
                 Self::parse_dns_response(&response, domain)
             }
         }
     }
 
-    async fn resolve_domain_direct_via(&self, domain: &str, nameservers: &[WireAddress]) -> Result<BTreeSet<IpAddr>> {
+    async fn query_dns_direct_tls(
+        nameserver: &WireAddress,
+        domain: &str,
+        timeout: Duration,
+    ) -> Result<Vec<IpAddr>> {
+        let query_bytes = Self::build_dns_query(domain)?;
+        let nameserver_addr = Self::resolve_wire_socket_addr(nameserver).await?;
+
+        let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(nameserver_addr))
+            .await
+            .context("Timeout connecting TLS DNS server")?
+            .context("Failed connecting TLS DNS server")?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let tls_connector = TlsConnector::from(Arc::new(tls_config));
+        let server_name_raw = match nameserver {
+            WireAddress::SocketAddress(sock) => sock.ip().to_string(),
+            WireAddress::DomainAddress(host, _) => host.clone(),
+        };
+        let server_name = ServerName::try_from(server_name_raw)
+            .context("Invalid server name for DNS-over-TLS")?;
+
+        let mut tls_stream = tokio::time::timeout(timeout, tls_connector.connect(server_name, tcp_stream))
+            .await
+            .context("Timeout during DNS-over-TLS handshake")?
+            .context("DNS-over-TLS handshake failed")?;
+
+        let len = query_bytes.len() as u16;
+        let mut request = Vec::with_capacity(2 + query_bytes.len());
+        request.extend_from_slice(&len.to_be_bytes());
+        request.extend_from_slice(&query_bytes);
+
+        tokio::time::timeout(timeout, tls_stream.write_all(&request))
+            .await
+            .context("Timeout writing DNS-over-TLS query")?
+            .context("Failed writing DNS-over-TLS query")?;
+
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(timeout, tls_stream.read_exact(&mut len_buf))
+            .await
+            .context("Timeout reading DNS-over-TLS response length")?
+            .context("Failed reading DNS-over-TLS response length")?;
+
+        let response_len = u16::from_be_bytes(len_buf) as usize;
+        let mut response = vec![0u8; response_len];
+        tokio::time::timeout(timeout, tls_stream.read_exact(&mut response))
+            .await
+            .context("Timeout reading DNS-over-TLS response body")?
+            .context("Failed reading DNS-over-TLS response body")?;
+
+        Self::parse_dns_response(&response, domain)
+    }
+
+    async fn resolve_domain_direct_via(
+        &self,
+        domain: &str,
+        nameservers: &BTreeSet<WireAddress>,
+    ) -> Result<BTreeSet<IpAddr>> {
         let timeout = Duration::from_secs(8);
         let mut last_err: Option<anyhow::Error> = None;
 
@@ -787,24 +938,27 @@ impl ClashState {
             match Self::query_dns_direct(nameserver, domain, timeout).await {
                 Ok(ips) => return Ok(ips.into_iter().collect()),
                 Err(e) => {
-                    warn!("Direct DNS query failed via {} for {}: {}", nameserver, domain, e);
+                    warn!(
+                        "Direct DNS query failed via {} for {}: {}",
+                        nameserver, domain, e
+                    );
                     last_err = Some(e);
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!(
-            "All direct DNS queries failed for {}",
-            domain
-        )))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("All direct DNS queries failed for {}", domain)))
     }
 
     async fn resolve_domain_direct_tier2(&self, domain: &str) -> Result<BTreeSet<IpAddr>> {
-        self.resolve_domain_direct_via(domain, &self.tier2_nameservers).await
+        self.resolve_domain_direct_via(domain, &self.tier2_nameservers)
+            .await
     }
 
     async fn resolve_domain_direct_tier1(&self, domain: &str) -> Result<BTreeSet<IpAddr>> {
-        self.resolve_domain_direct_via(domain, &self.tier1_nameservers).await
+        self.resolve_domain_direct_via(domain, &self.tier1_nameservers)
+            .await
     }
 
     async fn attempt_path(
@@ -822,7 +976,7 @@ impl ClashState {
                 if !Self::has_proxy_resolvers(hub) || proxy_tier2_servers.is_empty() {
                     return PathAttempt::Skipped;
                 }
-                match Self::resolve_via_available_proxies(hub, domain, &proxy_tier2_servers).await {
+                match Self::resolve_via_available_proxies(hub, domain, proxy_tier2_servers).await {
                     Ok(ips) => PathAttempt::Resolved(ips),
                     Err(e) => PathAttempt::Failed(e),
                 }
@@ -835,23 +989,19 @@ impl ClashState {
                 if !Self::has_proxy_resolvers(hub) || proxy_tier1_servers.is_empty() {
                     return PathAttempt::Skipped;
                 }
-                match Self::resolve_via_available_proxies(hub, domain, &proxy_tier1_servers).await {
+                match Self::resolve_via_available_proxies(hub, domain, proxy_tier1_servers).await {
                     Ok(ips) => PathAttempt::Resolved(ips),
                     Err(e) => PathAttempt::Failed(e),
                 }
             }
-            ResolutionPath::DirectTier2 => {
-                match self.resolve_domain_direct_tier2(domain).await {
-                    Ok(ips) => PathAttempt::Resolved(ips),
-                    Err(e) => PathAttempt::Failed(e),
-                }
-            }
-            ResolutionPath::DirectTier1 => {
-                match self.resolve_domain_direct_tier1(domain).await {
-                    Ok(ips) => PathAttempt::Resolved(ips),
-                    Err(e) => PathAttempt::Failed(e),
-                }
-            }
+            ResolutionPath::DirectTier2 => match self.resolve_domain_direct_tier2(domain).await {
+                Ok(ips) => PathAttempt::Resolved(ips),
+                Err(e) => PathAttempt::Failed(e),
+            },
+            ResolutionPath::DirectTier1 => match self.resolve_domain_direct_tier1(domain).await {
+                Ok(ips) => PathAttempt::Resolved(ips),
+                Err(e) => PathAttempt::Failed(e),
+            },
         }
     }
 
@@ -870,26 +1020,17 @@ impl ClashState {
         }
 
         for path in ResolutionPolicy::paths_for(target) {
-            match self.attempt_path(
-                *path,
-                domain,
-                hub,
-            )
-            .await
-            {
+            match self.attempt_path(*path, domain, hub).await {
                 PathAttempt::Resolved(ip_set) => {
-                    info!(
-                        "Resolved {} -> {} IPs via {:?}",
-                        domain,
-                        ip_set.len(),
-                        path
-                    );
+                    info!("Resolved {} -> {} IPs via {:?}", domain, ip_set.len(), path);
                     metrics.mark_resolved(*path);
                     solved.add_resolution(domain.to_string(), ip_set.clone());
                     self.store_target_resolution(target, domain, ip_set);
                     return;
                 }
-                PathAttempt::Skipped => {}
+                PathAttempt::Skipped => {
+                    info!("Skipped {:?} for {}", path, domain);
+                }
                 PathAttempt::Failed(e) => {
                     warn!("Resolution path {:?} failed for {}: {}", path, domain, e);
                 }
@@ -902,7 +1043,7 @@ impl ClashState {
     async fn resolve_via_available_proxies(
         hub: &UplinkHub,
         domain: &str,
-        dns_servers: &[WireAddress],
+        dns_servers: &BTreeSet<WireAddress>,
     ) -> Result<BTreeSet<IpAddr>> {
         use super::proxy_adapters::{RemoteAdapter, TrojanAdapter};
 
@@ -918,59 +1059,57 @@ impl ClashState {
                 match proxy {
                     UplinkProxy::Trojan(trojan) => {
                         let resolved_ip = trojan.server_addr.ip();
-                        let mut conn = match TrojanAdapter::connect(trojan, &dns_host, dns_port, resolved_ip).await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                warn!(
-                                    "Proxy DNS connect failed via trojan {} for server {}: {}",
-                                    trojan.server_name,
-                                    dns_server,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
+                        let mut conn =
+                            match TrojanAdapter::connect(trojan, &dns_host, dns_port, resolved_ip)
+                                .await
+                            {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    warn!(
+                                        "Proxy DNS connect failed via trojan {} for server {}: {}",
+                                        trojan.server_name, dns_server, e
+                                    );
+                                    continue;
+                                }
+                            };
 
-                        match proxy_dns::query_via_proxy(&mut conn, dns_server, domain, timeout).await {
+                        match proxy_dns::query_via_proxy(&mut conn, dns_server, domain, timeout)
+                            .await
+                        {
                             Ok(ips) => {
                                 return Ok(ips.into_iter().collect());
                             }
                             Err(e) => {
                                 warn!(
                                     "Proxy DNS query failed via trojan {} using {} for {}: {}",
-                                    trojan.server_name,
-                                    dns_server,
-                                    domain,
-                                    e
+                                    trojan.server_name, dns_server, domain, e
                                 );
                             }
                         }
                     }
                     UplinkProxy::Remote(remote) => {
-                        let mut conn = match RemoteAdapter::connect(remote, &dns_host, dns_port).await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                warn!(
-                                    "Proxy DNS connect failed via remote {} for server {}: {}",
-                                    remote.addr,
-                                    dns_server,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
+                        let mut conn =
+                            match RemoteAdapter::connect(remote, &dns_host, dns_port).await {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    warn!(
+                                        "Proxy DNS connect failed via remote {} for server {}: {}",
+                                        remote.addr, dns_server, e
+                                    );
+                                    continue;
+                                }
+                            };
 
-                        match proxy_dns::query_via_proxy(&mut conn, dns_server, domain, timeout).await {
+                        match proxy_dns::query_via_proxy(&mut conn, dns_server, domain, timeout)
+                            .await
+                        {
                             Ok(ips) => {
                                 return Ok(ips.into_iter().collect());
                             }
                             Err(e) => {
                                 warn!(
                                     "Proxy DNS query failed via remote {} using {} for {}: {}",
-                                    remote.addr,
-                                    dns_server,
-                                    domain,
-                                    e
+                                    remote.addr, dns_server, domain, e
                                 );
                             }
                         }
@@ -980,12 +1119,16 @@ impl ClashState {
             }
         }
 
-        anyhow::bail!("All proxy-based DNS resolution attempts failed for {}", domain)
+        anyhow::bail!(
+            "All proxy-based DNS resolution attempts failed for {}",
+            domain
+        )
     }
 
-    /// Resolve a profile using strategy-driven path policy.
-    pub async fn resolve_profile(&mut self, profile: &ClashProfile, hub: Option<&UplinkHub>) -> Result<ResolveProfileReport> {
-        // Seed tier lists if empty
+    /// Prepare tier2 DNS hostnames by resolving them via tier1 DNS resolvers
+    /// and storing results into `tier2_cache`.
+    pub async fn prepare_tier2_dns_via_tier1(&mut self, profile: &ClashProfile) -> Result<()> {
+        warn!("Resolving Tier2 DNS servers");
         if self.tier1_nameservers.is_empty() {
             self.tier1_nameservers = Self::parse_nameserver_list(&profile.bootstrap_nameservers)
                 .context("Failed to parse tier1 nameservers")?;
@@ -996,41 +1139,76 @@ impl ClashState {
         }
 
         let tier2_query_hosts = Self::nameserver_query_hosts(&self.tier2_nameservers);
+        let mut failed_hosts = Vec::new();
 
+        for host in tier2_query_hosts {
+            if host.parse::<IpAddr>().is_ok() {
+                continue;
+            }
+
+            if self.get_latest_ips(&host).is_some() {
+                continue;
+            }
+
+            match self.resolve_domain_direct_tier1(&host).await {
+                Ok(ip_set) => {
+                    info!(
+                        "Prepared tier2 DNS host {} via tier1 ({} IPs)",
+                        host,
+                        ip_set.len()
+                    );
+                    self.update_cache(&host, ip_set);
+                }
+                Err(e) => {
+                    warn!("Failed preparing tier2 DNS host {} via tier1: {}", host, e);
+                    failed_hosts.push(format!("{} ({})", host, e));
+                }
+            }
+        }
+
+        if !failed_hosts.is_empty() {
+            anyhow::bail!(
+                "Failed to prepare tier2 DNS hosts via tier1: {}",
+                failed_hosts.join(", ")
+            );
+        }
+
+        if let Err(e) = self.save_atomic() {
+            warn!(
+                "Failed to persist ClashState after tier2 preparation: {}",
+                e
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a profile using strategy-driven path policy.
+    pub async fn resolve_profile(
+        &mut self,
+        profile: &ClashProfile,
+        hub: Option<&UplinkHub>,
+    ) -> Result<ResolveProfileReport> {
         info!("ClashState DNS resolver initialized (internal)");
-        info!("  Bootstrap tier: {} nameservers", self.tier1_nameservers.len());
+        info!(
+            "  Bootstrap tier: {} nameservers",
+            self.tier1_nameservers.len()
+        );
         info!("  Main tier: {} nameservers", self.tier2_nameservers.len());
 
         let mut solved = ProfileSolved::new();
         let mut metrics = ResolutionMetrics::default();
 
-        // Step 1: resolve tier2 nameserver hostnames.
-        for host in &tier2_query_hosts {
-            if host.parse::<IpAddr>().is_ok() {
-                continue;
-            }
-            self
-                .resolve_target_domain(
-                    ResolutionTargetKind::Tier2DnsDomain,
-                    host,
-                    hub,
-                    &mut solved,
-                    &mut metrics,
-                )
-                .await;
-        }
-
-        // Step 2: resolve proxy domains.
+        // Resolve proxy domains (tier2 DNS is assumed to be pre-prepared).
         for domain in &profile.proxy_domains {
-            self
-                .resolve_target_domain(
-                    ResolutionTargetKind::ProxyDomain,
-                    domain,
-                    hub,
-                    &mut solved,
-                    &mut metrics,
-                )
-                .await;
+            self.resolve_target_domain(
+                ResolutionTargetKind::ProxyDomain,
+                domain,
+                hub,
+                &mut solved,
+                &mut metrics,
+            )
+            .await;
         }
 
         // Persist updated clash state

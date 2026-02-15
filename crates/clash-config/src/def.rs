@@ -218,7 +218,9 @@ pub struct DNS {
     pub ipv6: bool,
     #[educe(Default = true)]
     pub user_hosts: bool,
+    /// Tier 2 DNS, URLs
     pub nameserver: Vec<String>,
+    /// Tier 2 DNS, URLs
     pub fallback: Vec<String>,
     pub fallback_filter: FallbackFilter,
     pub listen: Option<DNSListen>,
@@ -230,6 +232,7 @@ pub struct DNS {
         String::from("114.114.114.114"),
         String::from("8.8.8.8")
     ])]
+    /// Tier 1, Host:Port
     pub default_nameserver: Vec<String>,
     pub nameserver_policy: HashMap<String, String>,
 }
