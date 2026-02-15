@@ -1523,6 +1523,12 @@ pub enum MainCommand {
         #[arg(default_value = "./install")]
         dir: PathBuf,
     },
+    /// Generate shell completions
+    Completions {
+        /// Install fish completions to ~/.config/fish/completions
+        #[arg(long)]
+        fish: bool,
+    },
     /// Remove a bind-mount file
     Rm { file: PathBuf },
     /// Manage wrapped binaries for security (wraps all configured binaries)
