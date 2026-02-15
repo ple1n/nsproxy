@@ -1374,57 +1374,6 @@ pub enum MainCommand {
         #[arg(long)]
         no_proxy: bool,
     },
-    /// Run for profile isolation
-    #[command(alias = "m")]
-    Make {
-        /// Source network namespace (src=/path OR src=1234)
-        #[arg(long, default_value = "this")]
-        src: NsInput,
-        /// Target network namespace (dst=/path OR dst=1234)
-        #[arg(long, default_value = "new")]
-        dst: NsInput,
-        /// Profile config JSON (stable schema)
-        #[arg(long)]
-        profile: Option<PathBuf>,
-        #[command(flatten)]
-        tun: IArgs,
-        /// Make veths, with inner IP defaulting to 100.120.0.2/24
-        /// Not supporting more than one veth for now
-        #[arg(short, long)]
-        veth: bool,
-        /// Persist this container, add it to config file
-        #[arg(short, long)]
-        keep: bool,
-        /// Activate other containers too
-        #[arg(short, long)]
-        all: bool,
-        /// Set TUN as default route. This defaults to true for new net ns
-        #[arg(short, long)]
-        default: bool,
-        /// Do not set TUN as default route.
-        #[arg(short, long)]
-        no_default: bool,
-        #[arg(short, long)]
-        log: Option<LevelFilter>,
-        /// Mount namespaces that are created such that you can access them by paths later
-        #[arg(short, long)]
-        bind: Option<PathBuf>,
-        // This can derive profile path as /nsp3/name/various json files
-        /// Instance name (explicit, used for veth names)
-        #[arg(long)]
-        name: Option<String>,
-        #[command(flatten)]
-        sargs: ShellArgs,
-        /// Validate configs and paths without executing
-        #[arg(long)]
-        check: bool,
-        /// Requires explicit flag for no proxying
-        #[arg(long)]
-        no_proxy: bool,
-        /// Requires explicit flag for no TUN device
-        #[arg(long)]
-        no_tun: bool,
-    },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
