@@ -1639,7 +1639,21 @@ pub enum MainCommand {
     },
     /// Print a typed blueprint tree for global state paths
     StateTree,
+    Dig {
+        #[command(subcommand)]
+        kind: DigTyp,
+        host: String,
+    },
 }
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DigTyp {
+    DOH,
+    DOT,
+    TCP,
+    UDP
+}
+
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum UplinkCommand {
