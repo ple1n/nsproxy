@@ -773,13 +773,7 @@ impl ClashState {
         }
     }
 
-    fn nameserver_protocol_from_scheme(scheme: &str) -> DNSProtocol {
-        match scheme {
-            "tls" => DNSProtocol::TLS,
-            "tcp" => DNSProtocol::TCP,
-            _ => DNSProtocol::UDP,
-        }
-    }
+
 
     fn parse_nameserver(raw: &str) -> Result<(DNSHost, DNSEndpoint)> {
         if let Ok(url) = url::Url::parse(raw) {
@@ -810,7 +804,11 @@ impl ClashState {
                     "Insecure DoH URL scheme 'http' is not supported for nameserver '{}'; use https://.../dns-query",
                     raw
                 ),
-                _ => Self::nameserver_protocol_from_scheme(url.scheme()),
+                _ => match url.scheme() {
+                    "tls" => DNSProtocol::TLS,
+                    "tcp" => DNSProtocol::TCP,
+                    _ => unreachable!(),
+                },
             };
             let endpoint = DNSEndpoint { proto, port };
             if let Ok(ip) = host.parse::<IpAddr>() {
@@ -978,31 +976,57 @@ impl ClashState {
             .to_vec()
             .context("Failed to serialize DNS query for DoH")?;
 
-        info!("Querying {} via DoH endpoint {}", domain, url);
+        info!("DoH query: domain={}, authority={}, path={}, url={}", domain, authority, path, url);
+        info!("DoH payload size={} bytes", payload.len());
+
         let client = reqwest::Client::builder().build()?;
 
-        let response = tokio::time::timeout(
-            timeout,
-            client
-                .post(&url)
-                .header("accept", "application/dns-message")
-                .header("content-type", "application/dns-message")
-                .body(payload)
-                .send(),
-        )
-        .await
-        .context("DoH request timeout")??;
+        let send_future = client
+            .post(&url)
+            .header("accept", "application/dns-message")
+            .header("content-type", "application/dns-message")
+            .body(payload)
+            .send();
 
+        let response = match tokio::time::timeout(timeout, send_future).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                warn!("DoH send error for {}: {}", url, e);
+                return Err(anyhow::anyhow!("DoH send error for {}: {}", url, e));
+            }
+            Err(e) => {
+                warn!("DoH send timeout for {}: {}", url, e);
+                return Err(anyhow::anyhow!("DoH send timeout for {}: {}", url, e));
+            }
+        };
+
+        info!("DoH response status={} for {}", response.status(), url);
         if !response.status().is_success() {
+            warn!("DoH server returned HTTP {} for {}", response.status(), url);
             anyhow::bail!("DoH server returned HTTP {} for {}", response.status(), url);
         }
 
-        let response_bytes = tokio::time::timeout(timeout, response.bytes())
-            .await
-            .context("DoH response read timeout")??;
+        let response_bytes = match tokio::time::timeout(timeout, response.bytes()).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                warn!("DoH response read error for {}: {}", url, e);
+                return Err(anyhow::anyhow!("DoH response read error for {}: {}", url, e));
+            }
+            Err(e) => {
+                warn!("DoH response read timeout for {}: {}", url, e);
+                return Err(anyhow::anyhow!("DoH response read timeout for {}: {}", url, e));
+            }
+        };
 
-        let response = Message::from_bytes(response_bytes.as_ref())
-            .context("Failed to parse DoH DNS response")?;
+        info!("DoH response size={} bytes for {}", response_bytes.len(), url);
+
+        let response = match Message::from_bytes(response_bytes.as_ref()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!("Failed to parse DoH DNS response from {}: {}", url, e);
+                return Err(anyhow::anyhow!("Failed to parse DoH DNS response from {}: {}", url, e));
+            }
+        };
 
         let mut ips = Vec::new();
         for answer in response.answers() {
@@ -1013,7 +1037,9 @@ impl ClashState {
             }
         }
 
+        info!("DoH parsed {} answer(s) for {}", ips.len(), domain);
         if ips.is_empty() {
+            warn!("No IP addresses found for {} via DoH ({})", domain, url);
             anyhow::bail!("No IP addresses found for {} via DoH", domain);
         }
 
@@ -1291,8 +1317,8 @@ impl ClashState {
         }
 
         Err(anyhow::anyhow!(
-            "No cached tier2 IPs available for DNS host '{}'",
-            dns_host
+            "DNS resolution failed for '{}'",
+            domain
         ))
     }
 
