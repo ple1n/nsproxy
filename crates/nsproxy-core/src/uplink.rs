@@ -360,6 +360,23 @@ pub enum UplinkProxy {
     File(PathBuf),
 }
 
+impl std::fmt::Display for UplinkProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UplinkProxy::Trojan(t) => write!(
+                f,
+                "trojan {}@{}:{}",
+                t.name,
+                t.server_name,
+                t.server_addr.port()
+            ),
+            UplinkProxy::Geph => write!(f, "geph"),
+            UplinkProxy::Remote(arg) => write!(f, "remote {}", arg.addr),
+            UplinkProxy::File(p) => write!(f, "file {}", p.display()),
+        }
+    }
+}
+
 impl UplinkHub {
     /// Create a new UplinkHub with a default routing function
     pub fn new() -> Self {
