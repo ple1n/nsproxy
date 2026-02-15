@@ -1007,7 +1007,7 @@ pub mod proxy_adapters {
     pub struct TrojanAdapter;
 
     impl TrojanAdapter {
-        /// Create a Trojan connection (TCP or UDP tunnel)
+        /// Create a Trojan connection 
         pub async fn connect(
             proxy: &clash::TrojanProxy,
             target_host: &str,
@@ -1030,16 +1030,36 @@ pub mod proxy_adapters {
                         ),
                     })))
                 }
-                clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
-                    Ok(ProxyConnection::Udp(Box::new(TrojanUdpConn {
+                _ => unreachable!()
+            }
+        }
+
+        /// Create a Trojan UDP tunnel explicitly (UDP ASSOCIATE)
+        pub async fn connect_udp(
+            proxy: &clash::TrojanProxy,
+            target_host: &str,
+            target_port: u16,
+            resolved_ip: std::net::IpAddr,
+        ) -> anyhow::Result<ProxyConnection> {
+            info!(
+                "Preparing Trojan UDP-associate to {}:{} via {} ({})",
+                target_host, target_port, proxy.server_name, resolved_ip
+            );
+            let conn = proxy
+                .connect_udp(resolved_ip, target_host, target_port)
+                .await?;
+            match conn {
+                clash::TrojanConnection::UdpAssociate(tunnel, _target) => Ok(ProxyConnection::Udp(
+                    Box::new(TrojanUdpConn {
                         inner: tunnel,
                         info: format!(
                             "trojan+udp://{}:{}",
                             proxy.server_name,
                             proxy.server_addr.port()
                         ),
-                    })))
-                }
+                    }),
+                )),
+                _ => unreachable!()
             }
         }
     }

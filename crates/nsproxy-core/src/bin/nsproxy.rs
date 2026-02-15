@@ -18,6 +18,7 @@ use futures::{
     future::join_all,
 };
 use reqwest::redirect::Policy;
+use socks5_impl::protocol::WireAddress;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as TokioWriteExt},
     time::sleep,
@@ -2266,7 +2267,7 @@ fn main() -> anyhow::Result<()> {
                                             match conn {
                                                 nsproxy_core::uplink::clash::TrojanConnection::TcpConnect(mut stream, _) => {
                                                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                                                    
+
                                                     let request = "GET / HTTP/1.1\r\nHost: ip.me\r\nConnection: close\r\n\r\n";
                                                     if let Err(e) = stream.write_all(request.as_bytes()).await {
                                                         println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
@@ -2277,6 +2278,12 @@ fn main() -> anyhow::Result<()> {
                                                             stream.read_to_string(&mut response)
                                                         ).await {
                                                             Ok(Ok(_)) => {
+                                                                // Print raw response data
+                                                                println!("    Raw TCP response ({} bytes):", response.len());
+                                                                for line in response.lines() {
+                                                                    println!("      {}", line);
+                                                                }
+
                                                                 if response.contains("200 OK") || !response.is_empty() {
                                                                     println!("{}  TCP test passed (ip.me responded)", "[✓]".green().bold());
                                                                 } else {
@@ -2304,22 +2311,48 @@ fn main() -> anyhow::Result<()> {
 
                                     // UDP Test: DNS resolution via Trojan
                                     println!("{}  Testing UDP connectivity...", "[•]".cyan());
-                                    match trojan.connect_udp(server_ip, "1.1.1.1", 53).await {
-                                        Ok(conn) => {
-                                            match conn {
-                                                nsproxy_core::uplink::clash::TrojanConnection::UdpAssociate(_, _) => {
-                                                    // Successfully created UDP tunnel
-                                                    // Full DNS query test would require implementing the tunnel protocol
-                                                    println!("{}  UDP tunnel established (Trojan supports UDP)", "[✓]".green().bold());
-                                                    println!("    Trojan UDP ASSOCIATE command successful");
+                                    {
+                                        use nsproxy_core::uplink::proxy_adapters::TrojanAdapter;
+                                        use nsproxy_core::uplink::proxy_dns;
+                                        use std::net::IpAddr;
+
+                                        match nsproxy_core::uplink::proxy_adapters::TrojanAdapter::connect_udp(
+                                            &trojan,
+                                            "1.1.1.1",
+                                            53,
+                                            trojan.server_addr.ip(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(conn) => match conn {
+                                                nsproxy_core::uplink::proxy_adapters::ProxyConnection::Udp(mut tunnel) => {
+                                                    let dns_server = WireAddress::SocketAddress(std::net::SocketAddr::new(
+                                                        "1.1.1.1".parse::<IpAddr>().unwrap(),
+                                                        53,
+                                                    ));
+                                                    match proxy_dns::query_via_udp(
+                                                        tunnel.as_mut(),
+                                                        &dns_server,
+                                                        "ip.me",
+                                                        std::time::Duration::from_secs(5),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(ips) => {
+                                                            println!("{}  UDP test passed (resolved): {:?}", "[✓]".green().bold(), ips);
+                                                        }
+                                                        Err(e) => {
+                                                            println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
+                                                        }
+                                                    }
                                                 }
                                                 _ => {
                                                     println!("{}  UDP test failed: wrong connection type", "[✗]".red().bold());
                                                 }
+                                            },
+                                            Err(e) => {
+                                                println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
                                             }
-                                        }
-                                        Err(e) => {
-                                            println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
                                         }
                                     }
 
