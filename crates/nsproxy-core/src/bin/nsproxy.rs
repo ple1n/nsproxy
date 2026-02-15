@@ -204,6 +204,10 @@ fn load_saved_uplink_hub() -> Result<nsproxy_core::uplink::UplinkHub> {
 
 fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
+    if let Some(root) = cli.root.clone() {
+        state_paths::set_persist_root(root.clone());
+        info!("Using state root: {:?}", root);
+    }
     // DEBUG is annoying because its filled with TCP retransmission logs
     let (layer, reload_handle) = tracing_subscriber::reload::Layer::new(
         fmt::Layer::new()
@@ -1059,7 +1063,7 @@ fn main() -> anyhow::Result<()> {
             info!("Template config: {:?}", path);
 
             // Create target directory at /nsp3/{clean_name}
-            let target_dir = PathBuf::from(PERSIST_ROOT).join(&clean_name);
+            let target_dir = state_paths::profile_dir(&clean_name);
             info!("Target directory: {:?}", target_dir);
 
             let profile_path = target_dir.join("profile.json");
