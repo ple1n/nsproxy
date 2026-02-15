@@ -286,6 +286,10 @@ sp tun --profile container1 -p socks5://127.0.0.1:9909
 sp enter container1
 ```
 
+## On root namespace shielding
+
+I was thinking of a way to prevent identity leak from eg accidental launch of browsers from root namespace such as through desktop launchers. I think there isn't a need for that. The best way is to isolate the state too, such that desktop launchers can not, access the profiles that I need to be anonymous about.
+
 ## Operational philosophy
 
 - Perfection
