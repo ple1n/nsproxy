@@ -1639,21 +1639,7 @@ pub enum MainCommand {
     },
     /// Print a typed blueprint tree for global state paths
     StateTree,
-    Dig {
-        #[command(subcommand)]
-        kind: DigTyp,
-        host: String,
-    },
 }
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum DigTyp {
-    DOH,
-    DOT,
-    TCP,
-    UDP
-}
-
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum UplinkCommand {
@@ -1692,7 +1678,16 @@ pub enum ClashOps {
     },
     /// Resolve proxies that do not have a known IP
     /// Regular upkeeping
-    Resolve,
+    Resolve {
+        #[arg(long)]
+        direct: bool,
+    },
+    /// Test the DNS resolution for one host
+    TestResolve {
+        #[arg(long)]
+        direct: bool,
+        query: String
+    },
 }
 
 pub mod uplink;

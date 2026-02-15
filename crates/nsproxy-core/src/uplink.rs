@@ -1008,7 +1008,7 @@ pub mod proxy_adapters {
 
     impl TrojanAdapter {
         /// Create a Trojan connection 
-        pub async fn connect(
+        pub async fn connect_tcp(
             proxy: &clash::TrojanProxy,
             target_host: &str,
             target_port: u16,
@@ -1018,7 +1018,7 @@ pub mod proxy_adapters {
                 "Preparing Trojan connection to {}:{} via {} ({})",
                 target_host, target_port, proxy.server_name, resolved_ip
             );
-            let conn = proxy.connect(resolved_ip, target_host, target_port).await?;
+            let conn = proxy.connect_tcp(resolved_ip, target_host, target_port).await?;
             match conn {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
                     Ok(ProxyConnection::Tcp(Box::new(TrojanTcpConn {
@@ -1575,7 +1575,7 @@ async fn handle_tcp_via_proxy(
             UplinkProxy::Trojan(t) => {
                 // runtime proxies already carry a resolved `server_addr`
                 let ip = t.server_addr.ip();
-                TrojanAdapter::connect(t, &target_host, target_port, ip).await?
+                TrojanAdapter::connect_tcp(t, &target_host, target_port, ip).await?
             }
             UplinkProxy::Remote(arg) => {
                 RemoteAdapter::connect(arg, &target_host, target_port).await?

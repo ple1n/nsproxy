@@ -48,6 +48,7 @@ use nsproxy_core::{
     utils::ToExactNs,
 };
 use nsproxy_core::{env::ENV_PROFILE, *};
+use owo_colors::OwoColorize;
 use passfd::FdPassingExt;
 use pidfd::PidFd;
 use rtnetlink::packet_route::{
@@ -85,7 +86,6 @@ use std::{
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use owo_colors::OwoColorize;
 use tun2socks5::{
     ArgMode, IArgs, VirtDNSChange, aok, diag,
     dns::{TUNResponse, VirtDNSHandle},
@@ -541,7 +541,11 @@ fn main() -> anyhow::Result<()> {
                                     };
                                     let json = serde_json::to_string_pretty(&ns_alive)?;
                                     let jsonpath = state_paths::metadata_for_bind(&mount);
-                                    info!("Writing NS metadata to {:?} ({} bytes)", &jsonpath, json.len());
+                                    info!(
+                                        "Writing NS metadata to {:?} ({} bytes)",
+                                        &jsonpath,
+                                        json.len()
+                                    );
                                     std::fs::write(&jsonpath, json)?;
                                     warn!("Auxiliary data written to {:?}", &jsonpath);
                                     tx.write(&[0]);
@@ -855,7 +859,6 @@ fn main() -> anyhow::Result<()> {
             sproxyf.set_file_name("nswrap");
             let fd = dstdir.join(sproxyf.file_name().unwrap());
             overwrite(&sproxyf, &fd)?;
-
         }
         MainCommand::Completions { fish } => {
             if fish {
@@ -1368,7 +1371,11 @@ fn main() -> anyhow::Result<()> {
                             child_pid: Some(child_pid as u32),
                         };
                         let json = serde_json::to_string_pretty(&ns_alive)?;
-                        info!("Writing NS metadata to {:?} ({} bytes)", &ns_meta, json.len());
+                        info!(
+                            "Writing NS metadata to {:?} ({} bytes)",
+                            &ns_meta,
+                            json.len()
+                        );
                         std::fs::write(&ns_meta, json)?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
@@ -1485,13 +1492,18 @@ fn main() -> anyhow::Result<()> {
 
                             // Set txqueuelen for TUN device to handle bursty traffic
                             let txqueuelen = 500_000u32; // 
-                            warn!("setting TUN txqueuelen to {} for high throughput", txqueuelen);
+                            warn!(
+                                "setting TUN txqueuelen to {} for high throughput",
+                                txqueuelen
+                            );
                             nl.link()
                                 .set(
                                     LinkMessageBuilder::<LinkUnspec>::default()
                                         .index(tun_state.dev_index)
-                                        .append_extra_attribute(LinkAttribute::TxQueueLen(txqueuelen))
-                                        .build()
+                                        .append_extra_attribute(LinkAttribute::TxQueueLen(
+                                            txqueuelen,
+                                        ))
+                                        .build(),
                                 )
                                 .execute()
                                 .await?;
@@ -1828,17 +1840,21 @@ fn main() -> anyhow::Result<()> {
                     let _ = hub.hydrate_from_persisted()?;
                     let mut clash_state = hub.load_clash_state()?.clone();
 
-                    let clash_profile = nsproxy_core::uplink::clash::ClashProfile::load_file(
-                        profile_name,
-                        &path,
-                    )?;
+                    let clash_profile =
+                        nsproxy_core::uplink::clash::ClashProfile::load_file(profile_name, &path)?;
 
                     let append_report = clash_state.append_profile(&clash_profile)?;
                     hub.set_clash_state(clash_state)?;
 
                     println!("\n✓ Profile imported");
-                    println!("  Tier1 nameservers: {}", clash_profile.tier1_nameservers.len());
-                    println!("  Tier2 nameservers: {}", clash_profile.tier2_nameservers.len());
+                    println!(
+                        "  Tier1 nameservers: {}",
+                        clash_profile.tier1_nameservers.len()
+                    );
+                    println!(
+                        "  Tier2 nameservers: {}",
+                        clash_profile.tier2_nameservers.len()
+                    );
                     println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
                     println!(
                         "  Appended tier1 nameservers: {}",
@@ -1850,7 +1866,6 @@ fn main() -> anyhow::Result<()> {
                     );
 
                     println!("\n✓ Profile '{}' is ready to use", profile_name);
-
                 }
                 ClashOps::Status => {
                     let uplink_dir = state_paths::uplink_dir("clash");
@@ -1879,7 +1894,9 @@ fn main() -> anyhow::Result<()> {
                                 println!("  Loaded {} proxy entries across profiles", count);
                                 let max_show = 5usize;
                                 println!("  Proxy nyms (first {}):", max_show);
-                                for (i, (id, proxy)) in hub.all_proxies().iter().take(max_show).enumerate() {
+                                for (i, (id, proxy)) in
+                                    hub.all_proxies().iter().take(max_show).enumerate()
+                                {
                                     if let Some(nym) = hub.get_nym(id) {
                                         println!(
                                             "    {}: {:?} => {:?} => {}",
@@ -1903,9 +1920,8 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-
                 }
-                ClashOps::Resolve => {
+                ClashOps::Resolve { direct } => {
                     use nsproxy_core::uplink::clash::ClashProfile;
 
                     println!("Resolving Clash profiles and updating resolved state...");
@@ -1973,18 +1989,25 @@ fn main() -> anyhow::Result<()> {
                             );
 
                             match profile
-                                .solve_file(&mut state, Some(&hub), Some(cancel_flag.as_ref()))
+                                .solve_file(
+                                    &mut state,
+                                    Some(&hub),
+                                    Some(cancel_flag.as_ref()),
+                                    direct,
+                                )
                                 .await
                             {
                                 Ok(report) => {
-                                    println!("  Resolved {} domains", report.solved.domains.len());
-                                    println!("  Path metrics:");
-                                    println!("    cache_hits: {}", report.metrics.cache_hits);
-                                    println!("    proxy_tier2: {}", report.metrics.resolved_proxy_tier2);
-                                    println!("    proxy_tier1: {}", report.metrics.resolved_proxy_tier1);
-                                    println!("    direct_tier2: {}", report.metrics.resolved_direct_tier2);
-                                    println!("    direct_tier1: {}", report.metrics.resolved_direct_tier1);
-                                    println!("    unresolved: {}", report.metrics.unresolved);
+                                    println!("  resolved_domains={}", report.solved.domains.len());
+                                    println!(
+                                        "  metrics cache_hits={} proxied_tier2={} proxied_tier1={} direct_tier2={} direct_tier1={} unresolved={}",
+                                        report.metrics.cache_hits,
+                                        report.metrics.resolved_proxy_tier2,
+                                        report.metrics.resolved_proxy_tier1,
+                                        report.metrics.resolved_direct_tier2,
+                                        report.metrics.resolved_direct_tier1,
+                                        report.metrics.unresolved
+                                    );
                                 }
                                 Err(e) => {
                                     println!("  Failed to resolve {}: {}", profile_name, e);
@@ -2036,52 +2059,74 @@ fn main() -> anyhow::Result<()> {
 
                     println!("{}", "Two-Tier DNS".bold());
                     println!();
-                    println!("  {} {} {} {}",
+                    println!(
+                        "  {} {} {} {}",
                         "Bootstrap".cyan().bold(),
                         "->".dimmed(),
                         "Main".cyan().bold(),
-                        "->".dimmed());
-                    println!("  {} resolves {} resolves {}",
+                        "->".dimmed()
+                    );
+                    println!(
+                        "  {} resolves {} resolves {}",
                         "IP nameservers".dimmed(),
                         "main tier".dimmed(),
-                        "proxy domains".dimmed());
+                        "proxy domains".dimmed()
+                    );
                     println!();
 
                     let max_show = 3;
-                    println!("  {} ({} total)", "Bootstrap Tier".cyan(), config.dns.default_nameserver.len());
+                    println!(
+                        "  {} ({} total)",
+                        "Bootstrap Tier".cyan(),
+                        config.dns.default_nameserver.len()
+                    );
                     for ns in config.dns.default_nameserver.iter().take(max_show) {
                         println!("    {}", ns);
                     }
                     if config.dns.default_nameserver.len() > max_show {
-                        println!("    {} ...", format!("+{} more", config.dns.default_nameserver.len() - max_show).dimmed());
+                        println!(
+                            "    {} ...",
+                            format!("+{} more", config.dns.default_nameserver.len() - max_show)
+                                .dimmed()
+                        );
                     }
 
                     println!();
-                    println!("  {} ({} total)", "Main Tier".cyan(), config.dns.nameserver.len());
+                    println!(
+                        "  {} ({} total)",
+                        "Main Tier".cyan(),
+                        config.dns.nameserver.len()
+                    );
                     for ns in config.dns.nameserver.iter().take(max_show) {
                         println!("    {}", ns);
                     }
                     if config.dns.nameserver.len() > max_show {
-                        println!("    {} ...", format!("+{} more", config.dns.nameserver.len() - max_show).dimmed());
+                        println!(
+                            "    {} ...",
+                            format!("+{} more", config.dns.nameserver.len() - max_show).dimmed()
+                        );
                     }
 
                     // Extract proxy information
-                    let proxies = config.proxy.as_ref()
+                    let proxies = config
+                        .proxy
+                        .as_ref()
                         .context("No proxies found in Clash config")?;
 
                     let mut trojan_count = 0;
                     let mut other_count = 0;
-                    let mut proxy_domains = Vec::new();
+                    let mut proxy_domains: HashSet<String> = HashSet::new();
 
                     for proxy in proxies {
-                        let proxy_type = proxy.get("type")
+                        let proxy_type = proxy
+                            .get("type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
 
                         if proxy_type == "trojan" {
                             trojan_count += 1;
                             if let Some(server) = proxy.get("server").and_then(|v| v.as_str()) {
-                                proxy_domains.push(server.to_string());
+                                proxy_domains.insert(server.to_string());
                             }
                         } else {
                             other_count += 1;
@@ -2092,24 +2137,33 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", "Proxies".bold());
                     println!();
                     println!("  {}  {}", "Total".dimmed(), proxies.len());
+                    println!(
+                        "  {}  {}",
+                        "Proxy Domains (unique)".dimmed(),
+                        proxy_domains.len()
+                    );
                     if trojan_count > 0 {
-                        println!("  {}  {} {}", "Trojan".dimmed(), trojan_count, "(supported)".green());
+                        println!(
+                            "  {}  {} {}",
+                            "Trojan".dimmed(),
+                            trojan_count,
+                            "(supported)".green()
+                        );
                     } else {
-                        println!("  {}  {} {}", "Trojan".dimmed(), trojan_count, "(none found)".yellow());
+                        println!(
+                            "  {}  {} {}",
+                            "Trojan".dimmed(),
+                            trojan_count,
+                            "(none found)".yellow()
+                        );
                     }
                     if other_count > 0 {
-                        println!("  {}  {} {}", "Other".dimmed(), other_count, "(not supported)".yellow());
-                    }
-
-                    if !proxy_domains.is_empty() {
-                        println!();
-                        println!("  {}", "Proxy Servers".cyan());
-                        for domain in proxy_domains.iter().take(max_show) {
-                            println!("    {}", domain);
-                        }
-                        if proxy_domains.len() > max_show {
-                            println!("    {} ...", format!("+{} more", proxy_domains.len() - max_show).dimmed());
-                        }
+                        println!(
+                            "  {}  {} {}",
+                            "Other".dimmed(),
+                            other_count,
+                            "(not supported)".yellow()
+                        );
                     }
 
                     // Validate profile
@@ -2149,42 +2203,18 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    if config.dns.nameserver.is_empty() {
-                        println!("  {} No main nameservers", "[x]".red().bold());
-                        valid = false;
-                    } else {
-                        let mut all_valid = true;
-                        for ns in &config.dns.nameserver {
-                            let valid_entry = url::Url::parse(ns).is_ok()
-                                || ns.parse::<std::net::SocketAddr>().is_ok()
-                                || ns.parse::<std::net::IpAddr>().is_ok()
-                                || url::Host::parse(ns).is_ok();
-                            if !valid_entry {
-                                println!(
-                                    "  {} Invalid main nameserver entry: {}",
-                                    "[!]".yellow().bold(),
-                                    ns
-                                );
-                                all_valid = false;
-                            }
-                        }
-
-                        if all_valid {
-                            println!(
-                                "  {} Main nameservers ({})",
-                                "[✓]".green().bold(),
-                                config.dns.nameserver.len()
-                            );
-                        } else {
-                            valid = false;
-                        }
-                    }
-
                     if trojan_count == 0 {
-                        println!("  {} No Trojan proxies (only type supported)", "[!]".yellow().bold());
+                        println!(
+                            "  {} No Trojan proxies (only type supported)",
+                            "[!]".yellow().bold()
+                        );
                         valid = false;
                     } else {
-                        println!("  {} Trojan proxies ({})", "[✓]".green().bold(), trojan_count);
+                        println!(
+                            "  {} Trojan proxies ({})",
+                            "[✓]".green().bold(),
+                            trojan_count
+                        );
                     }
 
                     println!();
@@ -2202,8 +2232,8 @@ fn main() -> anyhow::Result<()> {
             UplinkCommand::Instance { name, cmd } => {
                 match cmd {
                     UplinkInstanceCommand::Test => {
-                        use owo_colors::OwoColorize;
                         use nsproxy_core::uplink::clash::ClashProfile;
+                        use owo_colors::OwoColorize;
                         use std::time::Duration;
 
                         println!("{}", "Proxy Instance Test".bold().bright_cyan());
@@ -2214,7 +2244,9 @@ fn main() -> anyhow::Result<()> {
                         // Load all Clash profiles and build UplinkHub
                         let uplink_dir = state_paths::uplink_dir("clash");
                         if !uplink_dir.exists() {
-                            bail!("No Clash profiles found. Import a profile first with 'sp uplink clash profile-add'.");
+                            bail!(
+                                "No Clash profiles found. Import a profile first with 'sp uplink clash profile-add'."
+                            );
                         }
 
                         let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
@@ -2234,7 +2266,8 @@ fn main() -> anyhow::Result<()> {
                         println!();
 
                         // Look up the proxy by nym
-                        let (proxy_id, proxy) = hub.get_proxy_by_nym(&name)
+                        let (proxy_id, proxy) = hub
+                            .get_proxy_by_nym(&name)
                             .ok_or_else(|| anyhow!("Proxy with nym '{}' not found", name))?;
 
                         println!("Found proxy: {:?}", proxy_id);
@@ -2262,7 +2295,7 @@ fn main() -> anyhow::Result<()> {
 
                                     // TCP Test: Connect to ip.me via Trojan
                                     println!("{}  Testing TCP connectivity...", "[•]".cyan());
-                                    match trojan.connect(server_ip, "ip.me", 80).await {
+                                    match trojan.connect_tcp(server_ip, "ip.me", 80).await {
                                         Ok(conn) => {
                                             match conn {
                                                 nsproxy_core::uplink::clash::TrojanConnection::TcpConnect(mut stream, _) => {

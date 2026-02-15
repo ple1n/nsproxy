@@ -15,14 +15,14 @@ pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
     fn load_or_default() -> Result<Self> {
         let path = Self::path();
         if path.exists() {
-            warn!(action = "load_state_read", path = %path.display());
+            warn!("load_state_read {:?}", path);
             let content = std::fs::read_to_string(&path)
                 .context(format!("Failed to read state from {:?}", path))?;
             let state: Self =
                 serde_json::from_str(&content).context("Failed to parse state json")?;
             Ok(state)
         } else {
-            warn!(action = "load_state_default", path = %path.display());
+            warn!("load_state_default {:?}", path);
             Ok(Self::default())
         }
     }
@@ -30,14 +30,13 @@ pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
     fn save_atomic(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
-            warn!(action = "save_state_create_dir", path = %parent.display());
             std::fs::create_dir_all(parent).context("Failed to create state dir")?;
         }
 
         let tmp = path.with_extension("tmp");
         let content = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
         std::fs::write(&tmp, content).context("Failed to write temp state file")?;
-        warn!(action = "save_state", path = %path.display());
+        warn!("save_state {:?}", path);
         std::fs::rename(&tmp, &path).context("Failed to replace state file atomically")?;
         Ok(())
     }
