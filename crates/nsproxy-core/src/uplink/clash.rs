@@ -985,11 +985,11 @@ impl ClashState {
         query: &str,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
-        use super::proxy_adapters::{wrap_tls_no_sni, NoProxyAdapter};
-        use rustls::pki_types::{ServerName, DnsName};
-        use h2::client;
-        use http::{Request, Method};
+        use super::proxy_adapters::{NoProxyAdapter, wrap_tls_for_doh};
         use bytes::Bytes;
+        use h2::client;
+        use http::{Method, Request};
+        use rustls::pki_types::{DnsName, ServerName};
 
         let authority = match resolver {
             DNSHost::Tier2Domain { domain, .. } => domain.clone(),
@@ -1034,25 +1034,28 @@ impl ClashState {
 
         // Determine TLS server name
         let tls_server_name = match resolver {
-            DNSHost::Tier2Domain { domain, .. } => ServerName::DnsName(
-                DnsName::try_from(domain.as_str())
-                    .context("Invalid TLS server name for DoH")?
-                    .to_owned(),
-            ),
+            DNSHost::Tier2Domain { domain, socket } => {
+                // ServerName::DnsName(
+                //     DnsName::try_from(domain.as_str())
+                //         .context("Invalid TLS server name for DoH")?
+                //         .to_owned(),
+                // )
+
+                ServerName::IpAddress(socket.unwrap().ip().into())
+            }
             DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => {
                 ServerName::IpAddress(sock.ip().into())
             }
         };
 
         // Wrap in no-SNI TLS (trust-dns equivalent: SNI disabled, h2 ALPN)
-        let tls_stream = wrap_tls_no_sni(tcp_stream, tls_server_name, "doh").await?;
+        let tls_stream = wrap_tls_for_doh(tcp_stream, tls_server_name, "doh").await?;
 
         // Perform HTTP/2 handshake
-        let (mut client, h2_conn) =
-            tokio::time::timeout(timeout, client::handshake(tls_stream))
-                .await
-                .context("Timeout during HTTP/2 handshake")?
-                .context("HTTP/2 handshake failed")?;
+        let (mut client, h2_conn) = tokio::time::timeout(timeout, client::handshake(tls_stream))
+            .await
+            .context("Timeout during HTTP/2 handshake")?
+            .context("HTTP/2 handshake failed")?;
 
         // Spawn connection driver
         tokio::spawn(async move {
@@ -1062,10 +1065,7 @@ impl ClashState {
         });
 
         // Wait for client to be ready
-        let mut client = client
-            .ready()
-            .await
-            .context("HTTP/2 client not ready")?;
+        let mut client = client.ready().await.context("HTTP/2 client not ready")?;
 
         // Build HTTP/2 request
         let request = Request::builder()
