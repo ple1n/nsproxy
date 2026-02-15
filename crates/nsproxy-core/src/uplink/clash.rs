@@ -1032,23 +1032,25 @@ impl ClashState {
             _ => anyhow::bail!("Expected TCP connection for DoH"),
         };
 
-        // Determine TLS server name
+        let use_ip = false;
+
         let tls_server_name = match resolver {
             DNSHost::Tier2Domain { domain, socket } => {
-                // ServerName::DnsName(
-                //     DnsName::try_from(domain.as_str())
-                //         .context("Invalid TLS server name for DoH")?
-                //         .to_owned(),
-                // )
-
-                ServerName::IpAddress(socket.unwrap().ip().into())
+                if use_ip {
+                    ServerName::IpAddress(socket.unwrap().ip().into())
+                } else {
+                    ServerName::DnsName(
+                        DnsName::try_from(domain.as_str())
+                            .context("Invalid TLS server name for DoH")?
+                            .to_owned(),
+                    )
+                }
             }
             DNSHost::Tier1(sock) | DNSHost::Tier2IP(sock) => {
                 ServerName::IpAddress(sock.ip().into())
             }
         };
 
-        // Wrap in no-SNI TLS (trust-dns equivalent: SNI disabled, h2 ALPN)
         let tls_stream = wrap_tls_for_doh(tcp_stream, tls_server_name, "doh").await?;
 
         // Perform HTTP/2 handshake
