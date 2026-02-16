@@ -70,6 +70,8 @@ use tun2socks5::dns::{TUNResponse, VDNSRES, VirtDNSAsync, VirtDNSHandle};
 
 use crate::state_paths;
 
+pub mod router;
+
 /// Maximum number of concurrent virtual DNS entries (mirrors tun2socks5 default)
 const POOL_SIZE: usize = 65_535;
 const DNS_PORT: u16 = 53;
