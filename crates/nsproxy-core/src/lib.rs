@@ -1531,6 +1531,7 @@ pub enum MainCommand {
     },
     /// Remove a bind-mount file
     Rm { file: PathBuf },
+    /// Obsolete
     /// Manage wrapped binaries for security (wraps all configured binaries)
     /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
     /// The wrapper handles such problems by requiring confirmation before executing
@@ -1544,6 +1545,7 @@ pub enum MainCommand {
         #[arg(short, long)]
         add: Option<String>,
     },
+    /// Obsolete
     /// Show wrapped binaries status
     Wrapped,
     #[command(alias = "c")]
@@ -1688,7 +1690,7 @@ pub enum ClashOps {
     TestResolve {
         #[arg(long)]
         direct: bool,
-        query: String
+        query: String,
     },
 }
 
