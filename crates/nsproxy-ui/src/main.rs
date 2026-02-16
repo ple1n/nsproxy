@@ -1,8 +1,11 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use egui_json_tree::{JsonTree, DefaultExpand};
+use egui_json_tree::{DefaultExpand, JsonTree};
+use nsproxy_core::uplink::UplinkHub;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+use std::thread;
+use tokio::sync::{mpsc, Mutex};
 
 const HOTCONFIG_EXAMPLE: &str = r#"{
     "hot_reload": true,
@@ -49,7 +52,9 @@ enum Selected {
 }
 
 impl Default for Selected {
-    fn default() -> Self { Selected::Global }
+    fn default() -> Self {
+        Selected::Global
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -84,6 +89,8 @@ struct App {
     // per-scope UI state keyed by Scope
     current_scope: Scope,
     scope_states: HashMap<Scope, ScopeUiState>,
+    uplink: Arc<Mutex<UplinkHub>>,
+    uplink_reload_tx: mpsc::Sender<()>,
 }
 
 impl Default for App {
@@ -109,9 +116,24 @@ impl Default for App {
         }
 
         let profiles = vec![
-            Profile { name: "office".into(), status: "stopped".into(), proxies: vec![], instantiated: false },
-            Profile { name: "guest".into(), status: "running".into(), proxies: vec![proxies[0].url.clone()], instantiated: true },
-            Profile { name: "dev".into(), status: "stopped".into(), proxies: vec![], instantiated: false },
+            Profile {
+                name: "office".into(),
+                status: "stopped".into(),
+                proxies: vec![],
+                instantiated: false,
+            },
+            Profile {
+                name: "guest".into(),
+                status: "running".into(),
+                proxies: vec![proxies[0].url.clone()],
+                instantiated: true,
+            },
+            Profile {
+                name: "dev".into(),
+                status: "stopped".into(),
+                proxies: vec![],
+                instantiated: false,
+            },
         ];
 
         let hotconfig_text = HOTCONFIG_EXAMPLE.to_owned();
@@ -131,15 +153,44 @@ impl Default for App {
 
         // pre-populate per-profile scope states (use profile name)
         for p in &profiles {
-            scope_states.entry(Scope::Profile(p.name.clone())).or_insert_with(|| ScopeUiState {
-                hotconfig_text: hotconfig_text.clone(),
-                profile_json_text: profile_json_text.clone(),
-                hotconfig_saved: false,
-                profile_saved: false,
-            });
+            scope_states
+                .entry(Scope::Profile(p.name.clone()))
+                .or_insert_with(|| ScopeUiState {
+                    hotconfig_text: hotconfig_text.clone(),
+                    profile_json_text: profile_json_text.clone(),
+                    hotconfig_saved: false,
+                    profile_saved: false,
+                });
         }
 
-        Self { profiles, selected: Selected::Global, right_tab: RightTab::Proxies, proxies, hovered_proxy: None, current_scope: Scope::Global, scope_states }
+        let uplink = Arc::new(Mutex::new(UplinkHub::new()));
+
+        // create channel and spawn background task using the same uplink Arc
+        let (tx, mut rx) = mpsc::channel::<()>(8);
+        let uplink_clone = uplink.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async move {
+                while let Some(_) = rx.recv().await {
+                    match uplink_clone.lock().await.hydrate_from_persisted() {
+                        Ok(n) => eprintln!("uplink reloaded: {} proxies", n),
+                        Err(e) => eprintln!("uplink reload failed: {:?}", e),
+                    }
+                }
+            });
+        });
+
+        Self {
+            profiles,
+            selected: Selected::Global,
+            right_tab: RightTab::Proxies,
+            proxies,
+            hovered_proxy: None,
+            current_scope: Scope::Global,
+            scope_states,
+            uplink,
+            uplink_reload_tx: tx,
+        }
     }
 }
 
@@ -147,70 +198,115 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::Color32;
 
-        egui::SidePanel::left("left_sidebar").resizable(false).default_width(280.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Network Namespaces");
-            });
-
-            ui.add_space(6.0);
-
-            // Global configuration box at the top
-            let global_selected = matches!(self.selected, Selected::Global);
-            let global_status_color = egui::Color32::from_rgb(100, 150, 240);
-            if sidebar_box(ui, "Global Configuration", "Apply proxy configuration globally", global_selected, global_status_color).clicked() {
-                self.selected = Selected::Global;
-                self.current_scope = Scope::Global;
-                self.scope_states.entry(Scope::Global).or_insert_with(|| ScopeUiState {
-                    hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
-                    profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
-                    hotconfig_saved: false,
-                    profile_saved: false,
+        egui::SidePanel::left("left_sidebar")
+            .resizable(false)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Network Namespaces");
                 });
-            }
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Profiles
-            for (i, profile) in self.profiles.iter().enumerate() {
-                let is_selected = matches!(self.selected, Selected::Profile(idx) if idx == i);
-                let status_color = if profile.instantiated { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
-                if sidebar_box(ui, &profile.name, &profile.status, is_selected, status_color).clicked() {
-                    self.selected = Selected::Profile(i);
-                    // map profile selection to a profile-name Scope for per-scope UI state
-                    let scope_key = Scope::Profile(profile.name.clone());
-                    self.current_scope = scope_key.clone();
-                    self.scope_states.entry(scope_key).or_insert_with(|| ScopeUiState {
-                        hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
-                        profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
-                        hotconfig_saved: false,
-                        profile_saved: false,
-                    });
-                }
                 ui.add_space(6.0);
-            }
-        });
+
+                // Global configuration box at the top
+                let global_selected = matches!(self.selected, Selected::Global);
+                let global_status_color = egui::Color32::from_rgb(100, 150, 240);
+                if sidebar_box(
+                    ui,
+                    "Global Configuration",
+                    "Apply proxy configuration globally",
+                    global_selected,
+                    global_status_color,
+                )
+                .clicked()
+                {
+                    self.selected = Selected::Global;
+                    self.current_scope = Scope::Global;
+                    self.scope_states
+                        .entry(Scope::Global)
+                        .or_insert_with(|| ScopeUiState {
+                            hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                            profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                            hotconfig_saved: false,
+                            profile_saved: false,
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Profiles
+                for (i, profile) in self.profiles.iter().enumerate() {
+                    let is_selected = matches!(self.selected, Selected::Profile(idx) if idx == i);
+                    let status_color = if profile.instantiated {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::LIGHT_RED
+                    };
+                    if sidebar_box(
+                        ui,
+                        &profile.name,
+                        &profile.status,
+                        is_selected,
+                        status_color,
+                    )
+                    .clicked()
+                    {
+                        self.selected = Selected::Profile(i);
+                        // map profile selection to a profile-name Scope for per-scope UI state
+                        let scope_key = Scope::Profile(profile.name.clone());
+                        self.current_scope = scope_key.clone();
+                        self.scope_states
+                            .entry(scope_key)
+                            .or_insert_with(|| ScopeUiState {
+                                hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                                profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                                hotconfig_saved: false,
+                                profile_saved: false,
+                            });
+                    }
+                    ui.add_space(6.0);
+                }
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Tabs
             ui.horizontal(|ui| {
-                if ui.selectable_label(self.right_tab == RightTab::Proxies, "Proxies").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Proxies, "Proxies")
+                    .clicked()
+                {
                     self.right_tab = RightTab::Proxies;
                 }
-                if ui.selectable_label(self.right_tab == RightTab::Processes, "Processes").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Processes, "Processes")
+                    .clicked()
+                {
                     self.right_tab = RightTab::Processes;
                 }
-                if ui.selectable_label(self.right_tab == RightTab::Diagnostics, "Diagnostics").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Diagnostics, "Diagnostics")
+                    .clicked()
+                {
                     self.right_tab = RightTab::Diagnostics;
                 }
-                if ui.selectable_label(self.right_tab == RightTab::Dns, "DNS").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Dns, "DNS")
+                    .clicked()
+                {
                     self.right_tab = RightTab::Dns;
                 }
-                if ui.selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig")
+                    .clicked()
+                {
                     self.right_tab = RightTab::Hotconfig;
                 }
-                if ui.selectable_label(self.right_tab == RightTab::ProfileEditor, "Profile").clicked() {
+                if ui
+                    .selectable_label(self.right_tab == RightTab::ProfileEditor, "Profile")
+                    .clicked()
+                {
                     self.right_tab = RightTab::ProfileEditor;
                 }
             });
@@ -233,9 +329,15 @@ impl eframe::App for App {
                             .column(Column::remainder())
                             .column(Column::exact(120.0))
                             .header(header_h, |mut header| {
-                                header.col(|ui| { ui.strong("Name"); });
-                                header.col(|ui| { ui.strong("Proxy URL"); });
-                                header.col(|ui| { ui.strong("Status"); });
+                                header.col(|ui| {
+                                    ui.strong("Name");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Proxy URL");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Status");
+                                });
                             })
                             .body(|mut body| {
                                 let widths = body.widths().to_vec();
@@ -250,7 +352,9 @@ impl eframe::App for App {
 
                                     row.col(|ui| {
                                         ui.vertical(|ui| {
-                                            let resp = ui.label(egui::RichText::new(&self.proxies[i].name).strong());
+                                            let resp = ui.label(
+                                                egui::RichText::new(&self.proxies[i].name).strong(),
+                                            );
                                             let row_rect = egui::Rect::from_min_size(
                                                 resp.rect.min,
                                                 egui::vec2(row_width, row_h),
@@ -258,11 +362,15 @@ impl eframe::App for App {
                                             let pointer_pos = ui.ctx().input(|i| {
                                                 i.pointer.interact_pos().or(i.pointer.hover_pos())
                                             });
-                                            row_hot = pointer_pos.is_some_and(|pos| row_rect.contains(pos));
+                                            row_hot = pointer_pos
+                                                .is_some_and(|pos| row_rect.contains(pos));
                                             is_active = row_hot || self.hovered_proxy == Some(i);
 
                                             if is_active {
-                                                ui.small(format!("Status: {}", self.proxies[i].status));
+                                                ui.small(format!(
+                                                    "Status: {}",
+                                                    self.proxies[i].status
+                                                ));
                                             } else if self.proxies[i].udp_capable {
                                                 ui.small("UDP + TCP");
                                             } else {
@@ -277,29 +385,49 @@ impl eframe::App for App {
                                             if is_active {
                                                 ui.add_space(4.0);
                                                 ui.horizontal_wrapped(|ui| {
-                                                    ui.checkbox(&mut self.proxies[i].enabled_globally, "Enabled globally");
+                                                    ui.checkbox(
+                                                        &mut self.proxies[i].enabled_globally,
+                                                        "Enabled globally",
+                                                    );
 
                                                     if let Selected::Profile(pidx) = self.selected {
-                                                        if let Some(profile) = self.profiles.get_mut(pidx) {
-                                                            let mut assigned = profile.proxies.contains(&self.proxies[i].url);
-                                                            if ui.checkbox(&mut assigned, "Assigned").changed() {
+                                                        if let Some(profile) =
+                                                            self.profiles.get_mut(pidx)
+                                                        {
+                                                            let mut assigned = profile
+                                                                .proxies
+                                                                .contains(&self.proxies[i].url);
+                                                            if ui
+                                                                .checkbox(&mut assigned, "Assigned")
+                                                                .changed()
+                                                            {
                                                                 if assigned {
-                                                                    profile.proxies.push(self.proxies[i].url.clone());
+                                                                    profile.proxies.push(
+                                                                        self.proxies[i].url.clone(),
+                                                                    );
                                                                 } else {
-                                                                    profile.proxies.retain(|x| x != &self.proxies[i].url);
+                                                                    profile.proxies.retain(|x| {
+                                                                        x != &self.proxies[i].url
+                                                                    });
                                                                 }
                                                             }
                                                         }
                                                     }
 
                                                     if ui.button("Test TCP").clicked() {
-                                                        self.proxies[i].status = "TCP OK".to_owned();
+                                                        self.proxies[i].status =
+                                                            "TCP OK".to_owned();
                                                     }
-                                                    if self.proxies[i].udp_capable && ui.button("Test DNS").clicked() {
-                                                        self.proxies[i].status = "DNS OK".to_owned();
+                                                    if self.proxies[i].udp_capable
+                                                        && ui.button("Test DNS").clicked()
+                                                    {
+                                                        self.proxies[i].status =
+                                                            "DNS OK".to_owned();
                                                     }
                                                 });
-                                                ui.small("Hover the row to show controls and status.");
+                                                ui.small(
+                                                    "Hover the row to show controls and status.",
+                                                );
                                             } else {
                                                 ui.small("Hover for controls");
                                             }
@@ -316,7 +444,11 @@ impl eframe::App for App {
                                         ui.vertical(|ui| {
                                             ui.colored_label(status_color, status);
                                             if is_active {
-                                                let enabled = if self.proxies[i].enabled_globally { "on" } else { "off" };
+                                                let enabled = if self.proxies[i].enabled_globally {
+                                                    "on"
+                                                } else {
+                                                    "off"
+                                                };
                                                 ui.small(format!("Global: {}", enabled));
                                             }
                                         });
@@ -381,9 +513,12 @@ impl eframe::App for App {
                 }
 
                 RightTab::Hotconfig => {
-                            // get or create the scope UI state
-                            let key = self.current_scope.clone();
-                            let state = self.scope_states.entry(key.clone()).or_insert_with(|| ScopeUiState {
+                    // get or create the scope UI state
+                    let key = self.current_scope.clone();
+                    let state =
+                        self.scope_states
+                            .entry(key.clone())
+                            .or_insert_with(|| ScopeUiState {
                                 hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
                                 profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
                                 hotconfig_saved: false,
@@ -416,17 +551,22 @@ impl eframe::App for App {
                         Scope::Global => format!("hotconfig-global"),
                         Scope::Profile(name) => format!("hotconfig-profile-{}", name),
                     };
-                    JsonTree::new(id, &json_value).default_expand(DefaultExpand::All).show(ui);
+                    JsonTree::new(id, &json_value)
+                        .default_expand(DefaultExpand::All)
+                        .show(ui);
                 }
 
                 RightTab::ProfileEditor => {
                     let key = self.current_scope.clone();
-                    let state = self.scope_states.entry(key.clone()).or_insert_with(|| ScopeUiState {
-                        hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
-                        profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
-                        hotconfig_saved: false,
-                        profile_saved: false,
-                    });
+                    let state =
+                        self.scope_states
+                            .entry(key.clone())
+                            .or_insert_with(|| ScopeUiState {
+                                hotconfig_text: HOTCONFIG_EXAMPLE.to_owned(),
+                                profile_json_text: PROFILE_JSON_EXAMPLE.to_owned(),
+                                hotconfig_saved: false,
+                                profile_saved: false,
+                            });
 
                     ui.horizontal(|ui| {
                         ui.heading("Profile JSON");
@@ -453,8 +593,9 @@ impl eframe::App for App {
                         Scope::Global => format!("profile-global"),
                         Scope::Profile(name) => format!("profile-{}", name),
                     };
-                    JsonTree::new(id, &json_value).default_expand(DefaultExpand::All).show(ui);
-                
+                    JsonTree::new(id, &json_value)
+                        .default_expand(DefaultExpand::All)
+                        .show(ui);
                 }
             }
         });
@@ -503,20 +644,48 @@ fn sidebar_box(
 
     // Avatar circle on the left
     let avatar_radius = 20.0;
-    let avatar_center = rect.min + eframe::egui::vec2(12.0 + avatar_radius, rect.height() / 2.0 - 2.0);
-    let avatar_fill = if selected { status_color } else { status_color.linear_multiply(0.9) };
-    ui.painter().circle_filled(avatar_center, avatar_radius, avatar_fill);
+    let avatar_center =
+        rect.min + eframe::egui::vec2(12.0 + avatar_radius, rect.height() / 2.0 - 2.0);
+    let avatar_fill = if selected {
+        status_color
+    } else {
+        status_color.linear_multiply(0.9)
+    };
+    ui.painter()
+        .circle_filled(avatar_center, avatar_radius, avatar_fill);
 
     // Initial letter inside avatar
-    let initial = title.chars().next().map(|c| c.to_string()).unwrap_or_else(|| "?".to_string());
-    ui.painter().text(avatar_center, Align2::CENTER_CENTER, initial, FontId::proportional(16.0), eframe::egui::Color32::WHITE);
+    let initial = title
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    ui.painter().text(
+        avatar_center,
+        Align2::CENTER_CENTER,
+        initial,
+        FontId::proportional(16.0),
+        eframe::egui::Color32::WHITE,
+    );
 
     // Title & subtitle
     let text_x = avatar_center.x + avatar_radius + 12.0;
     let name_pos = eframe::egui::pos2(text_x, rect.min.y + 12.0);
     let status_pos = eframe::egui::pos2(text_x, rect.min.y + 34.0);
-    ui.painter().text(name_pos, Align2::LEFT_TOP, title, FontId::proportional(16.0), visuals.text_color());
-    ui.painter().text(status_pos, Align2::LEFT_TOP, subtitle, FontId::proportional(12.0), visuals.widgets.inactive.fg_stroke.color);
+    ui.painter().text(
+        name_pos,
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(16.0),
+        visuals.text_color(),
+    );
+    ui.painter().text(
+        status_pos,
+        Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(12.0),
+        visuals.widgets.inactive.fg_stroke.color,
+    );
 
     // Status dot on the top-right
     let dot_center = rect.right_top() + eframe::egui::vec2(-18.0, 18.0);
