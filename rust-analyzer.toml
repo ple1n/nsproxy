@@ -1,0 +1,41 @@
+# Rust Analyzer workspace configuration
+# This reduces load time and memory usage for large workspaces
+
+[cargo]
+# Don't check all targets (examples, tests, benches)
+allTargets = false
+
+# Build scripts can be expensive
+buildScripts.enable = false
+
+# Only load specific features if needed
+noDefaultFeatures = false
+
+[checkOnSave]
+# Only check the current crate, not dependencies
+extraArgs = ["--no-deps"]
+allTargets = false
+
+[files]
+# Exclude paths from watching and indexing
+excludeDirs = [
+    "target",
+    "examples", 
+    "devnotes",
+    "dev",
+    "devscripts",
+    "install",
+    "release",
+    "profiles",
+    "derive"
+]
+
+[procMacro]
+# Disable proc macros to prevent cycle panics
+enable = false
+
+[diagnostics]
+# Disable expensive diagnostics
+disabled = [
+    "unresolved-proc-macro"
+]

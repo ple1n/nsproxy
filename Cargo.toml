@@ -14,7 +14,7 @@ panic = "abort"
 opt-level = 0       # No optimizations → fastest compile
 debug = true        # Keep debug symbols
 incremental = true  # Enable incremental builds
-codegen-units = 256 # More parallelism in LLVM codegen (default is ~16)
+codegen-units = 16  
 lto = false         # No link-time optimization
 
 [profile.release]
