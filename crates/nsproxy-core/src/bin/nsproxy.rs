@@ -36,8 +36,11 @@ use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
     BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
-    ProfileChmod, ProfileConfig, ProfileMount, RootfsMode, TunMaker,
+    ProfileConfig, RootfsMode, TunMaker,
+    cmd_common::{apply_ns_env, check_proxy_mode, check_wrap, enter_ns, read_ns_alive, read_ns_alive_opt, report_clone3_err},
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
+    hot_reload::{VethIps, sync_links, watch_hot},
+    sandbox::{apply_chmod, apply_mounts},
     shell::{ShellArgs, ShellPrefs},
     state_paths,
     sys::{
@@ -93,107 +96,6 @@ use tun2socks5::{
     ipstack::stream::{IpStackStream, IpStackTcpStream},
     tun_rs::AsyncDevice,
 };
-use warp::server::accept::Accept;
-
-fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
-    let (mut tx, rx) = tokio::sync::mpsc::channel(1);
-    let tx1 = tx.clone();
-    tokio::spawn(async move { tx1.send(()).await });
-
-    // Automatically select the best implementation for your platform.
-    // You can also access each implementation directly e.g. INotifyWatcher.
-    let watcher = RecommendedWatcher::new(
-        move |res: std::result::Result<Event, notify::Error>| match res {
-            Ok(res) => {
-                if matches!(res.kind, EventKind::Modify(ModifyKind::Data(_))) {
-                    info!("file data changed");
-                    let _ = tx.try_send(());
-                }
-            }
-            _ => {}
-        },
-        notify::Config::default(),
-    )?;
-
-    Ok((watcher, rx))
-}
-
-struct ServerItem {
-    marked: bool,
-}
-
-struct WarpAcceptor {
-    path: PathBuf,
-    rx: flume::Receiver<(PathBuf, IpStackTcpStream)>,
-}
-
-impl Accept for WarpAcceptor {
-    type IO = hyper_util::rt::TokioIo<IpStackTcpStream>;
-    type AcceptError = flume::RecvError;
-    type Accepting = std::future::Ready<Result<Self::IO, Self::AcceptError>>;
-    async fn accept(&mut self) -> std::result::Result<Self::Accepting, std::io::Error> {
-        loop {
-            let rx: std::result::Result<(PathBuf, IpStackTcpStream), flume::RecvError> =
-                self.rx.recv_async().await;
-            match rx {
-                Ok((p, s)) => {
-                    if p == self.path {
-                        info!("accepted stream");
-                        return Ok(ready(Ok(hyper_util::rt::TokioIo::new(s))));
-                    }
-                }
-                Err(e) => {
-                    return Ok(ready(Err(e)));
-                }
-            }
-        }
-    }
-}
-
-struct AssignedIps {
-    vout: Ipv4Addr,
-    vin: Ipv4Addr,
-}
-
-fn apply_profile_mounts(root: &Path, mounts: &[ProfileMount]) -> Result<()> {
-    let vars = PathExpansionState::without_instance();
-    for m in mounts {
-        let expanded_source = vars.expand(&m.source);
-        let expanded_target = vars.expand(&m.target);
-        let rel = expanded_target.strip_prefix("/").unwrap();
-        let target = root.join(rel);
-        if m.read_only {
-            mount_bind_ro_explicit(&expanded_source, &target, m.recursive)?;
-        } else {
-            mount_bind_rw_explicit(&expanded_source, &target, m.recursive)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_profile_chmod(root: &Path, chmods: &[ProfileChmod]) -> Result<()> {
-    let vars = PathExpansionState::without_instance();
-    for c in chmods {
-        let expanded_path = vars.expand(&c.path);
-        let rel = expanded_path.strip_prefix("/").unwrap();
-        let target = root.join(rel);
-
-        if let Some(mode) = c.mode {
-            let mut perms = std::fs::metadata(&target)?.permissions();
-            perms.set_mode(mode);
-            std::fs::set_permissions(&target, perms)?;
-        }
-
-        if c.uid.is_some() || c.gid.is_some() {
-            let uid = c.uid.map(Uid::from_raw);
-            let gid = c.gid.map(Gid::from_raw);
-            chown(&target, uid, gid)?;
-        }
-    }
-
-    Ok(())
-}
 
 /// Load all saved proxies and build an UplinkHub with all available proxies
 fn load_saved_uplink_hub() -> Result<nsproxy_core::uplink::UplinkHub> {
@@ -270,437 +172,32 @@ fn main() -> anyhow::Result<()> {
             name,
             profile,
             mnt,
-            mut binds,
+            binds,
             no_proxy,
-        } => {
-            // Check wrapped binaries wellness before starting
-            if !cli.no_wrap_check {
-                let wrapped_config = WrappedBinariesConfig::load()?;
-                wrapped_config.check_all_wrapped()?;
-            }
-
-            // Validate proxy and no_proxy are mutually exclusive
-            let mut iargs = proxy;
-            match (iargs.proxy.is_some(), no_proxy) {
-                (true, true) => {
-                    bail!(
-                        "Cannot specify both --proxy and --no-proxy. They are mutually exclusive."
-                    );
-                }
-                (false, false) => {
-                    bail!("Must specify either --proxy <URL> or --no-proxy explicitly.");
-                }
-                _ => {} // Valid: (true, false) or (false, true)
-            }
-
-            let mtu = 1500;
-            let tun_name = "tun2".to_owned();
-            let proc = procfs::process::Process::myself()?;
-            let ns = proc.namespaces()?;
-            let self_net = ns.0.get(OsStr::new("net")).unwrap();
-            let self_netns = self_net.clone().to_exactns();
-            let dst_ns = try_resolve_nsinput(dst.clone())?;
-            let mut shell_prefs = ShellPrefs::default();
-            shell_prefs.take_args(sargs);
-            shell_prefs.adjust();
-            shell_prefs.set_nsproxy_env(profile.clone());
-            let ns_moved = [0; 1];
-            // Tun2socks runs in SRC ns, connects to the socks5 in it
-            // We will get the TUN FD from DST ns
-            let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
-            iargs.tun_name = Some(tun_name.clone());
-            let vname = name.clone().unwrap_or("v".to_owned());
-            let v_in = format!("{vname}_in");
-            let v_out = format!("{vname}_out");
-            let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
-            let host_bits = 2;
-            let subnet_prefix = 32 - host_bits;
-
-            mount = args_deduce_mount(&name, &mount);
-            if let Some(mount) = &mount {
-                shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
-            } else {
-                // Clear any existing NS env if it exists
-                shell_prefs.set_ns_env(None);
-            }
-
-            if cli.conf.is_none() {
-                warn!("Live config is not specified. Use sp -c ./nsproxy.json run");
-                if let Some(p) = &profile {
-                    let conf = PathBuf::from(".").join(p).with_extension("json");
-                    if conf.exists() {
-                        cli.conf = Some(conf);
-                        warn!("config file defaults to {:?}", &cli.conf);
-                    } else {
-                        warn!("config file defaults to {:?} but its not found", &conf);
-                    }
-                }
-            }
-
-            if !mnt {
-                warn!(
-                    "Not directed to use a new mount namespace. Mounts will operate on root namespace. Use --mnt"
-                );
-            }
-
-            if mnt {
-                binds = true
-            }
-
-            if dst != NsInput::This {
-                let clone = nsproxy_core::sys::clone3::<true>(mnt, false);
-                match clone {
-                    Ok(clone) => {
-                        match clone {
-                            Clone3Result::IsChild { mut tx } => {
-                                let mut buf = [0; 8];
-
-                                if let Some(dst) = dst_ns {
-                                    dst.enter(CloneFlags::CLONE_NEWNET)?;
-                                }
-                                if dst != NsInput::New {
-                                    bail!("unexpected {:?}", &dst);
-                                }
-                                enable_ping_all()?;
-
-                                let mut tun = TunMaker::default();
-                                tun.name = tun_name.clone();
-                                tun.mtu = mtu;
-                                let mut tun_state = tun.make()?;
-                                tun_state.sync_basic()?;
-                                let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
-                                let raw = dev.as_raw_fd();
-
-                                info!("send TUN fd");
-                                tx.send_fd(raw)?;
-                                drop(dev);
-
-                                tx.read(&mut buf)?; // wait for bind mount;
-                                if mnt {
-                                    mount_bind_root()?;
-                                    tx.write(&[0])?;
-                                }
-
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()?;
-                                rt.block_on(async {
-                                    use tokio::io::AsyncReadExt;
-                                    use tokio_send_fd::SendFd;
-
-                                    let mut read = [0u8; 4];
-                                    tx.set_nonblocking(true)?;
-                                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
-                                    let add_default = (dst == NsInput::New && !no_default)
-                                        || (dst == NsInput::This && default);
-
-                                    let nl = tokio_netlink_conn()?;
-                                    nl.up_lo().await?;
-
-                                    let initial_conf = if let Some(conf) = &cli.conf {
-                                        let fc = std::fs::read_to_string(&conf)?;
-                                        match serde_json::from_str::<HotConfig>(&fc) {
-                                            Ok(newconf) => Some(newconf),
-                                            _ => None,
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                    if add_default {
-                                        warn!("adding TUN as default route");
-                                        nl.ip_add_default_route(tun_state.dev_index).await?;
-                                    }
-                                    if veth {
-                                        tx.read(&mut read).await;
-                                        let ip = veth_addr_for(
-                                            Ipv4Addr::from_octets(read),
-                                            host_bits,
-                                            false,
-                                        );
-
-                                        let dev = nl.fetch_link_by_name(v_in).await?;
-                                        nl.address()
-                                            .add(dev.header.index, ip.into(), subnet_prefix)
-                                            .execute()
-                                            .await?;
-
-                                        nl.link()
-                                            .set(
-                                                LinkMessageBuilder::<LinkUnspec>::default()
-                                                    .index(dev.header.index)
-                                                    .up()
-                                                    .build(),
-                                            )
-                                            .execute()
-                                            .await?;
-                                    }
-
-                                    // TODO: Top level async task should be wrapped and logged
-                                    // Otherwise errors go silent
-                                    tokio::spawn(async move {
-                                        let conf = cli.conf;
-                                        if let Some(conf) = conf {
-                                            let mut mnt: HashMap<PathBuf, PathBuf> =
-                                                Default::default();
-                                            let mut read = [0u8; 24];
-                                            loop {
-                                                info!("in-ns wait for config");
-                                                let k = tx.read(&mut read[..]).await?;
-                                                if k < 1 {
-                                                    error!("in-ns config watcher exits due to EOF");
-                                                    // EOF??
-                                                    break;
-                                                }
-                                                info!("in-ns reload config");
-                                                let fc = tokio::fs::read_to_string(&conf).await?;
-                                                match serde_json::from_str::<HotConfig>(&fc) {
-                                                    Ok(newconf) => {
-                                                        for (s, t) in mnt.clone() {
-                                                            if let Some(new) = newconf.mnt.get(&s) {
-                                                                // skip
-                                                            } else {
-                                                                rm_mount(&t);
-                                                                mnt.remove(&s);
-                                                            }
-                                                        }
-
-                                                        if binds {
-                                                            for (s, t) in newconf.mnt.clone() {
-                                                                if let Some(current) = mnt.get(&s)
-                                                                    && current == &t
-                                                                {
-                                                                    // skip
-                                                                } else {
-                                                                    let x = mount_bind(&s, &t);
-                                                                    if let Err(e) = x {
-                                                                        error!(
-                                                                            "Bind mount {:?}",
-                                                                            &e
-                                                                        );
-                                                                    }
-                                                                    mnt.insert(s, t);
-                                                                }
-                                                            }
-                                                        }
-
-                                                        tx.write(&[0, 0, 0, 0]).await?;
-                                                        for (in_port, dst) in &newconf.locals {
-                                                            // bind all tcp at 127.0.0.1:src and pass all descriptiors through the socket.
-                                                            let bind = std::net::TcpListener::bind(
-                                                                format!("127.0.0.1:{}", in_port),
-                                                            )?;
-                                                            let raw = bind.as_raw_fd();
-                                                            tx.write(&in_port.to_le_bytes())
-                                                                .await?;
-                                                            tx.send_fd(raw).await?;
-                                                        }
-                                                        tx.write(&[0, 0, 0, 0]).await?;
-
-                                                        let _ =
-                                                            enumerate_links(None, &newconf).await;
-
-                                                        // TODO: remove stale mounts
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-
-                                        aok!()
-                                    });
-
-                                    let clone = shell_prefs.spawn()?;
-                                    clone.wait_for_child().await?;
-
-                                    exit(0);
-                                    aok!()
-                                })?;
-                            }
-                            Clone3Result::Parent {
-                                child_pid,
-                                child_pidfd,
-                                mut tx,
-                            } => {
-                                info!("recved fd");
-                                let dev = tx.recv_fd()?;
-                                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
-
-                                if let Some(mount) = mount {
-                                    // Ensure runtime directory exists
-                                    std::fs::create_dir_all(RUNTIME_ROOT)?;
-
-                                    let path = format!("/proc/{}/ns/net", child_pid);
-                                    let path = PathBuf::from(path);
-                                    mount_ns(&path, &mount)?;
-
-                                    let ns_alive = nsproxy_core::NsAlive {
-                                        browser_profile: profile.clone(),
-                                        bind_mount: mount.clone(),
-                                        child_pid: Some(child_pid as u32),
-                                    };
-                                    let json = serde_json::to_string_pretty(&ns_alive)?;
-                                    let jsonpath = state_paths::metadata_for_bind(&mount);
-                                    info!(
-                                        "Writing NS metadata to {:?} ({} bytes)",
-                                        &jsonpath,
-                                        json.len()
-                                    );
-                                    std::fs::write(&jsonpath, json)?;
-                                    warn!("Auxiliary data written to {:?}", &jsonpath);
-                                    tx.write(&[0]);
-
-                                    // Also mount the mnt namespace if it was created
-                                    if mnt {
-                                        let mut buf = [0; 1];
-                                        tx.read(&mut buf);
-                                        // Somehow doesnt work
-                                        // let mnt_path = format!("/proc/{}/ns/mnt", child_pid);
-                                        // let mnt_path = PathBuf::from(mnt_path);
-                                        // let mnt_ns_file = mount.with_extension("mntns");
-
-                                        // let _ = mount_ns(&mnt_path, &mnt_ns_file);
-                                        // warn!("Mount namespace mounted to {:?}", &mnt_ns_file);
-                                    }
-                                } else {
-                                    warn!("not mounting this namespace");
-                                }
-
-                                let rt = tokio::runtime::Builder::new_multi_thread()
-                                    .enable_all()
-                                    .build()?;
-                                if let Some(log) = log {
-                                    reload_handle.modify(|k| *k.filter_mut() = log)?;
-                                }
-                                rt.spawn(async move {
-                                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
-                                    let k = fd.into_future().await?;
-                                    // Against Unix philosophy again, the tool does not confuse users. 
-                                    warn!("Shell has exited but nsproxy is still running. Press CtrlC to exit.");
-                                    aok!()
-                                });
-
-                                let mut vethips = None;
-
-                                rt.block_on(async move {
-                                    use tokio::io::AsyncWriteExt;
-
-                                    let nl = tokio_netlink_conn()?;
-                                    tx.set_nonblocking(true)?;
-                                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
-                                    if veth {
-                                        info!(
-                                            "attempting to add veths named, {}, {}",
-                                            &v_out, &v_in
-                                        );
-                                        let addrs = nl.fetch_all_ip_addrs().await?;
-                                        let ips: Vec<_> = addrs
-                                            .iter()
-                                            .filter_map(|f| match f {
-                                                IpNetwork::V4(v4) => Some(v4.ip()),
-                                                _ => None,
-                                            })
-                                            .collect();
-
-                                        let v1: Option<Ipv4Addr> =
-                                            find_vacant_ipv4_subnet(ips, veth_net, host_bits);
-                                        if let Some(subnet) = v1 {
-                                            vethips = Some(AssignedIps {
-                                                vout: veth_addr_for(subnet, host_bits, true),
-                                                vin: veth_addr_for(subnet, host_bits, false),
-                                            });
-                                            nl.add_veth(&v_out, &v_in).await;
-                                            let vin = nl.fetch_link_by_name(v_in.clone()).await?;
-                                            let msg: LinkMessageBuilder<LinkVeth> =
-                                                LinkMessageBuilder::default()
-                                                    .index(vin.header.index)
-                                                    .setns_by_pid(child_pid as u32);
-                                            nl.link().set(msg.build()).execute().await;
-                                            tx.write(subnet.as_octets()).await?;
-
-                                            let vout = nl.fetch_link_by_name(v_out.clone()).await?;
-                                            nl.address()
-                                                .add(
-                                                    vout.header.index,
-                                                    veth_addr_for(subnet, host_bits, true).into(),
-                                                    subnet_prefix,
-                                                )
-                                                .execute()
-                                                .await?;
-                                            nl.link()
-                                                .set(
-                                                    LinkMessageBuilder::<LinkUnspec>::default()
-                                                        .index(vout.header.index)
-                                                        .up()
-                                                        .build(),
-                                                )
-                                                .execute()
-                                                .await?;
-                                        } else {
-                                            tracing::error!("cannot find any vacant ip");
-                                        }
-                                    }
-
-                                    let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
-                                    let (st_sx, acceptor) = flume::unbounded();
-
-                                    tokio::spawn(async move {
-                                        let x = watch_config(
-                                            vdns_rx,
-                                            cli.conf.clone(),
-                                            acceptor,
-                                            child_pid as u32,
-                                            tx,
-                                            vethips,
-                                        )
-                                        .await;
-                                        warn!("out-ns, watcher exited {:?}", x);
-                                    });
-
-                                    tun2socks5::main_entry(
-                                        dev,
-                                        mtu,
-                                        false,
-                                        iargs,
-                                        vdns_sx.clone(),
-                                        st_sx,
-                                    )
-                                    .await?;
-                                    warn!("tun exited");
-                                    let _ = vdns_sx.send(None).await;
-
-                                    std::future::pending::<()>().await;
-                                    aok!()
-                                })?;
-                            }
-                        }
-                    }
-                    // This is what you dont get in Unix philosophy. User experience.
-                    Err(er) => {
-                        warn!("Clone3 failed with {:?}", &er);
-                        let res = getresuid()?;
-                        if res.real.is_root() {
-                            warn!("{:?}", res);
-                        } else {
-                            warn!("Is this the executable set with SUID? {:?}", res)
-                        }
-                    }
-                }
-            } else {
-                if let Some(url) = &iargs.proxy {
-                    let tun = TunMaker::default();
-                    let mut state = tun.make()?;
-                    state.sync_basic()?;
-                } else {
-                    warn!("netns did not change");
-
-                    let clone = shell_prefs.spawn()?;
-                    let rt = tokio::runtime::Builder::new_current_thread().build()?;
-                    rt.block_on(async { clone.wait_for_child().await })?;
-                    warn!("exit");
-                }
-            }
-        }
+        } => cmd_run(
+            &mut cli.conf,
+            cli.no_wrap_check,
+            src,
+            dst,
+            proxy,
+            veth,
+            keep,
+            all,
+            default,
+            no_default,
+            log,
+            mount,
+            sargs,
+            name,
+            profile,
+            mnt,
+            binds,
+            no_proxy,
+            &mut |level| {
+                reload_handle.modify(|k| *k.filter_mut() = level)?;
+                Ok(())
+            },
+        )?,
         MainCommand::Rm { file } => {
             rm_mount(&file)?;
         }
@@ -766,32 +263,9 @@ fn main() -> anyhow::Result<()> {
             };
 
             if let Some(path) = resolved_path {
-                let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
-                    std::fs::read_to_string(&nsdata)
-                        .ok()
-                        .and_then(|content| serde_json::from_str(&content).ok())
-                } else {
-                    None
-                };
-
-                if let Some(ns_alive) = ns_alive {
-                    // Use child_pid if available to enter both namespaces
-                    if let Some(child_pid) = ns_alive.child_pid {
-                        let ns_source = NSSource::Pid(child_pid as i32);
-                        // Enter mount namespace first
-                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
-                        info!("Entered mount namespace from child PID {}", child_pid);
-                        // Then enter network namespace
-                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
-                        info!("Entered network namespace from child PID {}", child_pid);
-                    } else {
-                        // Fallback to path-based entry for backwards compatibility
-                        let ns = NSSource::Path(path.clone());
-                        ns.enter(CloneFlags::CLONE_NEWNET)?;
-                    }
-
-                    shell_prefs.set_nsproxy_env(ns_alive.browser_profile);
-                    shell_prefs.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
+                if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
+                    enter_ns(&ns_alive, &path)?;
+                    apply_ns_env(&mut shell_prefs, &ns_alive);
                 } else {
                     error!("NS data not found at {:?}", nsdata)
                 }
@@ -1312,8 +786,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         MainCommand::Up { profile } => {
-            let wrapped_config = WrappedBinariesConfig::load()?;
-            wrapped_config.check_all_wrapped()?;
+            check_wrap(false)?;
 
             let profile_path = state_paths::profile_config(&profile);
             if !profile_path.exists() {
@@ -1382,15 +855,7 @@ fn main() -> anyhow::Result<()> {
                         tx.write(&[0])?;
                     }
                 },
-                Err(er) => {
-                    warn!("Clone3 failed with {:?}", &er);
-                    let res = getresuid()?;
-                    if res.real.is_root() {
-                        warn!("{:?}", res);
-                    } else {
-                        warn!("Is this the executable set with SUID? {:?}", res)
-                    }
-                }
+                Err(er) => report_clone3_err(&er)?,
             }
         }
         MainCommand::Serve {
@@ -1400,261 +865,27 @@ fn main() -> anyhow::Result<()> {
             no_proxy,
             log,
             clash,
-        } => {
-            let wrapped_config = WrappedBinariesConfig::load()?;
-            wrapped_config.check_all_wrapped()?;
-
-            let mut iargs = proxy;
-            match (iargs.proxy.is_some(), no_proxy) {
-                (true, true) => {
-                    bail!(
-                        "Cannot specify both --proxy and --no-proxy. They are mutually exclusive."
-                    );
-                }
-                (false, false) => {
-                    bail!("Must specify either --proxy <URL> or --no-proxy explicitly.");
-                }
-                _ => {}
-            }
-
-            let ns_meta = state_paths::profile_ns_meta(&profile);
-            let ns_alive: nsproxy_core::NsAlive = std::fs::read_to_string(&ns_meta)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-                .ok_or_else(|| anyhow!("NS data not found at {:?}", &ns_meta))?;
-
-            let child_pid = ns_alive
-                .child_pid
-                .ok_or_else(|| anyhow!("ns_alive has no child_pid"))?;
-
-            let hot_conf = state_paths::hot_config(&profile);
-            if !hot_conf.exists() {
-                bail!("hot config does not exist: {:?}", hot_conf);
-            }
-
-            let diag_path = diag::diag_sock_path(&profile);
-            if diag_path.exists() {
-                match std::os::unix::net::UnixStream::connect(&diag_path) {
-                    Ok(_) => {
-                        bail!(
-                            "tun appears to be running (diag socket accepts connections): {:?}",
-                            diag_path
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "diag socket probe failed ({}), proceeding with startup: {:?}",
-                            e, diag_path
-                        );
-                    }
-                }
-            }
-            iargs.diag_sock = Some(diag_path);
-
-            let mtu = 1500;
-            let tun_name = iargs.tun_name.unwrap_or_else(|| "tun2".to_owned());
-            iargs.tun_name = Some(tun_name.clone());
-
-            let clone = nsproxy_core::sys::clone3::<false>(false, false);
-            match clone {
-                Ok(clone) => match clone {
-                    Clone3Result::IsChild { mut tx } => {
-                        let hot_conf = hot_conf.clone();
-                        let ns_source = NSSource::Pid(child_pid as i32);
-                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
-                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
-                        // already done in ::Up
-                        // enable_ping_all()?;
-
-                        let mut tun = TunMaker::default();
-                        tun.name = tun_name.clone();
-                        tun.mtu = mtu;
-                        let mut tun_state = tun.make()?;
-                        tun_state.sync_basic()?;
-                        let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
-                        let raw = dev.as_raw_fd();
-
-                        info!("send TUN fd");
-                        tx.send_fd(raw)?;
-                        drop(dev);
-
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        rt.block_on(async {
-                            use tokio::io::AsyncReadExt;
-                            use tokio_send_fd::SendFd;
-                            tx.set_nonblocking(true)?;
-                            let mut tx = tokio::net::UnixStream::from_std(tx)?;
-
-                            let nl = tokio_netlink_conn()?;
-                            nl.up_lo().await?;
-
-                            // Set txqueuelen for TUN device to handle bursty traffic
-                            let txqueuelen = 500_000u32; // 
-                            warn!(
-                                "setting TUN txqueuelen to {} for high throughput",
-                                txqueuelen
-                            );
-                            nl.link()
-                                .set(
-                                    LinkMessageBuilder::<LinkUnspec>::default()
-                                        .index(tun_state.dev_index)
-                                        .append_extra_attribute(LinkAttribute::TxQueueLen(
-                                            txqueuelen,
-                                        ))
-                                        .build(),
-                                )
-                                .execute()
-                                .await?;
-
-                            let add_default = !no_default;
-                            if add_default {
-                                warn!("adding TUN as default route");
-                                nl.ip_add_default_route(tun_state.dev_index).await?;
-                            }
-
-                            tokio::spawn(async move {
-                                let conf = Some(hot_conf);
-                                if let Some(conf) = conf {
-                                    let mut mnt: HashMap<PathBuf, PathBuf> = Default::default();
-                                    let mut read = [0u8; 24];
-                                    loop {
-                                        info!("in-ns wait for config");
-                                        let k = tx.read(&mut read[..]).await?;
-                                        if k < 1 {
-                                            error!("in-ns config watcher exits due to EOF");
-                                            break;
-                                        }
-                                        info!("in-ns reload config");
-                                        let fc = tokio::fs::read_to_string(&conf).await?;
-                                        match serde_json::from_str::<HotConfig>(&fc) {
-                                            Ok(newconf) => {
-                                                for (s, t) in mnt.clone() {
-                                                    if let Some(_new) = newconf.mnt.get(&s) {
-                                                    } else {
-                                                        rm_mount(&t);
-                                                        mnt.remove(&s);
-                                                    }
-                                                }
-
-                                                for (s, t) in newconf.mnt.clone() {
-                                                    if let Some(current) = mnt.get(&s)
-                                                        && current == &t
-                                                    {
-                                                    } else {
-                                                        let x = mount_bind(&s, &t);
-                                                        if let Err(e) = x {
-                                                            error!("Bind mount {:?}", &e);
-                                                        }
-                                                        mnt.insert(s, t);
-                                                    }
-                                                }
-
-                                                tx.write(&[0, 0, 0, 0]).await?;
-                                                for (in_port, _dst) in &newconf.locals {
-                                                    let bind = std::net::TcpListener::bind(
-                                                        format!("127.0.0.1:{}", in_port),
-                                                    )?;
-                                                    let raw = bind.as_raw_fd();
-                                                    tx.write(&in_port.to_le_bytes()).await?;
-                                                    tx.send_fd(raw).await?;
-                                                }
-                                                tx.write(&[0, 0, 0, 0]).await?;
-
-                                                let _ = enumerate_links(None, &newconf).await;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-
-                                aok!()
-                            });
-
-                            std::future::pending::<()>().await;
-                            aok!()
-                        })?;
-                    }
-                    Clone3Result::Parent {
-                        child_pid,
-                        child_pidfd,
-                        mut tx,
-                    } => {
-                        let hot_conf = hot_conf.clone();
-                        info!("recved fd");
-                        let dev = tx.recv_fd()?;
-                        let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
-
-                        let rt = tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .build()?;
-                        if let Some(log) = log {
-                            reload_handle.modify(|k| *k.filter_mut() = log)?;
-                        }
-                        rt.spawn(async move {
-                            let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
-                            let _ = fd.into_future().await?;
-                            warn!("tun helper exited");
-                            aok!()
-                        });
-
-                        rt.block_on(async move {
-                            use tokio::io::AsyncWriteExt;
-
-                            tx.set_nonblocking(true)?;
-                            let mut tx = tokio::net::UnixStream::from_std(tx)?;
-
-                            let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
-                            let (st_sx, acceptor) = flume::unbounded();
-
-                            tokio::spawn(async move {
-                                let x = watch_config(
-                                    vdns_rx,
-                                    Some(hot_conf),
-                                    acceptor,
-                                    child_pid as u32,
-                                    tx,
-                                    None,
-                                )
-                                .await;
-                                warn!("out-ns, watcher exited {:?}", x);
-                            });
-
-                            tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx.clone(), st_sx)
-                                .await?;
-                            warn!("tun exited");
-                            let _ = vdns_sx.send(None).await;
-
-                            std::future::pending::<()>().await;
-                            aok!()
-                        })?;
-                    }
-                },
-                Err(er) => {
-                    warn!("Clone3 failed with {:?}", &er);
-                    let res = getresuid()?;
-                    if res.real.is_root() {
-                        warn!("{:?}", res);
-                    } else {
-                        warn!("Is this the executable set with SUID? {:?}", res)
-                    }
-                }
-            }
-        }
+        } => cmd_serve(
+            profile,
+            proxy,
+            no_default,
+            no_proxy,
+            log,
+            clash,
+            &mut |level| {
+                reload_handle.modify(|k| *k.filter_mut() = level)?;
+                Ok(())
+            },
+        )?,
         MainCommand::Veth {
             profile,
             veth_name,
             log,
         } => {
-            let wrapped_config = WrappedBinariesConfig::load()?;
-            wrapped_config.check_all_wrapped()?;
+            check_wrap(false)?;
 
             let ns_meta = state_paths::profile_ns_meta(&profile);
-            let ns_alive: nsproxy_core::NsAlive = std::fs::read_to_string(&ns_meta)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-                .ok_or_else(|| anyhow!("NS data not found at {:?}", &ns_meta))?;
+            let ns_alive = read_ns_alive(&ns_meta)?;
 
             let child_pid = ns_alive
                 .child_pid
@@ -1755,9 +986,7 @@ fn main() -> anyhow::Result<()> {
                                 tx.write(subnet.as_octets())?;
                             }
                         },
-                        Err(er) => {
-                            warn!("Clone3 failed with {:?}", &er);
-                        }
+                        Err(er) => warn!("Clone3 failed with {:?}", &er),
                     }
                 } else {
                     tracing::error!("cannot find any vacant ip");
@@ -1784,28 +1013,9 @@ fn main() -> anyhow::Result<()> {
                 let bind_mount = state_paths::profile_netns_bind("basis");
                 let nsdata = state_paths::profile_ns_meta("basis");
 
-                let ns_alive: Option<nsproxy_core::NsAlive> = if nsdata.exists() {
-                    std::fs::read_to_string(&nsdata)
-                        .ok()
-                        .and_then(|content| serde_json::from_str(&content).ok())
-                } else {
-                    None
-                };
-
-                if let Some(ns_alive) = ns_alive {
-                    if let Some(child_pid) = ns_alive.child_pid {
-                        let ns_source = NSSource::Pid(child_pid as i32);
-                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
-                        info!("Entered mount namespace from child PID {}", child_pid);
-                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
-                        info!("Entered network namespace from child PID {}", child_pid);
-                    } else {
-                        let ns = NSSource::Path(bind_mount.clone());
-                        ns.enter(CloneFlags::CLONE_NEWNET)?;
-                    }
-
-                    shell_prefs.set_nsproxy_env(ns_alive.browser_profile);
-                    shell_prefs.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
+                if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
+                    enter_ns(&ns_alive, &bind_mount)?;
+                    apply_ns_env(&mut shell_prefs, &ns_alive);
                 } else {
                     let ns = NSSource::Path(bind_mount.clone());
                     ns.enter(CloneFlags::CLONE_NEWNET)?;
@@ -2450,284 +1660,603 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_tcp_forward_local(fd: OwnedFd, port: u32, dst_port: u32) {
-    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
-    std_listener.set_nonblocking(true).unwrap();
-    match tokio::net::TcpListener::from_std(std_listener) {
-        Ok(listener) => loop {
-            match listener.accept().await {
-                Ok((mut client, _)) => {
-                    let dst_addr = format!("127.0.0.1:{}", dst_port);
-                    tokio::spawn(async move {
-                        match tokio::net::TcpStream::connect(&dst_addr).await {
-                            Ok(mut server) => {
-                                info!("forwarded connection from port {} to {}", port, dst_addr);
-                                if let Err(e) =
-                                    tokio::io::copy_bidirectional(&mut client, &mut server).await
-                                {
-                                    warn!("forward error: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("failed to connect to {}: {}", dst_addr, e);
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!("accept error on port {}: {}", port, e);
-                    break;
-                }
+#[allow(clippy::too_many_arguments)]
+fn cmd_run(
+    conf: &mut Option<PathBuf>,
+    no_wrap_check: bool,
+    _src: NsInput,
+    dst: NsInput,
+    proxy: IArgs,
+    veth: bool,
+    _keep: bool,
+    _all: bool,
+    default: bool,
+    no_default: bool,
+    log: Option<LevelFilter>,
+    mut mount: Option<PathBuf>,
+    sargs: ShellArgs,
+    name: Option<String>,
+    profile: Option<String>,
+    mnt: bool,
+    mut binds: bool,
+    no_proxy: bool,
+    set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
+) -> Result<()> {
+    check_wrap(no_wrap_check)?;
+
+    let mut iargs = proxy;
+    check_proxy_mode(iargs.proxy.is_some(), no_proxy)?;
+
+    let mtu = 1500;
+    let tun_name = "tun2".to_owned();
+    let proc = procfs::process::Process::myself()?;
+    let ns = proc.namespaces()?;
+    let self_net = ns.0.get(OsStr::new("net")).unwrap();
+    let _self_netns = self_net.clone().to_exactns();
+    let dst_ns = try_resolve_nsinput(dst.clone())?;
+    let mut shell_prefs = ShellPrefs::default();
+    shell_prefs.take_args(sargs);
+    shell_prefs.adjust();
+    shell_prefs.set_nsproxy_env(profile.clone());
+    let _ns_moved = [0; 1];
+
+    let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
+    iargs.tun_name = Some(tun_name.clone());
+    let vname = name.clone().unwrap_or("v".to_owned());
+    let v_in = format!("{vname}_in");
+    let v_out = format!("{vname}_out");
+    let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
+    let host_bits = 2;
+    let subnet_prefix = 32 - host_bits;
+
+    mount = args_deduce_mount(&name, &mount);
+    if let Some(mount) = &mount {
+        shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
+    } else {
+        shell_prefs.set_ns_env(None);
+    }
+
+    if conf.is_none() {
+        warn!("Live config is not specified. Use sp -c ./nsproxy.json run");
+        if let Some(p) = &profile {
+            let conf_path = PathBuf::from(".").join(p).with_extension("json");
+            if conf_path.exists() {
+                *conf = Some(conf_path);
+                warn!("config file defaults to {:?}", conf);
+            } else {
+                warn!("config file defaults to {:?} but its not found", &conf_path);
             }
-        },
-        Err(e) => {
-            warn!("failed to create async listener for port {}: {}", port, e);
         }
     }
-}
 
-async fn watch_config(
-    mut vdns_rx: mpsc::Receiver<Option<VirtDNSHandle>>,
-    conf: Option<PathBuf>,
-    acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
-    child_pid: u32,
-    mut tx: tokio::net::UnixStream,
-    veths: Option<AssignedIps>,
-) -> Result<()> {
-    let mut warps: HashMap<PathBuf, ServerItem> = HashMap::new();
-    let vdns: Option<Option<VirtDNSHandle>> = vdns_rx.next().await;
-    let vdns = vdns.unwrap();
-    let mut futs = Vec::new();
-    let mut prev_conf_ = None;
-
-    if let Some(vdns) = &vdns
-        && let Some(veth) = veths
-    {
-        vdns.pin(
-            Some(veth.vout),
-            "veth.host.".to_owned(),
-            TUNResponse::Unreachable,
-        );
-        vdns.pin(
-            Some(veth.vin),
-            "veth.peer.".to_owned(),
-            TUNResponse::Unreachable,
+    if !mnt {
+        warn!(
+            "Not directed to use a new mount namespace. Mounts will operate on root namespace. Use --mnt"
         );
     }
+    if mnt {
+        binds = true;
+    }
 
-    if let Some(conf) = conf {
-        let (mut wx, mut rx) = async_watcher()?;
-        wx.watch(&conf, notify::RecursiveMode::NonRecursive)?;
-        info!("watch config");
+    if dst == NsInput::This {
+        if iargs.proxy.is_some() {
+            let tun = TunMaker::default();
+            let mut state = tun.make()?;
+            state.sync_basic()?;
+            return Ok(());
+        }
 
-        loop {
-            let vdns = vdns.clone();
-            let conf = conf.clone();
-            let warps = &mut warps;
-            let acceptor = acceptor.clone();
-            let prev_conf = &mut prev_conf_;
-            let tx = &mut tx;
-            let o = async move {
-                warn!("config hot reload");
+        warn!("netns did not change");
+        let clone = shell_prefs.spawn()?;
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        rt.block_on(async { clone.wait_for_child().await })?;
+        warn!("exit");
+        return Ok(());
+    }
 
-                let mut futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
-                let conf = conf;
-                let fc = tokio::fs::read_to_string(&conf).await?;
-                match serde_json::from_str::<HotConfig>(&fc) {
-                    Ok(newconf) => {
-                        let cloned = newconf.clone();
-                        if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
-                            return Ok(futs);
-                        }
-                        use serde_json::{self, Value};
-                        warps.iter_mut().map(|(p, k)| k.marked = false);
+    let clone = nsproxy_core::sys::clone3::<true>(mnt, false);
+    match clone {
+        Ok(clone) => match clone {
+            Clone3Result::IsChild { mut tx } => {
+                let mut buf = [0; 8];
 
-                        info!("enumerate link devices in parent process");
-                        enumerate_links(Some(child_pid), &newconf).await?;
+                if let Some(dst) = dst_ns {
+                    dst.enter(CloneFlags::CLONE_NEWNET)?;
+                }
+                if dst != NsInput::New {
+                    bail!("unexpected {:?}", &dst);
+                }
+                enable_ping_all()?;
 
-                        if let Some(vdns) = &vdns {
-                            for (domain, ip) in newconf.dns {
-                                let target = TUNResponse::Unreachable;
-                                if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-                                    info!("DNS {} -> {}", &domain, addr);
-                                    vdns.pin(Some(addr), domain, target)?;
-                                };
-                            }
-                            for (domain, spec) in newconf.tun {
-                                match spec {
-                                    Value::String(mapstr) => {
-                                        if let Ok(addr) = mapstr.parse::<SocketAddr>() {
-                                            info!("NAT-out {} -> {}", &domain, addr);
-                                            let target = TUNResponse::NATByTUN(addr);
-                                        } else if let Ok(path) = mapstr.parse::<PathBuf>() {
-                                            info!("Files {} -> {}", &domain, mapstr);
-                                            match warps.entry(path.clone()) {
-                                                Entry::Vacant(e) => {
-                                                    let f = warp::fs::dir(path.clone());
-                                                    let wa = WarpAcceptor {
-                                                        rx: acceptor.clone(),
-                                                        path: path.clone(),
-                                                    };
-                                                    let ws = warp::serve(f).incoming(wa);
-                                                    futs.push(Box::pin(ws.run()));
-                                                    e.insert(ServerItem { marked: true });
-                                                }
-                                                Entry::Occupied(mut e) => {
-                                                    e.get_mut().marked = true;
-                                                }
-                                            }
-                                            let target = TUNResponse::Files(path);
-                                            vdns.pin(None, domain, target)?;
-                                        }
-                                    }
-                                    Value::Number(port) => {
-                                        let p = port.as_u64().ok_or(anyhow!("invalid port"))?;
-                                        let p: u16 = p.try_into()?;
-                                        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
-                                        info!("NAT-out {} -> {}", &domain, addr);
-                                        let target = TUNResponse::NATByTUN(addr);
-                                        vdns.pin(None, domain, target);
-                                    }
-                                    _ => (),
-                                };
-                            }
-                        }
-                        info!("ping child");
-                        tx.write(&[1u8]).await?;
-                        use tokio_send_fd::SendFd;
-                        let mut port_bytes = [0u8; 4];
-                        let mut first = false;
-                        while tx.read(&mut port_bytes).await.ok() == Some(4) {
-                            let in_port = u32::from_le_bytes(port_bytes);
-                            if in_port == 0 {
-                                if !first {
-                                    first = true;
-                                    continue;
-                                } else {
+                let mut tun = TunMaker::default();
+                tun.name = tun_name.clone();
+                tun.mtu = mtu;
+                let mut tun_state = tun.make()?;
+                tun_state.sync_basic()?;
+                let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
+                let raw = dev.as_raw_fd();
+
+                info!("send TUN fd");
+                tx.send_fd(raw)?;
+                drop(dev);
+
+                tx.read(&mut buf)?;
+                if mnt {
+                    mount_bind_root()?;
+                    tx.write(&[0])?;
+                }
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    use tokio::io::AsyncReadExt;
+                    use tokio_send_fd::SendFd;
+
+                    let mut read = [0u8; 4];
+                    tx.set_nonblocking(true)?;
+                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                    let add_default =
+                        (dst == NsInput::New && !no_default) || (dst == NsInput::This && default);
+
+                    let nl = tokio_netlink_conn()?;
+                    nl.up_lo().await?;
+
+                    if add_default {
+                        warn!("adding TUN as default route");
+                        nl.ip_add_default_route(tun_state.dev_index).await?;
+                    }
+                    if veth {
+                        tx.read(&mut read).await;
+                        let ip = veth_addr_for(Ipv4Addr::from_octets(read), host_bits, false);
+
+                        let dev = nl.fetch_link_by_name(v_in).await?;
+                        nl.address()
+                            .add(dev.header.index, ip.into(), subnet_prefix)
+                            .execute()
+                            .await?;
+
+                        nl.link()
+                            .set(
+                                LinkMessageBuilder::<LinkUnspec>::default()
+                                    .index(dev.header.index)
+                                    .up()
+                                    .build(),
+                            )
+                            .execute()
+                            .await?;
+                    }
+
+                    let conf = conf.clone();
+                    tokio::spawn(async move {
+                        if let Some(conf) = conf {
+                            let mut mnt: HashMap<PathBuf, PathBuf> = Default::default();
+                            let mut read = [0u8; 24];
+                            loop {
+                                info!("in-ns wait for config");
+                                let k = tx.read(&mut read[..]).await?;
+                                if k < 1 {
+                                    error!("in-ns config watcher exits due to EOF");
                                     break;
                                 }
-                            }
-                            let fd = tx.recv_fd().await?;
-                            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                            let dst_port = newconf.locals.get(&in_port).copied();
-                            futs.push(Box::pin(async move {
-                                if let Some(dst_port) = dst_port {
-                                    handle_tcp_forward_local(fd, in_port, dst_port).await;
+                                info!("in-ns reload config");
+                                let fc = tokio::fs::read_to_string(&conf).await?;
+                                match serde_json::from_str::<HotConfig>(&fc) {
+                                    Ok(newconf) => {
+                                        for (s, t) in mnt.clone() {
+                                            if newconf.mnt.get(&s).is_none() {
+                                                rm_mount(&t);
+                                                mnt.remove(&s);
+                                            }
+                                        }
+
+                                        if binds {
+                                            for (s, t) in newconf.mnt.clone() {
+                                                if let Some(current) = mnt.get(&s)
+                                                    && current == &t
+                                                {
+                                                } else {
+                                                    let x = mount_bind(&s, &t);
+                                                    if let Err(e) = x {
+                                                        error!("Bind mount {:?}", &e);
+                                                    }
+                                                    mnt.insert(s, t);
+                                                }
+                                            }
+                                        }
+
+                                        tx.write(&[0, 0, 0, 0]).await?;
+                                        for (in_port, _dst) in &newconf.locals {
+                                            let bind = std::net::TcpListener::bind(format!(
+                                                "127.0.0.1:{}",
+                                                in_port
+                                            ))?;
+                                            let raw = bind.as_raw_fd();
+                                            tx.write(&in_port.to_le_bytes()).await?;
+                                            tx.send_fd(raw).await?;
+                                        }
+                                        tx.write(&[0, 0, 0, 0]).await?;
+
+                                        let _ = sync_links(None, &newconf).await;
+                                    }
+                                    _ => {}
                                 }
-                            }));
+                            }
                         }
-                        info!("localhost forward {}", newconf.locals.len());
-                        info!("received and spawned TCP listener tasks");
 
-                        *prev_conf = Some(cloned);
-                    }
-                    _ => {
-                        warn!("config changed, but is invalid");
-                    }
-                }
+                        aok!()
+                    });
 
-                anyhow::Ok(futs)
-            };
+                    let clone = shell_prefs.spawn()?;
+                    clone.wait_for_child().await?;
 
-            info!("serving {} file roots. wait for new event.", futs.len());
-            futs = select! {
-                k = rx.recv() => {if let Some(_) = k { o.await? } else {break;}},
-                _ = join_all(futs), if futs.len() > 0 => {
-                    Vec::new()
-                }
+                    exit(0);
+                    aok!()
+                })?;
             }
-        }
+            Clone3Result::Parent {
+                child_pid,
+                child_pidfd,
+                mut tx,
+            } => {
+                info!("recved fd");
+                let dev = tx.recv_fd()?;
+                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
 
-        warn!("config watching ended");
-    } else {
-        error!("no config specified. config watcher stopped");
+                if let Some(mount) = mount {
+                    std::fs::create_dir_all(RUNTIME_ROOT)?;
+
+                    let path = format!("/proc/{}/ns/net", child_pid);
+                    let path = PathBuf::from(path);
+                    mount_ns(&path, &mount)?;
+
+                    let ns_alive = nsproxy_core::NsAlive {
+                        browser_profile: profile.clone(),
+                        bind_mount: mount.clone(),
+                        child_pid: Some(child_pid as u32),
+                    };
+                    let json = serde_json::to_string_pretty(&ns_alive)?;
+                    let jsonpath = state_paths::metadata_for_bind(&mount);
+                    info!(
+                        "Writing NS metadata to {:?} ({} bytes)",
+                        &jsonpath,
+                        json.len()
+                    );
+                    std::fs::write(&jsonpath, json)?;
+                    warn!("Auxiliary data written to {:?}", &jsonpath);
+                    tx.write(&[0]);
+
+                    if mnt {
+                        let mut buf = [0; 1];
+                        tx.read(&mut buf);
+                    }
+                } else {
+                    warn!("not mounting this namespace");
+                }
+
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                if let Some(log) = log {
+                    set_log(log)?;
+                }
+                rt.spawn(async move {
+                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
+                    let _ = fd.into_future().await?;
+                    warn!("Shell has exited but nsproxy is still running. Press CtrlC to exit.");
+                    aok!()
+                });
+
+                let mut vethips = None;
+
+                rt.block_on(async move {
+                    use tokio::io::AsyncWriteExt;
+
+                    let nl = tokio_netlink_conn()?;
+                    tx.set_nonblocking(true)?;
+                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                    if veth {
+                        info!("attempting to add veths named, {}, {}", &v_out, &v_in);
+                        let addrs = nl.fetch_all_ip_addrs().await?;
+                        let ips: Vec<_> = addrs
+                            .iter()
+                            .filter_map(|f| match f {
+                                IpNetwork::V4(v4) => Some(v4.ip()),
+                                _ => None,
+                            })
+                            .collect();
+
+                        let v1: Option<Ipv4Addr> = find_vacant_ipv4_subnet(ips, veth_net, host_bits);
+                        if let Some(subnet) = v1 {
+                            vethips = Some(VethIps {
+                                vout: veth_addr_for(subnet, host_bits, true),
+                                vin: veth_addr_for(subnet, host_bits, false),
+                            });
+                            nl.add_veth(&v_out, &v_in).await;
+                            let vin = nl.fetch_link_by_name(v_in.clone()).await?;
+                            let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
+                                .index(vin.header.index)
+                                .setns_by_pid(child_pid as u32);
+                            nl.link().set(msg.build()).execute().await;
+                            tx.write(subnet.as_octets()).await?;
+
+                            let vout = nl.fetch_link_by_name(v_out.clone()).await?;
+                            nl.address()
+                                .add(
+                                    vout.header.index,
+                                    veth_addr_for(subnet, host_bits, true).into(),
+                                    subnet_prefix,
+                                )
+                                .execute()
+                                .await?;
+                            nl.link()
+                                .set(
+                                    LinkMessageBuilder::<LinkUnspec>::default()
+                                        .index(vout.header.index)
+                                        .up()
+                                        .build(),
+                                )
+                                .execute()
+                                .await?;
+                        } else {
+                            tracing::error!("cannot find any vacant ip");
+                        }
+                    }
+
+                    let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
+                    let (st_sx, acceptor) = flume::unbounded();
+
+                    let conf = conf.clone();
+                    tokio::spawn(async move {
+                        let x = watch_hot(
+                            vdns_rx,
+                            conf,
+                            acceptor,
+                            child_pid as u32,
+                            tx,
+                            vethips,
+                        )
+                        .await;
+                        warn!("out-ns, watcher exited {:?}", x);
+                    });
+
+                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx.clone(), st_sx)
+                        .await?;
+                    warn!("tun exited");
+                    let _ = vdns_sx.send(None).await;
+
+                    std::future::pending::<()>().await;
+                    aok!()
+                })?;
+            }
+        },
+        Err(er) => report_clone3_err(&er)?,
     }
-    aok!()
+
+    Ok(())
 }
 
-pub async fn enumerate_links(child_pid: Option<u32>, newconf: &HotConfig) -> Result<()> {
-    let handle = tokio_netlink_conn()?;
+fn cmd_serve(
+    profile: String,
+    proxy: IArgs,
+    no_default: bool,
+    no_proxy: bool,
+    log: Option<LevelFilter>,
+    _clash: Option<String>,
+    set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
+) -> Result<()> {
+    let mut iargs = proxy;
+    check_proxy_mode(iargs.proxy.is_some(), no_proxy)?;
 
-    let mut links = handle.link().get().execute();
-    'outer: loop {
-        match links.try_next().await {
-            Ok(Some(msg)) => {
-                for nla in msg.attributes.into_iter() {
-                    match nla {
-                        LinkAttribute::IfName(name) => {
-                            info!("found interface {}", &name);
-                            if let Some(ipstr) = newconf.devs.get(&name) {
-                                if let Some(pid) = child_pid {
-                                    let msg: LinkMessageBuilder<LinkUnspec> =
-                                        LinkMessageBuilder::default()
-                                            .index(msg.header.index)
-                                            .setns_by_pid(pid);
-                                    handle.link().set(msg.build()).execute().await?;
-                                    info!("set dev to ns");
-                                }
-                                if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-                                    info!("assigning IP {} to dev {}", ip, name);
-                                    let _ = handle
-                                        .address()
-                                        .add(msg.header.index, ip.ip(), ip.prefix())
-                                        .execute()
-                                        .await;
+    let ns_meta = state_paths::profile_ns_meta(&profile);
+    let ns_alive = read_ns_alive(&ns_meta)?;
 
-                                    let _ = handle
-                                        .link()
-                                        .set(
-                                            LinkUnspec::new_with_index(msg.header.index)
-                                                .up()
-                                                .build(),
-                                        )
-                                        .execute()
-                                        .await;
-                                }
-                            }
-                            continue 'outer;
-                        }
-                        LinkAttribute::Address(mac) => {
-                            info!("found mac {:?}", mac);
-                            if mac.len() == 6 {
-                                let mac: [u8; 6] = mac[..6].try_into().unwrap();
-                                let macstr = MacAddr::from_raw(mac).to_colon_separated();
-                                if let Some(pid) = child_pid {
-                                    let msg: LinkMessageBuilder<LinkUnspec> =
-                                        LinkMessageBuilder::default()
-                                            .index(msg.header.index)
-                                            .setns_by_pid(pid);
-                                    handle.link().set(msg.build()).execute().await?;
-                                }
-                                if let Some(ipstr) = newconf.devs.get(&macstr) {
-                                    if let Ok(ip) = ipstr.parse::<IpNetwork>() {
-                                        info!("assigning IP {} to dev {}", ip, macstr);
-                                        let _ = handle
-                                            .address()
-                                            .add(msg.header.index, ip.ip(), ip.prefix())
-                                            .execute()
-                                            .await;
-                                    }
-                                }
-                            };
-                        }
-                        LinkAttribute::PermAddress(addr) => {
-                            info!("found PermAddress {:?}", addr);
-                        }
-                        _ => {}
-                    }
-                }
+    let child_pid = ns_alive
+        .child_pid
+        .ok_or_else(|| anyhow!("ns_alive has no child_pid"))?;
+
+    let hot_conf = state_paths::hot_config(&profile);
+    if !hot_conf.exists() {
+        bail!("hot config does not exist: {:?}", hot_conf);
+    }
+
+    let diag_path = diag::diag_sock_path(&profile);
+    if diag_path.exists() {
+        match std::os::unix::net::UnixStream::connect(&diag_path) {
+            Ok(_) => {
+                bail!(
+                    "tun appears to be running (diag socket accepts connections): {:?}",
+                    diag_path
+                );
             }
-            Err(er) => {
-                warn!("link enumeration failed with {:?}", er);
-                break 'outer;
-            }
-            Ok(None) => {
-                break 'outer;
+            Err(e) => {
+                warn!(
+                    "diag socket probe failed ({}), proceeding with startup: {:?}",
+                    e, diag_path
+                );
             }
         }
     }
+    iargs.diag_sock = Some(diag_path);
 
-    aok!()
+    let mtu = 1500;
+    let tun_name = iargs.tun_name.unwrap_or_else(|| "tun2".to_owned());
+    iargs.tun_name = Some(tun_name.clone());
+
+    let clone = nsproxy_core::sys::clone3::<false>(false, false);
+    match clone {
+        Ok(clone) => match clone {
+            Clone3Result::IsChild { mut tx } => {
+                let hot_conf = hot_conf.clone();
+                let ns_source = NSSource::Pid(child_pid as i32);
+                ns_source.enter(CloneFlags::CLONE_NEWNS)?;
+                ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+
+                let mut tun = TunMaker::default();
+                tun.name = tun_name.clone();
+                tun.mtu = mtu;
+                let mut tun_state = tun.make()?;
+                tun_state.sync_basic()?;
+                let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
+                let raw = dev.as_raw_fd();
+
+                info!("send TUN fd");
+                tx.send_fd(raw)?;
+                drop(dev);
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    use tokio::io::AsyncReadExt;
+                    use tokio_send_fd::SendFd;
+                    tx.set_nonblocking(true)?;
+                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+
+                    let nl = tokio_netlink_conn()?;
+                    nl.up_lo().await?;
+
+                    let txqueuelen = 500_000u32;
+                    warn!(
+                        "setting TUN txqueuelen to {} for high throughput",
+                        txqueuelen
+                    );
+                    nl.link()
+                        .set(
+                            LinkMessageBuilder::<LinkUnspec>::default()
+                                .index(tun_state.dev_index)
+                                .append_extra_attribute(LinkAttribute::TxQueueLen(txqueuelen))
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
+
+                    if !no_default {
+                        warn!("adding TUN as default route");
+                        nl.ip_add_default_route(tun_state.dev_index).await?;
+                    }
+
+                    tokio::spawn(async move {
+                        let conf = Some(hot_conf);
+                        if let Some(conf) = conf {
+                            let mut mnt: HashMap<PathBuf, PathBuf> = Default::default();
+                            let mut read = [0u8; 24];
+                            loop {
+                                info!("in-ns wait for config");
+                                let k = tx.read(&mut read[..]).await?;
+                                if k < 1 {
+                                    error!("in-ns config watcher exits due to EOF");
+                                    break;
+                                }
+                                info!("in-ns reload config");
+                                let fc = tokio::fs::read_to_string(&conf).await?;
+                                match serde_json::from_str::<HotConfig>(&fc) {
+                                    Ok(newconf) => {
+                                        for (s, t) in mnt.clone() {
+                                            if newconf.mnt.get(&s).is_none() {
+                                                rm_mount(&t);
+                                                mnt.remove(&s);
+                                            }
+                                        }
+
+                                        for (s, t) in newconf.mnt.clone() {
+                                            if let Some(current) = mnt.get(&s)
+                                                && current == &t
+                                            {
+                                            } else {
+                                                let x = mount_bind(&s, &t);
+                                                if let Err(e) = x {
+                                                    error!("Bind mount {:?}", &e);
+                                                }
+                                                mnt.insert(s, t);
+                                            }
+                                        }
+
+                                        tx.write(&[0, 0, 0, 0]).await?;
+                                        for (in_port, _dst) in &newconf.locals {
+                                            let bind = std::net::TcpListener::bind(format!(
+                                                "127.0.0.1:{}",
+                                                in_port
+                                            ))?;
+                                            let raw = bind.as_raw_fd();
+                                            tx.write(&in_port.to_le_bytes()).await?;
+                                            tx.send_fd(raw).await?;
+                                        }
+                                        tx.write(&[0, 0, 0, 0]).await?;
+
+                                        let _ = sync_links(None, &newconf).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        aok!()
+                    });
+
+                    std::future::pending::<()>().await;
+                    aok!()
+                })?;
+            }
+            Clone3Result::Parent {
+                child_pid,
+                child_pidfd,
+                mut tx,
+            } => {
+                let hot_conf = hot_conf.clone();
+                info!("recved fd");
+                let dev = tx.recv_fd()?;
+                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
+
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                if let Some(log) = log {
+                    set_log(log)?;
+                }
+                rt.spawn(async move {
+                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
+                    let _ = fd.into_future().await?;
+                    warn!("tun helper exited");
+                    aok!()
+                });
+
+                rt.block_on(async move {
+                    use tokio::io::AsyncWriteExt;
+
+                    tx.set_nonblocking(true)?;
+                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
+
+                    let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
+                    let (st_sx, acceptor) = flume::unbounded();
+
+                    tokio::spawn(async move {
+                        let x = watch_hot(
+                            vdns_rx,
+                            Some(hot_conf),
+                            acceptor,
+                            child_pid as u32,
+                            tx,
+                            None,
+                        )
+                        .await;
+                        warn!("out-ns, watcher exited {:?}", x);
+                    });
+
+                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx.clone(), st_sx)
+                        .await?;
+                    warn!("tun exited");
+                    let _ = vdns_sx.send(None).await;
+
+                    std::future::pending::<()>().await;
+                    aok!()
+                })?;
+            }
+        },
+        Err(er) => report_clone3_err(&er)?,
+    }
+
+    Ok(())
 }
 
 use anyhow::{Result, anyhow, bail};

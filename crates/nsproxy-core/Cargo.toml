@@ -99,3 +99,6 @@ flume.workspace = true
 tun-rs.workspace = true
 thiserror = "1.0"
 ctrlc2 = { version = "3.5", features = ["tokio", "termination"] }
+
+[lints.clippy]
+all = "allow"

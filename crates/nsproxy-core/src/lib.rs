@@ -58,6 +58,9 @@ pub mod prelude;
 pub mod shell;
 pub mod state_blueprint;
 pub mod sys;
+pub mod sandbox;
+pub mod hot_reload;
+pub mod cmd_common;
 pub mod utils;
 
 pub struct TunMaker {
