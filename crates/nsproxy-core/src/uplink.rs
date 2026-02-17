@@ -24,14 +24,14 @@
 //! // 1. Create a UplinkHub with custom routing logic
 //! let routing = RoutingBuilder::new()
 //!     .add_rule(|ctx| ctx.target_domain == Some("blocked.com".to_string()),
-//!              RoutingDecision::Proxy { target: WireAddress::DomainAddress("blocked.com".into(), 443), id: ProxyID::ClashName("primary".into()) })
+//!              RoutingDecision::Proxy { target: WireAddress::DomainAddress("blocked.com".into(), 443), id: ProxyID::for_trojan("1.2.3.4:443".parse().unwrap(), "example.com", "secret") })
 //!     .build();
 //!
 //! let mut hub = UplinkHub::with_routing(routing);
 //!
 //! // 2. Add proxies to the hub
 //! hub.add_proxy(
-//!     ProxyID::ClashName("primary".into()),
+//!     ProxyID::for_trojan("1.2.3.4:443".parse().unwrap(), "example.com", "secret"),
 //!     UplinkProxy::Clash(trojan_proxy)
 //! );
 //!
@@ -58,7 +58,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bimap::BiHashMap;
 use nsproxy_common::routing::{
     ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
 };
@@ -339,11 +338,25 @@ where
 /// Modify this function to customize routing behavior
 pub type RoutingFunction = Arc<dyn Fn(&RoutingContext) -> RoutingDecision + Send + Sync>;
 
+pub fn simple_routing(id: ProxyID) -> RoutingFunction {
+    Arc::new(move |ctx: &RoutingContext| {
+        let target = if let Some(domain) = &ctx.target_domain {
+            WireAddress::DomainAddress(domain.clone(), ctx.target_port)
+        } else {
+            WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
+        };
+
+        RoutingDecision::Proxy {
+            target,
+            id: id.clone(),
+        }
+    })
+}
+
 /// Central hub of all resources we have
 pub struct UplinkHub {
     proxies: HashMap<ProxyID, UplinkProxy>,
     routing_fn: RoutingFunction,
-    proxy_nym: BiHashMap<ProxyID, ProxyNym>,
     /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
     clash: Option<clash::ClashState>,
     stats: HashMap<ProxyID, LinkStats>,
@@ -383,7 +396,7 @@ impl RemoteProxyState {
     pub fn remove_proxy(&mut self, nym: &ProxyNym) -> bool {
         let before = self.proxies.len();
         self.proxies.retain(|proxy| {
-            let id = ProxyID::Remote(proxy.addr);
+            let id = ProxyID::for_remote(proxy.addr);
             id.nym() != *nym
         });
         self.proxies.len() != before
@@ -431,7 +444,6 @@ impl UplinkHub {
             routing_fn: Arc::new(|ctx: &RoutingContext| {
                 RoutingDecision::Drop
             }),
-            proxy_nym: BiHashMap::new(),
             clash: None,
             stats: HashMap::new(),
         }
@@ -442,7 +454,6 @@ impl UplinkHub {
         Self {
             proxies: HashMap::new(),
             routing_fn,
-            proxy_nym: BiHashMap::new(),
             clash: None,
             stats: HashMap::new(),
         }
@@ -473,8 +484,6 @@ impl UplinkHub {
 
     /// Add a proxy to the hub
     pub fn add_proxy(&mut self, id: ProxyID, proxy: UplinkProxy) {
-        let nym = id.nym();
-        self.proxy_nym.insert(id.clone(), nym);
         self.proxies.insert(id, proxy);
     }
 
@@ -500,14 +509,15 @@ impl UplinkHub {
 
     /// Get a proxy by its pseudonym (nym)
     pub fn get_proxy_by_nym(&self, nym: &ProxyNym) -> Option<(&ProxyID, &UplinkProxy)> {
-        let id = self.proxy_nym.get_by_right(nym)?;
-        let proxy = self.proxies.get(id)?;
-        Some((id, proxy))
+        self.proxies
+            .iter()
+            .find(|(id, _)| id.nym() == *nym)
+            .map(|(id, proxy)| (id, proxy))
     }
 
     /// Get the nym for a proxy ID
-    pub fn get_nym(&self, id: &ProxyID) -> Option<&ProxyNym> {
-        self.proxy_nym.get_by_left(id)
+    pub fn get_nym(&self, id: &ProxyID) -> Option<ProxyNym> {
+        self.proxies.contains_key(id).then(|| id.nym())
     }
 
     /// Load all saved proxies across all uplink kinds
@@ -548,7 +558,7 @@ impl UplinkHub {
         let mut count = 0;
 
         for proxy in state.proxies {
-            let id = ProxyID::Remote(proxy.addr);
+            let id = ProxyID::for_remote(proxy.addr);
             self.add_proxy(id, UplinkProxy::Remote(proxy));
             count += 1;
         }
@@ -604,7 +614,12 @@ impl UplinkHub {
                         server_name: cfg.server.clone(),
                         password: cfg.password.clone(),
                     };
-                    let id = ProxyID::ClashName(cfg.name.clone());
+
+                    let id = ProxyID::for_trojan(
+                        runtime.server_addr,
+                        &runtime.server_name,
+                        &runtime.password,
+                    );
                     self.add_proxy(id, UplinkProxy::Trojan(runtime));
                     count += 1;
                 }
@@ -890,6 +905,12 @@ pub mod proxy_adapters {
         info: String,
     }
 
+    /// SOCKS5 UDP tunnel wrapper (UDP ASSOCIATE)
+    struct Socks5UdpConn {
+        inner: tokio::sync::Mutex<client::SocksUdpClient>,
+        info: String,
+    }
+
     impl TcpLike for Socks5TcpConn {
         fn info(&self) -> &str {
             &self.info
@@ -924,6 +945,36 @@ pub mod proxy_adapters {
             cx: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UdpLike for Socks5UdpConn {
+        async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize> {
+            let inner = self.inner.lock().await;
+            inner
+                .send_to(data, dst)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(data.len())
+        }
+
+        async fn recv_from(&mut self) -> std::io::Result<UdpPacket> {
+            let inner = self.inner.lock().await;
+            let mut buf = Vec::new();
+            let (_read, src) = inner
+                .recv_from(Duration::from_secs(86_400), &mut buf)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+            Ok(UdpPacket {
+                data: buf,
+                dst_addr: src,
+            })
+        }
+
+        fn info(&self) -> &str {
+            &self.info
         }
     }
 
@@ -1371,7 +1422,7 @@ pub mod proxy_adapters {
 
     impl RemoteAdapter {
         /// Create a SOCKS5 connection
-        pub async fn connect(
+        pub async fn connect_tcp(
             proxy: &ArgProxy,
             target_host: &str,
             target_port: u16,
@@ -1394,6 +1445,47 @@ pub mod proxy_adapters {
                 }
                 ProxyType::Socks4 | ProxyType::Http => {
                     anyhow::bail!("proxy type {:?} not yet supported", proxy.proxy_type)
+                }
+            }
+        }
+
+        /// Create a SOCKS5 UDP tunnel via UDP ASSOCIATE
+        pub async fn connect_udp(proxy: &ArgProxy) -> anyhow::Result<ProxyConnection> {
+            use tun2socks5::ProxyType;
+
+            match proxy.proxy_type {
+                ProxyType::Socks5 => {
+                    info!("Opening SOCKS5 UDP associate to proxy {}", proxy.addr);
+
+                    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                        .await
+                        .context("Timeout connecting to SOCKS5 proxy for UDP")??;
+                    let stream = BufStream::new(tcp);
+
+                    let bind_addr = if proxy.addr.is_ipv4() {
+                        "0.0.0.0:0"
+                    } else {
+                        "[::]:0"
+                    };
+                    let socket = UdpSocket::bind(bind_addr)
+                        .await
+                        .context("Failed to bind local UDP socket for SOCKS5 UDP associate")?;
+
+                    let datagram = client::SocksDatagram::udp_associate(
+                        stream,
+                        socket,
+                        proxy.credentials.clone(),
+                    )
+                    .await
+                    .context("SOCKS5 UDP associate failed")?;
+
+                    Ok(ProxyConnection::Udp(Box::new(Socks5UdpConn {
+                        inner: tokio::sync::Mutex::new(datagram),
+                        info: format!("socks5+udp://{}", proxy.addr),
+                    })))
+                }
+                ProxyType::Socks4 | ProxyType::Http => {
+                    anyhow::bail!("proxy type {:?} not yet supported for UDP", proxy.proxy_type)
                 }
             }
         }
@@ -1725,7 +1817,7 @@ fn preprocess_vdns(vh: &VirtDNSHandle, dest: SocketAddr) -> DnsOutcome {
             target_domain: None,
             decision: Some(RoutingDecision::Proxy {
                 target: WireAddress::SocketAddress(dest),
-                id: ProxyID::File(path),
+                id: ProxyID::for_file(path.as_path()),
             }),
         },
         VDNSRES::SpecialHandling(TUNResponse::Unreachable) => DnsOutcome {
@@ -1733,7 +1825,7 @@ fn preprocess_vdns(vh: &VirtDNSHandle, dest: SocketAddr) -> DnsOutcome {
             decision: Some(RoutingDecision::Drop),
         },
         VDNSRES::SpecialHandling(TUNResponse::SpecifiedProxy(addr, proxy)) => {
-            let id = ProxyID::Remote(proxy.addr);
+            let id = ProxyID::for_remote(proxy.addr);
             DnsOutcome {
                 target_domain: None,
                 decision: Some(RoutingDecision::Proxy { target: addr, id }),
@@ -1882,7 +1974,7 @@ async fn handle_tcp_via_proxy(
                 TrojanAdapter::connect_tcp(t, &target_host, target_port, ip).await?
             }
             UplinkProxy::Remote(arg) => {
-                RemoteAdapter::connect(arg, &target_host, target_port).await?
+                RemoteAdapter::connect_tcp(arg, &target_host, target_port).await?
             }
             UplinkProxy::File(path) => {
                 anyhow::bail!("file proxy {:?} cannot proxy tcp", path)
@@ -2006,18 +2098,20 @@ async fn handle_udp_connection(
                 bytes_down: 0,
             });
         }
-        RoutingDecision::Proxy {
-            id: ProxyID::File(_),
-            ..
-        } => {
-            warn!("udp file serving unsupported for {}", dest);
-        }
-        RoutingDecision::Proxy { id, .. } => {
-            warn!(
-                "udp proxying not implemented for {:?}, dropping {}",
-                id, dest
-            );
-        }
+        RoutingDecision::Proxy { id, .. } => match hub.get_proxy(&id) {
+            Some(UplinkProxy::File(_)) => {
+                warn!("udp file serving unsupported for {}", dest);
+            }
+            Some(_) => {
+                warn!(
+                    "udp proxying not implemented for {:?}, dropping {}",
+                    id, dest
+                );
+            }
+            None => {
+                warn!("udp proxy {:?} not found, dropping {}", id, dest);
+            }
+        },
     }
     Ok(())
 }

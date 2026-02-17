@@ -384,7 +384,7 @@ impl Router {
                     use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
 
                     let (target_host, target_port) = Self::wire_to_host_port(&target);
-                    let mut conn = RemoteAdapter::connect(&proxy, &target_host, target_port).await?;
+                    let mut conn = RemoteAdapter::connect_tcp(&proxy, &target_host, target_port).await?;
 
                     let proxy_stream = match conn {
                         ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
