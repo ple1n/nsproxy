@@ -682,7 +682,7 @@ pub mod proxy_adapters {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpStream, UdpSocket};
     use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
@@ -901,13 +901,13 @@ pub mod proxy_adapters {
 
     /// SOCKS5 TCP connection wrapper
     struct Socks5TcpConn {
-        inner: BufStream<TcpStream>,
+        inner: TcpStream,
         info: String,
     }
 
     /// SOCKS5 UDP tunnel wrapper (UDP ASSOCIATE)
     struct Socks5UdpConn {
-        inner: tokio::sync::Mutex<client::SocksUdpClient>,
+        inner: tokio::sync::Mutex<client::SocksDatagram<TcpStream>>,
         info: String,
     }
 
@@ -1432,10 +1432,9 @@ pub mod proxy_adapters {
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
                     info!("Opening SOCKS5 TCP connection to proxy {}", proxy.addr);
-                    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
                         .await
                         .context("Timeout connecting to SOCKS5 proxy")??;
-                    let mut stream = BufStream::new(tcp);
                     let dest = WireAddress::DomainAddress(target_host.to_string(), target_port);
                     client::connect(&mut stream, dest, proxy.credentials.clone()).await?;
                     Ok(ProxyConnection::Tcp(Box::new(Socks5TcpConn {
@@ -1457,10 +1456,9 @@ pub mod proxy_adapters {
                 ProxyType::Socks5 => {
                     info!("Opening SOCKS5 UDP associate to proxy {}", proxy.addr);
 
-                    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
                         .await
                         .context("Timeout connecting to SOCKS5 proxy for UDP")??;
-                    let stream = BufStream::new(tcp);
 
                     let bind_addr = if proxy.addr.is_ipv4() {
                         "0.0.0.0:0"
