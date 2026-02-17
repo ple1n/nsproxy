@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -41,7 +42,7 @@ pub enum RoutingDecision {
     Drop,
 }
 
-#[derive(Hash, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Hash, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyID(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,6 +55,12 @@ impl ProxyNym {
 }
 
 impl std::fmt::Display for ProxyID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.nym())
+    }
+}
+
+impl Debug for ProxyID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.nym())
     }
