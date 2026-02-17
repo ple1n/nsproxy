@@ -102,9 +102,7 @@ fn clash_list() -> Result<()> {
             println!("  Proxy nyms (first {}):", max_show);
             for (i, (id, proxy)) in hub.all_proxies().iter().take(max_show).enumerate() {
                 if let Some(nym) = hub.get_nym(id) {
-                    println!("    {}: {:?} => {:?} => {}", i + 1, id, nym, proxy);
-                } else {
-                    println!("    {}: {:?} => <no nym> => {}", i + 1, id, proxy);
+                    println!("    {} => {} => {}", i + 1, nym, proxy);
                 }
             }
         }

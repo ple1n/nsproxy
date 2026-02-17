@@ -53,6 +53,12 @@ impl ProxyNym {
     }
 }
 
+impl std::fmt::Display for ProxyID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.nym())
+    }
+}
+
 impl std::fmt::Display for ProxyNym {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -97,6 +103,6 @@ impl ProxyID {
     }
 
     pub fn nym(&self) -> ProxyNym {
-        ProxyNym(hex::encode(&self.0[..8]))
+        ProxyNym(hex::encode(&self.0[..4]))
     }
 }
