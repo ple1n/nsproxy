@@ -1671,9 +1671,9 @@ pub enum RemoteOps {
     Add {
         url: String,
     },
-    /// Remove a remote proxy by socket address
+    /// Remove a remote proxy by proxy nym
     Remove {
-        addr: SocketAddr,
+        nym: ProxyNym,
     },
     /// List saved remote proxies
     List,
