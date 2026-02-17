@@ -102,7 +102,50 @@ fn ensure_rustls_crypto_provider() -> Result<()> {
 
 // IPs are not ever deleted here.
 // Because its expected sometimes DNS servers pollute the records with junk
-pub type DomainsSolved = BTreeMap<String, BTreeMap<u64, DNSResponse>>;
+pub type DomainsSolved = BTreeMap<Domain, BTreeMap<u64, DNSResponse>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Domain(pub String);
+
+impl Domain {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Domain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for Domain {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Domain {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<Domain> for String {
+    fn from(value: Domain) -> Self {
+        value.0
+    }
+}
+
+impl std::ops::Deref for Domain {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 
 // Response of a single DNS packet
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +168,7 @@ impl ProfileSolved {
     }
 
     /// Add a resolved IP for a domain with current timestamp
-    pub fn add_resolution(&mut self, domain: String, ips: BTreeSet<IpAddr>) {
+    pub fn add_resolution(&mut self, domain: Domain, ips: BTreeSet<IpAddr>) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -140,7 +183,7 @@ impl ProfileSolved {
     /// Get the most recent IPs for a domain
     pub fn get_latest_ips(&self, domain: &str) -> Option<&BTreeSet<IpAddr>> {
         self.domains
-            .get(domain)?
+            .get(&Domain::from(domain))?
             .last_key_value()
             .map(|(_, response)| &response.ips)
     }
@@ -522,34 +565,10 @@ impl UplinkHub {
 
     /// Load all saved proxies across all uplink kinds
     pub fn load_saved_proxies(&mut self) -> Result<usize> {
-        let mut count = self.load_remote_proxies()?;
+        self.load_remote_proxies()?;
+        self.load_clash_proxies()?;
 
-        let uplink_root = state_paths::uplink_root();
-        if !uplink_root.exists() {
-            return Ok(count);
-        }
-
-        let kinds: Vec<_> = std::fs::read_dir(&uplink_root)?
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .collect();
-
-        for entry in kinds {
-            let kind = entry.file_name().to_string_lossy().to_string();
-            match kind.as_str() {
-                "clash" => {
-                    count += self.load_clash_proxies()?;
-                }
-                _ => {
-                    info!(
-                        "Skipping unknown uplink kind '{}'; no loader registered",
-                        kind
-                    );
-                }
-            }
-        }
-
-        Ok(count)
+        Ok(self.proxies.len())
     }
 
     /// Load all saved remote proxies from /nsp3/uplink/remote.json
@@ -566,63 +585,33 @@ impl UplinkHub {
         Ok(count)
     }
 
-    /// Load all Clash proxies from saved profiles and add them to the hub
-    /// This incrementally updates the hub's state with all available proxies
+    /// Load all Clash proxies from centralized clash state and add them to the hub
     pub fn load_clash_proxies(&mut self) -> Result<usize> {
-        use crate::state_paths;
-
-        let state_proxies = self.load_clash_state()?.proxies.clone();
-
-        let uplink_dir = state_paths::uplink_dir("clash");
-        if !uplink_dir.exists() {
-            return Ok(0);
-        }
-
-        let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .collect();
+        let clash_state = self.load_clash_state()?.clone();
+        let state_proxies = clash_state.proxies;
 
         let mut count = 0;
-        for entry in profiles {
-            let profile_name = entry.file_name().to_string_lossy().to_string();
-            let config_path = state_paths::uplink_profile_config("clash", &profile_name);
+        for (_proxy_id, cfg) in clash_state.trojan_proxies {
+            let resolved_ip = state_proxies
+                .get(&Domain::from(cfg.server.clone()))
+                .and_then(|responses| responses.last_key_value())
+                .and_then(|(_, response)| response.ips.iter().next().copied());
 
-            if !config_path.exists() {
-                warn!(
-                    "Skipping profile {}: missing config ({})",
-                    profile_name,
-                    config_path.exists()
+            if let Some(ip) = resolved_ip {
+                let runtime = clash::TrojanProxy {
+                    name: cfg.name.clone(),
+                    server_addr: SocketAddr::new(ip, cfg.port),
+                    server_name: cfg.server.clone(),
+                    password: cfg.password.clone(),
+                };
+
+                let id = ProxyID::for_trojan(
+                    runtime.server_addr,
+                    &runtime.server_name,
+                    &runtime.password,
                 );
-                continue;
-            }
-
-            let profile = clash::ClashProfile::load_file(&profile_name, &config_path)?;
-
-            // Load proxies (config entries) and add runtime proxies to hub when resolved
-            let trojan_configs = profile.load_trojan_proxies()?;
-            for cfg in trojan_configs {
-                let resolved_ip = state_proxies
-                    .get(&cfg.server)
-                    .and_then(|responses| responses.last_key_value())
-                    .and_then(|(_, response)| response.ips.iter().next().copied());
-
-                if let Some(ip) = resolved_ip {
-                    let runtime = clash::TrojanProxy {
-                        name: cfg.name.clone(),
-                        server_addr: SocketAddr::new(ip, cfg.port),
-                        server_name: cfg.server.clone(),
-                        password: cfg.password.clone(),
-                    };
-
-                    let id = ProxyID::for_trojan(
-                        runtime.server_addr,
-                        &runtime.server_name,
-                        &runtime.password,
-                    );
-                    self.add_proxy(id, UplinkProxy::Trojan(runtime));
-                    count += 1;
-                }
+                self.add_proxy(id, UplinkProxy::Trojan(runtime));
+                count += 1;
             }
         }
 

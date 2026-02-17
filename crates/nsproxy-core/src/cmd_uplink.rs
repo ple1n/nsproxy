@@ -20,7 +20,7 @@ pub fn load_saved_uplink_hub() -> Result<crate::uplink::UplinkHub> {
     let count = hub.load_saved_proxies()?;
 
     if count == 0 {
-        bail!("No saved proxies found. Import a profile first with 'sp uplink clash profile-add'.");
+        bail!("No saved proxies found. Import Clash config first with 'sp uplink clash config-add'.");
     }
 
     Ok(hub)
@@ -37,7 +37,10 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
 
 fn cmd_clash(cmd: ClashOps) -> Result<()> {
     match cmd {
-        ClashOps::ConfigAdd { name, path } => clash_config_add(name, path),
+        ClashOps::ConfigAdd {
+            group_id,
+            path,
+        } => clash_config_add(group_id, path),
         ClashOps::List => clash_list(),
         ClashOps::ConfigExplain { path } => clash_config_explain(path),
         ClashOps::Resolve { direct, refresh } => clash_resolve(direct, refresh),
@@ -45,17 +48,19 @@ fn cmd_clash(cmd: ClashOps) -> Result<()> {
     }
 }
 
-fn clash_config_add(name: String, path: std::path::PathBuf) -> Result<()> {
-    println!("Importing Clash profile '{}'...", name);
+fn clash_config_add(group_id: String, path: std::path::PathBuf) -> Result<()> {
+    println!("Importing Clash profile");
+    println!("  Group: {}", group_id);
     println!("  Config: {:?}", path);
 
     let mut hub = crate::uplink::UplinkHub::new();
     let _ = hub.hydrate_from_persisted()?;
     let mut clash_state = hub.load_clash_state()?.clone();
 
-    let clash_profile = crate::uplink::clash::ClashProfile::load_file(&name, &path)?;
+    let clash_profile = crate::uplink::clash::ClashProfile::load_file(&path)?;
 
-    let append_report = clash_state.append_profile(&clash_profile)?;
+    let append_report = clash_state
+        .append_profile_to_group(&clash_profile, crate::uplink::clash::GroupId::from(group_id))?;
     hub.set_clash_state(clash_state)?;
 
     println!("\n✓ Profile imported");
@@ -70,34 +75,29 @@ fn clash_config_add(name: String, path: std::path::PathBuf) -> Result<()> {
         "  Appended tier2 nameservers: {}",
         append_report.added_tier2_nameservers
     );
+    println!(
+        "  Appended trojan proxies: {}",
+        append_report.added_trojan_proxies
+    );
 
-    println!("\n✓ Profile '{}' is ready to use", name);
     Ok(())
 }
 
 fn clash_list() -> Result<()> {
-    let uplink_dir = state_paths::uplink_dir("clash");
-    if !uplink_dir.exists() {
-        println!("No Clash profiles found");
+    let state = crate::uplink::clash::ClashState::load_or_default()?;
+    if state.groups.is_empty() {
+        println!("No Clash groups found");
         return Ok(());
     }
 
-    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .collect();
-
-    if profiles.is_empty() {
-        println!("No Clash profiles found");
-        return Ok(());
-    }
-
-    println!("Clash Profiles:");
+    println!("Clash Groups: {}", state.groups.len());
+    println!("Tracked proxy domains: {}", state.domain_group.len());
+    println!("Tracked trojan proxies: {}", state.trojan_proxies.len());
 
     let mut hub = crate::uplink::UplinkHub::new();
     match hub.load_clash_proxies() {
         Ok(count) => {
-            println!("  Loaded {} proxy entries across profiles", count);
+            println!("  Loaded {} proxy entries from clash state", count);
             let max_show = 5usize;
             println!("  Proxy nyms (first {}):", max_show);
             for (i, (id, proxy)) in hub.all_proxies().iter().take(max_show).enumerate() {
@@ -115,25 +115,17 @@ fn clash_list() -> Result<()> {
 }
 
 fn clash_resolve(direct: bool, refresh: bool) -> Result<()> {
-    use crate::uplink::clash::ClashProfile;
+    use crate::uplink::clash::GroupId;
 
-    println!("Resolving Clash profiles and updating resolved state...");
+    println!("Resolving Clash groups and updating resolved state...");
 
-    let uplink_dir = state_paths::uplink_dir("clash");
-    if !uplink_dir.exists() {
-        println!("No Clash profiles found");
+    let state = crate::uplink::clash::ClashState::load_or_default()?;
+    if state.groups.is_empty() {
+        println!("No Clash groups found");
         return Ok(());
     }
 
-    let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .collect();
-
-    if profiles.is_empty() {
-        println!("No Clash profiles found");
-        return Ok(());
-    }
+    let group_ids: Vec<GroupId> = state.groups.keys().cloned().collect();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -158,36 +150,28 @@ fn clash_resolve(direct: bool, refresh: bool) -> Result<()> {
 
         let mut interrupted = false;
 
-        for entry in profiles {
+        for group_id in group_ids {
             if cancel_flag.load(Ordering::Relaxed) {
                 println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
                 interrupted = true;
                 break;
             }
 
-            let profile_name = entry.file_name().to_string_lossy().to_string();
-            let config_path = state_paths::uplink_profile_config("clash", &profile_name);
-            if !config_path.exists() {
-                println!("Skipping {}: config missing", profile_name);
-                continue;
-            }
-
-            println!("Resolving profile: {}", profile_name);
-            let profile = ClashProfile::load_file(&profile_name, &config_path)?;
-            let unresolved_before = profile
-                .proxy_domains
+            let unresolved_before = state
+                .domain_group
                 .iter()
-                .filter(|domain| state.get_latest_proxy_ips(domain).is_none())
+                .filter(|(domain, gid)| gid == &&group_id && state.get_latest_proxy_ips(domain.as_str()).is_none())
                 .count();
 
             println!(
-                "  Unresolved proxy domains before resolve: {}",
+                "Resolving group: {} (unresolved proxy domains before resolve: {})",
+                group_id.as_str(),
                 unresolved_before
             );
 
-            match profile
-                .solve_file(
-                    &mut state,
+            match state
+                .resolve_group(
+                    &group_id,
                     Some(&hub),
                     Some(cancel_flag.as_ref()),
                     direct,
@@ -208,7 +192,7 @@ fn clash_resolve(direct: bool, refresh: bool) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    println!("  Failed to resolve {}: {}", profile_name, e);
+                    println!("  Failed to resolve group {}: {}", group_id.as_str(), e);
                 }
             }
             

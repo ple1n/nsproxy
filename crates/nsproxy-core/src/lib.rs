@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, create_dir_all};
 use std::net::IpAddr;
-use std::net::SocketAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -54,15 +54,15 @@ use tokio::time::timeout;
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 pub use tun2socks5;
+pub mod cmd_common;
+pub mod cmd_uplink;
 pub mod env;
+pub mod hot_reload;
 pub mod prelude;
+pub mod sandbox;
 pub mod shell;
 pub mod state_blueprint;
 pub mod sys;
-pub mod sandbox;
-pub mod hot_reload;
-pub mod cmd_common;
-pub mod cmd_uplink;
 pub mod utils;
 
 pub struct TunMaker {
@@ -1670,13 +1670,9 @@ pub enum UplinkCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub enum RemoteOps {
     /// Add a remote proxy by URL, e.g. socks5://127.0.0.1:1080
-    Add {
-        url: String,
-    },
+    Add { url: String },
     /// Remove a remote proxy by proxy nym
-    Remove {
-        nym: ProxyNym,
-    },
+    Remove { nym: ProxyNym },
     /// List saved remote proxies
     List,
 }
@@ -1688,14 +1684,14 @@ pub enum UplinkInstanceCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ClashOps {
-    /// Import or override clash configs for a profile
+    /// Import Clash config data into global clash state for a group
     ConfigAdd {
-        /// Name of target profile
-        name: String,
+        /// Target group id for nameservers + domains
+        group_id: String,
         /// Path to Clash YAML config file
         path: PathBuf,
     },
-    /// Show status of imported Clash profiles
+    /// Show status of imported Clash groups and cached proxies
     List,
     /// Analyze a Clash profile and explain the two-tier DNS bootstrap process
     ConfigExplain {

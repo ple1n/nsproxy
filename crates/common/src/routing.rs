@@ -42,7 +42,7 @@ pub enum RoutingDecision {
     Drop,
 }
 
-#[derive(Hash, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Hash, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProxyID(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
