@@ -1077,7 +1077,7 @@ fn main() -> anyhow::Result<()> {
 
                     println!("\n✓ Profile '{}' is ready to use", profile_name);
                 }
-                ClashOps::Status => {
+                ClashOps::List => {
                     let uplink_dir = state_paths::uplink_dir("clash");
                     if !uplink_dir.exists() {
                         println!("No Clash profiles found");
@@ -1481,6 +1481,50 @@ fn main() -> anyhow::Result<()> {
             UplinkCommand::Geph => {
                 bail!("Geph uplink not yet implemented");
             }
+            UplinkCommand::Remote { cmd } => match cmd {
+                nsproxy_core::RemoteOps::Add { url } => {
+                    let proxy = tun2socks5::ArgProxy::from_url(&url)?;
+                    let mut state = nsproxy_core::uplink::RemoteProxyState::load_or_default()?;
+
+                    if state.add_proxy(proxy.clone()) {
+                        state.save_atomic()?;
+                        println!(
+                            "Added remote proxy: {}://{}",
+                            proxy.proxy_type,
+                            proxy.addr
+                        );
+                    } else {
+                        println!("Remote proxy already exists: {}", proxy.addr);
+                    }
+                }
+                nsproxy_core::RemoteOps::Remove { addr } => {
+                    let mut state = nsproxy_core::uplink::RemoteProxyState::load_or_default()?;
+                    if state.remove_proxy(addr) {
+                        state.save_atomic()?;
+                        println!("Removed remote proxy: {}", addr);
+                    } else {
+                        println!("Remote proxy not found: {}", addr);
+                    }
+                }
+                nsproxy_core::RemoteOps::List => {
+                    let state = nsproxy_core::uplink::RemoteProxyState::load_or_default()?;
+                    if state.proxies.is_empty() {
+                        println!("No remote proxies saved");
+                    } else {
+                        println!("Remote proxies:");
+                        for (index, proxy) in state.proxies.iter().enumerate() {
+                            let id = nsproxy_common::routing::ProxyID::Remote(proxy.addr);
+                            println!(
+                                "  {}. {}://{} (nym: {})",
+                                index + 1,
+                                proxy.proxy_type,
+                                proxy.addr,
+                                id.nym()
+                            );
+                        }
+                    }
+                }
+            },
             UplinkCommand::Instance { name, cmd } => {
                 match cmd {
                     UplinkInstanceCommand::Test => {

@@ -135,6 +135,12 @@ pub mod state_paths {
     pub fn uplink_clash_state() -> PathBuf {
         uplink_root().join("clash.json")
     }
+
+    /// Persistent remote proxy list state path
+    /// Returns /nsp3/uplink/remote.json
+    pub fn uplink_remote_state() -> PathBuf {
+        uplink_root().join("remote.json")
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
