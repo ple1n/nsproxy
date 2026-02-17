@@ -1307,7 +1307,7 @@ impl ClashState {
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
                             let mut conn =
-                                RemoteAdapter::connect(remote, &dns_host, endpoint.port).await?;
+                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port).await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
                                     super::proxy_dns::query_via_udp(
@@ -1325,7 +1325,7 @@ impl ClashState {
                         }
                         DNSProtocol::TCP => {
                             let mut conn =
-                                RemoteAdapter::connect(remote, &dns_host, endpoint.port).await?;
+                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port).await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {
                                     super::proxy_dns::query_via_tcp(

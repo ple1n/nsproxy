@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Context available during routing decision
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +42,7 @@ pub enum RoutingDecision {
 }
 
 #[derive(Hash, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProxyID {
-    ClashName(String),
-    Remote(SocketAddr),
-    File(PathBuf),
-}
+pub struct ProxyID(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProxyNym(pub String);
@@ -72,12 +68,35 @@ impl std::str::FromStr for ProxyNym {
 }
 
 impl ProxyID {
+    fn hash_chunks(chunks: &[&[u8]]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        for chunk in chunks {
+            hasher.update(&((*chunk).len() as u64).to_le_bytes());
+            hasher.update(chunk);
+        }
+        ProxyID(*hasher.finalize().as_bytes())
+    }
+
+    pub fn for_trojan(server_addr: SocketAddr, server_name: &str, password: &str) -> Self {
+        let server_addr = server_addr.to_string();
+        Self::hash_chunks(&[
+            b"trojan",
+            server_addr.as_bytes(),
+            server_name.as_bytes(),
+            password.as_bytes(),
+        ])
+    }
+
+    pub fn for_remote(addr: SocketAddr) -> Self {
+        let addr = addr.to_string();
+        Self::hash_chunks(&[b"remote", addr.as_bytes()])
+    }
+
+    pub fn for_file(path: &Path) -> Self {
+        Self::hash_chunks(&[b"file", path.to_string_lossy().as_bytes()])
+    }
+
     pub fn nym(&self) -> ProxyNym {
-        // cropped blake3 hash as a nym
-        let hash_input = format!("{:?}", self);
-        let hash = blake3::hash(hash_input.as_bytes());
-        let hash_bytes = hash.as_bytes();
-        // Take first 8 bytes for a short 16-character hex nym
-        ProxyNym(hex::encode(&hash_bytes[..8]))
+        ProxyNym(hex::encode(&self.0[..8]))
     }
 }

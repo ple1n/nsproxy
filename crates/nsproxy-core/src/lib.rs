@@ -1608,14 +1608,15 @@ pub enum MainCommand {
         /// Profile name (must have been brought up with `up` first)
         #[arg(long)]
         profile: String,
-        #[command(flatten)]
-        tun: IArgs,
+        /// TUN interface name (defaults to tun2)
+        #[arg(long)]
+        tun_name: Option<String>,
+        /// Route all traffic through one proxy instance nym
+        #[arg(long)]
+        simple: Option<ProxyNym>,
         /// Do not set TUN as default route
         #[arg(short, long)]
         no_default: bool,
-        /// Requires explicit flag for no proxying
-        #[arg(long)]
-        no_proxy: bool,
         #[arg(short, long)]
         log: Option<LevelFilter>,
         /// Use Clash uplink profile for all TUN connections

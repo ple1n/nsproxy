@@ -860,16 +860,16 @@ fn main() -> anyhow::Result<()> {
         }
         MainCommand::Serve {
             profile,
-            tun: proxy,
+            tun_name,
+            simple,
             no_default,
-            no_proxy,
             log,
             clash,
         } => cmd_serve(
             profile,
-            proxy,
+            tun_name,
+            simple,
             no_default,
-            no_proxy,
             log,
             clash,
             &mut |level| {
@@ -1513,7 +1513,7 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         println!("Remote proxies:");
                         for (index, proxy) in state.proxies.iter().enumerate() {
-                            let id = nsproxy_common::routing::ProxyID::Remote(proxy.addr);
+                            let id = nsproxy_common::routing::ProxyID::for_remote(proxy.addr);
                             println!(
                                 "  {}. {}://{} (nym: {})",
                                 index + 1,
@@ -2082,16 +2082,13 @@ fn cmd_run(
 
 fn cmd_serve(
     profile: String,
-    proxy: IArgs,
+    tun_name: Option<String>,
+    simple: Option<nsproxy_common::routing::ProxyNym>,
     no_default: bool,
-    no_proxy: bool,
     log: Option<LevelFilter>,
     _clash: Option<String>,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
 ) -> Result<()> {
-    let mut iargs = proxy;
-    check_proxy_mode(iargs.proxy.is_some(), no_proxy)?;
-
     let ns_meta = state_paths::profile_ns_meta(&profile);
     let ns_alive = read_ns_alive(&ns_meta)?;
 
@@ -2121,11 +2118,8 @@ fn cmd_serve(
             }
         }
     }
-    iargs.diag_sock = Some(diag_path);
-
     let mtu = 1500;
-    let tun_name = iargs.tun_name.unwrap_or_else(|| "tun2".to_owned());
-    iargs.tun_name = Some(tun_name.clone());
+    let tun_name = tun_name.unwrap_or_else(|| "tun2".to_owned());
 
     let clone = nsproxy_core::sys::clone3::<false>(false, false);
     match clone {
@@ -2300,7 +2294,7 @@ fn cmd_serve(
                         mtu,
                         packet_info: false,
                         udp_timeout: Duration::from_secs(20),
-                        diag_sock: iargs.diag_sock.clone(),
+                        diag_sock: Some(diag_path.clone()),
                     };
                     let mut router = nsproxy_core::uplink::router::Router::new(
                         dev,
@@ -2310,9 +2304,23 @@ fn cmd_serve(
                         shared_hot,
                     )?;
 
-                    if let Some(sock) = iargs.diag_sock.as_ref() {
-                        router.init_diag(sock).await?;
+                    if let Some(nym) = simple {
+                        let proxy_id = {
+                            let uplink = router.uplink().await;
+                            uplink
+                                .get_proxy_by_nym(&nym)
+                                .map(|(id, _)| id.clone())
+                                .ok_or_else(|| {
+                                    anyhow!("Simple route proxy not found for nym {}", nym)
+                                })?
+                        };
+
+                        router
+                            .set_routing(nsproxy_core::uplink::simple_routing(proxy_id))
+                            .await;
                     }
+
+                    router.init_diag(&diag_path).await?;
 
                     let _ = vdns_sx.send(Some(router.dns_handle())).await;
 
