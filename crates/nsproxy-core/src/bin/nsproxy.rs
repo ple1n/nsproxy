@@ -2230,6 +2230,48 @@ fn cmd_serve(
                     let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
                     let (st_sx, acceptor) = flume::unbounded();
 
+                    let initial_hot = match tokio::fs::read_to_string(&hot_conf).await {
+                        Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
+                            Ok(conf) => conf,
+                            Err(e) => {
+                                warn!(
+                                    "failed to parse hot config {:?} at startup: {}, using default",
+                                    hot_conf, e
+                                );
+                                HotConfig::default()
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "failed to read hot config {:?} at startup: {}, using default",
+                                hot_conf, e
+                            );
+                            HotConfig::default()
+                        }
+                    };
+                    let shared_hot = Arc::new(tokio::sync::RwLock::new(initial_hot));
+
+                    let hub = load_saved_uplink_hub()?;
+                    let router_conf = nsproxy_core::uplink::router::RouterConfig {
+                        mtu,
+                        packet_info: false,
+                        udp_timeout: Duration::from_secs(20),
+                        diag_sock: iargs.diag_sock.clone(),
+                    };
+                    let mut router = nsproxy_core::uplink::router::Router::new(
+                        dev,
+                        router_conf,
+                        hub,
+                        Some(st_sx),
+                        shared_hot,
+                    )?;
+
+                    if let Some(sock) = iargs.diag_sock.as_ref() {
+                        router.init_diag(sock).await?;
+                    }
+
+                    let _ = vdns_sx.send(Some(router.dns_handle())).await;
+
                     tokio::spawn(async move {
                         let x = watch_hot(
                             vdns_rx,
@@ -2243,9 +2285,8 @@ fn cmd_serve(
                         warn!("out-ns, watcher exited {:?}", x);
                     });
 
-                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx.clone(), st_sx)
-                        .await?;
-                    warn!("tun exited");
+                    router.run().await?;
+                    warn!("router exited");
                     let _ = vdns_sx.send(None).await;
 
                     std::future::pending::<()>().await;

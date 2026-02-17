@@ -384,8 +384,8 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|ctx| {
-                RoutingDecision::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
+            routing_fn: Arc::new(|ctx: &RoutingContext| {
+                RoutingDecision::Drop
             }),
             proxy_nym: BiHashMap::new(),
             clash: None,
