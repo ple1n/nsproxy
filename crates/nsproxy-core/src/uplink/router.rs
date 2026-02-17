@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use bytes::BytesMut;
 use diag::{ConnId, DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
 use futures::SinkExt;
@@ -16,7 +16,7 @@ use ipstack::{
 use nsproxy_common::routing::{ProxyID, RoutingContext, RoutingDecision, RoutingProtocol};
 use socks5_impl::protocol::WireAddress;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::RwLock,
 };
@@ -31,6 +31,65 @@ use crate::{
 // based off crates/tun2socks5/src/lib.rs
 
 const DNS_PORT: u16 = 53;
+
+#[derive(Debug, Clone, Copy)]
+enum RelaySide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelayOp {
+    Copy,
+    Shutdown,
+}
+
+#[derive(Debug)]
+enum RelayError {
+    Io {
+        flow: &'static str,
+        from: RelaySide,
+        to: RelaySide,
+        op: RelayOp,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayError::Io {
+                flow,
+                from,
+                to,
+                op,
+                source,
+            } => {
+                let from = match from {
+                    RelaySide::Left => "left",
+                    RelaySide::Right => "right",
+                };
+                let to = match to {
+                    RelaySide::Left => "left",
+                    RelaySide::Right => "right",
+                };
+                let op = match op {
+                    RelayOp::Copy => "copy",
+                    RelayOp::Shutdown => "shutdown",
+                };
+                write!(f, "{} {}", flow, source)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RelayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RelayError::Io { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Main TUN packet router with dynamic proxy/routing configuration
 pub struct Router {
@@ -253,19 +312,209 @@ impl Router {
 
         match decision {
             RoutingDecision::Proxy { target, id } => {
-                info!("TCP {:?} -> Proxy {:?} -> {:?}", conn_id, id, target);
-                // TODO: Implement proxy connection logic
-                Ok(())
+                enum SelectedProxy {
+                    Trojan(crate::uplink::clash::TrojanProxy),
+                    Remote(tun2socks5::ArgProxy),
+                    File(PathBuf),
+                }
+
+                let selected = {
+                    let hub = uplink.read().await;
+                    match hub.get_proxy(&id) {
+                        Some(UplinkProxy::Trojan(proxy)) => SelectedProxy::Trojan(proxy.clone()),
+                        Some(UplinkProxy::Remote(proxy)) => SelectedProxy::Remote(proxy.clone()),
+                        Some(UplinkProxy::File(path)) => SelectedProxy::File(path.clone()),
+                        Some(UplinkProxy::Geph) => {
+                            bail!("proxy {:?} (geph) is not supported yet", id)
+                        }
+                        None => bail!("proxy {:?} not found", id),
+                    }
+                };
+
+                match selected {
+                    SelectedProxy::File(path) => {
+                        if let Some(tx) = file_tx {
+                            tx.send_async((path, tcp)).await?;
+                            Ok(())
+                        } else {
+                            bail!("file proxy route requested but file server channel is unavailable")
+                        }
+                    }
+                    SelectedProxy::Trojan(proxy) => {
+                        use crate::uplink::proxy_adapters::{ProxyConnection, TrojanAdapter};
+
+                        let (target_host, target_port) = Self::wire_to_host_port(&target);
+                        let resolved_ip = proxy.server_addr.ip();
+                        let mut conn = TrojanAdapter::connect_tcp(
+                            &proxy,
+                            &target_host,
+                            target_port,
+                            resolved_ip,
+                        )
+                        .await?;
+
+                        let proxy_stream = match conn {
+                            ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
+                            ProxyConnection::Udp(_) => {
+                                bail!("udp proxy tunnel cannot serve tcp stream")
+                            }
+                        };
+
+                        let mut tcp = tcp;
+                        diag.emit(DiagEvent::Connected {
+                            id: conn_id.clone(),
+                            ts: Timestamp::now(),
+                        });
+                        match Self::relay_tcp_with_cause(
+                            &mut tcp,
+                            proxy_stream,
+                            "tun->proxy",
+                            "proxy->tun",
+                        )
+                        .await
+                        {
+                            Ok((up, down)) => {
+                                diag.emit(DiagEvent::Finished {
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
+                                    error: None,
+                                    bytes_up: up,
+                                    bytes_down: down,
+                                });
+                                Ok(())
+                            }
+                            Err(relay_err) => {
+                                diag.emit(DiagEvent::Finished {
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
+                                    error: Some(relay_err.to_string()),
+                                    bytes_up: 0,
+                                    bytes_down: 0,
+                                });
+                                Err(anyhow::Error::new(relay_err))
+                            }
+                        }
+                    }
+                    SelectedProxy::Remote(proxy) => {
+                        use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
+
+                        let (target_host, target_port) = Self::wire_to_host_port(&target);
+                        let mut conn = RemoteAdapter::connect(&proxy, &target_host, target_port).await?;
+
+                        let proxy_stream = match conn {
+                            ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
+                            ProxyConnection::Udp(_) => {
+                                bail!("udp proxy tunnel cannot serve tcp stream")
+                            }
+                        };
+
+                        let mut tcp = tcp;
+                        diag.emit(DiagEvent::Connected {
+                            id: conn_id.clone(),
+                            ts: Timestamp::now(),
+                        });
+                        match Self::relay_tcp_with_cause(
+                            &mut tcp,
+                            proxy_stream,
+                            "tun->proxy",
+                            "proxy->tun",
+                        )
+                        .await
+                        {
+                            Ok((up, down)) => {
+                                diag.emit(DiagEvent::Finished {
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
+                                    error: None,
+                                    bytes_up: up,
+                                    bytes_down: down,
+                                });
+                                Ok(())
+                            }
+                            Err(relay_err) => {
+                                diag.emit(DiagEvent::Finished {
+                                    id: conn_id,
+                                    ts: Timestamp::now(),
+                                    error: Some(relay_err.to_string()),
+                                    bytes_up: 0,
+                                    bytes_down: 0,
+                                });
+                                Err(anyhow::Error::new(relay_err))
+                            }
+                        }
+                    }
+                }
             }
             RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
-                info!("TCP {:?} -> Direct to {}", conn_id, addr);
                 Self::tcp_direct(tcp, addr, diag, conn_id).await
             }
             RoutingDecision::Drop => {
-                info!("TCP {:?} -> Dropped by policy", conn_id);
                 Ok(())
             }
         }
+    }
+
+    fn wire_to_host_port(addr: &WireAddress) -> (String, u16) {
+        match addr {
+            WireAddress::SocketAddress(sock) => (sock.ip().to_string(), sock.port()),
+            WireAddress::DomainAddress(host, port) => (host.clone(), *port),
+        }
+    }
+
+    async fn relay_tcp_with_cause<A, B>(
+        left: &mut A,
+        right: &mut B,
+        left_to_right_flow: &'static str,
+        right_to_left_flow: &'static str,
+    ) -> std::result::Result<(u64, u64), RelayError>
+    where
+        A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+        B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    {
+        let (mut left_read, mut left_write) = tokio::io::split(left);
+        let (mut right_read, mut right_write) = tokio::io::split(right);
+
+        let up = async {
+            let copied = tokio::io::copy(&mut left_read, &mut right_write)
+                .await
+                .map_err(|source| RelayError::Io {
+                    flow: left_to_right_flow,
+                    from: RelaySide::Left,
+                    to: RelaySide::Right,
+                    op: RelayOp::Copy,
+                    source,
+                })?;
+            right_write.shutdown().await.map_err(|source| RelayError::Io {
+                flow: left_to_right_flow,
+                from: RelaySide::Left,
+                to: RelaySide::Right,
+                op: RelayOp::Shutdown,
+                source,
+            })?;
+            Ok::<u64, RelayError>(copied)
+        };
+
+        let down = async {
+            let copied = tokio::io::copy(&mut right_read, &mut left_write)
+                .await
+                .map_err(|source| RelayError::Io {
+                    flow: right_to_left_flow,
+                    from: RelaySide::Right,
+                    to: RelaySide::Left,
+                    op: RelayOp::Copy,
+                    source,
+                })?;
+            left_write.shutdown().await.map_err(|source| RelayError::Io {
+                flow: right_to_left_flow,
+                from: RelaySide::Right,
+                to: RelaySide::Left,
+                op: RelayOp::Shutdown,
+                source,
+            })?;
+            Ok::<u64, RelayError>(copied)
+        };
+
+        tokio::try_join!(up, down)
     }
 
     async fn tcp_direct(
@@ -281,18 +530,31 @@ impl Router {
             ts: Timestamp::now(),
         });
 
-        let (up, down) = tokio::io::copy_bidirectional(&mut tcp, &mut remote).await?;
-
-        diag.emit(DiagEvent::Finished {
-            id: conn_id.clone(),
-            ts: Timestamp::now(),
-            error: None,
-            bytes_up: up,
-            bytes_down: down,
-        });
-
-        debug!("TCP {:?} done: {} up, {} down", conn_id, up, down);
-        Ok(())
+        match Self::relay_tcp_with_cause(&mut tcp, &mut remote, "tun->direct", "direct->tun")
+            .await
+        {
+            Ok((up, down)) => {
+                diag.emit(DiagEvent::Finished {
+                    id: conn_id.clone(),
+                    ts: Timestamp::now(),
+                    error: None,
+                    bytes_up: up,
+                    bytes_down: down,
+                });
+                debug!("TCP {:?} done: {} up, {} down", conn_id, up, down);
+                Ok(())
+            }
+            Err(relay_err) => {
+                diag.emit(DiagEvent::Finished {
+                    id: conn_id,
+                    ts: Timestamp::now(),
+                    error: Some(relay_err.to_string()),
+                    bytes_up: 0,
+                    bytes_down: 0,
+                });
+                Err(anyhow::Error::new(relay_err))
+            }
+        }
     }
 
     async fn handle_udp(&self, udp: IpStackUdpStream) {
@@ -475,5 +737,23 @@ impl Router {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_relay_error_example() {
+        let err = RelayError::Io {
+            flow: "tun->proxy",
+            from: RelaySide::Left,
+            to: RelaySide::Right,
+            op: RelayOp::Copy,
+            source: std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset"),
+        };
+
+        println!("{}", err);
     }
 }
