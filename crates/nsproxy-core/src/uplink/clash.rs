@@ -24,20 +24,22 @@ use trojan_proto::{AddressRef, HostRef, write_request_header};
 use trust_dns_proto::op::{Message, Query};
 use trust_dns_proto::rr::{Name, RecordType};
 use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
+use tun2socks5::dns::{VIRT_IP, default_virtip};
 // Shorter alias for the commonly used TLS stream type
 type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 /// Clash-specific profile information
+/// Ephemeral
 #[derive(Debug, Clone)]
 pub struct ClashProfile {
-    pub name: String,
     pub tier1_nameservers: BTreeMap<SocketAddr, DNSEndpoints>,
     pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
     pub proxy_domains: HashSet<String>,
+    pub trojan_proxies: Vec<TrojanConfig>,
 }
 
 /// Trojan proxy configuration as read from Clash config
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TrojanConfig {
     pub name: String,
     /// server as provided in config (domain or IP string) - used for SNI and resolving
@@ -319,7 +321,7 @@ impl TrojanProxy {
 
 impl ClashProfile {
     /// Import a Clash profile from a YAML file
-    pub fn load_file(profile_name: &str, yaml_path: &PathBuf) -> Result<Self> {
+    pub fn load_file(yaml_path: &PathBuf) -> Result<Self> {
         let config =
             Config::try_from(yaml_path.clone()).context("Failed to parse Clash YAML config")?;
 
@@ -352,9 +354,7 @@ impl ClashProfile {
                 .insert(endpoint.proto.clone(), endpoint);
         }
         if tier2_nameservers.is_empty() {
-            anyhow::bail!(
-                "No supported tier2 nameservers found after parsing config (DoH endpoints are not supported yet)"
-            );
+            anyhow::bail!("No supported tier2 nameservers found after parsing config");
         }
         let proxies = config
             .proxy
@@ -370,51 +370,6 @@ impl ClashProfile {
                     .map(|s| s.to_string())
             })
             .collect();
-
-        if proxy_domains.is_empty() {
-            anyhow::bail!("No proxy servers found in config");
-        }
-
-        let profile_dir = state_paths::uplink_profile_dir("clash", profile_name);
-        let dest_config = state_paths::uplink_profile_config("clash", profile_name);
-
-        info!(
-            "Importing Clash profile '{}' into {:?}",
-            profile_name, profile_dir
-        );
-        info!("Ensuring profile directory exists: {:?}", profile_dir);
-        std::fs::create_dir_all(&profile_dir)
-            .context("Failed to create clash profile directory")?;
-
-        // Avoid copying file onto itself when caller already provided the state config path
-        let skip_copy = match (yaml_path.canonicalize(), dest_config.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => yaml_path == &dest_config,
-        };
-        if skip_copy {
-            info!(
-                "Source and destination identical; skipping config copy for {:?}",
-                yaml_path
-            );
-        } else {
-            info!("Copying config {:?} -> {:?}", yaml_path, dest_config);
-            std::fs::copy(yaml_path, &dest_config).context("Failed to copy config file")?;
-        }
-
-        Ok(Self {
-            name: profile_name.to_string(),
-            tier1_nameservers,
-            tier2_nameservers,
-            proxy_domains,
-        })
-    }
-
-    /// Load Trojan proxies from the config file (returns config-level entries)
-    pub fn load_trojan_proxies(&self) -> Result<Vec<TrojanConfig>> {
-        let config_path = state_paths::uplink_profile_config("clash", &self.name);
-        let config = Config::try_from(config_path).context("Failed to load Clash config")?;
-
-        let proxies = config.proxy.as_ref().context("No proxies in config")?;
 
         let mut trojan_proxies = Vec::new();
         for proxy in proxies {
@@ -463,11 +418,18 @@ impl ClashProfile {
             });
         }
 
-        if trojan_proxies.is_empty() {
-            anyhow::bail!("No trojan proxies found in config");
+        if proxy_domains.is_empty() {
+            anyhow::bail!("No proxy servers found in config");
         }
 
-        Ok(trojan_proxies)
+        info!("Parsed Clash config from {:?}", yaml_path);
+
+        Ok(Self {
+            tier1_nameservers,
+            tier2_nameservers,
+            proxy_domains,
+            trojan_proxies,
+        })
     }
 
     /// Get all domains that need to be resolved (both nameservers and proxies)
@@ -482,22 +444,6 @@ impl ClashProfile {
 
         domains.extend(self.proxy_domains.iter().cloned());
         domains.into_iter().collect()
-    }
-
-    /// Solve profile using provided `ClashState` and optional `UplinkHub`.
-    /// Returns a structured report with domains and path metrics.
-    pub async fn solve_file(
-        &self,
-        state: &mut ClashState,
-        hub: Option<&UplinkHub>,
-        cancel: Option<&AtomicBool>,
-        direct_only: bool,
-        refresh: bool,
-    ) -> Result<ResolveProfileReport> {
-        state.prepare_tier2_dns_via_tier1(self, cancel).await?;
-        state
-            .resolve_profile(self, hub, cancel, direct_only, refresh)
-            .await
     }
 }
 
@@ -574,6 +520,38 @@ pub struct ResolveProfileReport {
 pub struct AppendProfileReport {
     pub added_tier1_nameservers: usize,
     pub added_tier2_nameservers: usize,
+    pub added_trojan_proxies: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GroupId(pub String);
+
+impl GroupId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for GroupId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for GroupId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ClashGroupState {
+    pub tier1_nameservers: BTreeMap<SocketAddr, DNSEndpoints>,
+    /// Host -> available endpoints
+    pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
+    pub tier2_cache: DomainsSolved,
 }
 
 enum PathAttempt {
@@ -582,15 +560,51 @@ enum PathAttempt {
     Failed(anyhow::Error),
 }
 
+mod trojan_proxy_map_serde {
+    use super::*;
+
+    pub fn serialize<S>(
+        value: &BTreeMap<ProxyID, TrojanConfig>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded: BTreeMap<String, &TrojanConfig> = value
+            .iter()
+            .map(|(id, cfg)| (hex::encode(id.0), cfg))
+            .collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<ProxyID, TrojanConfig>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = BTreeMap::<String, TrojanConfig>::deserialize(deserializer)?;
+        let mut decoded = BTreeMap::new();
+        for (id_hex, cfg) in encoded {
+            let raw = hex::decode(&id_hex).map_err(serde::de::Error::custom)?;
+            let id: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("invalid ProxyID length"))?;
+            decoded.insert(ProxyID(id), cfg);
+        }
+        Ok(decoded)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ClashState {
     pub schema_version: u32,
-    pub tier1_nameservers: BTreeMap<SocketAddr, DNSEndpoints>, // direct IP/domain nameservers
-    /// Host -> available endpoints
-    pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
-    pub tier2_cache: DomainsSolved,
+    pub domain_group: BTreeMap<Domain, GroupId>,
+    pub groups: BTreeMap<GroupId, ClashGroupState>,
     pub proxies: DomainsSolved,
+    #[serde(default, with = "trojan_proxy_map_serde")]
+    pub trojan_proxies: BTreeMap<ProxyID, TrojanConfig>,
 }
 
 pub type DNSEndpoints = BTreeMap<DNSProtocol, DNSEndpoint>;
@@ -706,20 +720,68 @@ impl ClashState {
     }
 
     pub fn load_or_default() -> Result<Self> {
-        <Self as PersistentState>::load_or_default()
+        let mut m = <Self as PersistentState>::load_or_default()?;
+        m.remove_private_ips();
+        Ok(m)
     }
 
     pub fn save_atomic(&self) -> Result<()> {
         <Self as PersistentState>::save_atomic(self)
     }
 
-    /// Append profile tier nameservers into centralized clash state.
-    /// Existing nameservers are preserved and not duplicated.
-    pub fn append_profile(&mut self, profile: &ClashProfile) -> Result<AppendProfileReport> {
+    fn ensure_group_mut(&mut self, group_id: &GroupId) -> &mut ClashGroupState {
+        self.groups
+            .entry(group_id.clone())
+            .or_insert_with(ClashGroupState::default)
+    }
+
+    fn group(&self, group_id: &GroupId) -> Result<&ClashGroupState> {
+        self.groups
+            .get(group_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown clash group '{}'", group_id.as_str()))
+    }
+
+    fn set_domain_group(&mut self, domain: Domain, group_id: GroupId) {
+        self.domain_group.insert(domain, group_id);
+    }
+
+    pub fn group_for_domain(&self, domain: &Domain) -> Option<&GroupId> {
+        self.domain_group.get(domain)
+    }
+
+    pub fn remove_private_ips(&mut self) {
+        let virt = default_virtip();
+
+        let scrub = |domains: &mut DomainsSolved| {
+            domains.retain(|_, responses| {
+                responses.retain(|_, response| {
+                    response.ips.retain(|addr| {
+                        !matches!(addr, IpAddr::V6(ip6) if virt.contains(*ip6))
+                    });
+                    !response.ips.is_empty()
+                });
+                !responses.is_empty()
+            });
+        };
+
+        scrub(&mut self.proxies);
+        for group in self.groups.values_mut() {
+            scrub(&mut group.tier2_cache);
+        }
+
+        info!("Removed virtual DNS IPs from clash state subnet={}", VIRT_IP);
+    }
+
+    pub fn append_profile_to_group(
+        &mut self,
+        profile: &ClashProfile,
+        group_id: GroupId,
+    ) -> Result<AppendProfileReport> {
         let mut report = AppendProfileReport::default();
+        let group = self.ensure_group_mut(&group_id);
 
         for (socket, endpoints) in &profile.tier1_nameservers {
-            let current = self
+            let current = group
                 .tier1_nameservers
                 .entry(*socket)
                 .or_insert_with(BTreeMap::new);
@@ -734,7 +796,7 @@ impl ClashState {
         }
 
         for (host, endpoints) in &profile.tier2_nameservers {
-            let current = self
+            let current = group
                 .tier2_nameservers
                 .entry(host.clone())
                 .or_insert_with(BTreeMap::new);
@@ -748,27 +810,68 @@ impl ClashState {
             }
         }
 
+        for domain in &profile.proxy_domains {
+            self.set_domain_group(Domain::from(domain.clone()), group_id.clone());
+        }
+
+        for proxy in &profile.trojan_proxies {
+            let unresolved =
+                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), proxy.port);
+            let proxy_id = ProxyID::for_trojan(unresolved, &proxy.server, &proxy.password);
+            if self
+                .trojan_proxies
+                .insert(proxy_id, proxy.clone())
+                .is_none()
+            {
+                report.added_trojan_proxies += 1;
+            }
+        }
+
         Ok(report)
     }
 
-    /// Return the newest cached tier2 nameserver-host resolution.
-    pub fn get_latest_ips(&self, host: &str) -> Option<&BTreeSet<IpAddr>> {
-        self.tier2_cache
-            .get(host)?
+    fn get_latest_ips_in_group(&self, group_id: &GroupId, host: &str) -> Option<&BTreeSet<IpAddr>> {
+        self.groups
+            .get(group_id)?
+            .tier2_cache
+            .get(&Domain::from(host))?
             .last_key_value()
             .map(|(_, response)| &response.ips)
     }
 
-    /// Update tier2 nameserver-host cache.
-    pub fn update_cache(&mut self, host: &str, ips: BTreeSet<IpAddr>) {
+    fn update_cache_in_group(&mut self, group_id: &GroupId, host: &str, ips: BTreeSet<IpAddr>) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        self.tier2_cache
-            .entry(host.to_string())
+        self.ensure_group_mut(group_id)
+            .tier2_cache
+            .entry(Domain::from(host))
             .or_insert_with(BTreeMap::new)
             .insert(now, DNSResponse { ips });
+    }
+
+    /// Return the newest cached tier2 nameserver-host resolution.
+    pub fn get_latest_ips(&self, host: &str) -> Option<&BTreeSet<IpAddr>> {
+        self.groups
+            .values()
+            .filter_map(|group| {
+                group
+                    .tier2_cache
+                    .get(&Domain::from(host))
+                    .and_then(|responses| {
+                        responses
+                            .last_key_value()
+                            .map(|(_, response)| &response.ips)
+                    })
+            })
+            .next()
+    }
+
+    /// Update tier2 nameserver-host cache into `default` group.
+    pub fn update_cache(&mut self, host: &str, ips: BTreeSet<IpAddr>) {
+        let group_id = GroupId::from("default");
+        self.update_cache_in_group(&group_id, host, ips);
     }
 
     /// Store latest resolved proxy-domain IPs in the centralized clash state.
@@ -778,7 +881,7 @@ impl ClashState {
             .unwrap()
             .as_secs();
         self.proxies
-            .entry(domain.to_string())
+            .entry(Domain::from(domain))
             .or_insert_with(BTreeMap::new)
             .insert(now, DNSResponse { ips });
     }
@@ -786,35 +889,39 @@ impl ClashState {
     /// Get latest resolved proxy-domain IPs from centralized clash state.
     pub fn get_latest_proxy_ips(&self, domain: &str) -> Option<&BTreeSet<IpAddr>> {
         self.proxies
-            .get(domain)?
+            .get(&Domain::from(domain))?
             .last_key_value()
             .map(|(_, response)| &response.ips)
     }
 
     fn cached_for_target(
         &self,
+        group_id: &GroupId,
         target: ResolutionTargetKind,
         domain: &str,
     ) -> Option<BTreeSet<IpAddr>> {
         let map = match target {
             ResolutionTargetKind::ProxyDomain => &self.proxies,
-            ResolutionTargetKind::Tier2DnsDomain => &self.tier2_cache,
+            ResolutionTargetKind::Tier2DnsDomain => &self.groups.get(group_id)?.tier2_cache,
         };
 
-        map.get(domain)
+        map.get(&Domain::from(domain))
             .and_then(|responses| responses.last_key_value())
             .map(|(_, response)| response.ips.clone())
     }
 
     fn store_target_resolution(
         &mut self,
+        group_id: &GroupId,
         target: ResolutionTargetKind,
         domain: &str,
         ips: BTreeSet<IpAddr>,
     ) {
         match target {
             ResolutionTargetKind::ProxyDomain => self.add_proxy_resolution(domain, ips),
-            ResolutionTargetKind::Tier2DnsDomain => self.update_cache(domain, ips),
+            ResolutionTargetKind::Tier2DnsDomain => {
+                self.update_cache_in_group(group_id, domain, ips)
+            }
         }
     }
 
@@ -1307,7 +1414,8 @@ impl ClashState {
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port).await?;
+                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port)
+                                    .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
                                     super::proxy_dns::query_via_udp(
@@ -1325,7 +1433,8 @@ impl ClashState {
                         }
                         DNSProtocol::TCP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port).await?;
+                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port)
+                                    .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {
                                     super::proxy_dns::query_via_tcp(
@@ -1360,12 +1469,14 @@ impl ClashState {
 
     async fn query_dns_via_tier2_no_proxy_endpoint(
         &self,
+        group_id: &GroupId,
         dns_host: &str,
         protocol: DNSProtocol,
         domain: &str,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
         let endpoint = self
+            .group(group_id)?
             .tier2_nameservers
             .get(dns_host)
             .and_then(|endpoints| endpoints.get(&protocol))
@@ -1383,7 +1494,7 @@ impl ClashState {
             return Self::query_dns_via_no_proxy_endpoint(&host, endpoint, domain, timeout).await;
         }
 
-        if let Some(cached_ips) = self.get_latest_ips(dns_host) {
+        if let Some(cached_ips) = self.get_latest_ips_in_group(group_id, dns_host) {
             if cached_ips.len() > 1 {
                 info!(
                     "resolver_cache host={} ip_count={} ips={}",
@@ -1428,6 +1539,7 @@ impl ClashState {
 
     async fn query_dns_via_tier2_proxy_endpoint(
         &self,
+        group_id: &GroupId,
         hub: &UplinkHub,
         dns_host: &str,
         protocol: DNSProtocol,
@@ -1435,6 +1547,7 @@ impl ClashState {
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
         let endpoint = self
+            .group(group_id)?
             .tier2_nameservers
             .get(dns_host)
             .and_then(|endpoints| endpoints.get(&protocol))
@@ -1452,7 +1565,7 @@ impl ClashState {
             return Self::query_dns_via_proxy_endpoint(hub, &host, endpoint, domain, timeout).await;
         }
 
-        if let Some(cached_ips) = self.get_latest_ips(dns_host) {
+        if let Some(cached_ips) = self.get_latest_ips_in_group(group_id, dns_host) {
             if cached_ips.len() > 1 {
                 info!(
                     "resolver_cache host={} ip_count={} ips={}",
@@ -1495,12 +1608,14 @@ impl ClashState {
 
     async fn query_dns_via_tier1_no_proxy_endpoint(
         &self,
+        group_id: &GroupId,
         server: &SocketAddr,
         protocol: DNSProtocol,
         domain: &str,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
         let endpoint = self
+            .group(group_id)?
             .tier1_nameservers
             .get(server)
             .and_then(|endpoints| endpoints.get(&protocol))
@@ -1518,6 +1633,7 @@ impl ClashState {
 
     async fn query_dns_via_tier1_proxy_endpoint(
         &self,
+        group_id: &GroupId,
         hub: &UplinkHub,
         server: &SocketAddr,
         protocol: DNSProtocol,
@@ -1525,6 +1641,7 @@ impl ClashState {
         timeout: Duration,
     ) -> Result<Vec<IpAddr>> {
         let endpoint = self
+            .group(group_id)?
             .tier1_nameservers
             .get(server)
             .and_then(|endpoints| endpoints.get(&protocol))
@@ -1540,13 +1657,19 @@ impl ClashState {
         Self::query_dns_via_proxy_endpoint(hub, &host, endpoint, domain, timeout).await
     }
 
-    async fn resolve_domain_direct_tier2(&self, domain: &str) -> Result<BTreeSet<IpAddr>> {
+    async fn resolve_domain_direct_tier2(
+        &self,
+        group_id: &GroupId,
+        domain: &str,
+    ) -> Result<BTreeSet<IpAddr>> {
+        let group = self.group(group_id)?;
         let timeout = Duration::from_secs(8);
 
-        for (hostname, endpoints) in &self.tier2_nameservers {
+        for (hostname, endpoints) in &group.tier2_nameservers {
             for protocol in endpoints.keys().cloned() {
                 match self
                     .query_dns_via_tier2_no_proxy_endpoint(
+                        group_id,
                         hostname,
                         protocol.clone(),
                         domain,
@@ -1573,13 +1696,19 @@ impl ClashState {
         ))
     }
 
-    async fn resolve_domain_direct_tier1(&self, domain: &str) -> Result<BTreeSet<IpAddr>> {
+    async fn resolve_domain_direct_tier1(
+        &self,
+        group_id: &GroupId,
+        domain: &str,
+    ) -> Result<BTreeSet<IpAddr>> {
+        let group = self.group(group_id)?;
         let timeout = Duration::from_secs(8);
 
-        for (server, endpoints) in &self.tier1_nameservers {
+        for (server, endpoints) in &group.tier1_nameservers {
             for protocol in endpoints.keys().cloned() {
                 match self
                     .query_dns_via_tier1_no_proxy_endpoint(
+                        group_id,
                         server,
                         protocol.clone(),
                         domain,
@@ -1608,6 +1737,7 @@ impl ClashState {
 
     async fn attempt_path(
         &self,
+        group_id: &GroupId,
         path: ResolutionPath,
         domain: &str,
         hub: Option<&UplinkHub>,
@@ -1625,10 +1755,19 @@ impl ClashState {
                 let Some(hub) = hub else {
                     return PathAttempt::Skipped;
                 };
-                if !Self::has_proxy_resolvers(hub) || self.tier2_nameservers.is_empty() {
+                if !Self::has_proxy_resolvers(hub)
+                    || self
+                        .groups
+                        .get(group_id)
+                        .map(|g| g.tier2_nameservers.is_empty())
+                        .unwrap_or(true)
+                {
                     return PathAttempt::Skipped;
                 }
-                match self.resolve_via_available_tier2_proxies(hub, domain).await {
+                match self
+                    .resolve_via_available_tier2_proxies(group_id, hub, domain)
+                    .await
+                {
                     Ok(ips) => PathAttempt::Resolved(ips),
                     Err(e) => PathAttempt::Failed(e),
                 }
@@ -1637,27 +1776,41 @@ impl ClashState {
                 let Some(hub) = hub else {
                     return PathAttempt::Skipped;
                 };
-                if !Self::has_proxy_resolvers(hub) || self.tier1_nameservers.is_empty() {
+                if !Self::has_proxy_resolvers(hub)
+                    || self
+                        .groups
+                        .get(group_id)
+                        .map(|g| g.tier1_nameservers.is_empty())
+                        .unwrap_or(true)
+                {
                     return PathAttempt::Skipped;
                 }
-                match self.resolve_via_available_tier1_proxies(hub, domain).await {
+                match self
+                    .resolve_via_available_tier1_proxies(group_id, hub, domain)
+                    .await
+                {
                     Ok(ips) => PathAttempt::Resolved(ips),
                     Err(e) => PathAttempt::Failed(e),
                 }
             }
-            ResolutionPath::DirectTier2 => match self.resolve_domain_direct_tier2(domain).await {
-                Ok(ips) => PathAttempt::Resolved(ips),
-                Err(e) => PathAttempt::Failed(e),
-            },
-            ResolutionPath::DirectTier1 => match self.resolve_domain_direct_tier1(domain).await {
-                Ok(ips) => PathAttempt::Resolved(ips),
-                Err(e) => PathAttempt::Failed(e),
-            },
+            ResolutionPath::DirectTier2 => {
+                match self.resolve_domain_direct_tier2(group_id, domain).await {
+                    Ok(ips) => PathAttempt::Resolved(ips),
+                    Err(e) => PathAttempt::Failed(e),
+                }
+            }
+            ResolutionPath::DirectTier1 => {
+                match self.resolve_domain_direct_tier1(group_id, domain).await {
+                    Ok(ips) => PathAttempt::Resolved(ips),
+                    Err(e) => PathAttempt::Failed(e),
+                }
+            }
         }
     }
 
     async fn resolve_target_domain(
         &mut self,
+        group_id: &GroupId,
         target: ResolutionTargetKind,
         domain: &str,
         hub: Option<&UplinkHub>,
@@ -1667,10 +1820,10 @@ impl ClashState {
         metrics: &mut ResolutionMetrics,
         refresh: bool,
     ) {
-        if !refresh && let Some(cached) = self.cached_for_target(target, domain) {
+        if !refresh && let Some(cached) = self.cached_for_target(group_id, target, domain) {
             metrics.cache_hits += 1;
             info!("domain {} has been cached, not resolving", domain);
-            solved.add_resolution(domain.to_string(), cached);
+            solved.add_resolution(Domain::from(domain), cached);
             return;
         }
 
@@ -1686,7 +1839,10 @@ impl ClashState {
                 return;
             }
 
-            match self.attempt_path(*path, domain, hub, cancel).await {
+            match self
+                .attempt_path(group_id, *path, domain, hub, cancel)
+                .await
+            {
                 PathAttempt::Resolved(ip_set) => {
                     let (proxied, tier) = Self::path_label(*path);
                     info!(
@@ -1698,8 +1854,8 @@ impl ClashState {
                         Self::ips_brief(&ip_set)
                     );
                     metrics.mark_resolved(*path);
-                    solved.add_resolution(domain.to_string(), ip_set.clone());
-                    self.store_target_resolution(target, domain, ip_set);
+                    solved.add_resolution(Domain::from(domain), ip_set.clone());
+                    self.store_target_resolution(group_id, target, domain, ip_set);
                     return;
                 }
                 PathAttempt::Skipped => {
@@ -1724,19 +1880,22 @@ impl ClashState {
 
     async fn resolve_via_available_tier2_proxies(
         &self,
+        group_id: &GroupId,
         hub: &UplinkHub,
         domain: &str,
     ) -> Result<BTreeSet<IpAddr>> {
-        if self.tier2_nameservers.is_empty() {
+        let group = self.group(group_id)?;
+        if group.tier2_nameservers.is_empty() {
             anyhow::bail!("No tier2 DNS servers available for proxy-based resolution");
         }
 
         let timeout = Duration::from_secs(8);
 
-        for (hostname, endpoints) in &self.tier2_nameservers {
+        for (hostname, endpoints) in &group.tier2_nameservers {
             for protocol in endpoints.keys().cloned() {
                 match self
                     .query_dns_via_tier2_proxy_endpoint(
+                        group_id,
                         hub,
                         hostname,
                         protocol.clone(),
@@ -1767,19 +1926,22 @@ impl ClashState {
 
     async fn resolve_via_available_tier1_proxies(
         &self,
+        group_id: &GroupId,
         hub: &UplinkHub,
         domain: &str,
     ) -> Result<BTreeSet<IpAddr>> {
-        if self.tier1_nameservers.is_empty() {
+        let group = self.group(group_id)?;
+        if group.tier1_nameservers.is_empty() {
             anyhow::bail!("No tier1 DNS servers available for proxy-based resolution");
         }
 
         let timeout = Duration::from_secs(8);
 
-        for (server, endpoints) in &self.tier1_nameservers {
+        for (server, endpoints) in &group.tier1_nameservers {
             for protocol in endpoints.keys().cloned() {
                 match self
                     .query_dns_via_tier1_proxy_endpoint(
+                        group_id,
                         hub,
                         server,
                         protocol.clone(),
@@ -1812,18 +1974,14 @@ impl ClashState {
     /// and storing results into `tier2_cache`.
     pub async fn prepare_tier2_dns_via_tier1(
         &mut self,
-        profile: &ClashProfile,
+        group_id: &GroupId,
         cancel: Option<&AtomicBool>,
     ) -> Result<()> {
         warn!("prepare_tier2_dns_hosts_start");
-        if self.tier1_nameservers.is_empty() {
-            self.tier1_nameservers = profile.tier1_nameservers.clone();
-        }
-        if self.tier2_nameservers.is_empty() {
-            self.tier2_nameservers = profile.tier2_nameservers.clone();
-        }
 
-        let tier2_query_hosts: Vec<_> = self.tier2_nameservers.keys().cloned().collect();
+        let group = self.group(group_id)?;
+
+        let tier2_query_hosts: Vec<_> = group.tier2_nameservers.keys().cloned().collect();
         let mut failed_hosts = Vec::new();
 
         for host in tier2_query_hosts {
@@ -1839,11 +1997,11 @@ impl ClashState {
                 continue;
             }
 
-            if self.get_latest_ips(&host).is_some() {
+            if self.get_latest_ips_in_group(group_id, &host).is_some() {
                 continue;
             }
 
-            match self.resolve_domain_direct_tier1(&host).await {
+            match self.resolve_domain_direct_tier1(group_id, &host).await {
                 Ok(ip_set) => {
                     info!(
                         "prepare_tier2_dns_host_resolved host={} proxied=false tier=tier1 ip_count={} ips={}",
@@ -1851,7 +2009,7 @@ impl ClashState {
                         ip_set.len(),
                         Self::ips_brief(&ip_set)
                     );
-                    self.update_cache(&host, ip_set);
+                    self.update_cache_in_group(group_id, &host, ip_set);
                 }
                 Err(e) => {
                     warn!(
@@ -1880,37 +2038,46 @@ impl ClashState {
         Ok(())
     }
 
-    /// Resolve a profile using strategy-driven path policy.
-    pub async fn resolve_profile(
+    pub async fn resolve_group(
         &mut self,
-        profile: &ClashProfile,
+        group_id: &GroupId,
         hub: Option<&UplinkHub>,
         cancel: Option<&AtomicBool>,
         direct_only: bool,
         refresh: bool,
     ) -> Result<ResolveProfileReport> {
+        self.prepare_tier2_dns_via_tier1(group_id, cancel).await?;
+
+        let group = self.group(group_id)?;
+
         info!(
             "resolver_ready tier1_nameserver_count={} tier2_nameserver_count={}",
-            self.tier1_nameservers.len(),
-            self.tier2_nameservers.len()
+            group.tier1_nameservers.len(),
+            group.tier2_nameservers.len()
         );
+
+        let domains: Vec<Domain> = self
+            .domain_group
+            .iter()
+            .filter_map(|(domain, gid)| (gid == group_id).then_some(domain.clone()))
+            .collect();
 
         let mut solved = ProfileSolved::new();
         let mut metrics = ResolutionMetrics::default();
 
-        // Resolve proxy domains (tier2 DNS is assumed to be pre-prepared).
-        for domain in &profile.proxy_domains {
+        for domain in domains {
             if cancel
                 .map(|flag| flag.load(Ordering::Relaxed))
                 .unwrap_or(false)
             {
-                warn!("Interrupt observed during profile resolve; stopping before next entry");
+                warn!("Interrupt observed during group resolve; stopping before next entry");
                 break;
             }
 
             self.resolve_target_domain(
+                group_id,
                 ResolutionTargetKind::ProxyDomain,
-                domain,
+                domain.as_str(),
                 hub,
                 cancel,
                 direct_only,
@@ -1921,7 +2088,6 @@ impl ClashState {
             .await;
         }
 
-        // Persist updated clash state
         if let Err(e) = self.save_atomic() {
             warn!("Failed to persist ClashState: {}", e);
         }
@@ -1940,11 +2106,18 @@ impl ClashState {
         direct_only: bool,
     ) -> Result<ResolveProfileReport> {
         let mut working = self.clone();
+        let domain_key = Domain::from(domain);
+        let group_id = working
+            .group_for_domain(&domain_key)
+            .cloned()
+            .or_else(|| working.groups.keys().next().cloned())
+            .unwrap_or_else(|| GroupId::from("default"));
 
+        let group = working.group(&group_id)?;
         info!(
             "resolver_ready tier1_nameserver_count={} tier2_nameserver_count={}",
-            working.tier1_nameservers.len(),
-            working.tier2_nameservers.len()
+            group.tier1_nameservers.len(),
+            group.tier2_nameservers.len()
         );
 
         let mut solved = ProfileSolved::new();
@@ -1963,6 +2136,7 @@ impl ClashState {
 
         working
             .resolve_target_domain(
+                &group_id,
                 ResolutionTargetKind::ProxyDomain,
                 domain,
                 hub,
