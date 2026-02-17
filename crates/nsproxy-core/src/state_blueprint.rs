@@ -150,6 +150,7 @@ pub fn global_state_tree() -> StateNode {
                 state_paths::uplink_root(),
                 vec![
                     <crate::uplink::clash::ClashState as PersistentState>::node(),
+                    <crate::uplink::RemoteProxyState as PersistentState>::node(),
                     StateNode::leaf("uplink_kind_dir", state_paths::uplink_dir("{kind}")),
                     StateNode::leaf(
                         "uplink_profile_dir",

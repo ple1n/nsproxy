@@ -68,7 +68,7 @@ use tracing::{info, warn};
 use tun2socks5::ArgProxy;
 use tun2socks5::dns::{TUNResponse, VDNSRES, VirtDNSAsync, VirtDNSHandle};
 
-use crate::state_paths;
+use crate::{state_blueprint::PersistentState, state_paths};
 
 pub mod router;
 
@@ -354,6 +354,47 @@ pub struct LinkStats {
     latency_checked: Instant,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteProxyState {
+    pub proxies: Vec<ArgProxy>,
+}
+
+impl RemoteProxyState {
+    pub fn path() -> PathBuf {
+        <Self as PersistentState>::path()
+    }
+
+    pub fn load_or_default() -> Result<Self> {
+        <Self as PersistentState>::load_or_default()
+    }
+
+    pub fn save_atomic(&self) -> Result<()> {
+        <Self as PersistentState>::save_atomic(self)
+    }
+
+    pub fn add_proxy(&mut self, proxy: ArgProxy) -> bool {
+        if self.proxies.iter().any(|existing| existing.addr == proxy.addr) {
+            return false;
+        }
+        self.proxies.push(proxy);
+        true
+    }
+
+    pub fn remove_proxy(&mut self, addr: SocketAddr) -> bool {
+        let before = self.proxies.len();
+        self.proxies.retain(|proxy| proxy.addr != addr);
+        self.proxies.len() != before
+    }
+}
+
+impl PersistentState for RemoteProxyState {
+    const STATE_NAME: &'static str = "uplink_remote";
+
+    fn path() -> PathBuf {
+        state_paths::uplink_remote_state()
+    }
+}
+
 /// All proxies here should be immediately connectable without further resolution dependent on other state
 pub enum UplinkProxy {
     Trojan(clash::TrojanProxy),
@@ -468,9 +509,11 @@ impl UplinkHub {
 
     /// Load all saved proxies across all uplink kinds
     pub fn load_saved_proxies(&mut self) -> Result<usize> {
+        let mut count = self.load_remote_proxies()?;
+
         let uplink_root = state_paths::uplink_root();
         if !uplink_root.exists() {
-            return Ok(0);
+            return Ok(count);
         }
 
         let kinds: Vec<_> = std::fs::read_dir(&uplink_root)?
@@ -478,7 +521,6 @@ impl UplinkHub {
             .filter(|entry| entry.path().is_dir())
             .collect();
 
-        let mut count = 0;
         for entry in kinds {
             let kind = entry.file_name().to_string_lossy().to_string();
             match kind.as_str() {
@@ -492,6 +534,20 @@ impl UplinkHub {
                     );
                 }
             }
+        }
+
+        Ok(count)
+    }
+
+    /// Load all saved remote proxies from /nsp3/uplink/remote.json
+    pub fn load_remote_proxies(&mut self) -> Result<usize> {
+        let state = RemoteProxyState::load_or_default()?;
+        let mut count = 0;
+
+        for proxy in state.proxies {
+            let id = ProxyID::Remote(proxy.addr);
+            self.add_proxy(id, UplinkProxy::Remote(proxy));
+            count += 1;
         }
 
         Ok(count)

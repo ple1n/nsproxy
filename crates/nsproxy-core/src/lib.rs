@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, create_dir_all};
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::fd::AsFd;
@@ -1658,10 +1659,24 @@ pub enum UplinkCommand {
         #[command(subcommand)]
         cmd: UplinkInstanceCommand,
     },
-    // 
     Remote {
+        #[command(subcommand)]
+        cmd: RemoteOps,
+    },
+}
 
-    }
+#[derive(Debug, Clone, Subcommand)]
+pub enum RemoteOps {
+    /// Add a remote proxy by URL, e.g. socks5://127.0.0.1:1080
+    Add {
+        url: String,
+    },
+    /// Remove a remote proxy by socket address
+    Remove {
+        addr: SocketAddr,
+    },
+    /// List saved remote proxies
+    List,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1679,7 +1694,7 @@ pub enum ClashOps {
         path: PathBuf,
     },
     /// Show status of imported Clash profiles
-    Status,
+    List,
     /// Analyze a Clash profile and explain the two-tier DNS bootstrap process
     ConfigExplain {
         /// Path to Clash YAML config file
