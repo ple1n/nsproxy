@@ -312,137 +312,123 @@ impl Router {
 
         match decision {
             RoutingDecision::Proxy { target, id } => {
-                enum SelectedProxy {
-                    Trojan(crate::uplink::clash::TrojanProxy),
-                    Remote(tun2socks5::ArgProxy),
-                    File(PathBuf),
-                }
-
-                let selected = {
+                let (trojan, remote, file_path) = {
                     let hub = uplink.read().await;
                     match hub.get_proxy(&id) {
-                        Some(UplinkProxy::Trojan(proxy)) => SelectedProxy::Trojan(proxy.clone()),
-                        Some(UplinkProxy::Remote(proxy)) => SelectedProxy::Remote(proxy.clone()),
-                        Some(UplinkProxy::File(path)) => SelectedProxy::File(path.clone()),
-                        Some(UplinkProxy::Geph) => {
-                            bail!("proxy {:?} (geph) is not supported yet", id)
-                        }
+                        Some(UplinkProxy::Trojan(proxy)) => (Some(proxy.clone()), None, None),
+                        Some(UplinkProxy::Remote(proxy)) => (None, Some(proxy.clone()), None),
+                        Some(UplinkProxy::File(path)) => (None, None, Some(path.clone())),
+                        Some(UplinkProxy::Geph) => bail!("proxy {:?} (geph) is not supported yet", id),
                         None => bail!("proxy {:?} not found", id),
                     }
                 };
 
-                match selected {
-                    SelectedProxy::File(path) => {
-                        if let Some(tx) = file_tx {
-                            tx.send_async((path, tcp)).await?;
+                if let Some(path) = file_path {
+                    if let Some(tx) = file_tx {
+                        tx.send_async((path, tcp)).await?;
+                        Ok(())
+                    } else {
+                        bail!("file proxy route requested but file server channel is unavailable")
+                    }
+                } else if let Some(proxy) = trojan {
+                    use crate::uplink::proxy_adapters::{ProxyConnection, TrojanAdapter};
+
+                    let (target_host, target_port) = Self::wire_to_host_port(&target);
+                    let resolved_ip = proxy.server_addr.ip();
+                    let mut conn =
+                        TrojanAdapter::connect_tcp(&proxy, &target_host, target_port, resolved_ip)
+                            .await?;
+
+                    let proxy_stream = match conn {
+                        ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
+                        ProxyConnection::Udp(_) => {
+                            bail!("udp proxy tunnel cannot serve tcp stream")
+                        }
+                    };
+
+                    let mut tcp = tcp;
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id.clone(),
+                        ts: Timestamp::now(),
+                    });
+                    match Self::relay_tcp_with_cause(
+                        &mut tcp,
+                        proxy_stream,
+                        "tun->proxy",
+                        "proxy->tun",
+                    )
+                    .await
+                    {
+                        Ok((up, down)) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: up,
+                                bytes_down: down,
+                            });
                             Ok(())
-                        } else {
-                            bail!("file proxy route requested but file server channel is unavailable")
+                        }
+                        Err(relay_err) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(relay_err.to_string()),
+                                bytes_up: 0,
+                                bytes_down: 0,
+                            });
+                            Err(anyhow::Error::new(relay_err))
                         }
                     }
-                    SelectedProxy::Trojan(proxy) => {
-                        use crate::uplink::proxy_adapters::{ProxyConnection, TrojanAdapter};
+                } else if let Some(proxy) = remote {
+                    use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
 
-                        let (target_host, target_port) = Self::wire_to_host_port(&target);
-                        let resolved_ip = proxy.server_addr.ip();
-                        let mut conn = TrojanAdapter::connect_tcp(
-                            &proxy,
-                            &target_host,
-                            target_port,
-                            resolved_ip,
-                        )
-                        .await?;
+                    let (target_host, target_port) = Self::wire_to_host_port(&target);
+                    let mut conn = RemoteAdapter::connect(&proxy, &target_host, target_port).await?;
 
-                        let proxy_stream = match conn {
-                            ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
-                            ProxyConnection::Udp(_) => {
-                                bail!("udp proxy tunnel cannot serve tcp stream")
-                            }
-                        };
+                    let proxy_stream = match conn {
+                        ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
+                        ProxyConnection::Udp(_) => {
+                            bail!("udp proxy tunnel cannot serve tcp stream")
+                        }
+                    };
 
-                        let mut tcp = tcp;
-                        diag.emit(DiagEvent::Connected {
-                            id: conn_id.clone(),
-                            ts: Timestamp::now(),
-                        });
-                        match Self::relay_tcp_with_cause(
-                            &mut tcp,
-                            proxy_stream,
-                            "tun->proxy",
-                            "proxy->tun",
-                        )
-                        .await
-                        {
-                            Ok((up, down)) => {
-                                diag.emit(DiagEvent::Finished {
-                                    id: conn_id,
-                                    ts: Timestamp::now(),
-                                    error: None,
-                                    bytes_up: up,
-                                    bytes_down: down,
-                                });
-                                Ok(())
-                            }
-                            Err(relay_err) => {
-                                diag.emit(DiagEvent::Finished {
-                                    id: conn_id,
-                                    ts: Timestamp::now(),
-                                    error: Some(relay_err.to_string()),
-                                    bytes_up: 0,
-                                    bytes_down: 0,
-                                });
-                                Err(anyhow::Error::new(relay_err))
-                            }
+                    let mut tcp = tcp;
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id.clone(),
+                        ts: Timestamp::now(),
+                    });
+                    match Self::relay_tcp_with_cause(
+                        &mut tcp,
+                        proxy_stream,
+                        "tun->proxy",
+                        "proxy->tun",
+                    )
+                    .await
+                    {
+                        Ok((up, down)) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: up,
+                                bytes_down: down,
+                            });
+                            Ok(())
+                        }
+                        Err(relay_err) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(relay_err.to_string()),
+                                bytes_up: 0,
+                                bytes_down: 0,
+                            });
+                            Err(anyhow::Error::new(relay_err))
                         }
                     }
-                    SelectedProxy::Remote(proxy) => {
-                        use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
-
-                        let (target_host, target_port) = Self::wire_to_host_port(&target);
-                        let mut conn = RemoteAdapter::connect(&proxy, &target_host, target_port).await?;
-
-                        let proxy_stream = match conn {
-                            ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
-                            ProxyConnection::Udp(_) => {
-                                bail!("udp proxy tunnel cannot serve tcp stream")
-                            }
-                        };
-
-                        let mut tcp = tcp;
-                        diag.emit(DiagEvent::Connected {
-                            id: conn_id.clone(),
-                            ts: Timestamp::now(),
-                        });
-                        match Self::relay_tcp_with_cause(
-                            &mut tcp,
-                            proxy_stream,
-                            "tun->proxy",
-                            "proxy->tun",
-                        )
-                        .await
-                        {
-                            Ok((up, down)) => {
-                                diag.emit(DiagEvent::Finished {
-                                    id: conn_id,
-                                    ts: Timestamp::now(),
-                                    error: None,
-                                    bytes_up: up,
-                                    bytes_down: down,
-                                });
-                                Ok(())
-                            }
-                            Err(relay_err) => {
-                                diag.emit(DiagEvent::Finished {
-                                    id: conn_id,
-                                    ts: Timestamp::now(),
-                                    error: Some(relay_err.to_string()),
-                                    bytes_up: 0,
-                                    bytes_down: 0,
-                                });
-                                Err(anyhow::Error::new(relay_err))
-                            }
-                        }
-                    }
+                } else {
+                    bail!("proxy {:?} resolved to no supported runtime variant", id)
                 }
             }
             RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {

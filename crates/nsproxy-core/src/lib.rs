@@ -1658,6 +1658,10 @@ pub enum UplinkCommand {
         #[command(subcommand)]
         cmd: UplinkInstanceCommand,
     },
+    // 
+    Remote {
+
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
