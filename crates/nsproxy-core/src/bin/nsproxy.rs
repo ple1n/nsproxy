@@ -1537,28 +1537,9 @@ fn main() -> anyhow::Result<()> {
                         println!("  Instance: {}", name.to_string().cyan());
                         println!();
 
-                        // Load all Clash profiles and build UplinkHub
-                        let uplink_dir = state_paths::uplink_dir("clash");
-                        if !uplink_dir.exists() {
-                            bail!(
-                                "No Clash profiles found. Import a profile first with 'sp uplink clash profile-add'."
-                            );
-                        }
+                        let hub = load_saved_uplink_hub()?;
 
-                        let profiles: Vec<_> = std::fs::read_dir(&uplink_dir)?
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry.path().is_dir())
-                            .collect();
-
-                        if profiles.is_empty() {
-                            bail!("No Clash profiles found.");
-                        }
-
-                        let mut hub = nsproxy_core::uplink::UplinkHub::new();
-
-                        println!("Loading Clash profiles...");
-                        let count = hub.load_clash_proxies()?;
-                        println!("  Loaded {} proxies", count);
+                        println!("Loaded {} proxies", hub.all_proxies().len());
                         println!();
 
                         // Look up the proxy by nym
@@ -1641,7 +1622,6 @@ fn main() -> anyhow::Result<()> {
                                     // UDP Test: DNS resolution via Trojan
                                     println!("{}  Testing UDP connectivity...", "[•]".cyan());
                                     {
-                                        use nsproxy_core::uplink::proxy_adapters::TrojanAdapter;
                                         use nsproxy_core::uplink::proxy_dns;
                                         use std::net::IpAddr;
 
@@ -1690,9 +1670,105 @@ fn main() -> anyhow::Result<()> {
                                     Ok::<(), anyhow::Error>(())
                                 })?;
                             }
-                            _ => {
-                                bail!("Proxy type not yet supported for testing");
+                            nsproxy_core::uplink::UplinkProxy::Remote(remote) => {
+                                println!("{}", "Remote Proxy Tests".bold());
+                                println!("  Type: {}", remote.proxy_type);
+                                println!("  Addr: {}", remote.addr);
+                                println!();
+
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()?;
+
+                                rt.block_on(async {
+                                    use nsproxy_core::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
+                                    use nsproxy_core::uplink::proxy_dns;
+                                    use tun2socks5::ProxyType;
+
+                                    match remote.proxy_type {
+                                        ProxyType::Socks5 => {
+                                            println!("{}  Testing TCP connectivity...", "[•]".cyan());
+                                            match RemoteAdapter::connect_tcp(remote, "ip.me", 80).await {
+                                                Ok(ProxyConnection::Tcp(mut stream)) => {
+                                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                                    println!("  TCP connected");
+                                                    let request = "GET / HTTP/1.1\r\nHost: ip.me\r\nConnection: close\r\n\r\n";
+                                                    if let Err(e) = stream.write_all(request.as_bytes()).await {
+                                                        println!("{}  TCP test failed: {:?}", "[✗]".red().bold(), e);
+                                                    } else {
+                                                        let mut response = String::new();
+                                                        match tokio::time::timeout(
+                                                            Duration::from_secs(10),
+                                                            stream.read_to_string(&mut response),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(_)) => {
+                                                                if response.contains("200 OK") || !response.is_empty() {
+                                                                    println!("{}", response);
+                                                                    println!("{}  TCP test passed (ip.me responded)", "[✓]".green().bold());
+                                                                } else {
+                                                                    println!("{}  TCP test failed: invalid response", "[✗]".red().bold());
+                                                                }
+                                                            }
+                                                            Ok(Err(e)) => {
+                                                                println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                                            }
+                                                            Err(_) => {
+                                                                println!("{}  TCP test failed: timeout", "[✗]".red().bold());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Ok(_) => {
+                                                    println!("{}  TCP test failed: wrong connection type", "[✗]".red().bold());
+                                                }
+                                                Err(e) => {
+                                                    println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                                }
+                                            }
+
+                                            println!("{}  Testing UDP connectivity...", "[•]".cyan());
+                                            match RemoteAdapter::connect_udp(remote).await {
+                                                Ok(ProxyConnection::Udp(mut tunnel)) => {
+                                                    let dns_server = WireAddress::SocketAddress(std::net::SocketAddr::new(
+                                                        "1.1.1.1".parse().unwrap(),
+                                                        53,
+                                                    ));
+
+                                                    match proxy_dns::query_via_udp(
+                                                        tunnel.as_mut(),
+                                                        &dns_server,
+                                                        "ip.me",
+                                                        Duration::from_secs(5),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(ips) => {
+                                                            println!("{}  UDP test passed (resolved): {:?}", "[✓]".green().bold(), ips);
+                                                        }
+                                                        Err(e) => {
+                                                            println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
+                                                        }
+                                                    }
+                                                }
+                                                Ok(_) => {
+                                                    println!("{}  UDP test failed: wrong connection type", "[✗]".red().bold());
+                                                }
+                                                Err(e) => {
+                                                    println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
+                                                }
+                                            }
+                                        }
+                                        ProxyType::Socks4 | ProxyType::Http => {}
+                                    }
+
+                                    println!();
+                                    println!("{}", "Test complete".bold());
+                                    Ok::<(), anyhow::Error>(())
+                                })?;
                             }
+                            _ => {}
                         }
                     }
                 }
