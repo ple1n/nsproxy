@@ -380,9 +380,12 @@ impl RemoteProxyState {
         true
     }
 
-    pub fn remove_proxy(&mut self, addr: SocketAddr) -> bool {
+    pub fn remove_proxy(&mut self, nym: &ProxyNym) -> bool {
         let before = self.proxies.len();
-        self.proxies.retain(|proxy| proxy.addr != addr);
+        self.proxies.retain(|proxy| {
+            let id = ProxyID::Remote(proxy.addr);
+            id.nym() != *nym
+        });
         self.proxies.len() != before
     }
 }

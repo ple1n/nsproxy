@@ -1497,13 +1497,13 @@ fn main() -> anyhow::Result<()> {
                         println!("Remote proxy already exists: {}", proxy.addr);
                     }
                 }
-                nsproxy_core::RemoteOps::Remove { addr } => {
+                nsproxy_core::RemoteOps::Remove { nym } => {
                     let mut state = nsproxy_core::uplink::RemoteProxyState::load_or_default()?;
-                    if state.remove_proxy(addr) {
+                    if state.remove_proxy(&nym) {
                         state.save_atomic()?;
-                        println!("Removed remote proxy: {}", addr);
+                        println!("Removed remote proxy: {}", nym);
                     } else {
-                        println!("Remote proxy not found: {}", addr);
+                        println!("Remote proxy not found: {}", nym);
                     }
                 }
                 nsproxy_core::RemoteOps::List => {
