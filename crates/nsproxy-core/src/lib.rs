@@ -62,6 +62,7 @@ pub mod sys;
 pub mod sandbox;
 pub mod hot_reload;
 pub mod cmd_common;
+pub mod cmd_uplink;
 pub mod utils;
 
 pub struct TunMaker {
