@@ -265,7 +265,7 @@ impl Router {
             )
             .await
             {
-                error!("TCP connection {:?} error: {:?}", conn_id, e);
+                error!("Drop TCP connection {:?} {:?}", conn_id, e);
                 diag.emit(DiagEvent::Finished {
                     id: conn_id,
                     ts: Timestamp::now(),
@@ -717,16 +717,30 @@ impl Router {
                     info!("UDP {:?} -> direct to {}", conn_id, addr);
                     use crate::uplink::proxy_adapters::NoProxyAdapter;
                     let mut remote = NoProxyAdapter::connect_udp(addr).await?;
-                    let (up, down) =
-                        Self::relay_udp(remote.as_udp_mut().unwrap(), &mut udp, peer).await?;
-                    diag.emit(DiagEvent::Finished {
-                        id: conn_id,
-                        ts: Timestamp::now(),
-                        error: None,
-                        bytes_up: up,
-                        bytes_down: down,
-                    });
-                    break;
+                    match Self::relay_udp(remote.as_udp_mut().unwrap(), &mut udp, peer).await {
+                        Ok((up, down)) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: up,
+                                bytes_down: down,
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("direct UDP relay failed for {peer}: {e:?}, retrying");
+                            ctx.attempt_num += 1;
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(e.to_string()),
+                                bytes_up: 0,
+                                bytes_down: 0,
+                            });
+                            continue;
+                        }
+                    }
                 }
                 RoutingDecision::Drop(reason) => {
                     info!("UDP {:?} {:?}", conn_id, reason);
@@ -885,6 +899,8 @@ impl Router {
                         });
                     }
                     udp.write_all(&resp).await?;
+                    break;
+                    // Finish DNS
                 }
                 Err(err) => {
                     let domain = query.unwrap_or_else(|| "<parse-error>".to_string());
