@@ -406,8 +406,16 @@ pub struct UplinkHub {
 }
 
 pub struct LinkStats {
+    /// time to first byte
     latency: Duration,
     latency_checked: Instant,
+    last_conn: LinkConnCheck,
+    last_conn_time: Instant
+}
+
+pub enum LinkConnCheck {
+    Fail,
+    Success
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
