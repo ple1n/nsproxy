@@ -823,11 +823,58 @@ fn sidebar_box(
     resp
 }
 
+/// Try to load a CJK font from common system paths and register it with egui.
+fn setup_cjk_font(ctx: &egui::Context) {
+    // Common Noto CJK / WQY font locations across major Linux distros.
+    let candidates = [
+        // Noto Sans CJK (Fedora / RHEL / Arch / Debian / Ubuntu)
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+        // SC-only variants (Ubuntu / Debian)
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf",
+        // WenQuanYi Micro Hei – very widely available
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        // WenQuanYi Zen Hei
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ];
+
+    for path in &candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            // Append after the built-in proportional fonts so Latin glyphs stay sharp.
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("cjk".to_owned());
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
 fn main() {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "nsproxy - dashboard",
         native_options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| {
+            setup_cjk_font(&cc.egui_ctx);
+            Ok(Box::new(App::default()))
+        }),
     );
 }
