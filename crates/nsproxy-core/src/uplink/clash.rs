@@ -284,7 +284,7 @@ impl TrojanProxy {
             .context("Invalid server name for TLS")?;
 
         info!(
-            "Starting Trojan TLS handshake with {} (SNI: {})",
+            "Trojan TLS handshake with {} (SNI: {})",
             server_addr, self.server_name
         );
         let mut tls_stream = tls_connector
