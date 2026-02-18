@@ -717,6 +717,11 @@ impl Router {
                     info!("UDP {:?} -> direct to {}", conn_id, addr);
                     use crate::uplink::proxy_adapters::NoProxyAdapter;
                     let mut remote = NoProxyAdapter::connect_udp(addr).await?;
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                    });
+
                     match Self::relay_udp(remote.as_udp_mut().unwrap(), &mut udp, peer).await {
                         Ok((up, down)) => {
                             diag.emit(DiagEvent::Finished {

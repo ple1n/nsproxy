@@ -18,3 +18,5 @@ In base system, the censor has no way to tell that I possess a secret material (
 Specifically, nsproxy should handle the environment through kernel namespaces, bind mounts, and chroot. 
 
 In the base system, the browser launch can not leak my secret identity because the profile folder is not mounted.
+
+Some basic anonymization. Anonymized user name, root directory paths for containers.

@@ -760,8 +760,15 @@ fn main() -> eframe::Result<()> {
                                     });
 
                                     row.col(|ui| {
-                                        if let Some(lat) = c.connect_latency() {
-                                            use diag::summary::format_duration_us;
+                                        use diag::summary::format_duration_us;
+                                        // For DNS connections show accept→resolved latency;
+                                        // for regular connections show accept→connected latency.
+                                        let lat_opt = if c.is_dns() {
+                                            c.dns_resolve_latency()
+                                        } else {
+                                            c.connect_latency()
+                                        };
+                                        if let Some(lat) = lat_opt {
                                             let us = lat.as_secs_f64() * 1_000_000.0;
                                             let color = if us > 500_000.0 {
                                                 egui::Color32::RED
@@ -772,17 +779,20 @@ fn main() -> eframe::Result<()> {
                                             };
                                             ui.colored_label(color, format_duration_us(us));
                                         } else {
-                                            ui.label("…");
+                                            // blank
                                         }
                                     });
 
                                     row.col(|ui| {
-                                        if let Some(dur) = c.total_duration() {
-                                            use diag::summary::format_duration_us;
-                                            let us = dur.as_secs_f64() * 1_000_000.0;
-                                            ui.label(format_duration_us(us));
-                                        } else {
-                                            ui.label("active");
+                                        // Leave duration blank for DNS connections.
+                                        if !c.is_dns() {
+                                            if let Some(dur) = c.total_duration() {
+                                                use diag::summary::format_duration_us;
+                                                let us = dur.as_secs_f64() * 1_000_000.0;
+                                                ui.label(format_duration_us(us));
+                                            } else {
+                                                ui.label("active");
+                                            }
                                         }
                                     });
 
@@ -792,6 +802,16 @@ fn main() -> eframe::Result<()> {
                                                 egui::Color32::RED,
                                                 format!("{}", &err[..err.len().min(40)]),
                                             );
+                                        } else if c.is_dns() {
+                                            // Show DNS resolution status instead of active/OK.
+                                            if let Some(ref resp) = c.dns_response {
+                                                if resp.starts_with("err:") {
+                                                    ui.colored_label(egui::Color32::RED, "error");
+                                                } else {
+                                                    ui.colored_label(egui::Color32::GREEN, "resolved");
+                                                }
+                                            }
+                                            // If no response yet, show nothing (pending).
                                         } else if c.finished_ts.is_some() {
                                             ui.colored_label(egui::Color32::GREEN, "OK");
                                         }

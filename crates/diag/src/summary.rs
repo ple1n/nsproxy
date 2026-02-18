@@ -28,6 +28,7 @@ pub struct ConnStats {
     pub bytes_down: u64,
     pub dns_query: Option<String>,
     pub dns_response: Option<String>,
+    pub dns_resolved_ts: Option<Timestamp>,
 }
 
 impl ConnStats {
@@ -41,6 +42,17 @@ impl ConnStats {
     pub fn total_duration(&self) -> Option<Duration> {
         self.finished_ts
             .map(|f| f.elapsed_since(&self.accept_ts))
+    }
+
+    /// Time from accept to DNS resolved (for DNS connections).
+    pub fn dns_resolve_latency(&self) -> Option<Duration> {
+        self.dns_resolved_ts
+            .map(|r| r.elapsed_since(&self.accept_ts))
+    }
+
+    /// True if this is a DNS connection (UDP that handled a DNS query).
+    pub fn is_dns(&self) -> bool {
+        self.dns_query.is_some()
     }
 }
 
@@ -145,6 +157,7 @@ impl DiagAccumulator {
                     bytes_down: 0,
                     dns_query: None,
                     dns_response: None,
+                    dns_resolved_ts: None,
                 };
                 self.conns.insert(*id, stats);
                 self.conn_order.push_back(*id);
@@ -179,12 +192,13 @@ impl DiagAccumulator {
                 }
                 self.loop_stats.push(*dispatch_us);
             }
-            DiagEvent::DnsResolved { id, domain, result, .. } => {
+            DiagEvent::DnsResolved { id, ts, domain, result, .. } => {
                 if let Some(c) = self.conns.get_mut(id) {
                     if c.dns_query.is_none() {
                         c.dns_query = Some(domain.clone());
                     }
                     c.dns_response = Some(result.clone());
+                    c.dns_resolved_ts = Some(*ts);
                 }
             }
             DiagEvent::DnsQuery { id, query, .. } => {
@@ -208,6 +222,7 @@ impl DiagAccumulator {
                     bytes_down: 0,
                     dns_query: None,
                     dns_response: None,
+                    dns_resolved_ts: None,
                 };
                 self.conns.insert(*id, stats);
                 self.conn_order.push_back(*id);
