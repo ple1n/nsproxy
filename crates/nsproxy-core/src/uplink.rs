@@ -1492,7 +1492,7 @@ pub mod proxy_adapters {
             resolved_ip: std::net::IpAddr,
         ) -> anyhow::Result<ProxyConnection> {
             info!(
-                "Preparing Trojan connection to {}:{} via {} ({})",
+                "Trojan TCP connection to {}:{} via {} ({})",
                 target_host, target_port, proxy.server_name, resolved_ip
             );
             let conn = proxy
@@ -1521,7 +1521,7 @@ pub mod proxy_adapters {
             resolved_ip: std::net::IpAddr,
         ) -> anyhow::Result<ProxyConnection> {
             info!(
-                "Preparing Trojan UDP-associate to {}:{} via {} ({})",
+                "Trojan UDP-associate to {}:{} via {} ({})",
                 target_host, target_port, proxy.server_name, resolved_ip
             );
             let conn = proxy
