@@ -1,11 +1,11 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use egui_json_tree::{DefaultExpand, JsonTree};
-use nsproxy_core::uplink::UplinkHub;
+use nsproxy_core::state_blueprint::PersistentState as _;
+use nsproxy_core::uplink::{UplinkHub, UplinkStatsState};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use std::thread;
-use tokio::sync::{mpsc, Mutex};
 
 const HOTCONFIG_EXAMPLE: &str = r#"{
     "hot_reload": true,
@@ -38,11 +38,14 @@ struct Profile {
 
 #[derive(Clone)]
 struct Proxy {
+    nym: String,
     name: String,
     url: String,
     udp_capable: bool,
     status: String,
     enabled_globally: bool,
+    latency_ms: Option<u64>,
+    conn_ok: Option<bool>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -89,30 +92,105 @@ struct App {
     // per-scope UI state keyed by Scope
     current_scope: Scope,
     scope_states: HashMap<Scope, ScopeUiState>,
-    uplink: Arc<Mutex<UplinkHub>>,
-    uplink_reload_tx: mpsc::Sender<()>,
+    /// Send `()` to trigger a background reload; receives updated proxy list.
+    reload_tx: flume::Sender<()>,
+    proxy_rx: flume::Receiver<Vec<Proxy>>,
+}
+
+/// Load proxies from persisted uplink state into render-ready `Vec<Proxy>`.
+/// This is the single source of truth for the conversion; called at init and on reload.
+fn load_proxies_from_persisted() -> Vec<Proxy> {
+    use nsproxy_core::uplink::{LatencyCheck, LinkConnCheck, UplinkProxy};
+
+    let stats_state = UplinkStatsState::load_or_default().unwrap_or_default();
+    let mut hub = UplinkHub::new();
+    if hub.hydrate_from_persisted().is_err() {
+        return Vec::new();
+    }
+
+    let mut proxies: Vec<Proxy> = hub
+        .all_proxies()
+        .iter()
+        .map(|(id, proxy)| {
+            let nym = id.nym().to_string();
+            let (latency_ms, conn_ok) = if let Some(s) = stats_state.stats.get(&id.nym()) {
+                let lat = match s.latency {
+                    LatencyCheck::TTFB(ms) => Some(ms),
+                    LatencyCheck::None => None,
+                };
+                let ok = match s.last_conn {
+                    LinkConnCheck::Success => Some(true),
+                    LinkConnCheck::Fail => Some(false),
+                };
+                (lat, ok)
+            } else {
+                (None, None)
+            };
+            let (name, url, udp_capable) = match proxy {
+                UplinkProxy::Trojan(t) => (
+                    t.name.clone(),
+                    format!("trojan://{}:{}", t.server_name, t.server_addr.port()),
+                    false,
+                ),
+                UplinkProxy::Remote(a) => (
+                    nym.clone(),
+                    format!("{}://{}", a.proxy_type, a.addr),
+                    true,
+                ),
+                UplinkProxy::Geph => (nym.clone(), "geph://".into(), false),
+                UplinkProxy::File(p) => (nym.clone(), format!("file://{}", p.display()), false),
+            };
+            Proxy {
+                nym,
+                name,
+                url,
+                udp_capable,
+                status: "idle".into(),
+                enabled_globally: false,
+                latency_ms,
+                conn_ok,
+            }
+        })
+        .collect();
+
+    // Proxies with stats float to top, then by nym.
+    proxies.sort_by(|a, b| {
+        b.latency_ms
+            .is_some()
+            .cmp(&a.latency_ms.is_some())
+            .then(a.nym.cmp(&b.nym))
+    });
+
+    proxies
 }
 
 impl Default for App {
     fn default() -> Self {
-        let mut proxies = Vec::new();
-        for i in 0..24 {
-            let udp_capable = i % 3 == 1;
-            let enabled_globally = i % 5 == 0;
-            let status = if i % 7 == 0 { "TCP OK" } else { "idle" };
-            let name = format!("proxy-{}", (b'a' + (i % 26) as u8) as char);
-            let url = if i % 2 == 0 {
-                format!("proxy-{}.local:{}", i + 1, 8000 + i as u16)
-            } else {
-                format!("proxy-{}.remote:{}", i + 1, 3000 + i as u16)
-            };
-            proxies.push(Proxy {
-                name,
-                url,
-                udp_capable,
-                status: status.to_owned(),
-                enabled_globally,
-            });
+        let mut proxies = load_proxies_from_persisted();
+
+        // Fall back to mock data if nothing was loaded.
+        if proxies.is_empty() {
+            for i in 0..24 {
+                let udp_capable = i % 3 == 1;
+                let enabled_globally = i % 5 == 0;
+                let status = if i % 7 == 0 { "TCP OK" } else { "idle" };
+                let name = format!("proxy-{}", (b'a' + (i % 26) as u8) as char);
+                let url = if i % 2 == 0 {
+                    format!("proxy-{}.local:{}", i + 1, 8000 + i as u16)
+                } else {
+                    format!("proxy-{}.remote:{}", i + 1, 3000 + i as u16)
+                };
+                proxies.push(Proxy {
+                    nym: format!("{:04x}", i),
+                    name,
+                    url,
+                    udp_capable,
+                    status: status.to_owned(),
+                    enabled_globally,
+                    latency_ms: None,
+                    conn_ok: None,
+                });
+            }
         }
 
         let profiles = vec![
@@ -163,21 +241,17 @@ impl Default for App {
                 });
         }
 
-        let uplink = Arc::new(Mutex::new(UplinkHub::new()));
-
-        // create channel and spawn background task using the same uplink Arc
-        let (tx, mut rx) = mpsc::channel::<()>(8);
-        let uplink_clone = uplink.clone();
+        // Background reload: caller sends () to trigger a reload on a worker thread.
+        // The worker calls load_proxies_from_persisted() (no async, no lock) and
+        // sends the render-ready Vec<Proxy> back. The GUI drains proxy_rx each frame.
+        let (reload_tx, reload_rx) = flume::bounded::<()>(1);
+        let (proxy_tx, proxy_rx) = flume::bounded::<Vec<Proxy>>(1);
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async move {
-                while let Some(_) = rx.recv().await {
-                    match uplink_clone.lock().await.hydrate_from_persisted() {
-                        Ok(n) => eprintln!("uplink reloaded: {} proxies", n),
-                        Err(e) => eprintln!("uplink reload failed: {:?}", e),
-                    }
-                }
-            });
+            while reload_rx.recv().is_ok() {
+                let updated = load_proxies_from_persisted();
+                eprintln!("uplink reloaded: {} proxies", updated.len());
+                let _ = proxy_tx.send(updated); // drop error if GUI has exited
+            }
         });
 
         Self {
@@ -188,8 +262,8 @@ impl Default for App {
             hovered_proxy: None,
             current_scope: Scope::Global,
             scope_states,
-            uplink,
-            uplink_reload_tx: tx,
+            reload_tx,
+            proxy_rx,
         }
     }
 }
@@ -197,6 +271,11 @@ impl Default for App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::Color32;
+
+        // Drain any reload results pushed by the background thread.
+        if let Ok(updated) = self.proxy_rx.try_recv() {
+            self.proxies = updated;
+        }
 
         egui::SidePanel::left("left_sidebar")
             .resizable(false)
@@ -317,6 +396,14 @@ impl eframe::App for App {
 
             match self.right_tab {
                 RightTab::Proxies => {
+                    ui.horizontal(|ui| {
+                        if ui.button("Reload").clicked() {
+                            // Non-blocking: if a reload is already queued the send is dropped.
+                            let _ = self.reload_tx.try_send(());
+                        }
+                    });
+                    ui.add_space(4.0);
+
                     let header_h = 28.0;
                     let row_h = 96.0;
                     let mut next_hovered_proxy: Option<usize> = None;
@@ -327,6 +414,7 @@ impl eframe::App for App {
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(Column::exact(160.0))
                             .column(Column::remainder())
+                            .column(Column::exact(80.0))
                             .column(Column::exact(120.0))
                             .header(header_h, |mut header| {
                                 header.col(|ui| {
@@ -334,6 +422,9 @@ impl eframe::App for App {
                                 });
                                 header.col(|ui| {
                                     ui.strong("Proxy URL");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Latency");
                                 });
                                 header.col(|ui| {
                                     ui.strong("Status");
@@ -435,14 +526,52 @@ impl eframe::App for App {
                                     });
 
                                     row.col(|ui| {
-                                        let status = &self.proxies[i].status;
-                                        let status_color = if status.contains("OK") {
-                                            egui::Color32::LIGHT_GREEN
-                                        } else {
-                                            egui::Color32::from_gray(160)
-                                        };
                                         ui.vertical(|ui| {
-                                            ui.colored_label(status_color, status);
+                                            match self.proxies[i].latency_ms {
+                                                Some(ms) => {
+                                                    let color = if ms < 100 {
+                                                        egui::Color32::LIGHT_GREEN
+                                                    } else if ms < 400 {
+                                                        egui::Color32::YELLOW
+                                                    } else {
+                                                        egui::Color32::LIGHT_RED
+                                                    };
+                                                    ui.colored_label(color, format!("{}ms", ms));
+                                                }
+                                                None => {
+                                                    ui.label(
+                                                        egui::RichText::new("—")
+                                                            .color(egui::Color32::from_gray(120)),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    });
+
+                                    row.col(|ui| {
+                                        let status = &self.proxies[i].status;
+                                        let (status_color, status_text) =
+                                            match self.proxies[i].conn_ok {
+                                                Some(true) => (
+                                                    egui::Color32::LIGHT_GREEN,
+                                                    "ok".to_owned(),
+                                                ),
+                                                Some(false) => (
+                                                    egui::Color32::LIGHT_RED,
+                                                    "fail".to_owned(),
+                                                ),
+                                                None => (
+                                                    if status.contains("OK") {
+                                                        egui::Color32::LIGHT_GREEN
+                                                    } else {
+                                                        egui::Color32::from_gray(160)
+                                                    },
+                                                    status.clone(),
+                                                ),
+                                            };
+                                        let _status_text = status_text;
+                                        ui.vertical(|ui| {
+                                            ui.colored_label(status_color, &_status_text);
                                             if is_active {
                                                 let enabled = if self.proxies[i].enabled_globally {
                                                     "on"
