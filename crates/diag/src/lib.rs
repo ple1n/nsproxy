@@ -65,6 +65,8 @@ pub enum DiagEvent {
     },
     /// How long the main loop body took to dispatch this connection (µs).
     /// Emitted once at the end of each loop iteration.
+    /// From .accept to the end of the loop body, which includes routing and spawning the proxy task.
+    /// Should be very fast
     Dispatched {
         id: ConnId,
         dispatch_us: u64,
