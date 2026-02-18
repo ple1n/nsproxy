@@ -141,6 +141,12 @@ pub mod state_paths {
     pub fn uplink_remote_state() -> PathBuf {
         uplink_root().join("remote.json")
     }
+
+    /// Persistent uplink link-stats state path
+    /// Returns /nsp3/uplink/stats.json
+    pub fn uplink_stats_state() -> PathBuf {
+        uplink_root().join("stats.json")
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]

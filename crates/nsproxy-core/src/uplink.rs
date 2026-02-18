@@ -54,7 +54,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -145,7 +145,6 @@ impl std::ops::Deref for Domain {
         self.as_str()
     }
 }
-
 
 // Response of a single DNS packet
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,26 +395,37 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     })
 }
 
+// This struct is not directly serialized
 /// Central hub of all resources we have
 pub struct UplinkHub {
-    proxies: HashMap<ProxyID, UplinkProxy>,
+    pub proxies: HashMap<ProxyID, UplinkProxy>,
     routing_fn: RoutingFunction,
     /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
-    clash: Option<clash::ClashState>,
-    stats: HashMap<ProxyID, LinkStats>,
+    pub clash: Option<clash::ClashState>,
+    pub stats: HashMap<ProxyID, LinkStats>,
+    /// Map from proxy pseudonym (nym) to ProxyID for O(1) lookup
+    pub nym_map: HashMap<ProxyNym, ProxyID>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinkStats {
-    /// time to first byte
-    latency: Duration,
-    latency_checked: Instant,
-    last_conn: LinkConnCheck,
-    last_conn_time: Instant
+    pub latency: LatencyCheck,
+    pub last_conn: LinkConnCheck,
+    /// Unix timestamp (seconds) of the last connection check
+    pub last_conn_time: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LatencyCheck {
+    /// time to first byte, in milliseconds
+    TTFB(u64),
+    None,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LinkConnCheck {
     Fail,
-    Success
+    Success,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -437,7 +447,11 @@ impl RemoteProxyState {
     }
 
     pub fn add_proxy(&mut self, proxy: ArgProxy) -> bool {
-        if self.proxies.iter().any(|existing| existing.addr == proxy.addr) {
+        if self
+            .proxies
+            .iter()
+            .any(|existing| existing.addr == proxy.addr)
+        {
             return false;
         }
         self.proxies.push(proxy);
@@ -463,6 +477,7 @@ impl PersistentState for RemoteProxyState {
 }
 
 /// All proxies here should be immediately connectable without further resolution dependent on other state
+#[derive(Debug, Clone)]
 pub enum UplinkProxy {
     Trojan(clash::TrojanProxy),
     Geph,
@@ -492,12 +507,94 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|ctx: &RoutingContext| {
-                RoutingDecision::Drop
-            }),
+            routing_fn: Arc::new(|ctx: &RoutingContext| RoutingDecision::Drop),
             clash: None,
             stats: HashMap::new(),
+            nym_map: HashMap::new(),
         }
+    }
+    pub fn update_link_ttfb(&mut self, id: &ProxyID, latency: Duration) {
+        use std::collections::hash_map::Entry;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        match self.stats.entry(id.clone()) {
+            Entry::Vacant(v) => {
+                v.insert(LinkStats {
+                    latency: LatencyCheck::TTFB(latency.as_millis() as u64),
+                    last_conn: LinkConnCheck::Success,
+                    last_conn_time: now,
+                });
+            }
+            Entry::Occupied(mut occ) => {
+                let s = occ.get_mut();
+                s.latency = LatencyCheck::TTFB(latency.as_millis() as u64);
+            }
+        }
+    }
+
+    pub fn update_link_conn_check(&mut self, id: &ProxyID, success: bool) {
+        use std::collections::hash_map::Entry;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        match self.stats.entry(id.clone()) {
+            Entry::Vacant(v) => {
+                v.insert(LinkStats {
+                    latency: LatencyCheck::None,
+                    last_conn: if success {
+                        LinkConnCheck::Success
+                    } else {
+                        LinkConnCheck::Fail
+                    },
+                    last_conn_time: now,
+                });
+            }
+            Entry::Occupied(mut occ) => {
+                let s = occ.get_mut();
+
+                s.last_conn = if success {
+                    LinkConnCheck::Success
+                } else {
+                    LinkConnCheck::Fail
+                };
+                s.last_conn_time = now;
+            }
+        }
+    }
+
+    /// Get a copy of link stats for an id, if present
+    pub fn get_link_stats(&self, id: &ProxyID) -> Option<LinkStats> {
+        self.stats.get(id).cloned()
+    }
+
+    /// Persist current in-memory stats to uplink/stats.json.
+    pub fn save_stats(&self) -> Result<()> {
+        let state = UplinkStatsState {
+            stats: self
+                .stats
+                .iter()
+                .map(|(id, s)| (id.nym(), s.clone()))
+                .collect(),
+        };
+        state.save_atomic()
+    }
+
+    /// Load persisted stats from uplink/stats.json and merge into in-memory state.
+    /// In-memory entries take precedence over persisted ones.
+    pub fn load_stats(&mut self) -> Result<()> {
+        let state = UplinkStatsState::load_or_default()?;
+        for (nym, stats) in state.stats {
+            // Only fill in entries that are not already present in-memory.
+            if let Some(id) = self.nym_map.get(&nym) {
+                self.stats.entry(id.clone()).or_insert(stats);
+            }
+        }
+        Ok(())
     }
 
     /// Create a new UplinkHub with a custom routing function
@@ -507,6 +604,7 @@ impl UplinkHub {
             routing_fn,
             clash: None,
             stats: HashMap::new(),
+            nym_map: HashMap::new(),
         }
     }
 
@@ -535,6 +633,9 @@ impl UplinkHub {
 
     /// Add a proxy to the hub
     pub fn add_proxy(&mut self, id: ProxyID, proxy: UplinkProxy) {
+        // insert into proxies and update proxynym map for fast lookup
+        let nym = id.nym();
+        self.nym_map.insert(nym, id.clone());
         self.proxies.insert(id, proxy);
     }
 
@@ -558,13 +659,7 @@ impl UplinkHub {
         &self.proxies
     }
 
-    /// Get a proxy by its pseudonym (nym)
-    pub fn get_proxy_by_nym(&self, nym: &ProxyNym) -> Option<(&ProxyID, &UplinkProxy)> {
-        self.proxies
-            .iter()
-            .find(|(id, _)| id.nym() == *nym)
-            .map(|(id, proxy)| (id, proxy))
-    }
+    // `get_proxy_by_nym` removed — use `nym_map` directly for lookups
 
     /// Get the nym for a proxy ID
     pub fn get_nym(&self, id: &ProxyID) -> Option<ProxyNym> {
@@ -624,6 +719,37 @@ impl UplinkHub {
         }
 
         Ok(count)
+    }
+}
+
+impl std::fmt::Display for LinkStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.latency {
+            LatencyCheck::TTFB(ms) => {
+                write!(
+                    f,
+                    "ttfb={}ms conn={:?}",
+                    ms,
+                    self.last_conn
+                )
+            }
+            LatencyCheck::None => write!(f, "ttfb=none conn={:?}", self.last_conn),
+        }
+    }
+}
+
+/// Serializable snapshot of all per-proxy link stats, stored at uplink/stats.json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UplinkStatsState {
+    /// Maps proxy nym (short hex string) to its recorded stats.
+    pub stats: HashMap<ProxyNym, LinkStats>,
+}
+
+impl PersistentState for UplinkStatsState {
+    const STATE_NAME: &'static str = "uplink_stats";
+
+    fn path() -> PathBuf {
+        state_paths::uplink_stats_state()
     }
 }
 
@@ -1429,9 +1555,10 @@ pub mod proxy_adapters {
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
                     info!("Opening SOCKS5 TCP connection to proxy {}", proxy.addr);
-                    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
-                        .await
-                        .context("Timeout connecting to SOCKS5 proxy")??;
+                    let mut stream =
+                        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                            .await
+                            .context("Timeout connecting to SOCKS5 proxy")??;
                     let dest = WireAddress::DomainAddress(target_host.to_string(), target_port);
                     client::connect(&mut stream, dest, proxy.credentials.clone()).await?;
                     Ok(ProxyConnection::Tcp(Box::new(Socks5TcpConn {
@@ -1453,9 +1580,10 @@ pub mod proxy_adapters {
                 ProxyType::Socks5 => {
                     info!("Opening SOCKS5 UDP associate to proxy {}", proxy.addr);
 
-                    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
-                        .await
-                        .context("Timeout connecting to SOCKS5 proxy for UDP")??;
+                    let stream =
+                        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
+                            .await
+                            .context("Timeout connecting to SOCKS5 proxy for UDP")??;
 
                     let bind_addr = if proxy.addr.is_ipv4() {
                         "0.0.0.0:0"
@@ -1480,7 +1608,10 @@ pub mod proxy_adapters {
                     })))
                 }
                 ProxyType::Socks4 | ProxyType::Http => {
-                    anyhow::bail!("proxy type {:?} not yet supported for UDP", proxy.proxy_type)
+                    anyhow::bail!(
+                        "proxy type {:?} not yet supported for UDP",
+                        proxy.proxy_type
+                    )
                 }
             }
         }
