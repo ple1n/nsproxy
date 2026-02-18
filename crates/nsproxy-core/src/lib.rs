@@ -1665,6 +1665,7 @@ pub enum UplinkCommand {
         #[command(subcommand)]
         cmd: RemoteOps,
     },
+    Stats
 }
 
 #[derive(Debug, Clone, Subcommand)]

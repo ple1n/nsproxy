@@ -18,6 +18,7 @@ use crate::{ClashOps, RemoteOps, UplinkCommand, UplinkInstanceCommand, state_pat
 pub fn load_saved_uplink_hub() -> Result<crate::uplink::UplinkHub> {
     let mut hub = crate::uplink::UplinkHub::new();
     let count = hub.load_saved_proxies()?;
+    hub.load_stats()?;
 
     if count == 0 {
         bail!("No saved proxies found. Import Clash config first with 'sp uplink clash config-add'.");
@@ -32,7 +33,81 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
         UplinkCommand::Geph => bail!("Geph uplink not yet implemented"),
         UplinkCommand::Instance { name, cmd } => cmd_instance(name, cmd),
         UplinkCommand::Remote { cmd } => cmd_remote(cmd),
+        UplinkCommand::Stats => cmd_stats(),
     }
+}
+
+fn cmd_stats() -> Result<()> {
+    use crate::uplink::{UplinkStatsState, LatencyCheck, LinkConnCheck};
+    use crate::state_blueprint::PersistentState;
+
+    let mut hub = crate::uplink::UplinkHub::new();
+    hub.hydrate_from_persisted()
+        .context("Failed to load persisted proxies")?;
+    hub.load_stats()
+        .context("Failed to load persisted stats")?;
+
+    let stats_state = UplinkStatsState::load_or_default()
+        .context("Failed to load stats.json")?;
+
+    // Collect all proxies; tag whether they have recorded stats for sort ordering.
+    let mut rows: Vec<(bool, String, String, String, String)> = hub
+        .all_proxies()
+        .iter()
+        .map(|(id, proxy)| {
+            let nym = id.nym().to_string();
+            let proxy_display = proxy.to_string();
+            let (has_stats, latency_s, conn_s) = if let Some(s) = stats_state.stats.get(&id.nym()) {
+                let lat = match s.latency {
+                    LatencyCheck::TTFB(ms) => format!("{}ms", ms),
+                    LatencyCheck::None => "-".to_string(),
+                };
+                let conn = match s.last_conn {
+                    LinkConnCheck::Success => "ok".green().to_string(),
+                    LinkConnCheck::Fail => "fail".red().to_string(),
+                };
+                (true, lat, conn)
+            } else {
+                (false, "-".to_string(), "?".dimmed().to_string())
+            };
+            (has_stats, nym, proxy_display, latency_s, conn_s)
+        })
+        .collect();
+
+    // Proxies with stats first; within each group sort by nym.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let total = rows.len();
+    let shown = rows.len().min(10);
+
+    println!(
+        "{}",
+        format!("Uplink proxy stats ({} total, showing first {}):", total, shown).bold()
+    );
+    println!(
+        "  {:<8}  {:<40}  {:<10}  {}",
+        "nym".bold(),
+        "proxy".bold(),
+        "latency".bold(),
+        "conn".bold(),
+    );
+    println!("  {}", "-".repeat(70));
+
+    for (_, nym, proxy_display, latency_s, conn_s) in rows.into_iter().take(10) {
+        println!(
+            "  {:<8}  {:<40}  {:<10}  {}",
+            nym.cyan(),
+            proxy_display,
+            latency_s,
+            conn_s,
+        );
+    }
+
+    if total > 10 {
+        println!("  ... and {} more", total - 10);
+    }
+
+    Ok(())
 }
 
 fn cmd_clash(cmd: ClashOps) -> Result<()> {
@@ -98,11 +173,21 @@ fn clash_list() -> Result<()> {
     match hub.load_clash_proxies() {
         Ok(count) => {
             println!("  Loaded {} proxy entries from clash state", count);
-            let max_show = 5usize;
+            let max_show = 15usize;
             println!("  Proxy nyms (first {}):", max_show);
             for (i, (id, proxy)) in hub.all_proxies().iter().take(max_show).enumerate() {
                 if let Some(nym) = hub.get_nym(id) {
-                    println!("    {} => {} => {}", i + 1, nym, proxy);
+                    if let Some(stats) = hub.get_link_stats(id) {
+                        println!(
+                            "    {} => {} => {} ({})",
+                            i + 1,
+                            nym,
+                            proxy,
+                            stats
+                        );
+                    } else {
+                        println!("    {} => {} => {}", i + 1, nym, proxy);
+                    }
                 }
             }
         }
@@ -503,26 +588,44 @@ fn cmd_instance_test(name: nsproxy_common::routing::ProxyNym) -> Result<()> {
     println!("  Instance: {}", name.to_string().cyan());
     println!();
 
-    let hub = load_saved_uplink_hub()?;
+    let mut hub = load_saved_uplink_hub()?;
 
     println!("Loaded {} proxies", hub.all_proxies().len());
     println!();
 
-    let (proxy_id, proxy) = hub
-        .get_proxy_by_nym(&name)
+    let proxy_id = hub
+        .nym_map
+        .get(&name)
+        .cloned()
         .ok_or_else(|| anyhow!("Proxy with nym '{}' not found", name))?;
 
-    println!("Found proxy: {:?}", proxy_id);
+    let proxy = hub
+        .proxies
+        .get(&proxy_id)
+        .ok_or_else(|| anyhow!("Proxy with id '{}' not found", proxy_id))?
+        .clone();
+
+    println!("Found proxy: {:?}", &proxy_id);
     println!();
 
     match proxy {
-        crate::uplink::UplinkProxy::Trojan(trojan) => run_trojan_tests(trojan),
+        crate::uplink::UplinkProxy::Trojan(trojan) => {
+            run_trojan_tests(&trojan, &mut hub, &proxy_id)
+        }
         crate::uplink::UplinkProxy::Remote(remote) => run_remote_tests(remote),
         _ => Ok(()),
-    }
+    }?;
+
+    hub.save_stats()?;
+
+    Ok(())
 }
 
-fn run_trojan_tests(trojan: &crate::uplink::clash::TrojanProxy) -> Result<()> {
+fn run_trojan_tests(
+    trojan: &crate::uplink::clash::TrojanProxy,
+    hub: &mut crate::uplink::UplinkHub,
+    proxy_id: &nsproxy_common::routing::ProxyID,
+) -> Result<()> {
     println!("{}", "Trojan Proxy Tests".bold());
     println!("  Server: {}", trojan.server_name);
     println!("  Port: {}", trojan.server_addr.port());
@@ -545,39 +648,66 @@ fn run_trojan_tests(trojan: &crate::uplink::clash::TrojanProxy) -> Result<()> {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
                 let request = "GET / HTTP/1.1\r\nHost: ip.me\r\nConnection: close\r\n\r\n";
-                if let Err(e) = stream.write_all(request.as_bytes()).await {
-                    println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
-                } else {
-                    let mut response = String::new();
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        stream.read_to_string(&mut response),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {
-                            println!("    Raw TCP response ({} bytes):", response.len());
-                            for line in response.lines() {
-                                println!("      {}", line);
-                            }
 
-                            if response.contains("200 OK") || !response.is_empty() {
-                                println!(
-                                    "{}  TCP test passed (ip.me responded)",
-                                    "[✓]".green().bold()
-                                );
+                // measure start before sending request; we'll treat first successful read as TTFB
+                let start = std::time::Instant::now();
+
+                    if let Err(e) = stream.write_all(request.as_bytes()).await {
+                    println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                    // record failure in hub
+                        hub.update_link_conn_check(proxy_id, false);
+                } else {
+                    // attempt first read (treat as TTFB)
+                    let mut first_buf = vec![0u8; 2048];
+                    match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut first_buf)).await {
+                            Ok(Ok(n)) => {
+                            if n == 0 {
+                                println!("{}  TCP test failed: remote closed", "[✗]".red().bold());
+                                hub.update_link_conn_check(proxy_id, false);
                             } else {
-                                println!(
-                                    "{}  TCP test failed: invalid response",
-                                    "[✗]".red().bold()
-                                );
+                                let latency = start.elapsed();
+                                hub.update_link_ttfb(proxy_id, latency);
+                                hub.update_link_conn_check(proxy_id, true);
+
+                                // build response string from first chunk then read rest
+                                let mut response = String::from_utf8_lossy(&first_buf[..n]).to_string();
+                                match tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut response)).await {
+                                    Ok(Ok(_)) => {
+                                        println!("    Raw TCP response ({} bytes):", response.len());
+                                        for line in response.lines() {
+                                            println!("      {}", line);
+                                        }
+
+                                        if response.contains("200 OK") || !response.is_empty() {
+                                            println!(
+                                                "{}  TCP test passed (ip.me responded)",
+                                                "[✓]".green().bold()
+                                            );
+                                        } else {
+                                            println!(
+                                                "{}  TCP test failed: invalid response",
+                                                "[✗]".red().bold()
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                                        hub.update_link_conn_check(proxy_id, false);
+                                    }
+                                    Err(_) => {
+                                        println!("{}  TCP test failed: timeout", "[✗]".red().bold());
+                                        hub.update_link_conn_check(proxy_id, false);
+                                    }
+                                }
                             }
                         }
                         Ok(Err(e)) => {
                             println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
+                            hub.update_link_conn_check(proxy_id, false);
                         }
                         Err(_) => {
                             println!("{}  TCP test failed: timeout", "[✗]".red().bold());
+                            hub.update_link_conn_check(proxy_id, false);
                         }
                     }
                 }
@@ -642,7 +772,7 @@ fn run_trojan_tests(trojan: &crate::uplink::clash::TrojanProxy) -> Result<()> {
     Ok(())
 }
 
-fn run_remote_tests(remote: &ArgProxy) -> Result<()> {
+fn run_remote_tests(remote: ArgProxy) -> Result<()> {
     println!("{}", "Remote Proxy Tests".bold());
     println!("  Type: {}", remote.proxy_type);
     println!("  Addr: {}", remote.addr);
@@ -654,7 +784,7 @@ fn run_remote_tests(remote: &ArgProxy) -> Result<()> {
 
     rt.block_on(async {
         match remote.proxy_type {
-            ProxyType::Socks5 => run_remote_socks5_tests(remote).await,
+            ProxyType::Socks5 => run_remote_socks5_tests(&remote).await,
             ProxyType::Socks4 | ProxyType::Http => Ok(()),
         }
     })?;

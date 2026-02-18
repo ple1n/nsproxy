@@ -1641,11 +1641,10 @@ fn cmd_serve(
                         let proxy_id = {
                             let uplink = router.uplink().await;
                             uplink
-                                .get_proxy_by_nym(&nym)
-                                .map(|(id, _)| id.clone())
-                                .ok_or_else(|| {
-                                    anyhow!("Simple route proxy not found for nym {}", nym)
-                                })?
+                                .nym_map
+                                .get(&nym)
+                                .cloned()
+                                .ok_or_else(|| anyhow!("Simple route proxy not found for nym {}", nym))?
                         };
 
                         router
