@@ -273,7 +273,7 @@ impl Router {
     }
 
     async fn handle_tcp_inner(
-        tcp: IpStackTcpStream,
+        mut tcp: IpStackTcpStream,
         uplink: Arc<RwLock<UplinkHub>>,
         dns_handle: VirtDNSHandle,
         diag: DiagServer,
@@ -284,81 +284,127 @@ impl Router {
         let peer = tcp.peer_addr();
         let local = tcp.local_addr();
 
-        // Resolve through virtual DNS
         let dns_result = dns_handle.process(peer);
-
-        // Extract domain name from DNS result or HotConfig
         let target_domain = Self::extract_domain(&dns_result, peer.ip(), &conf).await;
 
-        // Build routing context
-        let ctx = RoutingContext {
+        let dns_decision: Option<RoutingDecision> = match &dns_result {
+            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(sock)) => {
+                Some(RoutingDecision::NATByTUN(*sock))
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Direct(sock)) => {
+                Some(RoutingDecision::Direct(*sock))
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Files(path)) => {
+                Some(RoutingDecision::Proxy {
+                    target: WireAddress::SocketAddress(peer),
+                    id: ProxyID::for_file(path.as_path()),
+                })
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => {
+                Some(RoutingDecision::Drop)
+            }
+            _ => None,
+        };
+
+        let mut ctx = RoutingContext {
             target_domain,
             target_ip: peer.ip(),
             target_port: peer.port(),
             source_ip: local.ip(),
             protocol: RoutingProtocol::Tcp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: dns_decision,
         };
 
-        // Make routing decision
-        let hub = uplink.read().await;
-        let decision = hub.route(&ctx);
-        drop(hub);
+        loop {
+            let decision = {
+                let hub = uplink.read().await;
+                hub.route(&ctx)
+            };
 
-        diag.emit(DiagEvent::Route {
-            id: conn_id.clone(),
-            ts: Timestamp::now(),
-            route: decision.clone(),
-        });
+            diag.emit(DiagEvent::Route {
+                id: conn_id,
+                ts: Timestamp::now(),
+                route: decision.clone(),
+            });
 
-        match decision {
-            RoutingDecision::Proxy { target, id } => {
-                let (trojan, remote, file_path) = {
-                    let hub = uplink.read().await;
-                    match hub.get_proxy(&id) {
-                        Some(UplinkProxy::Trojan(proxy)) => (Some(proxy.clone()), None, None),
-                        Some(UplinkProxy::Remote(proxy)) => (None, Some(proxy.clone()), None),
-                        Some(UplinkProxy::File(path)) => (None, None, Some(path.clone())),
-                        Some(UplinkProxy::Geph) => bail!("proxy {:?} (geph) is not supported yet", id),
-                        None => bail!("proxy {:?} not found", id),
-                    }
-                };
-
-                if let Some(path) = file_path {
-                    if let Some(tx) = file_tx {
-                        tx.send_async((path, tcp)).await?;
-                        Ok(())
-                    } else {
-                        bail!("file proxy route requested but file server channel is unavailable")
-                    }
-                } else if let Some(proxy) = trojan {
-                    use crate::uplink::proxy_adapters::{ProxyConnection, TrojanAdapter};
-
-                    let (target_host, target_port) = Self::wire_to_host_port(&target);
-                    let resolved_ip = proxy.server_addr.ip();
-                    let mut conn =
-                        TrojanAdapter::connect_tcp(&proxy, &target_host, target_port, resolved_ip)
-                            .await?;
-
-                    let proxy_stream = match conn {
-                        ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
-                        ProxyConnection::Udp(_) => {
-                            bail!("udp proxy tunnel cannot serve tcp stream")
+            match decision {
+                RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+                    warn!("direct conn to {}", &addr);
+                    Self::tcp_direct(tcp, addr, diag, conn_id).await?;
+                    break;
+                }
+                RoutingDecision::Drop => {
+                    warn!("drop {}", peer);
+                    break;
+                }
+                RoutingDecision::Proxy { target, id } => {
+                    let proxy_clone = {
+                        let hub = uplink.read().await;
+                        match hub.get_proxy(&id) {
+                            Some(UplinkProxy::Trojan(p)) => Ok(Some(UplinkProxy::Trojan(p.clone()))),
+                            Some(UplinkProxy::Remote(p)) => Ok(Some(UplinkProxy::Remote(p.clone()))),
+                            Some(UplinkProxy::File(path)) => {
+                                if let Some(tx) = &file_tx {
+                                    tx.send_async((path.clone(), tcp)).await?;
+                                    return Ok(());
+                                } else {
+                                    bail!("file proxy route requested but file server channel is unavailable")
+                                }
+                            }
+                            Some(UplinkProxy::Geph) => {
+                                bail!("proxy {:?} (geph) is not supported yet", id)
+                            }
+                            None => Err(anyhow::anyhow!("proxy {:?} not found", id)),
                         }
                     };
 
-                    let mut tcp = tcp;
+                    let proxy = match proxy_clone {
+                        Ok(Some(p)) => p,
+                        Ok(None) => unreachable!(),
+                        Err(e) => {
+                            warn!("proxy {:?} lookup failed for {peer}: {e:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
+                            continue;
+                        }
+                    };
+
+                    use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter, TrojanAdapter};
+                    let (target_host, target_port) = Self::wire_to_host_port(&target);
+
+                    let conn_result = match &proxy {
+                        UplinkProxy::Trojan(p) => {
+                            TrojanAdapter::connect_tcp(p, &target_host, target_port, p.server_addr.ip()).await
+                        }
+                        UplinkProxy::Remote(p) => {
+                            RemoteAdapter::connect_tcp(p, &target_host, target_port).await
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let mut conn = match conn_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
+                            continue;
+                        }
+                    };
+
+                    let proxy_stream = match conn {
+                        ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
+                        ProxyConnection::Udp(_) => bail!("udp proxy tunnel cannot serve tcp stream"),
+                    };
+
                     diag.emit(DiagEvent::Connected {
-                        id: conn_id.clone(),
+                        id: conn_id,
                         ts: Timestamp::now(),
                     });
-                    match Self::relay_tcp_with_cause(
-                        &mut tcp,
-                        proxy_stream,
-                        "tun->proxy",
-                        "proxy->tun",
-                    )
-                    .await
-                    {
+
+                    match Self::relay_tcp_with_cause(&mut tcp, proxy_stream, "tun->proxy", "proxy->tun").await {
                         Ok((up, down)) => {
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
@@ -367,9 +413,12 @@ impl Router {
                                 bytes_up: up,
                                 bytes_down: down,
                             });
-                            Ok(())
+                            break;
                         }
                         Err(relay_err) => {
+                            warn!("proxy {:?} relay failed for {peer}: {relay_err:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
@@ -377,67 +426,14 @@ impl Router {
                                 bytes_up: 0,
                                 bytes_down: 0,
                             });
-                            Err(anyhow::Error::new(relay_err))
+                            continue;
                         }
                     }
-                } else if let Some(proxy) = remote {
-                    use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
-
-                    let (target_host, target_port) = Self::wire_to_host_port(&target);
-                    let mut conn = RemoteAdapter::connect_tcp(&proxy, &target_host, target_port).await?;
-
-                    let proxy_stream = match conn {
-                        ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
-                        ProxyConnection::Udp(_) => {
-                            bail!("udp proxy tunnel cannot serve tcp stream")
-                        }
-                    };
-
-                    let mut tcp = tcp;
-                    diag.emit(DiagEvent::Connected {
-                        id: conn_id.clone(),
-                        ts: Timestamp::now(),
-                    });
-                    match Self::relay_tcp_with_cause(
-                        &mut tcp,
-                        proxy_stream,
-                        "tun->proxy",
-                        "proxy->tun",
-                    )
-                    .await
-                    {
-                        Ok((up, down)) => {
-                            diag.emit(DiagEvent::Finished {
-                                id: conn_id,
-                                ts: Timestamp::now(),
-                                error: None,
-                                bytes_up: up,
-                                bytes_down: down,
-                            });
-                            Ok(())
-                        }
-                        Err(relay_err) => {
-                            diag.emit(DiagEvent::Finished {
-                                id: conn_id,
-                                ts: Timestamp::now(),
-                                error: Some(relay_err.to_string()),
-                                bytes_up: 0,
-                                bytes_down: 0,
-                            });
-                            Err(anyhow::Error::new(relay_err))
-                        }
-                    }
-                } else {
-                    bail!("proxy {:?} resolved to no supported runtime variant", id)
                 }
             }
-            RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
-                Self::tcp_direct(tcp, addr, diag, conn_id).await
-            }
-            RoutingDecision::Drop => {
-                Ok(())
-            }
         }
+
+        Ok(())
     }
 
     fn wire_to_host_port(addr: &WireAddress) -> (String, u16) {
@@ -604,6 +600,9 @@ impl Router {
             target_port: peer.port(),
             source_ip: local.ip(),
             protocol: RoutingProtocol::Udp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: None,
         };
 
         // Make routing decision
