@@ -613,7 +613,9 @@ impl UplinkHub {
     /// - loads all saved proxies that can be materialized from that state
     pub fn hydrate_from_persisted(&mut self) -> Result<usize> {
         let _ = self.load_clash_state()?;
-        self.load_saved_proxies()
+        self.load_saved_proxies()?;
+        self.load_stats()?;
+        Ok(self.proxies.len())
     }
 
     /// Load centralized Clash state from /nsp3/clash.json when not yet present.
