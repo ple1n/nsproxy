@@ -378,10 +378,11 @@ where
 
 /// Type alias for the routing decision function
 /// Modify this function to customize routing behavior
-pub type RoutingFunction = Arc<dyn Fn(&RoutingContext) -> RoutingDecision + Send + Sync>;
+pub type RoutingFunction =
+    Arc<dyn Fn(&RoutingContext, &UplinkHub) -> RoutingDecision + Send + Sync>;
 
 pub fn simple_routing(id: ProxyID) -> RoutingFunction {
-    Arc::new(move |ctx: &RoutingContext| {
+    Arc::new(move |ctx: &RoutingContext, _hub: &UplinkHub| {
         let target = if let Some(domain) = &ctx.target_domain {
             WireAddress::DomainAddress(domain.clone(), ctx.target_port)
         } else {
@@ -507,7 +508,7 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|ctx: &RoutingContext| RoutingDecision::Drop),
+            routing_fn: Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| RoutingDecision::Drop),
             clash: None,
             stats: HashMap::new(),
             nym_map: HashMap::new(),
@@ -648,7 +649,7 @@ impl UplinkHub {
 
     /// Make a routing decision for the given context
     pub fn route(&self, ctx: &RoutingContext) -> RoutingDecision {
-        (self.routing_fn)(ctx)
+        (self.routing_fn)(ctx, self)
     }
 
     /// Set a new routing function
@@ -728,12 +729,7 @@ impl std::fmt::Display for LinkStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.latency {
             LatencyCheck::TTFB(ms) => {
-                write!(
-                    f,
-                    "ttfb={}ms conn={:?}",
-                    ms,
-                    self.last_conn
-                )
+                write!(f, "ttfb={}ms conn={:?}", ms, self.last_conn)
             }
             LatencyCheck::None => write!(f, "ttfb=none conn={:?}", self.last_conn),
         }
@@ -1758,18 +1754,20 @@ impl RoutingBuilder {
         let rules = self.rules;
         let default_decision = self.default_decision;
 
-        Arc::new(move |ctx: &RoutingContext| -> RoutingDecision {
-            for (condition, decision) in &rules {
-                if condition(ctx) {
-                    return decision.clone();
+        Arc::new(
+            move |ctx: &RoutingContext, hub: &UplinkHub| -> RoutingDecision {
+                for (condition, decision) in &rules {
+                    if condition(ctx) {
+                        return decision.clone();
+                    }
                 }
-            }
-            if let Some(ref decision) = default_decision {
-                decision.clone()
-            } else {
-                RoutingDecision::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
-            }
-        })
+                if let Some(ref decision) = default_decision {
+                    decision.clone()
+                } else {
+                    RoutingDecision::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
+                }
+            },
+        )
     }
 }
 
@@ -1952,13 +1950,6 @@ fn preprocess_vdns(vh: &VirtDNSHandle, dest: SocketAddr) -> DnsOutcome {
             target_domain: None,
             decision: Some(RoutingDecision::Drop),
         },
-        VDNSRES::SpecialHandling(TUNResponse::SpecifiedProxy(addr, proxy)) => {
-            let id = ProxyID::for_remote(proxy.addr);
-            DnsOutcome {
-                target_domain: None,
-                decision: Some(RoutingDecision::Proxy { target: addr, id }),
-            }
-        }
         VDNSRES::NormalProxying => DnsOutcome {
             target_domain: None,
             decision: None,
@@ -1982,93 +1973,96 @@ async fn handle_tcp_connection(
     let src = tcp.local_addr();
     let dns = preprocess_vdns(&vh, dest);
 
-    let decision = dns.decision.unwrap_or_else(|| {
-        let ctx = RoutingContext {
-            target_domain: dns.target_domain.clone(),
-            target_ip: dest.ip(),
-            target_port: dest.port(),
-            source_ip: src.ip(),
-            protocol: RoutingProtocol::Tcp,
-        };
-        hub.route(&ctx)
-    });
+    let mut ctx = RoutingContext {
+        target_domain: dns.target_domain,
+        target_ip: dest.ip(),
+        target_port: dest.port(),
+        source_ip: src.ip(),
+        protocol: RoutingProtocol::Tcp,
+        tried_proxies: Default::default(),
+        attempt_num: 0,
+        dns: dns.decision,
+    };
 
-    diag.emit(diag::DiagEvent::Route {
-        id: conn_id,
-        ts: diag::Timestamp::now(),
-        route: decision.clone(),
-    });
+    loop {
+        let decision = hub.route(&ctx);
+        diag.emit(diag::DiagEvent::Route {
+            id: conn_id,
+            ts: diag::Timestamp::now(),
+            route: decision.clone(),
+        });
 
-    match decision {
-        RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
-            let res = handle_tcp_nat(tcp, addr).await;
-            match res {
-                Ok((up, down)) => {
-                    diag.emit(diag::DiagEvent::Finished {
-                        id: conn_id,
-                        ts: diag::Timestamp::now(),
-                        error: None,
-                        bytes_up: up,
-                        bytes_down: down,
-                    });
+        match decision {
+            RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+                let res = handle_tcp_nat(tcp, addr).await;
+                match res {
+                    Ok((up, down)) => {
+                        diag.emit(diag::DiagEvent::Finished {
+                            id: conn_id,
+                            ts: diag::Timestamp::now(),
+                            error: None,
+                            bytes_up: up,
+                            bytes_down: down,
+                        });
+                    }
+                    Err(e) => {
+                        diag.emit(diag::DiagEvent::Finished {
+                            id: conn_id,
+                            ts: diag::Timestamp::now(),
+                            error: Some(format!("{e:?}")),
+                            bytes_up: 0,
+                            bytes_down: 0,
+                        });
+                        return Err(e);
+                    }
                 }
-                Err(e) => {
+            }
+            RoutingDecision::Proxy { target, id } => match hub.get_proxy(&id) {
+                Some(UplinkProxy::File(path)) => {
+                    let _ = stream_sx.send_async((path.clone(), tcp)).await;
+                }
+                Some(_) => {
+                    let res = handle_tcp_via_proxy(
+                        tcp,
+                        hub,
+                        id.clone(),
+                        target.clone(),
+                        diag.clone(),
+                        conn_id,
+                    )
+                    .await;
+                    if let Err(e) = &res {
+                        diag.emit(diag::DiagEvent::Finished {
+                            id: conn_id,
+                            ts: diag::Timestamp::now(),
+                            error: Some(format!("{e:?}")),
+                            bytes_up: 0,
+                            bytes_down: 0,
+                        });
+                    }
+                    res?;
+                }
+                None => {
+                    warn!("proxy {:?} not found for {}", id, dest);
                     diag.emit(diag::DiagEvent::Finished {
                         id: conn_id,
                         ts: diag::Timestamp::now(),
-                        error: Some(format!("{e:?}")),
+                        error: Some("proxy not found".into()),
                         bytes_up: 0,
                         bytes_down: 0,
                     });
-                    return Err(e);
                 }
-            }
-        }
-        RoutingDecision::Proxy { target, id } => match hub.get_proxy(&id) {
-            Some(UplinkProxy::File(path)) => {
-                let _ = stream_sx.send_async((path.clone(), tcp)).await;
-            }
-            Some(_) => {
-                let res = handle_tcp_via_proxy(
-                    tcp,
-                    hub,
-                    id.clone(),
-                    target.clone(),
-                    diag.clone(),
-                    conn_id,
-                )
-                .await;
-                if let Err(e) = &res {
-                    diag.emit(diag::DiagEvent::Finished {
-                        id: conn_id,
-                        ts: diag::Timestamp::now(),
-                        error: Some(format!("{e:?}")),
-                        bytes_up: 0,
-                        bytes_down: 0,
-                    });
-                }
-                res?;
-            }
-            None => {
-                warn!("proxy {:?} not found for {}", id, dest);
+            },
+            RoutingDecision::Drop => {
+                warn!("drop {}", dest);
                 diag.emit(diag::DiagEvent::Finished {
                     id: conn_id,
                     ts: diag::Timestamp::now(),
-                    error: Some("proxy not found".into()),
+                    error: None,
                     bytes_up: 0,
                     bytes_down: 0,
                 });
             }
-        },
-        RoutingDecision::Drop => {
-            warn!("tcp unreachable for {}", dest);
-            diag.emit(diag::DiagEvent::Finished {
-                id: conn_id,
-                ts: diag::Timestamp::now(),
-                error: None,
-                bytes_up: 0,
-                bytes_down: 0,
-            });
         }
     }
 

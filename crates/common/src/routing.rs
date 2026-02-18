@@ -2,23 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::Path;
 
 /// Context available during routing decision
+/// This state is meant to be mutated and kept between retries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingContext {
-    /// Target domain name (if available)
     pub target_domain: Option<String>,
-    /// Target IP address
     pub target_ip: std::net::IpAddr,
-    /// Target port
     pub target_port: u16,
-    /// Source IP address
     pub source_ip: std::net::IpAddr,
-    /// Protocol type (TCP or UDP)
     pub protocol: RoutingProtocol,
+    /// Proxies that have been tried
+    pub tried_proxies: HashSet<ProxyID>,
+    pub attempt_num: usize,
+    /// Verdict given by DNS
+    pub dns: Option<RoutingDecision>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
