@@ -13,7 +13,9 @@ use ipstack::{
     IpStack, IpStackConfig, TUNDev,
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, tcp::TcpConfig},
 };
-use nsproxy_common::routing::{DropReason, ProxyID, RoutingContext, RoutingDecision, RoutingProtocol};
+use nsproxy_common::routing::{
+    DropReason, ProxyID, RoutingContext, RoutingDecision, RoutingProtocol,
+};
 use socks5_impl::protocol::WireAddress;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -301,9 +303,9 @@ impl Router {
                 target: WireAddress::SocketAddress(peer),
                 id: ProxyID::for_file(path.as_path()),
             }),
-            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => Some(
-                RoutingDecision::Drop(DropReason::Preprocess),
-            ),
+            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => {
+                Some(RoutingDecision::Drop(DropReason::Preprocess))
+            }
             _ => None,
         };
 
@@ -533,16 +535,19 @@ impl Router {
                     op: RelayOp::Copy,
                     source,
                 })?;
-            right_write
-                .shutdown()
-                .await
-                .map_err(|source| RelayError::Io {
-                    flow: left_to_right_flow,
-                    from: RelaySide::Left,
-                    to: RelaySide::Right,
-                    op: RelayOp::Shutdown,
-                    source,
-                })?;
+            if let Err(e) = right_write.shutdown().await {
+                if e.kind() != std::io::ErrorKind::BrokenPipe
+                    && e.kind() != std::io::ErrorKind::ConnectionReset
+                {
+                    return Err(RelayError::Io {
+                        flow: left_to_right_flow,
+                        from: RelaySide::Left,
+                        to: RelaySide::Right,
+                        op: RelayOp::Shutdown,
+                        source: e,
+                    });
+                }
+            }
             Ok::<u64, RelayError>(copied)
         };
 
@@ -556,16 +561,19 @@ impl Router {
                     op: RelayOp::Copy,
                     source,
                 })?;
-            left_write
-                .shutdown()
-                .await
-                .map_err(|source| RelayError::Io {
-                    flow: right_to_left_flow,
-                    from: RelaySide::Right,
-                    to: RelaySide::Left,
-                    op: RelayOp::Shutdown,
-                    source,
-                })?;
+            if let Err(e) = left_write.shutdown().await {
+                if e.kind() != std::io::ErrorKind::BrokenPipe
+                    && e.kind() != std::io::ErrorKind::ConnectionReset
+                {
+                    return Err(RelayError::Io {
+                        flow: right_to_left_flow,
+                        from: RelaySide::Right,
+                        to: RelaySide::Left,
+                        op: RelayOp::Shutdown,
+                        source: e,
+                    });
+                }
+            }
             Ok::<u64, RelayError>(copied)
         };
 
