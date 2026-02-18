@@ -41,7 +41,13 @@ pub enum RoutingDecision {
         target: WireAddress,
         id: ProxyID,
     },
-    Drop,
+    Drop(DropReason),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DropReason {
+    MaxRetry,
+    Preprocess
 }
 
 #[derive(Hash, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

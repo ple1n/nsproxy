@@ -60,7 +60,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use nsproxy_common::routing::{
-    ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
+    DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
 };
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
@@ -391,7 +391,7 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
         };
 
         if ctx.attempt_num > 0 {
-            return RoutingDecision::Drop;
+            return RoutingDecision::Drop(DropReason::MaxRetry);
         }
 
         RoutingDecision::Proxy {
@@ -513,7 +513,9 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| RoutingDecision::Drop),
+            routing_fn: Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| {
+                RoutingDecision::Drop(DropReason::Preprocess)
+            }),
             clash: None,
             stats: HashMap::new(),
             nym_map: HashMap::new(),
@@ -1656,10 +1658,7 @@ pub mod proxy_adapters {
             hostname: ServerName<'static>,
             target: SocketAddr,
         ) -> anyhow::Result<ProxyConnection> {
-            info!(
-                "Direct TLS connection to {:?} ({})",
-                &hostname, target
-            );
+            info!("Direct TLS connection to {:?} ({})", &hostname, target);
             let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
                 .await
                 .context("Timeout connecting direct TLS target")??;
