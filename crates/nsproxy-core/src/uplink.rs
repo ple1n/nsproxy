@@ -1962,7 +1962,7 @@ fn preprocess_vdns(vh: &VirtDNSHandle, dest: SocketAddr) -> DnsOutcome {
 }
 
 async fn handle_tcp_connection(
-    tcp: ipstack::stream::IpStackTcpStream,
+    mut tcp: ipstack::stream::IpStackTcpStream,
     vh: VirtDNSHandle,
     hub: Arc<UplinkHub>,
     stream_sx: flume::Sender<(PathBuf, ipstack::stream::IpStackTcpStream)>,
@@ -1994,7 +1994,7 @@ async fn handle_tcp_connection(
 
         match decision {
             RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
-                let res = handle_tcp_nat(tcp, addr).await;
+                let res = handle_tcp_nat(&mut tcp, addr).await;
                 match res {
                     Ok((up, down)) => {
                         diag.emit(diag::DiagEvent::Finished {
@@ -2020,11 +2020,12 @@ async fn handle_tcp_connection(
             RoutingDecision::Proxy { target, id } => match hub.get_proxy(&id) {
                 Some(UplinkProxy::File(path)) => {
                     let _ = stream_sx.send_async((path.clone(), tcp)).await;
+                    break;
                 }
                 Some(_) => {
                     let res = handle_tcp_via_proxy(
-                        tcp,
-                        hub,
+                        &mut tcp,
+                        &hub,
                         id.clone(),
                         target.clone(),
                         diag.clone(),
@@ -2075,8 +2076,8 @@ async fn select_proxy<'a>(hub: &'a UplinkHub, id: &'a ProxyID) -> anyhow::Result
 }
 
 async fn handle_tcp_via_proxy(
-    mut tcp: ipstack::stream::IpStackTcpStream,
-    hub: Arc<UplinkHub>,
+    tcp: &mut ipstack::stream::IpStackTcpStream,
+    hub: &UplinkHub,
     id: ProxyID,
     target: WireAddress,
     diag: diag::DiagServer,
@@ -2239,7 +2240,7 @@ async fn handle_udp_connection(
 }
 
 async fn handle_tcp_nat(
-    mut tcp_stack: ipstack::stream::IpStackTcpStream,
+    tcp_stack: &mut ipstack::stream::IpStackTcpStream,
     server_addr: SocketAddr,
 ) -> anyhow::Result<(u64, u64)> {
     info!("Opening direct TCP NAT connection to {}", server_addr);
