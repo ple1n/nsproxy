@@ -86,7 +86,6 @@ base64 = "0.21"
 digest_auth = "0.3"
 httparse = "1.8"
 trust-dns-proto = "0.23"
-udp-stream = { version = "0.0", default-features = false }
 unicase = "2.7"
 id_alloc = { path = "../id_alloc" }
 quick_cache = "0.6.3"

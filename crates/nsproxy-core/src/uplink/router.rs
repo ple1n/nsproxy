@@ -23,6 +23,7 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 use tun2socks5::dns::{TUNResponse, VDNSRES, VirtDNSAsync, VirtDNSHandle};
 
+
 use crate::{
     HotConfig,
     uplink::{UplinkHub, UplinkProxy},
@@ -443,6 +444,46 @@ impl Router {
         }
     }
 
+    /// Relay UDP datagrams between an IpStackUdpStream (TUN side) and a UdpLike tunnel.
+    /// Returns (bytes_up, bytes_down) on clean termination.
+    async fn relay_udp(
+        tunnel: &mut dyn crate::uplink::proxy_adapters::UdpLike,
+        udp: &mut IpStackUdpStream,
+        peer: SocketAddr,
+    ) -> Result<(u64, u64)> {
+        use socks5_impl::protocol::WireAddress;
+        use tokio::io::AsyncReadExt;
+
+        let dst = WireAddress::SocketAddress(peer);
+        let mut bytes_up: u64 = 0;
+        let mut bytes_down: u64 = 0;
+        let mut buf = vec![0u8; 65535];
+
+        loop {
+            tokio::select! {
+                // TUN -> tunnel (upstream)
+                result = udp.read(&mut buf) => {
+                    let n = result?;
+                    if n == 0 {
+                        break;
+                    }
+                    tunnel.send_to(&buf[..n], dst.clone()).await
+                        .map_err(|e| anyhow::anyhow!("UDP send_to failed: {}", e))?;
+                    bytes_up += n as u64;
+                }
+                // tunnel -> TUN (downstream)
+                result = tunnel.recv_from() => {
+                    let pkt = result.map_err(|e| anyhow::anyhow!("UDP recv_from failed: {}", e))?;
+                    let n = pkt.data.len();
+                    udp.write_all(&pkt.data).await?;
+                    bytes_down += n as u64;
+                }
+            }
+        }
+
+        Ok((bytes_up, bytes_down))
+    }
+
     async fn relay_tcp_with_cause<A, B>(
         left: &mut A,
         right: &mut B,
@@ -584,17 +625,34 @@ impl Router {
         let peer = udp.peer_addr();
         let local = udp.local_addr();
 
-        // Check if this is DNS traffic
-        if peer.port() == DNS_PORT {
+        // Check if this is DNS traffic destined for a captured range
+        if peer.port() == DNS_PORT && conf.read().await.captures_dns(local.ip()) {
             return Self::handle_dns(udp, dns_handle, diag, conn_id).await;
         }
 
-        // Resolve through virtual DNS
         let dns_result = dns_handle.process(peer);
         let target_domain = Self::extract_domain(&dns_result, peer.ip(), &conf).await;
 
-        // Build routing context
-        let ctx = RoutingContext {
+        let dns_decision: Option<RoutingDecision> = match &dns_result {
+            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(sock)) => {
+                Some(RoutingDecision::NATByTUN(*sock))
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Direct(sock)) => {
+                Some(RoutingDecision::Direct(*sock))
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Files(path)) => {
+                Some(RoutingDecision::Proxy {
+                    target: WireAddress::SocketAddress(peer),
+                    id: ProxyID::for_file(path.as_path()),
+                })
+            }
+            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => {
+                Some(RoutingDecision::Drop)
+            }
+            _ => None,
+        };
+
+        let mut ctx = RoutingContext {
             target_domain,
             target_ip: peer.ip(),
             target_port: peer.port(),
@@ -602,36 +660,132 @@ impl Router {
             protocol: RoutingProtocol::Udp,
             tried_proxies: Default::default(),
             attempt_num: 0,
-            dns: None,
+            dns: dns_decision,
         };
 
-        // Make routing decision
-        let hub = uplink.read().await;
-        let decision = hub.route(&ctx);
-        drop(hub);
+        loop {
+            let decision = {
+                let hub = uplink.read().await;
+                hub.route(&ctx)
+            };
 
-        diag.emit(DiagEvent::Route {
-            id: conn_id.clone(),
-            ts: Timestamp::now(),
-            route: decision.clone(),
-        });
+            diag.emit(DiagEvent::Route {
+                id: conn_id,
+                ts: Timestamp::now(),
+                route: decision.clone(),
+            });
 
-        match decision {
-            RoutingDecision::Proxy { target, id } => {
-                info!("UDP {:?} -> Proxy {:?} -> {:?}", conn_id, id, target);
-                // TODO: Implement UDP proxy logic
-                Ok(())
-            }
-            RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
-                info!("UDP {:?} -> Direct to {}", conn_id, addr);
-                // TODO: Implement UDP direct connection
-                Ok(())
-            }
-            RoutingDecision::Drop => {
-                info!("UDP {:?} -> Dropped by policy", conn_id);
-                Ok(())
+            match decision {
+                RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+                    info!("UDP {:?} -> direct to {}", conn_id, addr);
+                    use crate::uplink::proxy_adapters::NoProxyAdapter;
+                    let mut remote = NoProxyAdapter::connect_udp(addr).await?;
+                    let (up, down) = Self::relay_udp(remote.as_udp_mut().unwrap(), &mut udp, peer).await?;
+                    diag.emit(DiagEvent::Finished {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                        error: None,
+                        bytes_up: up,
+                        bytes_down: down,
+                    });
+                    break;
+                }
+                RoutingDecision::Drop => {
+                    info!("UDP {:?} -> dropped by policy", conn_id);
+                    diag.emit(DiagEvent::Finished {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                        error: None,
+                        bytes_up: 0,
+                        bytes_down: 0,
+                    });
+                    break;
+                }
+                RoutingDecision::Proxy { target, id } => {
+                    let proxy_clone = {
+                        let hub = uplink.read().await;
+                        match hub.get_proxy(&id) {
+                            Some(UplinkProxy::Trojan(p)) => Ok(Some(UplinkProxy::Trojan(p.clone()))),
+                            Some(UplinkProxy::Remote(p)) => Ok(Some(UplinkProxy::Remote(p.clone()))),
+                            Some(_) => Err(anyhow::anyhow!("proxy {:?} type not supported for UDP", id)),
+                            None => Err(anyhow::anyhow!("proxy {:?} not found", id)),
+                        }
+                    };
+
+                    let proxy = match proxy_clone {
+                        Ok(Some(p)) => p,
+                        Ok(None) => unreachable!(),
+                        Err(e) => {
+                            warn!("proxy {:?} lookup failed for {peer}: {e:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
+                            continue;
+                        }
+                    };
+
+                    use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter, TrojanAdapter};
+                    let (target_host, target_port) = Self::wire_to_host_port(&target);
+
+                    let conn_result = match &proxy {
+                        UplinkProxy::Trojan(p) => {
+                            TrojanAdapter::connect_udp(p, &target_host, target_port, p.server_addr.ip()).await
+                        }
+                        UplinkProxy::Remote(p) => {
+                            RemoteAdapter::connect_udp(p).await
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let mut conn = match conn_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
+                            continue;
+                        }
+                    };
+
+                    let tunnel = match conn.as_udp_mut() {
+                        Some(t) => t,
+                        None => bail!("proxy returned TCP connection for UDP stream"),
+                    };
+
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                    });
+
+                    match Self::relay_udp(tunnel, &mut udp, peer).await {
+                        Ok((up, down)) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: up,
+                                bytes_down: down,
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("proxy {:?} UDP relay failed for {peer}: {e:?}, retrying", id);
+                            ctx.tried_proxies.insert(id);
+                            ctx.attempt_num += 1;
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(e.to_string()),
+                                bytes_up: 0,
+                                bytes_down: 0,
+                            });
+                            continue;
+                        }
+                    }
+                }
             }
         }
+
+        Ok(())
     }
 
     async fn handle_dns(

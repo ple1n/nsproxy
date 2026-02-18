@@ -4534,7 +4534,6 @@ dependencies = [
  "tun-rs",
  "tun2socks5",
  "twox-hash",
- "udp-stream 0.0.12",
  "unicase",
  "url",
  "uzers",

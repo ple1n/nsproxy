@@ -1553,7 +1553,7 @@ pub mod proxy_adapters {
 
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
-                    info!("Opening SOCKS5 TCP connection to proxy {}", proxy.addr);
+                    info!("SOCKS5 TCP connection to proxy {}", proxy.addr);
                     let mut stream =
                         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
                             .await
@@ -1577,7 +1577,7 @@ pub mod proxy_adapters {
 
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
-                    info!("Opening SOCKS5 UDP associate to proxy {}", proxy.addr);
+                    info!("SOCKS5 UDP associate to proxy {}", proxy.addr);
 
                     let stream =
                         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
@@ -1621,7 +1621,7 @@ pub mod proxy_adapters {
 
     impl NoProxyAdapter {
         pub async fn connect_tcp(target: SocketAddr) -> anyhow::Result<ProxyConnection> {
-            info!("Opening direct TCP connection to {}", target);
+            info!("Direct TCP connection to {}", target);
             let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
                 .await
                 .context("Timeout connecting direct TCP target")??;
@@ -1638,7 +1638,7 @@ pub mod proxy_adapters {
                 "[::]:0"
             };
             info!(
-                "Opening direct UDP socket for target {} (bind {})",
+                "Direct UDP socket for target {} (bind {})",
                 target, bind_addr
             );
             let socket = UdpSocket::bind(bind_addr).await?;
@@ -1653,7 +1653,7 @@ pub mod proxy_adapters {
             target: SocketAddr,
         ) -> anyhow::Result<ProxyConnection> {
             info!(
-                "Opening direct TLS connection to {:?} ({})",
+                "Direct TLS connection to {:?} ({})",
                 &hostname, target
             );
             let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
