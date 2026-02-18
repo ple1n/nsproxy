@@ -390,6 +390,10 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
             WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
         };
 
+        if ctx.attempt_num > 0 {
+            return RoutingDecision::Drop;
+        }
+
         RoutingDecision::Proxy {
             target,
             id: id.clone(),
