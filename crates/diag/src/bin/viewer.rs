@@ -697,7 +697,7 @@ fn main() -> eframe::Result<()> {
                                 ui.strong("Dispatch");
                             });
                             header.col(|ui| {
-                                ui.strong("Connect Lat");
+                                ui.strong("Connect").on_hover_text("Accepted to Connected");
                             });
                             header.col(|ui| {
                                 ui.strong("Duration");
