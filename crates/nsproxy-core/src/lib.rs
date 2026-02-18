@@ -4,7 +4,7 @@
 #![feature(ip_as_octets)]
 #![feature(setgroups)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{File, create_dir_all};
 use std::net::IpAddr;
@@ -160,6 +160,34 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
+    /// Verify that the no_dns_capture sentinel ("0.0.0.0/32") matches no real IP.
+    #[test]
+    fn test_no_dns_capture_sentinel_matches_nothing() {
+        let mut hot = HotConfig::default();
+        hot.dns_capture = ["0.0.0.0/32".parse().unwrap()].into();
+
+        // Common routable addresses that should NOT be captured.
+        let candidates: &[&str] = &[
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.68.0.1",
+            "192.168.1.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "::1",
+            "fe80::1",
+            "127.0.0.1"
+        ];
+        for addr in candidates {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(
+                !hot.captures_dns(ip),
+                "sentinel should not capture {addr}"
+            );
+        }
+    }
+
+
     #[test]
     fn test_find_vacant_ipv4() {
         let net: Ipv4Network = "100.64.0.0/10".parse().unwrap();
@@ -240,6 +268,7 @@ mod tests {
                     m
                 },
                 locals: HashMap::new(),
+                dns_capture: Default::default(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -837,6 +866,10 @@ pub struct HotConfig {
     pub mnt: HashMap<PathBuf, PathBuf>,
     /// Mapping of localhost:port in container to localhost:port outside container
     pub locals: HashMap<u32, u32>,
+    /// Networks whose DNS traffic should be intercepted.
+    /// When absent or empty, all IPs are captured.
+    #[serde(default)]
+    pub dns_capture: HashSet<IpNetwork>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -930,6 +963,25 @@ impl HotConfig {
             expanded_mnt.insert(vars.expand(source), vars.expand(target));
         }
         self.mnt = expanded_mnt;
+    }
+
+    /// Returns true if the given IP's DNS traffic should be intercepted.
+    /// An empty `dns_capture` set means "capture all".
+    pub fn captures_dns(&self, ip: IpAddr) -> bool {
+        self.dns_capture.is_empty() || self.dns_capture.iter().any(|net| net.contains(ip))
+    }
+
+    /// Override `dns_capture` with a sentinel that matches no real IP,
+    /// effectively disabling DNS interception entirely.
+    pub fn disable_dns_capture(&mut self) {
+        self.dns_capture = ["0.0.0.0/32".parse().unwrap()].into();
+    }
+
+    /// Serialize and persist this config to `path`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 }
 
@@ -1623,6 +1675,9 @@ pub enum MainCommand {
         /// Use Clash uplink profile for all TUN connections
         #[arg(long)]
         clash: Option<String>,
+        // Convenience option to modify HotConfig
+        #[arg(long)]
+        no_dns_capture: bool,
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {
@@ -1665,7 +1720,7 @@ pub enum UplinkCommand {
         #[command(subcommand)]
         cmd: RemoteOps,
     },
-    Stats
+    Stats,
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -757,8 +757,7 @@ fn main() -> anyhow::Result<()> {
                 } else if !hot_path.exists() {
                     info!("Creating hot config from profile.hot_init");
                     let hot = profile.hot_init.clone().unwrap_or_default();
-                    let hot_json = serde_json::to_string_pretty(&hot)?;
-                    std::fs::write(&hot_path, hot_json)?;
+                    hot.save(&hot_path)?;
                     warn!("Created hot config: {:?}", hot_path);
                 }
 
@@ -857,6 +856,7 @@ fn main() -> anyhow::Result<()> {
             no_default,
             log,
             clash,
+            no_dns_capture,
         } => cmd_serve(
             profile,
             tun_name,
@@ -864,6 +864,7 @@ fn main() -> anyhow::Result<()> {
             no_default,
             log,
             clash,
+            no_dns_capture,
             &mut |level| {
                 reload_handle.modify(|k| *k.filter_mut() = level)?;
                 Ok(())
@@ -1420,6 +1421,7 @@ fn cmd_serve(
     no_default: bool,
     log: Option<LevelFilter>,
     _clash: Option<String>,
+    no_dns_capture: bool,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
 ) -> Result<()> {
     let ns_meta = state_paths::profile_ns_meta(&profile);
@@ -1620,6 +1622,15 @@ fn cmd_serve(
                             HotConfig::default()
                         }
                     };
+                    let initial_hot = if no_dns_capture {
+                        let mut h = initial_hot;
+                        h.disable_dns_capture();
+                        h.save(&hot_conf)?;
+                        h
+                    } else {
+                        initial_hot
+                    };
+                    
                     let shared_hot = Arc::new(tokio::sync::RwLock::new(initial_hot));
 
                     let hub = load_saved_uplink_hub()?;

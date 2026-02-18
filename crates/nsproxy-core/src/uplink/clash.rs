@@ -262,7 +262,7 @@ impl TrojanProxy {
         // TCP connect using resolved IP and the configured port from runtime proxy
         let server_addr = SocketAddr::new(server_ip, self.server_addr.port());
         info!(
-            "Opening Trojan TCP connection to {} for target {}:{} ({:?})",
+            "Trojan TCP connection to {} for target {}:{} ({:?})",
             server_addr, target_host, target_port, command
         );
         let tcp_stream = TcpStream::connect(server_addr)
