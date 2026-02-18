@@ -677,6 +677,7 @@ fn main() -> eframe::Result<()> {
                         .column(Column::auto().at_least(90.0))
                         .column(Column::auto().at_least(90.0))
                         .column(Column::auto().at_least(80.0))
+                        .column(Column::exact(12.0))
                         .header(row_height, |mut header| {
                             header.col(|ui| {
                                 ui.strong("ID");
@@ -705,6 +706,7 @@ fn main() -> eframe::Result<()> {
                             header.col(|ui| {
                                 ui.strong("Status");
                             });
+                            header.col(|_ui| {});
                         })
                         .body(|mut body| {
                             body.rows(row_height, acc.conn_order.len(), |mut row| {
@@ -794,6 +796,7 @@ fn main() -> eframe::Result<()> {
                                             ui.colored_label(egui::Color32::GREEN, "OK");
                                         }
                                     });
+                                    row.col(|_ui| {});
                                 }
                             });
                         });
