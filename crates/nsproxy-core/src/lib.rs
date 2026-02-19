@@ -234,7 +234,7 @@ mod tests {
             .map(PathBuf::from)
             .expect("HOME must be set for expansion tests");
 
-        let mut profile = ProfileConfig {
+        let mut profile = TemplateConfig {
             schema: 1,
             rootfs: ProfileRootfs {
                 mode: RootfsMode::Overlay,
@@ -987,7 +987,7 @@ impl HotConfig {
 
 /// Explicit, stable profile config for filesystem isolation and app launch
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct ProfileConfig {
+pub struct TemplateConfig {
     /// Schema version for compatibility checks
     pub schema: u32,
     /// Filesystem isolation plan
@@ -1068,11 +1068,11 @@ fn default_recursive() -> bool {
     true
 }
 
-impl ProfileConfig {
-    pub fn load(path: &Path) -> Result<ProfileConfig> {
+impl TemplateConfig {
+    pub fn load(path: &Path) -> Result<TemplateConfig> {
         create_dir_all(state_paths::persist_root())?;
         let fc = std::fs::read_to_string(path)?;
-        let conf: ProfileConfig = serde_json::from_str(&fc)?;
+        let conf: TemplateConfig = serde_json::from_str(&fc)?;
         conf.validate()?;
         Ok(conf)
     }
@@ -1161,7 +1161,7 @@ impl ProfileConfig {
         }
     }
 
-    pub fn template(name: &str, hot_path: &Path) -> Result<ProfileConfig> {
+    pub fn template(name: &str, hot_path: &Path) -> Result<TemplateConfig> {
         use nix::unistd::getresuid;
         use nsproxy_common::UID_HINT_VAR;
         use std::result::Result::Ok;
@@ -1201,7 +1201,7 @@ impl ProfileConfig {
             .map(|g| g.gid())
             .collect();
 
-        Ok(ProfileConfig {
+        Ok(TemplateConfig {
             schema: 1,
             rootfs: ProfileRootfs {
                 mode: RootfsMode::Overlay,

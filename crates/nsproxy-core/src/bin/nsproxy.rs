@@ -36,7 +36,7 @@ use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
     BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
-    ProfileConfig, RootfsMode, TunMaker,
+    TemplateConfig, RootfsMode, TunMaker,
     cmd_common::{apply_ns_env, check_proxy_mode, check_wrap, enter_ns, read_ns_alive, read_ns_alive_opt, report_clone3_err},
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     hot_reload::{VethIps, sync_links, watch_hot},
@@ -581,7 +581,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Load the new template
                 info!("Loading new template from {:?}...", path);
-                let mut profile = ProfileConfig::load(&path)?;
+                let mut profile = TemplateConfig::load(&path)?;
                 info!("Template loaded successfully");
 
                 // Expand @ placeholders
@@ -682,7 +682,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Load the profile template from provided path
                 info!("Loading profile template from {:?}...", path);
-                let mut profile = ProfileConfig::load(&path)?;
+                let mut profile = TemplateConfig::load(&path)?;
                 info!("Template loaded successfully");
 
                 // Expand @ placeholders for directory creation
@@ -786,7 +786,7 @@ fn main() -> anyhow::Result<()> {
                     profile_path
                 );
             }
-            let profile_conf = ProfileConfig::load(&profile_path)?;
+            let profile_conf = TemplateConfig::load(&profile_path)?;
 
             let bind_mount = state_paths::profile_netns_bind(&profile);
             if let Some(parent) = bind_mount.parent() {
