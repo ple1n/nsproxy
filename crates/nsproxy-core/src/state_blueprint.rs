@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::warn;
 
-use crate::{RUNTIME_ROOT, state_paths};
+use crate::state_paths;
 
 /// Standard persistence contract for global JSON state structs.
 pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
@@ -135,14 +135,6 @@ pub fn global_state_tree() -> StateNode {
                         "profile_ns_meta",
                         state_paths::profile_ns_meta("{profile}"),
                     ),
-                ],
-            ),
-            StateNode::branch(
-                "runtime",
-                PathBuf::from(RUNTIME_ROOT),
-                vec![
-                    StateNode::leaf("ns_bind_mount", state_paths::ns_bind_mount("{name}")),
-                    StateNode::leaf("ns_metadata", state_paths::ns_metadata("{name}")),
                 ],
             ),
             StateNode::branch(

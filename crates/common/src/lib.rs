@@ -33,9 +33,6 @@ pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 /// Persistent profile storage root
 pub const PERSIST_ROOT: &str = "/nsp3";
 
-/// Runtime state directory (namespace bind mounts and metadata)
-pub const RUNTIME_ROOT: &str = "/run/nsproxy";
-
 /// Helper functions for consistent path handling
 pub mod state_paths {
     use super::*;
@@ -73,26 +70,16 @@ pub mod state_paths {
         profile_dir(name).join("hot.json")
     }
 
-    /// Get namespace bind mount path (runtime, for ::Run)
-    pub fn ns_bind_mount(name: &str) -> PathBuf {
-        PathBuf::from(RUNTIME_ROOT).join(format!("{}.ns", name))
-    }
-
-    /// Get namespace bind mount path inside profile instance dir (for ::Make)
+    /// Get namespace bind mount path inside profile instance dir
     /// Returns /nsp3/{name}/net
     pub fn profile_netns_bind(name: &str) -> PathBuf {
         profile_dir(name).join("net")
     }
 
-    /// Get namespace metadata JSON path inside profile instance dir (for ::Make)
+    /// Get namespace metadata JSON path inside profile instance dir
     /// Returns /nsp3/{name}/ns_alive.json
     pub fn profile_ns_meta(name: &str) -> PathBuf {
         profile_dir(name).join("ns_alive.json")
-    }
-
-    /// Get metadata JSON path for a namespace
-    pub fn ns_metadata(name: &str) -> PathBuf {
-        PathBuf::from(RUNTIME_ROOT).join(format!("{}.json", name))
     }
 
     /// Get metadata JSON path from bind mount path
@@ -146,6 +133,12 @@ pub mod state_paths {
     /// Returns /nsp3/uplink/stats.json
     pub fn uplink_stats_state() -> PathBuf {
         uplink_root().join("stats.json")
+    }
+
+    /// Pivot-root staging directory for a named profile.
+    /// Returns /tmp/nsproxy_{name}
+    pub fn pivot_root_dir(name: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/nsproxy_{}", name))
     }
 }
 

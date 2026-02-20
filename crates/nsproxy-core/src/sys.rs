@@ -377,8 +377,15 @@ pub fn pivot_root_into(new_root: &Path, put_old: &Path) -> Result<()> {
     create_dir_all(put_old)?;
     pivot_root(new_root, put_old)?;
     set_current_dir("/")?;
-    umount2(put_old, MntFlags::MNT_DETACH)?;
-    remove_dir_all(put_old)?;
+    // After pivot_root the filesystem root is now `new_root`.  Paths that were
+    // absolute before pivot are no longer valid — strip the `new_root` prefix
+    // to get the path as seen from inside the new root.
+    let rel = put_old
+        .strip_prefix(new_root)
+        .unwrap_or_else(|_| put_old.strip_prefix("/").unwrap_or(put_old));
+    let put_old_inner = PathBuf::from("/").join(rel);
+    umount2(&put_old_inner, MntFlags::MNT_DETACH)?;
+    remove_dir_all(&put_old_inner)?;
 
     Ok(())
 }
@@ -400,6 +407,59 @@ pub fn rm_mount(dst: &Path) -> Result<()> {
     warn!("remove bind-mount {:?}", dst);
     umount(dst)?;
     remove_file(dst)?;
+    Ok(())
+}
+
+/// Errors if repeated mounted
+/// Write content to /tmp and bind mount it to the target path as read-only
+pub fn mount_file_content(content: &[u8], target: &Path) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // Generate a unique filename in /tmp
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = PathBuf::from(format!("/tmp/nsproxy_mount_{}.tmp", timestamp));
+    
+    // Write content to temporary file
+    let mut tmp_file = File::create(&tmp_path)?;
+    tmp_file.write_all(content)?;
+    tmp_file.flush()?;
+    
+    // Ensure the target parent directory exists
+    if let Some(parent) = target.parent() {
+        create_dir_all(parent)?;
+    }
+    
+    // Create the target file if it doesn't exist
+    if !target.exists() {
+        File::create(target)?;
+    }
+    
+    // Bind mount the temporary file to the target as read-only
+    mount_bind_ro_explicit(&tmp_path, target, false)?;
+    
+    info!("mounted {:?} to {:?}", tmp_path, target);
+    
+    Ok(())
+}
+
+/// Mount resolv.conf with DNS nameserver configuration
+/// Errors if repeated mounted
+pub fn mount_resolv_conf(nameserver: &str) -> Result<()> {
+    let content = format!("nameserver {}\n", nameserver);
+    mount_file_content(content.as_bytes(), Path::new("/etc/resolv.conf"))?;
+    info!("mounted resolv.conf with nameserver: {}", nameserver);
+    Ok(())
+}
+
+/// Mount nsswitch.conf for DNS resolution via glibc's libnss_dns
+/// Errors if repeated mounted
+pub fn mount_nsswitch_conf() -> Result<()> {
+    let content = b"hosts: files dns\n";
+    mount_file_content(content, Path::new("/etc/nsswitch.conf"))?;
+    info!("mounted nsswitch.conf for DNS resolution");
     Ok(())
 }
 

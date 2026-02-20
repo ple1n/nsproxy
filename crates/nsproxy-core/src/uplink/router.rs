@@ -14,7 +14,7 @@ use ipstack::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, tcp::TcpConfig},
 };
 use nsproxy_common::routing::{
-    DropReason, ProxyID, RoutingContext, RoutingDecision, RoutingProtocol,
+    DropReason, ProxyID, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled, VDNSRES,
 };
 use socks5_impl::protocol::WireAddress;
 use tokio::{
@@ -23,7 +23,7 @@ use tokio::{
     sync::RwLock,
 };
 use tracing::{debug, error, info, trace, warn};
-use tun2socks5::dns::{TUNResponse, VDNSRES, VirtDNSAsync, VirtDNSHandle};
+use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 
 use crate::{
     HotConfig,
@@ -290,34 +290,15 @@ impl Router {
         let local = tcp.local_addr();
 
         let dns_result = dns_handle.process(peer);
-        let target_domain = Self::extract_domain(&dns_result, peer.ip(), &conf).await;
-
-        let dns_decision: Option<RoutingDecision> = match &dns_result {
-            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(sock)) => {
-                Some(RoutingDecision::NATByTUN(*sock))
-            }
-            VDNSRES::SpecialHandling(TUNResponse::Direct(sock)) => {
-                Some(RoutingDecision::Direct(*sock))
-            }
-            VDNSRES::SpecialHandling(TUNResponse::Files(path)) => Some(RoutingDecision::Proxy {
-                target: WireAddress::SocketAddress(peer),
-                id: ProxyID::for_file(path.as_path()),
-            }),
-            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => {
-                Some(RoutingDecision::Drop(DropReason::Preprocess))
-            }
-            _ => None,
-        };
 
         let mut ctx = RoutingContext {
-            target_domain,
             target_ip: peer.ip(),
             target_port: peer.port(),
             source_ip: local.ip(),
             protocol: RoutingProtocol::Tcp,
             tried_proxies: Default::default(),
             attempt_num: 0,
-            dns: dns_decision,
+            dns: dns_result,
         };
 
         loop {
@@ -333,16 +314,16 @@ impl Router {
             });
 
             match decision {
-                RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+                RoutingResovled::Direct(addr) | RoutingResovled::NATByTUN(addr) => {
                     warn!("direct conn to {}", &addr);
                     Self::tcp_direct(tcp, addr, diag, conn_id).await?;
                     break;
                 }
-                RoutingDecision::Drop(reason) => {
+                RoutingResovled::Drop(reason) => {
                     warn!("{}: {:?}", peer, reason);
                     break;
                 }
-                RoutingDecision::Proxy { target, id } => {
+                RoutingResovled::ProxyResovled { target, id } => {
                     let proxy_clone = {
                         let hub = uplink.read().await;
                         match hub.get_proxy(&id) {
@@ -383,20 +364,18 @@ impl Router {
                     use crate::uplink::proxy_adapters::{
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
-                    let (target_host, target_port) = Self::wire_to_host_port(&target);
 
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
                             TrojanAdapter::connect_tcp(
                                 p,
-                                &target_host,
-                                target_port,
+                                target.clone(),
                                 p.server_addr.ip(),
                             )
                             .await
                         }
                         UplinkProxy::Remote(p) => {
-                            RemoteAdapter::connect_tcp(p, &target_host, target_port).await
+                            RemoteAdapter::connect_tcp(p, target.clone()).await
                         }
                         _ => unreachable!(),
                     };
@@ -670,34 +649,15 @@ impl Router {
         }
 
         let dns_result = dns_handle.process(peer);
-        let target_domain = Self::extract_domain(&dns_result, peer.ip(), &conf).await;
-
-        let dns_decision: Option<RoutingDecision> = match &dns_result {
-            VDNSRES::SpecialHandling(TUNResponse::NATByTUN(sock)) => {
-                Some(RoutingDecision::NATByTUN(*sock))
-            }
-            VDNSRES::SpecialHandling(TUNResponse::Direct(sock)) => {
-                Some(RoutingDecision::Direct(*sock))
-            }
-            VDNSRES::SpecialHandling(TUNResponse::Files(path)) => Some(RoutingDecision::Proxy {
-                target: WireAddress::SocketAddress(peer),
-                id: ProxyID::for_file(path.as_path()),
-            }),
-            VDNSRES::SpecialHandling(TUNResponse::Unreachable) | VDNSRES::ERR => {
-                Some(RoutingDecision::Drop(DropReason::Preprocess))
-            }
-            _ => None,
-        };
 
         let mut ctx = RoutingContext {
-            target_domain,
             target_ip: peer.ip(),
             target_port: peer.port(),
             source_ip: local.ip(),
             protocol: RoutingProtocol::Udp,
             tried_proxies: Default::default(),
             attempt_num: 0,
-            dns: dns_decision,
+            dns: dns_result,
         };
 
         loop {
@@ -713,7 +673,7 @@ impl Router {
             });
 
             match decision {
-                RoutingDecision::Direct(addr) | RoutingDecision::NATByTUN(addr) => {
+                RoutingResovled::Direct(addr) | RoutingResovled::NATByTUN(addr) => {
                     info!("UDP {:?} -> direct to {}", conn_id, addr);
                     use crate::uplink::proxy_adapters::NoProxyAdapter;
                     let mut remote = NoProxyAdapter::connect_udp(addr).await?;
@@ -747,7 +707,7 @@ impl Router {
                         }
                     }
                 }
-                RoutingDecision::Drop(reason) => {
+                RoutingResovled::Drop(reason) => {
                     info!("UDP {:?} {:?}", conn_id, reason);
                     diag.emit(DiagEvent::Finished {
                         id: conn_id,
@@ -758,7 +718,7 @@ impl Router {
                     });
                     break;
                 }
-                RoutingDecision::Proxy { target, id } => {
+                RoutingResovled::ProxyResovled { target, id } => {
                     let proxy_clone = {
                         let hub = uplink.read().await;
                         match hub.get_proxy(&id) {
@@ -789,14 +749,12 @@ impl Router {
                     use crate::uplink::proxy_adapters::{
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
-                    let (target_host, target_port) = Self::wire_to_host_port(&target);
 
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
                             TrojanAdapter::connect_udp(
                                 p,
-                                &target_host,
-                                target_port,
+                                target.clone(),
                                 p.server_addr.ip(),
                             )
                             .await
@@ -940,9 +898,9 @@ impl Router {
             }
         }
 
-        if let VDNSRES::SpecialHandling(response) = dns_result {
+        if let VDNSRES::Opine(response) = dns_result {
             match response {
-                TUNResponse::ProxiedHost(domain) => {
+                RoutingDecision::HostOverProxy(domain) => {
                     return Some(domain.clone());
                 }
                 _ => {}

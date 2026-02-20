@@ -643,7 +643,7 @@ fn run_trojan_tests(
             .ok_or_else(|| anyhow!("No resolved IP for {}", trojan.server_name))?;
 
         println!("{}  Testing TCP connectivity...", "[•]".cyan());
-        match trojan.connect_tcp(server_ip, "ip.me", 80).await {
+        match trojan.connect_tcp(server_ip, WireAddress::from(("ip.me", 80u16))).await {
             Ok(crate::uplink::clash::TrojanConnection::TcpConnect(mut stream, _)) => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -726,8 +726,7 @@ fn run_trojan_tests(
         println!("{}  Testing UDP connectivity...", "[•]".cyan());
         match crate::uplink::proxy_adapters::TrojanAdapter::connect_udp(
             trojan,
-            "1.1.1.1",
-            53,
+            WireAddress::from(("1.1.1.1", 53u16)),
             trojan.server_addr.ip(),
         )
         .await
@@ -805,7 +804,7 @@ async fn test_remote_socks5_tcp(remote: &ArgProxy) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     println!("{}  Testing TCP connectivity...", "[•]".cyan());
-    match RemoteAdapter::connect_tcp(remote, "ip.me", 80).await {
+    match RemoteAdapter::connect_tcp(remote, WireAddress::from(("ip.me", 80u16))).await {
         Ok(ProxyConnection::Tcp(mut stream)) => {
             println!("  TCP connected");
             let request = "GET / HTTP/1.1\r\nHost: ip.me\r\nConnection: close\r\n\r\n";

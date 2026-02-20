@@ -207,21 +207,18 @@ impl TrojanProxy {
     pub async fn connect_tcp(
         &self,
         server_ip: std::net::IpAddr,
-        target_host: &str,
-        target_port: u16,
+        dest: WireAddress,
     ) -> Result<TrojanConnection> {
-        let target = WireAddress::DomainAddress(target_host.to_string(), target_port);
         let stream = self
             .connect_with_command(
                 server_ip,
-                target_host,
-                target_port,
+                &dest,
                 TrojanCommand::TcpConnect,
             )
             .await?;
         Ok(TrojanConnection::TcpConnect(
             TrojanTcpStream(stream),
-            target,
+            dest,
         ))
     }
 
@@ -233,21 +230,18 @@ impl TrojanProxy {
     pub async fn connect_udp(
         &self,
         server_ip: std::net::IpAddr,
-        target_host: &str,
-        target_port: u16,
+        dest: WireAddress,
     ) -> Result<TrojanConnection> {
-        let target = WireAddress::DomainAddress(target_host.to_string(), target_port);
         let stream = self
             .connect_with_command(
                 server_ip,
-                target_host,
-                target_port,
+                &dest,
                 TrojanCommand::UdpAssociate,
             )
             .await?;
         Ok(TrojanConnection::UdpAssociate(
             TrojanUdpTunnel(stream),
-            target,
+            dest,
         ))
     }
 
@@ -255,15 +249,14 @@ impl TrojanProxy {
     async fn connect_with_command(
         &self,
         server_ip: std::net::IpAddr,
-        target_host: &str,
-        target_port: u16,
+        dest: &WireAddress,
         command: TrojanCommand,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         // TCP connect using resolved IP and the configured port from runtime proxy
         let server_addr = SocketAddr::new(server_ip, self.server_addr.port());
         info!(
-            "Trojan TCP connection to {} for target {}:{} ({:?})",
-            server_addr, target_host, target_port, command
+            "Trojan TCP connection to {} for target {} ({:?})",
+            server_addr, dest, command
         );
         let tcp_stream = TcpStream::connect(server_addr)
             .await
@@ -296,9 +289,23 @@ impl TrojanProxy {
         let password_hash = Self::hash_password(&self.password);
         let mut buf = BytesMut::new();
 
-        let address = AddressRef {
-            host: HostRef::Domain(target_host.as_bytes()),
-            port: target_port,
+        let (host_bytes_buf, address) = match dest {
+            WireAddress::DomainAddress(host, port) => {
+                let buf = host.clone().into_bytes();
+                let addr = AddressRef { host: HostRef::Domain(&[]), port: *port };
+                (Some(buf), addr)
+            }
+            WireAddress::SocketAddress(std::net::SocketAddr::V4(addr)) => {
+                (None, AddressRef { host: HostRef::Ipv4(addr.ip().octets()), port: addr.port() })
+            }
+            WireAddress::SocketAddress(std::net::SocketAddr::V6(addr)) => {
+                (None, AddressRef { host: HostRef::Ipv6(addr.ip().octets()), port: addr.port() })
+            }
+        };
+        let address = if let Some(ref buf) = host_bytes_buf {
+            AddressRef { host: HostRef::Domain(buf.as_slice()), port: address.port }
+        } else {
+            address
         };
 
         // Write the Trojan protocol request header (CONNECT = 0x01, UDP ASSOCIATE = 0x03)
@@ -1360,8 +1367,7 @@ impl ClashState {
                         DNSProtocol::UDP => {
                             let mut conn = TrojanAdapter::connect_udp(
                                 trojan,
-                                &dns_host,
-                                endpoint.port,
+                                dns_server.clone(),
                                 resolved_ip,
                             )
                             .await?;
@@ -1383,8 +1389,7 @@ impl ClashState {
                         DNSProtocol::TCP => {
                             let mut conn = TrojanAdapter::connect_tcp(
                                 trojan,
-                                &dns_host,
-                                endpoint.port,
+                                dns_server.clone(),
                                 resolved_ip,
                             )
                             .await?;
@@ -1414,7 +1419,7 @@ impl ClashState {
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port)
+                                RemoteAdapter::connect_tcp(remote, dns_server.clone())
                                     .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
@@ -1433,7 +1438,7 @@ impl ClashState {
                         }
                         DNSProtocol::TCP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, &dns_host, endpoint.port)
+                                RemoteAdapter::connect_tcp(remote, dns_server.clone())
                                     .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {

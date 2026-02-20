@@ -8,14 +8,6 @@ use tracing::warn;
 
 use crate::{NsAlive, WrappedBinariesConfig, shell::ShellPrefs, sys::NSEnter};
 
-pub fn check_wrap(no_wrap_check: bool) -> Result<()> {
-    if !no_wrap_check {
-        let wrapped_config = WrappedBinariesConfig::load()?;
-        wrapped_config.check_all_wrapped()?;
-    }
-    Ok(())
-}
-
 pub fn check_proxy_mode(proxy_is_set: bool, no_proxy: bool) -> Result<()> {
     match (proxy_is_set, no_proxy) {
         (true, true) => {
