@@ -223,7 +223,9 @@ impl ShellPrefs {
                     self.drop_privs()?;
 
                     if let Some(cwd) = &self.cwd {
-                        chdir(cwd)?;
+                        // in some pivot root situation new cwd is not created
+                        // TODO: might be bad.
+                        let _ = chdir(cwd);
                     }
 
                     execve(cmd.as_c_str(), &self.args, self.env.make_contiguous());

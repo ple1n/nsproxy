@@ -28,7 +28,7 @@ use ipnetwork::Ipv6Network;
 use libc::pid_t;
 use nsproxy_common::ExactNS;
 use nsproxy_common::NSFrom;
-pub use nsproxy_common::{NsAlive, PERSIST_ROOT, RUNTIME_ROOT, state_paths};
+pub use nsproxy_common::{NsAlive, PERSIST_ROOT, state_paths};
 use rtnetlink::Handle;
 use rtnetlink::LinkUnspec;
 use rtnetlink::LinkVeth;
@@ -176,17 +176,13 @@ mod tests {
             "172.16.0.1",
             "::1",
             "fe80::1",
-            "127.0.0.1"
+            "127.0.0.1",
         ];
         for addr in candidates {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(
-                !hot.captures_dns(ip),
-                "sentinel should not capture {addr}"
-            );
+            assert!(!hot.captures_dns(ip), "sentinel should not capture {addr}");
         }
     }
-
 
     #[test]
     fn test_find_vacant_ipv4() {
@@ -236,12 +232,7 @@ mod tests {
 
         let mut profile = TemplateConfig {
             schema: 1,
-            rootfs: ProfileRootfs {
-                mode: RootfsMode::Overlay,
-                root: PathBuf::from("/"),
-                put_old: None,
-                tmpfs: false,
-            },
+            sandbox_mode: SandboxMode::Overlay,
             mounts: vec![ProfileMount {
                 source: PathBuf::from("@/mnt-src"),
                 target: PathBuf::from("@/mnt-dst"),
@@ -269,6 +260,7 @@ mod tests {
                 },
                 locals: HashMap::new(),
                 dns_capture: Default::default(),
+                mounts: Vec::new(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -870,12 +862,17 @@ pub struct HotConfig {
     /// When absent or empty, all IPs are captured.
     #[serde(default)]
     pub dns_capture: HashSet<IpNetwork>,
+    /// Mnt but with full parameters
+    #[serde(default)]
+    pub mounts: Vec<ProfileMount>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct PathExpansionState {
     instance_root: Option<PathBuf>,
     home: Option<PathBuf>,
+    pub src_chroot: Option<PathBuf>,
+    pub dst_chroot: Option<PathBuf>,
 }
 
 impl PathExpansionState {
@@ -883,6 +880,7 @@ impl PathExpansionState {
         Self {
             instance_root: Some(instance_root.to_path_buf()),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            ..Default::default()
         }
     }
 
@@ -890,7 +888,42 @@ impl PathExpansionState {
         Self {
             instance_root: None,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            ..Default::default()
         }
+    }
+
+    pub fn with_src_chroot(mut self, src: &Path) -> Self {
+        self.src_chroot = Some(src.to_path_buf());
+        self
+    }
+
+    pub fn with_dst_chroot(mut self, dst: &Path) -> Self {
+        self.dst_chroot = Some(dst.to_path_buf());
+        self
+    }
+
+    /// Expand variables in `path` and, if `src_chroot` is set, relocate the
+    /// resulting absolute path underneath it.
+    pub fn expand_source(&self, path: &Path) -> PathBuf {
+        let expanded = self.expand(path);
+        if let Some(ref chroot) = self.src_chroot {
+            if expanded.is_absolute() {
+                let rel = expanded.strip_prefix("/").unwrap_or(&expanded);
+                return chroot.join(rel);
+            }
+        }
+        expanded
+    }
+
+    /// Expand variables in `path` and, if `dst_chroot` is set, resolve the
+    /// result relative to that chroot root.
+    pub fn expand_target(&self, path: &Path) -> PathBuf {
+        let expanded = self.expand(path);
+        if let Some(ref chroot) = self.dst_chroot {
+            let rel = expanded.strip_prefix("/").unwrap_or(&expanded);
+            return chroot.join(rel);
+        }
+        expanded
     }
 
     pub fn is_instance_variable(path: &Path) -> bool {
@@ -963,6 +996,43 @@ impl HotConfig {
             expanded_mnt.insert(vars.expand(source), vars.expand(target));
         }
         self.mnt = expanded_mnt;
+
+        for mount in &mut self.mounts {
+            mount.source = vars.expand(&mount.source);
+            mount.target = vars.expand(&mount.target);
+        }
+    }
+
+    /// Merge shorthand `mnt` entries with explicit `mounts`.
+    /// Errors on duplicate target paths.
+    pub fn merged_mounts(&self) -> Result<Vec<ProfileMount>> {
+        let mut merged = Vec::with_capacity(self.mounts.len() + self.mnt.len());
+        let mut seen_targets: HashSet<PathBuf> = HashSet::new();
+
+        for mount in &self.mounts {
+            ensure!(
+                seen_targets.insert(mount.target.clone()),
+                "duplicate mount target: {:?}",
+                mount.target
+            );
+            merged.push(mount.clone());
+        }
+
+        for (source, target) in &self.mnt {
+            ensure!(
+                seen_targets.insert(target.clone()),
+                "duplicate mount target: {:?}",
+                target
+            );
+            merged.push(ProfileMount {
+                source: source.clone(),
+                target: target.clone(),
+                read_only: false,
+                recursive: true,
+            });
+        }
+
+        Ok(merged)
     }
 
     /// Returns true if the given IP's DNS traffic should be intercepted.
@@ -990,8 +1060,8 @@ impl HotConfig {
 pub struct TemplateConfig {
     /// Schema version for compatibility checks
     pub schema: u32,
-    /// Filesystem isolation plan
-    pub rootfs: ProfileRootfs,
+    /// Filesystem isolation mode
+    pub sandbox_mode: SandboxMode,
     /// Explicit bind mounts, in order
     pub mounts: Vec<ProfileMount>,
     /// Optional chmod operations to apply after mounts
@@ -1020,20 +1090,10 @@ fn default_inherit_env() -> bool {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct ProfileRootfs {
-    /// Overlay keeps current root, Pivot swaps root
-    pub mode: RootfsMode,
-    /// Root prefix. For overlay this must be "/"; for pivot this is the new root.
-    pub root: PathBuf,
-    /// Required when mode is Pivot. Must be under root.
-    pub put_old: Option<PathBuf>,
-    /// If true, mount tmpfs at root before constructing
-    pub tmpfs: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum RootfsMode {
+pub enum SandboxMode {
+    /// Keep current root, layer bind-mounts onto it.
     Overlay,
+    /// Replace root via pivot_root(2) with a fresh tmpfs, old root at /pivot.
     Pivot,
 }
 
@@ -1078,35 +1138,6 @@ impl TemplateConfig {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(self.schema > 0, "schema must be > 0");
-        ensure!(
-            self.rootfs.root.is_absolute(),
-            "rootfs.root must be absolute"
-        );
-        match self.rootfs.mode {
-            RootfsMode::Overlay => {
-                ensure!(
-                    self.rootfs.root == PathBuf::from("/"),
-                    "overlay root must be '/'"
-                );
-                ensure!(
-                    self.rootfs.put_old.is_none(),
-                    "overlay must not set put_old"
-                );
-                ensure!(!self.rootfs.tmpfs, "overlay must not set tmpfs");
-            }
-            RootfsMode::Pivot => {
-                let put_old = self
-                    .rootfs
-                    .put_old
-                    .clone()
-                    .ok_or(anyhow!("pivot requires put_old"))?;
-                ensure!(put_old.is_absolute(), "put_old must be absolute");
-                ensure!(
-                    put_old.starts_with(&self.rootfs.root),
-                    "put_old must be under root"
-                );
-            }
-        }
         if let Some(ref cwd) = self.sargs.cwd {
             ensure!(cwd.is_absolute(), "sargs.cwd must be absolute");
         }
@@ -1203,12 +1234,7 @@ impl TemplateConfig {
 
         Ok(TemplateConfig {
             schema: 1,
-            rootfs: ProfileRootfs {
-                mode: RootfsMode::Overlay,
-                root: PathBuf::from("/"),
-                put_old: None,
-                tmpfs: false,
-            },
+            sandbox_mode: SandboxMode::Overlay,
             mounts: vec![],
             env: HashMap::new(),
             inherit_env: true,
@@ -1513,58 +1539,6 @@ pub enum NsInput {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum MainCommand {
-    /// Deprecated
-    /// Set up some containers
-    #[command(alias = "r")]
-    Run {
-        /// Source network namespace (src=/path OR src=1234)
-        #[arg(long, default_value = "this")]
-        src: NsInput,
-        /// Target network namespace (dst=/path OR dst=1234)
-        #[arg(long, default_value = "new")]
-        dst: NsInput,
-        #[command(flatten)]
-        tun: IArgs,
-        /// Make veths, with inner IP defaulting to 100.120.0.2/24
-        /// Not supporting more than one veth for now
-        #[arg(short, long)]
-        veth: bool,
-        /// Persist this container, add it to config file
-        #[arg(short, long)]
-        keep: bool,
-        /// Activate other containers too
-        #[arg(short, long)]
-        all: bool,
-        /// Set TUN as default route. This defaults to true for new net ns
-        #[arg(short, long)]
-        default: bool,
-        /// Do not set TUN as default route.
-        #[arg(short, long)]
-        no_default: bool,
-        #[arg(short, long)]
-        log: Option<LevelFilter>,
-        /// Mount namespaces that are created such that you can access them by paths later
-        #[arg(short, long)]
-        bind: Option<PathBuf>,
-        #[command(flatten)]
-        sargs: ShellArgs,
-        /// Instance name
-        #[arg(long)]
-        name: Option<String>,
-        /// Profile name for browsers
-        #[arg(long)]
-        profile: Option<String>,
-        /// Use a new mount namespace
-        #[arg(short, long)]
-        mnt: bool,
-        /// Enable bind mounts even when NOT using a new mount namspace
-        /// Defaults to true when --mnt is enabled, false when --mnt is not enabled.
-        #[arg(long)]
-        binds: bool,
-        /// Requires explicit flag for no proxying
-        #[arg(long)]
-        no_proxy: bool,
-    },
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
     /// Enter the best-match based on searching arguments provided
@@ -1588,23 +1562,6 @@ pub enum MainCommand {
     },
     /// Remove a bind-mount file
     Rm { file: PathBuf },
-    /// Obsolete
-    /// Manage wrapped binaries for security (wraps all configured binaries)
-    /// VSCode could for example call xdg-open when logging into github, which calls librewolf from within a namespace, which communicates with a librewolf instance outside netns, which escapes the netns
-    /// The wrapper handles such problems by requiring confirmation before executing
-    /// Warning. xdg-open takes the binary pointed by within .desktop file, which may differ from the path resolved by $PATH
-    /// eg. /usr/share/librewolf/librewolf
-    Wrap {
-        /// Unwrap all configured binaries instead of wrapping them
-        #[arg(short, long)]
-        undo: bool,
-        /// Add a binary to the wrapped binaries config (resolves using which)
-        #[arg(short, long)]
-        add: Option<String>,
-    },
-    /// Obsolete
-    /// Show wrapped binaries status
-    Wrapped,
     #[command(alias = "c")]
     Clean {
         /// Does a simple removal of default veth
@@ -1652,7 +1609,11 @@ pub enum MainCommand {
     /// Use `tun` and `veth` subcommands afterwards to attach networking.
     Up {
         /// Profile name (resolves to /nsp3/{name})
-        #[arg(long)]
+        profile: String,
+    },
+    /// Tear down a profile: kill the keeper process and remove the namespace bind mount.
+    Down {
+        /// Profile name
         profile: String,
     },
     /// Attach a TUN device + tun2socks5 proxy to an already-up profile namespace.
@@ -1702,6 +1663,15 @@ pub enum MainCommand {
     },
     /// Print a typed blueprint tree for global state paths
     StateTree,
+    /// Pivot-root sandbox: enters an existing namespace, builds a tmpfs pivot
+    /// root from a profile's TemplateConfig, and watches HotConfig for changes.
+    #[command(alias = "sb")]
+    Sandbox {
+        /// Profile name (must have been created with `profile` and brought up with `up`)
+        profile: String,
+        #[command(flatten)]
+        sargs: ShellArgs,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

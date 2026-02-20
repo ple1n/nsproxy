@@ -60,13 +60,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use nsproxy_common::routing::{
-    DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
+    DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled,
+    VDNSRES,
 };
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use tracing::{info, warn};
 use tun2socks5::ArgProxy;
-use tun2socks5::dns::{TUNResponse, VDNSRES, VirtDNSAsync, VirtDNSHandle};
+use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 
 use crate::{state_blueprint::PersistentState, state_paths};
 
@@ -380,23 +381,47 @@ where
 /// Type alias for the routing decision function
 /// Modify this function to customize routing behavior
 pub type RoutingFunction =
-    Arc<dyn Fn(&RoutingContext, &UplinkHub) -> RoutingDecision + Send + Sync>;
+    Arc<dyn Fn(&RoutingContext, &UplinkHub) -> RoutingResovled + Send + Sync>;
+
+pub fn preferred_addr(a: WireAddress, b: WireAddress) -> WireAddress {
+    match (&a, &b) {
+        (WireAddress::DomainAddress(..), _) => a,
+        (_, WireAddress::DomainAddress(..)) => b,
+        _ => a,
+    }
+}
 
 pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     Arc::new(move |ctx: &RoutingContext, _hub: &UplinkHub| {
-        let target = if let Some(domain) = &ctx.target_domain {
-            WireAddress::DomainAddress(domain.clone(), ctx.target_port)
-        } else {
-            WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
-        };
-
         if ctx.attempt_num > 0 {
-            return RoutingDecision::Drop(DropReason::MaxRetry);
+            return RoutingResovled::Drop(DropReason::MaxRetry);
         }
 
-        RoutingDecision::Proxy {
-            target,
-            id: id.clone(),
+        match &ctx.dns {
+            // Real IP from TUN, no VirtDNS mapping — proxy using raw socket address
+            VDNSRES::NormalProxying => RoutingResovled::ProxyResovled {
+                target: WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port)),
+                id: id.clone(),
+            },
+            // VirtDNS decoded to a domain — use hostname so the proxy resolves it, preserving privacy
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => RoutingResovled::ProxyResovled {
+                target: WireAddress::DomainAddress(host.clone(), ctx.target_port),
+                id: id.clone(),
+            },
+            // VirtDNS decoded to a concrete socket — proxy to that socket directly
+            VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => RoutingResovled::ProxyResovled {
+                target: WireAddress::SocketAddress(*sock),
+                id: id.clone(),
+            },
+            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => RoutingResovled::NATByTUN(*sock),
+            VDNSRES::Opine(RoutingDecision::Direct(sock)) => RoutingResovled::Direct(*sock),
+            VDNSRES::Opine(RoutingDecision::File(path)) => RoutingResovled::ProxyResovled {
+                target: WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port)),
+                id: ProxyID::for_file(path.as_path()),
+            },
+            VDNSRES::Opine(RoutingDecision::Drop(_)) | VDNSRES::ERR => {
+                RoutingResovled::Drop(DropReason::Preprocess)
+            }
         }
     })
 }
@@ -513,8 +538,8 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| {
-                RoutingDecision::Drop(DropReason::Preprocess)
+            routing_fn: Arc::new(|_ctx: &RoutingContext, _hub: &UplinkHub| {
+                RoutingResovled::Drop(DropReason::Preprocess)
             }),
             clash: None,
             stats: HashMap::new(),
@@ -654,9 +679,10 @@ impl UplinkHub {
         self.proxies.get(id)
     }
 
-    /// Make a routing decision for the given context
-    pub fn route(&self, ctx: &RoutingContext) -> RoutingDecision {
-        (self.routing_fn)(ctx, self)
+    /// Make a routing decision for the given context, resolving all intermediate variants
+    /// using hub state (proxy registry, etc.) into a concrete `RoutingResovled`.
+    pub fn route(&self, ctx: &RoutingContext) -> RoutingResovled {
+        (self.routing_fn)(ctx, self) 
     }
 
     /// Set a new routing function
@@ -1489,16 +1515,15 @@ pub mod proxy_adapters {
         /// Create a Trojan connection
         pub async fn connect_tcp(
             proxy: &clash::TrojanProxy,
-            target_host: &str,
-            target_port: u16,
-            resolved_ip: std::net::IpAddr,
+            dest: WireAddress,
+            proxy_ip: std::net::IpAddr,
         ) -> anyhow::Result<ProxyConnection> {
             info!(
-                "Trojan TCP connection to {}:{} via {} ({})",
-                target_host, target_port, proxy.server_name, resolved_ip
+                "Trojan TCP connection to {} via {} ({})",
+                dest, proxy.server_name, proxy_ip
             );
             let conn = proxy
-                .connect_tcp(resolved_ip, target_host, target_port)
+                .connect_tcp(proxy_ip, dest)
                 .await?;
             match conn {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
@@ -1518,16 +1543,15 @@ pub mod proxy_adapters {
         /// Create a Trojan UDP tunnel explicitly (UDP ASSOCIATE)
         pub async fn connect_udp(
             proxy: &clash::TrojanProxy,
-            target_host: &str,
-            target_port: u16,
+            dest: WireAddress,
             resolved_ip: std::net::IpAddr,
         ) -> anyhow::Result<ProxyConnection> {
             info!(
-                "Trojan UDP-associate to {}:{} via {} ({})",
-                target_host, target_port, proxy.server_name, resolved_ip
+                "Trojan UDP-associate to {} via {} ({})",
+                dest, proxy.server_name, resolved_ip
             );
             let conn = proxy
-                .connect_udp(resolved_ip, target_host, target_port)
+                .connect_udp(resolved_ip, dest)
                 .await?;
             match conn {
                 clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
@@ -1552,8 +1576,7 @@ pub mod proxy_adapters {
         /// Create a SOCKS5 connection
         pub async fn connect_tcp(
             proxy: &ArgProxy,
-            target_host: &str,
-            target_port: u16,
+            dest: WireAddress,
         ) -> anyhow::Result<ProxyConnection> {
             use tun2socks5::ProxyType;
 
@@ -1564,7 +1587,6 @@ pub mod proxy_adapters {
                         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.addr))
                             .await
                             .context("Timeout connecting to SOCKS5 proxy")??;
-                    let dest = WireAddress::DomainAddress(target_host.to_string(), target_port);
                     client::connect(&mut stream, dest, proxy.credentials.clone()).await?;
                     Ok(ProxyConnection::Tcp(Box::new(Socks5TcpConn {
                         inner: stream,
@@ -1724,9 +1746,9 @@ pub mod proxy_adapters {
 pub struct RoutingBuilder {
     rules: Vec<(
         Box<dyn Fn(&RoutingContext) -> bool + Send + Sync>,
-        RoutingDecision,
+        RoutingResovled,
     )>,
-    default_decision: Option<RoutingDecision>,
+    default_decision: Option<RoutingResovled>,
 }
 
 impl RoutingBuilder {
@@ -1739,7 +1761,7 @@ impl RoutingBuilder {
     }
 
     /// Add a routing rule (condition -> decision)
-    pub fn add_rule<F>(mut self, condition: F, decision: RoutingDecision) -> Self
+    pub fn add_rule<F>(mut self, condition: F, decision: RoutingResovled) -> Self
     where
         F: Fn(&RoutingContext) -> bool + Send + Sync + 'static,
     {
@@ -1748,7 +1770,7 @@ impl RoutingBuilder {
     }
 
     /// Set the default routing decision
-    pub fn default_route(mut self, decision: RoutingDecision) -> Self {
+    pub fn default_route(mut self, decision: RoutingResovled) -> Self {
         self.default_decision = Some(decision);
         self
     }
@@ -1759,7 +1781,7 @@ impl RoutingBuilder {
         let default_decision = self.default_decision;
 
         Arc::new(
-            move |ctx: &RoutingContext, hub: &UplinkHub| -> RoutingDecision {
+            move |ctx: &RoutingContext, _hub: &UplinkHub| -> RoutingResovled {
                 for (condition, decision) in &rules {
                     if condition(ctx) {
                         return decision.clone();
@@ -1768,7 +1790,7 @@ impl RoutingBuilder {
                 if let Some(ref decision) = default_decision {
                     decision.clone()
                 } else {
-                    RoutingDecision::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
+                    RoutingResovled::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
                 }
             },
         )

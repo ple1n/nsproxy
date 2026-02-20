@@ -5,13 +5,12 @@ use socks5_impl::protocol::WireAddress;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Context available during routing decision
 /// This state is meant to be mutated and kept between retries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingContext {
-    pub target_domain: Option<String>,
     pub target_ip: std::net::IpAddr,
     pub target_port: u16,
     pub source_ip: std::net::IpAddr,
@@ -20,13 +19,20 @@ pub struct RoutingContext {
     pub tried_proxies: HashSet<ProxyID>,
     pub attempt_num: usize,
     /// Verdict given by DNS
-    pub dns: Option<RoutingDecision>
+    pub dns: VDNSRES,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingProtocol {
     Tcp,
     Udp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VDNSRES {
+    Opine(RoutingDecision),
+    NormalProxying,
+    ERR,
 }
 
 /// Result of routing decision — always carries a concrete target when proxying
@@ -36,8 +42,22 @@ pub enum RoutingDecision {
     NATByTUN(SocketAddr),
     /// Direct connection to the given address
     Direct(SocketAddr),
+    Drop(DropReason),
+    // ::File can be converted to ::Proxy where ::File is represented as ProxyID::for_file(path.as_path()),
+    File(PathBuf),
+    HostOverProxy(String),
+    SocketOverProxy(SocketAddr),
+}
+
+/// Result of routing decision — always carries a concrete target when proxying
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RoutingResovled {
+    /// Warning: the connection is made by TUN process, which exists in SRC NS
+    NATByTUN(SocketAddr),
+    /// Direct connection to the given address
+    Direct(SocketAddr),
     /// Route through a specific proxy identified in the UplinkHub, including full target info
-    Proxy {
+    ProxyResovled {
         target: WireAddress,
         id: ProxyID,
     },
@@ -47,7 +67,7 @@ pub enum RoutingDecision {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DropReason {
     MaxRetry,
-    Preprocess
+    Preprocess,
 }
 
 #[derive(Hash, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::Result;
-use nsproxy_common::routing::RoutingDecision;
+use nsproxy_common::routing::RoutingResovled;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -75,7 +75,7 @@ pub enum DiagEvent {
     Route {
         id: ConnId,
         ts: Timestamp,
-        route: RoutingDecision,
+        route: RoutingResovled,
     },
     /// Connection to the proxy/remote server established.
     Connected {

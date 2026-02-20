@@ -29,6 +29,7 @@ use hardware_address::MacAddr;
 use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
 use nix::{
+    mount::{MsFlags, mount as nix_mount},
     sched::{CloneFlags, unshare},
     unistd::{Gid, Pid, Uid, chown, getresgid, getresuid},
 };
@@ -36,16 +37,20 @@ use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
 use nsproxy_core::{
     BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
-    TemplateConfig, RootfsMode, TunMaker,
-    cmd_common::{apply_ns_env, check_proxy_mode, check_wrap, enter_ns, read_ns_alive, read_ns_alive_opt, report_clone3_err},
+    SandboxMode, TemplateConfig, TunMaker,
+    cmd_common::{
+        apply_ns_env, check_proxy_mode, enter_ns, read_ns_alive, read_ns_alive_opt,
+        report_clone3_err,
+    },
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     hot_reload::{VethIps, sync_links, watch_hot},
     sandbox::{apply_chmod, apply_mounts},
     shell::{ShellArgs, ShellPrefs},
     state_paths,
     sys::{
-        Clone3Result, NSEnter, check_selfns, enable_ping_all, mount_bind, mount_bind_ro_explicit,
-        mount_bind_root, mount_bind_rw_explicit, mount_ns, mount_tmpfs, pivot_root_into, rm_mount,
+        Clone3Result, NSEnter, check_capsys, check_selfns, enable_ping_all, mount_bind,
+        mount_bind_ro_explicit, mount_bind_root, mount_bind_rw_explicit, mount_ns,
+        mount_nsswitch_conf, mount_resolv_conf, mount_tmpfs, pivot_root_into, rm_mount,
     },
     tokio_netlink_conn,
     utils::ToExactNs,
@@ -95,7 +100,7 @@ use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use tun2socks5::{
     ArgMode, IArgs, VirtDNSChange, aok, diag,
-    dns::{TUNResponse, VirtDNSHandle},
+    dns::VirtDNSHandle,
     flume,
     ipstack::stream::{IpStackStream, IpStackTcpStream},
     tun_rs::AsyncDevice,
@@ -149,47 +154,6 @@ fn main() -> anyhow::Result<()> {
                 aok!()
             })?;
         }
-        MainCommand::Run {
-            src,
-            dst,
-            tun: proxy,
-            veth,
-            keep,
-            all,
-            default,
-            no_default,
-            log,
-            bind: mut mount,
-            sargs,
-            name,
-            profile,
-            mnt,
-            binds,
-            no_proxy,
-        } => cmd_run(
-            &mut cli.conf,
-            cli.no_wrap_check,
-            src,
-            dst,
-            proxy,
-            veth,
-            keep,
-            all,
-            default,
-            no_default,
-            log,
-            mount,
-            sargs,
-            name,
-            profile,
-            mnt,
-            binds,
-            no_proxy,
-            &mut |level| {
-                reload_handle.modify(|k| *k.filter_mut() = level)?;
-                Ok(())
-            },
-        )?,
         MainCommand::Rm { file } => {
             rm_mount(&file)?;
         }
@@ -229,6 +193,16 @@ fn main() -> anyhow::Result<()> {
                             );
                         }
                     }
+
+                    let mnt = sandbox::assert_mount_ns_isolated();
+                    println!(
+                        "mount namespace is {}",
+                        if mnt.is_ok() {
+                            "isolated"
+                        } else {
+                            "not isolated"
+                        }
+                    );
                 }
             }
         }
@@ -364,76 +338,6 @@ fn main() -> anyhow::Result<()> {
                     warn!("v_out removed");
                     aok!(())
                 })?;
-            }
-        }
-        MainCommand::Wrap { undo, add } => {
-            let mut config = WrappedBinariesConfig::load()?;
-            config.update_nswrap_hash()?;
-            if let Some(name) = add {
-                if undo {
-                    info!("not supported");
-                    exit(0);
-                }
-                let resolved = config.add_binary(&name)?;
-                println!("Added {:?} to wrapped binaries config", resolved);
-                config.save()?;
-                return Ok(());
-            } else {
-                if undo {
-                    info!("Unwrapping all configured binaries...");
-                    config.unwrap_all()?;
-                } else {
-                    info!("Wrapping all configured binaries...");
-                    config.wrap_all()?;
-                }
-            }
-        }
-        MainCommand::Wrapped => {
-            let config = WrappedBinariesConfig::load()?;
-            let wrapped_config_path = state_paths::wrapped_binaries_config();
-
-            println!("Wrapped Binaries Configuration");
-            println!("================================");
-            println!("Config file: {}", wrapped_config_path.display());
-            println!();
-
-            if config.binaries.is_empty() {
-                println!("No binaries configured for wrapping.");
-                println!();
-                println!(
-                    "Edit {} to add binaries (absolute paths).",
-                    wrapped_config_path.display()
-                );
-                return Ok(());
-            }
-
-            println!("Configured binaries ({}):", config.binaries.len());
-
-            // Get cached hash
-            let nswrap_hash = if let Some(ref hash) = config.nswrap_hash {
-                println!("Cached nswrap hash: {}", hash);
-                println!();
-                Some(hash.clone())
-            } else {
-                println!("No cached hash found. Run 'sp wrap' to initialize.");
-                println!();
-                None
-            };
-
-            for binary_path in &config.binaries {
-                if let Some(ref expected_hash) = nswrap_hash {
-                    match config.check_single_wrapped(binary_path, expected_hash) {
-                        Ok(_) => println!("  ✓ {:?}", binary_path),
-                        Err(e) => println!("  ✗ {:?} - {}", binary_path, e),
-                    }
-                } else {
-                    let wrapped_path = binary_path.with_extension("wrapped");
-                    if wrapped_path.exists() {
-                        println!("  ? {:?} (cannot verify)", binary_path);
-                    } else {
-                        println!("  ✗ {:?} (not wrapped)", binary_path);
-                    }
-                }
             }
         }
         MainCommand::Gen { save_to } => {
@@ -777,8 +681,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
         MainCommand::Up { profile } => {
-            check_wrap(false)?;
-
             let profile_path = state_paths::profile_config(&profile);
             if !profile_path.exists() {
                 bail!(
@@ -816,7 +718,13 @@ fn main() -> anyhow::Result<()> {
                         let mut buf = [0; 1];
                         enable_ping_all()?;
                         tx.read(&mut buf)?; // wait for bind mount
+
+                        // always done when there is new mount namespace
                         mount_bind_root()?;
+                        // mounting DNS related things is also basic to either overlay or pivot sandbox
+                        mount_resolv_conf("100.68.0.2")?;
+                        mount_nsswitch_conf()?;
+
                         loop {
                             std::thread::park();
                         }
@@ -824,7 +732,9 @@ fn main() -> anyhow::Result<()> {
                     Clone3Result::Parent {
                         child_pid, mut tx, ..
                     } => {
-                        std::fs::create_dir_all(RUNTIME_ROOT)?;
+                        if let Some(parent) = bind_mount.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
                         let path = format!("/proc/{}/ns/net", child_pid);
                         let path = PathBuf::from(path);
                         mount_ns(&path, &bind_mount)?;
@@ -848,6 +758,47 @@ fn main() -> anyhow::Result<()> {
                 },
                 Err(er) => report_clone3_err(&er)?,
             }
+        }
+        MainCommand::Down { profile } => {
+            let ns_meta = state_paths::profile_ns_meta(&profile);
+            let bind_mount = state_paths::profile_netns_bind(&profile);
+
+            // Kill the keeper process if we know its PID.
+            if ns_meta.exists() {
+                if let Ok(content) = std::fs::read_to_string(&ns_meta) {
+                    if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
+                        if let Some(pid) = ns_alive.child_pid {
+                            let proc_path = PathBuf::from("/proc").join(pid.to_string());
+                            if proc_path.exists() {
+                                warn!("killing keeper process pid={}", pid);
+                                let _ = nix::sys::signal::kill(
+                                    nix::unistd::Pid::from_raw(pid as i32),
+                                    nix::sys::signal::Signal::SIGKILL,
+                                );
+                            } else {
+                                info!("keeper process pid={} is already gone", pid);
+                            }
+                        }
+                    }
+                }
+                std::fs::remove_file(&ns_meta)?;
+                info!("removed NS metadata {:?}", ns_meta);
+            } else {
+                warn!("no NS metadata found at {:?}", ns_meta);
+            }
+
+            // Unmount and remove the bind-mount file.
+            if bind_mount.exists() {
+                if let Err(e) = rm_mount(&bind_mount) {
+                    warn!("failed to remove bind mount {:?}: {:?}", bind_mount, e);
+                } else {
+                    info!("removed bind mount {:?}", bind_mount);
+                }
+            } else {
+                warn!("bind mount {:?} does not exist, nothing to unmount", bind_mount);
+            }
+
+            warn!("profile '{}' is down", profile);
         }
         MainCommand::Serve {
             profile,
@@ -875,8 +826,6 @@ fn main() -> anyhow::Result<()> {
             veth_name,
             log,
         } => {
-            check_wrap(false)?;
-
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let ns_alive = read_ns_alive(&ns_meta)?;
 
@@ -1032,383 +981,113 @@ fn main() -> anyhow::Result<()> {
             println!("{}", tree.render_tree());
         }
         MainCommand::Uplink { kind } => cmd_uplink(kind)?,
-        _ => unimplemented!(),
-    }
+        MainCommand::Sandbox { profile, sargs } => {
+            // Pivot-root sandbox: enter an existing namespace, apply
+            // TemplateConfig pivot, then watch HotConfig for mount changes.
+            check_capsys()?;
 
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_run(
-    conf: &mut Option<PathBuf>,
-    no_wrap_check: bool,
-    _src: NsInput,
-    dst: NsInput,
-    proxy: IArgs,
-    veth: bool,
-    _keep: bool,
-    _all: bool,
-    default: bool,
-    no_default: bool,
-    log: Option<LevelFilter>,
-    mut mount: Option<PathBuf>,
-    sargs: ShellArgs,
-    name: Option<String>,
-    profile: Option<String>,
-    mnt: bool,
-    mut binds: bool,
-    no_proxy: bool,
-    set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
-) -> Result<()> {
-    check_wrap(no_wrap_check)?;
-
-    let mut iargs = proxy;
-    check_proxy_mode(iargs.proxy.is_some(), no_proxy)?;
-
-    let mtu = 1500;
-    let tun_name = "tun2".to_owned();
-    let proc = procfs::process::Process::myself()?;
-    let ns = proc.namespaces()?;
-    let self_net = ns.0.get(OsStr::new("net")).unwrap();
-    let _self_netns = self_net.clone().to_exactns();
-    let dst_ns = try_resolve_nsinput(dst.clone())?;
-    let mut shell_prefs = ShellPrefs::default();
-    shell_prefs.take_args(sargs);
-    shell_prefs.adjust();
-    shell_prefs.set_nsproxy_env(profile.clone());
-    let _ns_moved = [0; 1];
-
-    let tun_name = iargs.tun_name.unwrap_or(tun_name.clone());
-    iargs.tun_name = Some(tun_name.clone());
-    let vname = name.clone().unwrap_or("v".to_owned());
-    let v_in = format!("{vname}_in");
-    let v_out = format!("{vname}_out");
-    let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
-    let host_bits = 2;
-    let subnet_prefix = 32 - host_bits;
-
-    mount = args_deduce_mount(&name, &mount);
-    if let Some(mount) = &mount {
-        shell_prefs.set_ns_env(Some(mount.to_str().unwrap()));
-    } else {
-        shell_prefs.set_ns_env(None);
-    }
-
-    if conf.is_none() {
-        warn!("Live config is not specified. Use sp -c ./nsproxy.json run");
-        if let Some(p) = &profile {
-            let conf_path = PathBuf::from(".").join(p).with_extension("json");
-            if conf_path.exists() {
-                *conf = Some(conf_path);
-                warn!("config file defaults to {:?}", conf);
-            } else {
-                warn!("config file defaults to {:?} but its not found", &conf_path);
+            let profile_path = state_paths::profile_config(&profile);
+            if !profile_path.exists() {
+                bail!(
+                    "profile config does not exist: {:?}. Use 'profile' subcommand to create it.",
+                    profile_path
+                );
             }
-        }
-    }
+            let mut profile_conf = TemplateConfig::load(&profile_path)?;
+            let instance_root = state_paths::profile_dir(&profile);
+            profile_conf.expand_placeholders(&instance_root);
 
-    if !mnt {
-        warn!(
-            "Not directed to use a new mount namespace. Mounts will operate on root namespace. Use --mnt"
-        );
-    }
-    if mnt {
-        binds = true;
-    }
+            let ns_meta = state_paths::profile_ns_meta(&profile);
+            let ns_alive = read_ns_alive(&ns_meta)?;
+            let bind_mount = state_paths::profile_netns_bind(&profile);
 
-    if dst == NsInput::This {
-        if iargs.proxy.is_some() {
-            let tun = TunMaker::default();
-            let mut state = tun.make()?;
-            state.sync_basic()?;
-            return Ok(());
-        }
+            // Enter the existing mount namespace.
+            enter_ns(&ns_alive, &bind_mount)?;
 
-        warn!("netns did not change");
-        let clone = shell_prefs.spawn()?;
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
-        rt.block_on(async { clone.wait_for_child().await })?;
-        warn!("exit");
-        return Ok(());
-    }
+            // Rigorous safety check: refuse to proceed if we're still in
+            // the host mount namespace. This prevents corrupting the host.
+            nsproxy_core::sandbox::assert_mount_ns_isolated()?;
 
-    let clone = nsproxy_core::sys::clone3::<true>(mnt, false);
-    match clone {
-        Ok(clone) => match clone {
-            Clone3Result::IsChild { mut tx } => {
-                let mut buf = [0; 8];
+            // Check if a previous sandbox is already in place (restart case).
+            let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state()?;
 
-                if let Some(dst) = dst_ns {
-                    dst.enter(CloneFlags::CLONE_NEWNET)?;
+            // Determine before consuming sandbox_state whether a pivot root will be/was applied.
+            // Hot mounts applied after a pivot must resolve source paths through /pivot (the old root).
+            let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
+            let pivoted =
+                matches!(
+                    sandbox_state,
+                    nsproxy_core::sandbox::SandboxState::AlreadyPivoted
+                ) || (matches!(sandbox_state, nsproxy_core::sandbox::SandboxState::Virgin)
+                    && is_pivot_mode);
+
+            match sandbox_state {
+                nsproxy_core::sandbox::SandboxState::AlreadyPivoted => {
+                    info!("sandbox already applied, skipping pivot");
                 }
-                if dst != NsInput::New {
-                    bail!("unexpected {:?}", &dst);
-                }
-                enable_ping_all()?;
-
-                let mut tun = TunMaker::default();
-                tun.name = tun_name.clone();
-                tun.mtu = mtu;
-                let mut tun_state = tun.make()?;
-                tun_state.sync_basic()?;
-                let dev = Arc::into_inner(tun_state.fd.unwrap()).unwrap();
-                let raw = dev.as_raw_fd();
-
-                info!("send TUN fd");
-                tx.send_fd(raw)?;
-                drop(dev);
-
-                tx.read(&mut buf)?;
-                if mnt {
-                    mount_bind_root()?;
-                    tx.write(&[0])?;
-                }
-
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(async {
-                    use tokio::io::AsyncReadExt;
-                    use tokio_send_fd::SendFd;
-
-                    let mut read = [0u8; 4];
-                    tx.set_nonblocking(true)?;
-                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
-                    let add_default =
-                        (dst == NsInput::New && !no_default) || (dst == NsInput::This && default);
-
-                    let nl = tokio_netlink_conn()?;
-                    nl.up_lo().await?;
-
-                    if add_default {
-                        warn!("adding TUN as default route");
-                        nl.ip_add_default_route(tun_state.dev_index).await?;
+                nsproxy_core::sandbox::SandboxState::Virgin => {
+                    if is_pivot_mode {
+                        // Build and pivot into the sandbox root.
+                        nsproxy_core::sandbox::apply_pivot(&profile_conf, &profile)?;
                     }
-                    if veth {
-                        tx.read(&mut read).await;
-                        let ip = veth_addr_for(Ipv4Addr::from_octets(read), host_bits, false);
-
-                        let dev = nl.fetch_link_by_name(v_in).await?;
-                        nl.address()
-                            .add(dev.header.index, ip.into(), subnet_prefix)
-                            .execute()
-                            .await?;
-
-                        nl.link()
-                            .set(
-                                LinkMessageBuilder::<LinkUnspec>::default()
-                                    .index(dev.header.index)
-                                    .up()
-                                    .build(),
-                            )
-                            .execute()
-                            .await?;
-                    }
-
-                    let conf = conf.clone();
-                    tokio::spawn(async move {
-                        if let Some(conf) = conf {
-                            let mut mnt: HashMap<PathBuf, PathBuf> = Default::default();
-                            let mut read = [0u8; 24];
-                            loop {
-                                info!("in-ns wait for config");
-                                let k = tx.read(&mut read[..]).await?;
-                                if k < 1 {
-                                    error!("in-ns config watcher exits due to EOF");
-                                    break;
-                                }
-                                info!("in-ns reload config");
-                                let fc = tokio::fs::read_to_string(&conf).await?;
-                                match serde_json::from_str::<HotConfig>(&fc) {
-                                    Ok(newconf) => {
-                                        for (s, t) in mnt.clone() {
-                                            if newconf.mnt.get(&s).is_none() {
-                                                rm_mount(&t);
-                                                mnt.remove(&s);
-                                            }
-                                        }
-
-                                        if binds {
-                                            for (s, t) in newconf.mnt.clone() {
-                                                if let Some(current) = mnt.get(&s)
-                                                    && current == &t
-                                                {
-                                                } else {
-                                                    let x = mount_bind(&s, &t);
-                                                    if let Err(e) = x {
-                                                        error!("Bind mount {:?}", &e);
-                                                    }
-                                                    mnt.insert(s, t);
-                                                }
-                                            }
-                                        }
-
-                                        tx.write(&[0, 0, 0, 0]).await?;
-                                        for (in_port, _dst) in &newconf.locals {
-                                            let bind = std::net::TcpListener::bind(format!(
-                                                "127.0.0.1:{}",
-                                                in_port
-                                            ))?;
-                                            let raw = bind.as_raw_fd();
-                                            tx.write(&in_port.to_le_bytes()).await?;
-                                            tx.send_fd(raw).await?;
-                                        }
-                                        tx.write(&[0, 0, 0, 0]).await?;
-
-                                        let _ = sync_links(None, &newconf).await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        aok!()
-                    });
-
-                    let clone = shell_prefs.spawn()?;
-                    clone.wait_for_child().await?;
-
-                    exit(0);
-                    aok!()
-                })?;
+                }
             }
-            Clone3Result::Parent {
-                child_pid,
-                child_pidfd,
-                mut tx,
-            } => {
-                info!("recved fd");
-                let dev = tx.recv_fd()?;
-                let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
 
-                if let Some(mount) = mount {
-                    std::fs::create_dir_all(RUNTIME_ROOT)?;
+            // Resolve the hot config path (already expanded).
+            let hot_path = profile_conf.hot.clone();
 
-                    let path = format!("/proc/{}/ns/net", child_pid);
-                    let path = PathBuf::from(path);
-                    mount_ns(&path, &mount)?;
-
-                    let ns_alive = nsproxy_core::NsAlive {
-                        browser_profile: profile.clone(),
-                        bind_mount: mount.clone(),
-                        child_pid: Some(child_pid as u32),
-                    };
-                    let json = serde_json::to_string_pretty(&ns_alive)?;
-                    let jsonpath = state_paths::metadata_for_bind(&mount);
-                    info!(
-                        "Writing NS metadata to {:?} ({} bytes)",
-                        &jsonpath,
-                        json.len()
-                    );
-                    std::fs::write(&jsonpath, json)?;
-                    warn!("Auxiliary data written to {:?}", &jsonpath);
-                    tx.write(&[0]);
-
-                    if mnt {
-                        let mut buf = [0; 1];
-                        tx.read(&mut buf);
-                    }
+            // After a pivot the process root is the new tmpfs root; the old host
+            // filesystem is accessible at /pivot.  Source paths in hot mounts are
+            // host paths, so we must chroot them to /pivot when in pivot mode.
+            let hot_vars = {
+                let base = nsproxy_core::PathExpansionState::for_instance(&instance_root);
+                if pivoted {
+                    base.with_src_chroot(std::path::Path::new("/pivot"))
                 } else {
-                    warn!("not mounting this namespace");
+                    base
                 }
+            };
+            if hot_path.exists() {
+                let fc = std::fs::read_to_string(&hot_path)?;
+                if let Ok(mut hot) = serde_json::from_str::<HotConfig>(&fc) {
+                    hot.expand_with(&hot_vars);
+                    if let Ok(mounts) = hot.merged_mounts() {
+                        if !mounts.is_empty() {
+                            nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
+                        }
+                    }
+                }
+            }
 
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                if let Some(log) = log {
-                    set_log(log)?;
-                }
-                rt.spawn(async move {
-                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
-                    let _ = fd.into_future().await?;
-                    warn!("Shell has exited but nsproxy is still running. Press CtrlC to exit.");
-                    aok!()
+            let mut shell_prefs = ShellPrefs::default();
+            shell_prefs.take_args(sargs);
+            if profile_conf.sargs.shell.is_some() {
+                shell_prefs.take_args(profile_conf.sargs.clone());
+            }
+            apply_ns_env(&mut shell_prefs, &ns_alive);
+            shell_prefs.adjust()?;
+
+            // Spawn shell and watch hot config for mount changes.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let child = shell_prefs.spawn()?;
+
+                // Watch hot config for changes in a background task.
+                let hot_watch_path = hot_path.clone();
+                let hot_watch_vars = hot_vars.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = watch_hot_mounts(&hot_watch_path, hot_watch_vars).await {
+                        warn!("hot config watcher exited: {}", e);
+                    }
                 });
 
-                let mut vethips = None;
-
-                rt.block_on(async move {
-                    use tokio::io::AsyncWriteExt;
-
-                    let nl = tokio_netlink_conn()?;
-                    tx.set_nonblocking(true)?;
-                    let mut tx = tokio::net::UnixStream::from_std(tx)?;
-                    if veth {
-                        info!("attempting to add veths named, {}, {}", &v_out, &v_in);
-                        let addrs = nl.fetch_all_ip_addrs().await?;
-                        let ips: Vec<_> = addrs
-                            .iter()
-                            .filter_map(|f| match f {
-                                IpNetwork::V4(v4) => Some(v4.ip()),
-                                _ => None,
-                            })
-                            .collect();
-
-                        let v1: Option<Ipv4Addr> = find_vacant_ipv4_subnet(ips, veth_net, host_bits);
-                        if let Some(subnet) = v1 {
-                            vethips = Some(VethIps {
-                                vout: veth_addr_for(subnet, host_bits, true),
-                                vin: veth_addr_for(subnet, host_bits, false),
-                            });
-                            nl.add_veth(&v_out, &v_in).await;
-                            let vin = nl.fetch_link_by_name(v_in.clone()).await?;
-                            let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
-                                .index(vin.header.index)
-                                .setns_by_pid(child_pid as u32);
-                            nl.link().set(msg.build()).execute().await;
-                            tx.write(subnet.as_octets()).await?;
-
-                            let vout = nl.fetch_link_by_name(v_out.clone()).await?;
-                            nl.address()
-                                .add(
-                                    vout.header.index,
-                                    veth_addr_for(subnet, host_bits, true).into(),
-                                    subnet_prefix,
-                                )
-                                .execute()
-                                .await?;
-                            nl.link()
-                                .set(
-                                    LinkMessageBuilder::<LinkUnspec>::default()
-                                        .index(vout.header.index)
-                                        .up()
-                                        .build(),
-                                )
-                                .execute()
-                                .await?;
-                        } else {
-                            tracing::error!("cannot find any vacant ip");
-                        }
-                    }
-
-                    let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
-                    let (st_sx, acceptor) = flume::unbounded();
-
-                    let conf = conf.clone();
-                    tokio::spawn(async move {
-                        let x = watch_hot(
-                            vdns_rx,
-                            conf,
-                            acceptor,
-                            child_pid as u32,
-                            tx,
-                            vethips,
-                        )
-                        .await;
-                        warn!("out-ns, watcher exited {:?}", x);
-                    });
-
-                    tun2socks5::main_entry(dev, mtu, false, iargs, vdns_sx.clone(), st_sx)
-                        .await?;
-                    warn!("tun exited");
-                    let _ = vdns_sx.send(None).await;
-
-                    std::future::pending::<()>().await;
-                    aok!()
-                })?;
-            }
-        },
-        Err(er) => report_clone3_err(&er)?,
+                child.wait_for_child().await?;
+                aok!()
+            })?;
+        }
+        _ => unimplemented!(),
     }
 
     Ok(())
@@ -1525,26 +1204,6 @@ fn cmd_serve(
                                 let fc = tokio::fs::read_to_string(&conf).await?;
                                 match serde_json::from_str::<HotConfig>(&fc) {
                                     Ok(newconf) => {
-                                        for (s, t) in mnt.clone() {
-                                            if newconf.mnt.get(&s).is_none() {
-                                                rm_mount(&t);
-                                                mnt.remove(&s);
-                                            }
-                                        }
-
-                                        for (s, t) in newconf.mnt.clone() {
-                                            if let Some(current) = mnt.get(&s)
-                                                && current == &t
-                                            {
-                                            } else {
-                                                let x = mount_bind(&s, &t);
-                                                if let Err(e) = x {
-                                                    error!("Bind mount {:?}", &e);
-                                                }
-                                                mnt.insert(s, t);
-                                            }
-                                        }
-
                                         tx.write(&[0, 0, 0, 0]).await?;
                                         for (in_port, _dst) in &newconf.locals {
                                             let bind = std::net::TcpListener::bind(format!(
@@ -1630,7 +1289,7 @@ fn cmd_serve(
                     } else {
                         initial_hot
                     };
-                    
+
                     let shared_hot = Arc::new(tokio::sync::RwLock::new(initial_hot));
 
                     let hub = load_saved_uplink_hub()?;
@@ -1651,11 +1310,9 @@ fn cmd_serve(
                     if let Some(nym) = simple {
                         let proxy_id = {
                             let uplink = router.uplink().await;
-                            uplink
-                                .nym_map
-                                .get(&nym)
-                                .cloned()
-                                .ok_or_else(|| anyhow!("Simple route proxy not found for nym {}", nym))?
+                            uplink.nym_map.get(&nym).cloned().ok_or_else(|| {
+                                anyhow!("Simple route proxy not found for nym {}", nym)
+                            })?
                         };
 
                         router
@@ -1759,6 +1416,76 @@ where
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Watch a HotConfig JSON file for changes and apply mount operations.
+///
+/// Runs in a loop, re-reading the file on each data-modify event,
+/// and applying any new `mnt` / `mounts` entries.
+async fn watch_hot_mounts(hot_path: &Path, vars: nsproxy_core::PathExpansionState) -> Result<()> {
+    if !hot_path.exists() {
+        info!("hot config {:?} does not exist, skipping watcher", hot_path);
+        return Ok(());
+    }
+
+    let (mut watcher, mut rx) = {
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        let watcher = RecommendedWatcher::new(
+            move |res: std::result::Result<Event, notify::Error>| {
+                if let Ok(res) = res {
+                    if matches!(res.kind, EventKind::Modify(ModifyKind::Data(_))) {
+                        let _ = tx.try_send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        )?;
+        (watcher, rx)
+    };
+
+    watcher.watch(hot_path, notify::RecursiveMode::NonRecursive)?;
+    info!("watching hot config {:?} for mount changes", hot_path);
+
+    let mut prev_hot: Option<HotConfig> = None;
+
+    while let Some(()) = rx.recv().await {
+        let fc = match tokio::fs::read_to_string(hot_path).await {
+            Ok(fc) => fc,
+            Err(e) => {
+                warn!("failed to read hot config: {}", e);
+                continue;
+            }
+        };
+        let mut hot: HotConfig = match serde_json::from_str(&fc) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("failed to parse hot config: {}", e);
+                continue;
+            }
+        };
+
+        hot.expand_with(&vars);
+
+        if prev_hot.as_ref() == Some(&hot) {
+            continue;
+        }
+
+        info!("hot config changed, applying mount updates");
+        match hot.merged_mounts() {
+            Ok(mounts) => {
+                if !mounts.is_empty() {
+                    if let Err(e) = nsproxy_core::sandbox::apply_mounts(&vars, &mounts) {
+                        warn!("failed to apply hot mounts: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("failed to merge hot mounts: {}", e),
+        }
+
+        prev_hot = Some(hot);
     }
 
     Ok(())

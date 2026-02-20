@@ -1,11 +1,6 @@
 {
   "schema": 1,
-  "rootfs": {
-    "mode": "Overlay",
-    "root": "/",
-    "put_old": null,
-    "tmpfs": false
-  },
+  "sandbox_mode": "Overlay",
   "mounts": [
     {
       "source": "@/.config/Code - Insiders",

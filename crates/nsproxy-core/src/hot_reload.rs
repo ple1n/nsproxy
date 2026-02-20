@@ -20,7 +20,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use tun2socks5::{
-    dns::{TUNResponse, VirtDNSHandle},
+    dns::{VirtDNSHandle},
     flume,
     ipstack::stream::IpStackTcpStream,
 };
@@ -30,6 +30,7 @@ use crate::{
     HotConfig,
     tokio_netlink_conn,
 };
+use nsproxy_common::routing::{DropReason, RoutingDecision};
 
 fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
     let (mut tx, rx) = tokio::sync::mpsc::channel(1);
@@ -147,12 +148,12 @@ pub async fn watch_hot(
         vdns.pin(
             Some(veth.vout),
             "veth.host.".to_owned(),
-            TUNResponse::Unreachable,
+            RoutingDecision::Drop(DropReason::Preprocess),
         );
         vdns.pin(
             Some(veth.vin),
             "veth.peer.".to_owned(),
-            TUNResponse::Unreachable,
+            RoutingDecision::Drop(DropReason::Preprocess),
         );
     }
 
@@ -188,7 +189,7 @@ pub async fn watch_hot(
 
                         if let Some(vdns) = &vdns {
                             for (domain, ip) in newconf.dns {
-                                let target = TUNResponse::Unreachable;
+                                let target = RoutingDecision::Drop(DropReason::Preprocess);
                                 if let Ok(addr) = ip.parse::<Ipv4Addr>() {
                                     info!("DNS {} -> {}", &domain, addr);
                                     vdns.pin(Some(addr), domain, target)?;
@@ -200,7 +201,7 @@ pub async fn watch_hot(
                                     Value::String(mapstr) => {
                                         if let Ok(addr) = mapstr.parse::<SocketAddr>() {
                                             info!("NAT-out {} -> {}", &domain, addr);
-                                            let target = TUNResponse::NATByTUN(addr);
+                                            let target = RoutingDecision::NATByTUN(addr);
                                             vdns.pin(None, domain, target)?;
                                         } else if let Ok(path) = mapstr.parse::<PathBuf>() {
                                             info!("Files {} -> {}", &domain, mapstr);
@@ -219,7 +220,7 @@ pub async fn watch_hot(
                                                     e.get_mut().marked = true;
                                                 }
                                             }
-                                            let target = TUNResponse::Files(path);
+                                            let target = RoutingDecision::File(path);
                                             vdns.pin(None, domain, target)?;
                                         }
                                     }
@@ -228,7 +229,7 @@ pub async fn watch_hot(
                                         let p: u16 = p.try_into()?;
                                         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, p).into();
                                         info!("NAT-out {} -> {}", &domain, addr);
-                                        let target = TUNResponse::NATByTUN(addr);
+                                        let target = RoutingDecision::NATByTUN(addr);
                                         vdns.pin(None, domain, target)?;
                                     }
                                     _ => {}
