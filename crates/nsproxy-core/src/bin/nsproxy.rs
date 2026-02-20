@@ -1014,12 +1014,6 @@ fn main() -> anyhow::Result<()> {
             // Determine before consuming sandbox_state whether a pivot root will be/was applied.
             // Hot mounts applied after a pivot must resolve source paths through /pivot (the old root).
             let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
-            let pivoted =
-                matches!(
-                    sandbox_state,
-                    nsproxy_core::sandbox::SandboxState::AlreadyPivoted
-                ) || (matches!(sandbox_state, nsproxy_core::sandbox::SandboxState::Virgin)
-                    && is_pivot_mode);
 
             match sandbox_state {
                 nsproxy_core::sandbox::SandboxState::AlreadyPivoted => {
@@ -1041,7 +1035,7 @@ fn main() -> anyhow::Result<()> {
             // host paths, so we must chroot them to /pivot when in pivot mode.
             let hot_vars = {
                 let base = nsproxy_core::PathExpansionState::for_instance(&instance_root);
-                if pivoted {
+                if is_pivot_mode {
                     base.with_src_chroot(std::path::Path::new("/pivot"))
                 } else {
                     base
