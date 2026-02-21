@@ -34,6 +34,8 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
         UplinkCommand::Instance { name, cmd } => cmd_instance(name, cmd),
         UplinkCommand::Remote { cmd } => cmd_remote(cmd),
         UplinkCommand::Stats => cmd_stats(),
+        UplinkCommand::Export { path } => cmd_export(path),
+        UplinkCommand::Import { path } => cmd_import(path),
     }
 }
 
@@ -874,4 +876,68 @@ async fn test_remote_socks5_udp(remote: &ArgProxy) {
             println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
         }
     }
+}
+
+fn cmd_export(path: std::path::PathBuf) -> Result<()> {
+    let mut hub = crate::uplink::UplinkHub::new();
+    hub.hydrate_from_persisted()
+        .context("Failed to load persisted uplink state")?;
+
+    let snapshot = hub.export();
+    let json = serde_json::to_string_pretty(&snapshot)
+        .context("Failed to serialize UplinkSnapshot")?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .context("Failed to create parent directory for export file")?;
+    }
+    std::fs::write(&path, &json)
+        .with_context(|| format!("Failed to write snapshot to {:?}", path))?;
+
+    let proxy_count = snapshot.remote_proxies.len()
+        + snapshot
+            .clash
+            .as_ref()
+            .map(|c| c.trojan_proxies.len())
+            .unwrap_or(0);
+    println!("✓ Exported uplink snapshot to {:?}", path);
+    println!("  proxy configs: {}", proxy_count);
+    println!("  stats entries: {}", snapshot.stats.len());
+    Ok(())
+}
+
+fn cmd_import(path: std::path::PathBuf) -> Result<()> {
+    let json = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read snapshot from {:?}", path))?;
+    let snapshot: crate::uplink::UplinkSnapshot =
+        serde_json::from_str(&json).context("Failed to parse UplinkSnapshot JSON")?;
+
+    // Persist each sub-state so subsequent commands see it.
+    use crate::state_blueprint::PersistentState;
+
+    if let Some(ref clash_state) = snapshot.clash {
+        clash_state
+            .save_atomic()
+            .context("Failed to persist Clash state from snapshot")?;
+        println!("  ✓ Clash state written");
+    }
+
+    let remote_state = crate::uplink::RemoteProxyState {
+        proxies: snapshot.remote_proxies.clone(),
+    };
+    remote_state
+        .save_atomic()
+        .context("Failed to persist remote proxy state from snapshot")?;
+    println!("  ✓ Remote proxy state written ({} proxies)", snapshot.remote_proxies.len());
+
+    let stats_state = crate::uplink::UplinkStatsState {
+        stats: snapshot.stats.clone(),
+    };
+    stats_state
+        .save_atomic()
+        .context("Failed to persist stats state from snapshot")?;
+    println!("  ✓ Stats written ({} entries)", snapshot.stats.len());
+
+    println!("✓ Import complete — run 'sp uplink clash resolve' to refresh proxy IPs if needed");
+    Ok(())
 }

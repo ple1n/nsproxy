@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::{Result, bail};
 use bytes::BytesMut;
-use diag::{ConnId, DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
+use diag::{ConnId, ControlCommand, DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
+use tokio::sync::mpsc;
 use futures::SinkExt;
 use ipstack::{
     IpStack, IpStackConfig, TUNDev,
@@ -105,6 +106,9 @@ pub struct Router {
     dns: VirtDNSAsync,
     /// Diagnostic monitoring server
     diag: DiagServer,
+    /// Receiver for control commands sent by connected EGUI clients.
+    /// Take with [`Router::take_cmd_rx`] to drive a command-handling loop.
+    pub cmd_rx: Option<mpsc::Receiver<ControlCommand>>,
     /// Channel for serving files over TCP
     file_server_tx: Option<flume::Sender<(PathBuf, IpStackTcpStream)>>,
     /// Explicit name mappings etc
@@ -158,6 +162,7 @@ impl Router {
             stack,
             dns,
             diag: DiagServer::noop(),
+            cmd_rx: None,
             file_server_tx,
             conf,
         })
@@ -168,12 +173,14 @@ impl Router {
         self.dns.handle.clone()
     }
 
-    /// Initialize diagnostic monitoring
+    /// Initialize diagnostic monitoring.
+    /// After calling this, use [`Router::take_cmd_rx`] to obtain the control-command receiver.
     pub async fn init_diag(&mut self, sock_path: &PathBuf) -> Result<()> {
         match DiagServer::start(sock_path.as_path()).await {
-            Ok(srv) => {
+            Ok((srv, cmd_rx)) => {
                 info!("diag server started at {:?}", sock_path);
                 self.diag = srv;
+                self.cmd_rx = Some(cmd_rx);
                 Ok(())
             }
             Err(e) => {
@@ -181,6 +188,12 @@ impl Router {
                 Ok(())
             }
         }
+    }
+
+    /// Take the control-command receiver out of the router.
+    /// Returns `None` if diag was not started or already taken.
+    pub fn take_cmd_rx(&mut self) -> Option<mpsc::Receiver<ControlCommand>> {
+        self.cmd_rx.take()
     }
 
     /// Get read access to the uplink hub for inspection
