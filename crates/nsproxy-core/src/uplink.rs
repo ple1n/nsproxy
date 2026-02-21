@@ -724,6 +724,61 @@ impl UplinkHub {
         Ok(count)
     }
 
+    /// Export a portable snapshot of all hub state that can be serialized to JSON.
+    ///
+    /// The routing function is excluded — it must be re-supplied on import.
+    pub fn export(&self) -> UplinkSnapshot {
+        let remote_proxies: Vec<ArgProxy> = self
+            .proxies
+            .values()
+            .filter_map(|p| {
+                if let UplinkProxy::Remote(arg) = p {
+                    Some(arg.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        UplinkSnapshot {
+            clash: self.clash.clone(),
+            remote_proxies,
+            stats: self
+                .stats
+                .iter()
+                .map(|(id, s)| (id.nym(), s.clone()))
+                .collect(),
+        }
+    }
+
+    /// Build an `UplinkHub` from a previously exported [`UplinkSnapshot`].
+    ///
+    /// All persisted sub-states (clash, remote proxies, stats) are applied in
+    /// memory.  The routing function defaults to the drop-all stub; callers
+    /// should call `set_routing` or `with_routing` afterwards.
+    pub fn from_snapshot(snapshot: UplinkSnapshot) -> Result<Self> {
+        let mut hub = Self::new();
+
+        if let Some(clash_state) = snapshot.clash {
+            hub.clash = Some(clash_state);
+        }
+
+        for proxy in snapshot.remote_proxies {
+            let id = ProxyID::for_remote(proxy.addr);
+            hub.add_proxy(id, UplinkProxy::Remote(proxy));
+        }
+
+        hub.load_clash_proxies()?;
+
+        for (nym, stats) in snapshot.stats {
+            if let Some(id) = hub.nym_map.get(&nym) {
+                hub.stats.entry(id.clone()).or_insert(stats);
+            }
+        }
+
+        Ok(hub)
+    }
+
     /// Load all Clash proxies from centralized clash state and add them to the hub
     pub fn load_clash_proxies(&mut self) -> Result<usize> {
         let clash_state = self.load_clash_state()?.clone();
@@ -773,6 +828,24 @@ impl std::fmt::Display for LinkStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UplinkStatsState {
     /// Maps proxy nym (short hex string) to its recorded stats.
+    pub stats: HashMap<ProxyNym, LinkStats>,
+}
+
+/// Portable, fully serializable snapshot of an `UplinkHub`.
+///
+/// Captures all the state that the hub is built from so it can be written to a
+/// single JSON file and later restored on another machine or after a reset.
+///
+/// The routing function is **not** included (it is code, not data).  When
+/// importing, callers should call `hydrate_from_persisted` or supply their own
+/// routing function with `UplinkHub::with_routing`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UplinkSnapshot {
+    /// Centralized Clash state (proxy configs, resolved IPs, …)
+    pub clash: Option<clash::ClashState>,
+    /// Saved remote proxies (SOCKS5 / HTTP, …)
+    pub remote_proxies: Vec<ArgProxy>,
+    /// Per-proxy link statistics keyed by nym
     pub stats: HashMap<ProxyNym, LinkStats>,
 }
 

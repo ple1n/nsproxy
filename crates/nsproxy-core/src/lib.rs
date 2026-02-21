@@ -1691,6 +1691,16 @@ pub enum UplinkCommand {
         cmd: RemoteOps,
     },
     Stats,
+    /// Export a portable snapshot of all uplink hub state to a JSON file
+    Export {
+        /// Path to write the snapshot JSON to
+        path: PathBuf,
+    },
+    /// Import uplink hub state from a previously exported snapshot JSON file
+    Import {
+        /// Path to the snapshot JSON file
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
