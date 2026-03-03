@@ -6,13 +6,15 @@ use std::{
         process::CommandExt,
         raw::{gid_t, uid_t},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
 use anyhow::{anyhow, bail};
+use nix::sched::CloneFlags;
 use nix::unistd::{Gid, chdir, execve, getegid, getresuid, setgroups, setresgid, setresuid};
 use nsproxy_common::UID_HINT_VAR;
+use nsproxy_common::NSSource;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
@@ -20,7 +22,7 @@ use uzers::{Group, os::unix::UserExt};
 use crate::{
     env::{CommandEnv, ENV_NS, ENV_PROFILE},
     prelude::*,
-    sys::{Clone3Result, clone3},
+    sys::{Clone3Result, NSEnter, clone3},
 };
 
 /// Dedicated to spawning a shell that maximally pleases the user
@@ -63,6 +65,9 @@ pub struct ShellArgs {
     /// You can override the entire vector.
     #[arg(long, value_delimiter = ',')]
     pub gids: Vec<u32>,
+    /// Command arguments (execve argv, excluding the program path)
+    #[arg(long, num_args = 1..)]
+    pub args: Vec<String>,
 }
 
 impl ShellPrefs {
@@ -81,6 +86,13 @@ impl ShellPrefs {
         }
         if !args.gids.is_empty() {
             self.gids_raw = args.gids.into_iter().collect();
+        }
+        if !args.args.is_empty() {
+            self.args = args
+                .args
+                .into_iter()
+                .map(|arg| CString::new(arg).unwrap())
+                .collect();
         }
     }
     /// Explicit environment with no inheritance
@@ -220,6 +232,11 @@ impl ShellPrefs {
             match &clone {
                 Clone3Result::IsChild { tx } => {
                     let cmd = CString::new(cmd.to_str().unwrap())?;
+                    if self.args.is_empty() {
+                        self.args.push(cmd.clone());
+                    } else if self.args.first().map(|c| c.as_c_str()) != Some(cmd.as_c_str()) {
+                        self.args.insert(0, cmd.clone());
+                    }
                     self.drop_privs()?;
 
                     if let Some(cwd) = &self.cwd {
@@ -235,6 +252,47 @@ impl ShellPrefs {
                     child_pidfd,
                     tx,
                 } => {}
+            }
+            Ok(clone)
+        } else {
+            bail!("no shell or program specified");
+        }
+    }
+
+    pub fn spawn_in_ns(mut self, ns_alive: &crate::NsAlive, fallback_netns: &Path) -> Result<Clone3Result> {
+        if let Some(name) = &self.prefer_shell {
+            self.shell = Some(which::which(name)?);
+        }
+        if let Some(cmd) = &self.shell {
+            let clone = clone3::<false>(false, false)?;
+            match &clone {
+                Clone3Result::IsChild { tx } => {
+                    if let Some(child_pid) = ns_alive.child_pid {
+                        let ns_source = nsproxy_common::NSSource::Pid(child_pid as i32);
+                        ns_source.enter(CloneFlags::CLONE_NEWNS)?;
+                        ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                    } else {
+                        let ns = nsproxy_common::NSSource::Path(fallback_netns.to_path_buf());
+                        ns.enter(CloneFlags::CLONE_NEWNET)?;
+                    }
+
+                    let cmd = CString::new(cmd.to_str().unwrap())?;
+                    if self.args.is_empty() {
+                        self.args.push(cmd.clone());
+                    } else if self.args.first().map(|c| c.as_c_str()) != Some(cmd.as_c_str()) {
+                        self.args.insert(0, cmd.clone());
+                    }
+                    self.drop_privs()?;
+
+                    if let Some(cwd) = &self.cwd {
+                        let _ = chdir(cwd);
+                    }
+
+                    execve(cmd.as_c_str(), &self.args, self.env.make_contiguous());
+                }
+                Clone3Result::Parent { child_pid, child_pidfd, tx } => {
+                    let _ = (child_pid, child_pidfd, tx);
+                }
             }
             Ok(clone)
         } else {

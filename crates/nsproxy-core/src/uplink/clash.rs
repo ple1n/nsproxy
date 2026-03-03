@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::ReadBuf;
@@ -24,7 +24,7 @@ use trojan_proto::{AddressRef, HostRef, write_request_header};
 use trust_dns_proto::op::{Message, Query};
 use trust_dns_proto::rr::{Name, RecordType};
 use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
-use tun2socks5::dns::{VIRT_IP, default_virtip};
+use tun2socks5::dns::{VIRT_IP6_NET, default_virtip6_net};
 // Shorter alias for the commonly used TLS stream type
 type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
@@ -612,6 +612,8 @@ pub struct ClashState {
     pub proxies: DomainsSolved,
     #[serde(default, with = "trojan_proxy_map_serde")]
     pub trojan_proxies: BTreeMap<ProxyID, TrojanConfig>,
+    #[serde(default)]
+    pub proxy_group: BTreeMap<ProxyID, HashSet<GroupId>>,
 }
 
 pub type DNSEndpoints = BTreeMap<DNSProtocol, DNSEndpoint>;
@@ -757,7 +759,7 @@ impl ClashState {
     }
 
     pub fn remove_private_ips(&mut self) {
-        let virt = default_virtip();
+        let virt = default_virtip6_net();
 
         let scrub = |domains: &mut DomainsSolved| {
             domains.retain(|_, responses| {
@@ -776,7 +778,7 @@ impl ClashState {
             scrub(&mut group.tier2_cache);
         }
 
-        info!("Removed virtual DNS IPs from clash state subnet={}", VIRT_IP);
+        info!("Removed virtual DNS IPs from clash state subnet={}", VIRT_IP6_NET);
     }
 
     pub fn append_profile_to_group(
@@ -847,15 +849,11 @@ impl ClashState {
     }
 
     fn update_cache_in_group(&mut self, group_id: &GroupId, host: &str, ips: BTreeSet<IpAddr>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         self.ensure_group_mut(group_id)
             .tier2_cache
             .entry(Domain::from(host))
-            .or_insert_with(BTreeMap::new)
-            .insert(now, DNSResponse { ips });
+            .or_default()
+            .insert(Timestamp::now(), DNSResponse { ips });
     }
 
     /// Return the newest cached tier2 nameserver-host resolution.
@@ -883,14 +881,10 @@ impl ClashState {
 
     /// Store latest resolved proxy-domain IPs in the centralized clash state.
     pub fn add_proxy_resolution(&mut self, domain: &str, ips: BTreeSet<IpAddr>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         self.proxies
             .entry(Domain::from(domain))
-            .or_insert_with(BTreeMap::new)
-            .insert(now, DNSResponse { ips });
+            .or_default()
+            .insert(Timestamp::now(), DNSResponse { ips });
     }
 
     /// Get latest resolved proxy-domain IPs from centralized clash state.

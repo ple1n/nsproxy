@@ -15,11 +15,12 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::Result;
-use nsproxy_common::routing::RoutingResovled;
+use nsproxy_common::routing::{ProxyID, RoutingResovled};
+pub use nsproxy_common::stats::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -32,20 +33,7 @@ pub mod summary;
 
 // ── Wire protocol types ──────────────────────────────────────────────
 
-/// Microsecond-precision wall-clock timestamp (µs since UNIX epoch).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(pub u64);
 
-impl Timestamp {
-    pub fn now() -> Self {
-        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        Self(d.as_micros() as u64)
-    }
-
-    pub fn elapsed_since(&self, earlier: &Timestamp) -> Duration {
-        Duration::from_micros(self.0.saturating_sub(earlier.0))
-    }
-}
 
 /// Unique connection identifier assigned in the accept loop.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -93,8 +81,8 @@ pub enum DiagEvent {
         id: ConnId,
         ts: Timestamp,
         error: Option<String>,
-        bytes_up: u64,
-        bytes_down: u64,
+        bytes_up: f32,
+        bytes_down: f32,
     },
     /// DNS resolution via VirtDNS.
     DnsResolved {
@@ -119,6 +107,36 @@ pub enum DiagEvent {
         id: ConnId,
         ts: Timestamp,
     },
+    /// HotConfig reload completed (from file watcher or direct request).
+    HotConfigReloaded {
+        ts: Timestamp,
+        ok: bool,
+        changed: bool,
+        source: String,
+        error: Option<String>,
+    },
+    /// Snapshot of the current HotConfig (JSON text) or the error reason.
+    HotConfigSnapshot {
+        ts: Timestamp,
+        ok: bool,
+        content: Option<String>,
+        error: Option<String>,
+    },
+    /// Current DNS state snapshot.
+    DnsState {
+        ts: Timestamp,
+        state: DnsState,
+    },
+    /// Current routing selection snapshot.
+    RoutingState {
+        ts: Timestamp,
+        state: RoutingState,
+    },
+    /// Per-proxy uplink stats snapshot.
+    UplinkStatsSnapshot {
+        ts: Timestamp,
+        stats: std::collections::HashMap<ProxyID, nsproxy_common::stats::ProxyStats>,
+    },
 }
 
 // ── Control commands (client → server) ─────────────────────────────
@@ -128,6 +146,41 @@ pub enum DiagEvent {
 pub enum ControlCommand {
     /// Reload all uplink proxy configurations.
     ReloadUplink,
+    /// Re-read hot.json from disk and apply it.
+    ReloadHotConfig,
+    /// Replace the active routing function with `simple_routing(proxy_id)`.
+    SetSimpleRouting {
+        proxy_id: nsproxy_common::routing::ProxyID,
+    },
+    /// Request current DNS state snapshot.
+    QueryDnsState,
+    /// Request current routing selection snapshot.
+    QueryRoutingState,
+    /// Request current hotconfig content snapshot.
+    QueryHotConfig,
+    /// Apply a new HotConfig JSON payload.
+    ApplyHotConfig {
+        content: String,
+    },
+    /// Request per-proxy uplink stats from the running hub.
+    QueryUplinkStats,
+    /// Clear all accumulated uplink stats data.
+    ClearStats,
+}
+
+/// Snapshot of DNS state derived from the VirtDNS handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsState {
+    pub aaaa_only: bool,
+    pub domain_count: usize,
+    pub ip4_count: usize,
+    pub ip6_count: usize,
+}
+
+/// Snapshot of current routing selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingState {
+    pub selected_proxy: Option<ProxyID>,
 }
 
 // ── Server (tun2socks5 side) ─────────────────────────────────────────
@@ -200,6 +253,8 @@ impl DiagServer {
     pub fn emit(&self, event: DiagEvent) {
         if let Ok(frame) = encode_frame(&event) {
             let _ = self.tx.send(Arc::new(frame));
+        } else {
+            warn!("diag: failed to encode event: {:?}", event);
         }
     }
 
@@ -316,6 +371,45 @@ impl DiagEventStream {
     }
 
     /// Send a [`ControlCommand`] to the server.
+    pub async fn send_cmd(&mut self, cmd: &ControlCommand) -> Result<()> {
+        let frame = encode_frame(cmd)?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Split the stream into independent reader and writer halves so both
+    /// directions can be used concurrently.
+    pub fn split(self) -> (DiagEventReader, DiagEventWriter) {
+        (
+            DiagEventReader {
+                read_half: self.read_half,
+            },
+            DiagEventWriter {
+                write_half: self.write_half,
+            },
+        )
+    }
+}
+
+/// Owned reader half of a diag connection.
+pub struct DiagEventReader {
+    read_half: tokio::net::unix::OwnedReadHalf,
+}
+
+impl DiagEventReader {
+    /// Read the next [`DiagEvent`] from the reader. Returns `None` on EOF.
+    pub async fn next(&mut self) -> Result<Option<DiagEvent>> {
+        read_frame(&mut self.read_half).await
+    }
+}
+
+/// Owned writer half of a diag connection.
+pub struct DiagEventWriter {
+    write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl DiagEventWriter {
+    /// Send a [`ControlCommand`] on the writer.
     pub async fn send_cmd(&mut self, cmd: &ControlCommand) -> Result<()> {
         let frame = encode_frame(cmd)?;
         self.write_half.write_all(&frame).await?;

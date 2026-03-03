@@ -36,6 +36,27 @@ pub fn read_ns_alive_opt(ns_meta: &Path) -> Option<NsAlive> {
         .and_then(|content| serde_json::from_str::<NsAlive>(&content).ok())
 }
 
+/// Helper function to safely update NsAlive state.
+/// This loads the existing state first, applies the update function,
+/// and persists the changes back to disk.
+/// This prevents multiple processes from clobbering each other's updates.
+pub fn update_ns_alive<F>(ns_meta: &Path, update_fn: F) -> Result<()>
+where
+    F: FnOnce(&mut NsAlive),
+{
+    // Load existing state or use default
+    let mut ns_alive = read_ns_alive_opt(ns_meta).unwrap_or_default();
+    
+    // Apply the update
+    update_fn(&mut ns_alive);
+    
+    // Persist back to disk
+    let json = serde_json::to_string_pretty(&ns_alive)?;
+    std::fs::write(ns_meta, json)?;
+    
+    Ok(())
+}
+
 pub fn report_clone3_err(er: &anyhow::Error) -> Result<()> {
     warn!("Clone3 failed with {:?}", er);
     let res = getresuid()?;

@@ -1,8 +1,3 @@
-//! Aggregated statistics derived from DiagEvent streams.
-//!
-//! The main concern is that some computation is blocking the async executor
-//! or reducing the 'accept' rate, which should be traced here.
-
 use std::{
     collections::{HashMap, VecDeque},
     time::Duration,
@@ -10,7 +5,6 @@ use std::{
 
 use crate::{ConnId, DiagEvent, Timestamp};
 
-/// Per-connection state accumulated from events.
 #[derive(Debug, Clone)]
 pub struct ConnStats {
     pub id: ConnId,
@@ -19,47 +13,40 @@ pub struct ConnStats {
     pub dst: String,
     pub route: String,
     pub accept_ts: Timestamp,
-    /// How long this connection blocked the accept loop (µs).
     pub dispatch_us: u64,
     pub connected_ts: Option<Timestamp>,
     pub finished_ts: Option<Timestamp>,
     pub error: Option<String>,
-    pub bytes_up: u64,
-    pub bytes_down: u64,
+    pub bytes_up: f32,
+    pub bytes_down: f32,
     pub dns_query: Option<String>,
     pub dns_response: Option<String>,
     pub dns_resolved_ts: Option<Timestamp>,
 }
 
 impl ConnStats {
-    /// Time from accept to proxy-connected.
     pub fn connect_latency(&self) -> Option<Duration> {
         self.connected_ts
-            .map(|c| c.elapsed_since(&self.accept_ts))
+            .map(|c| c.elapsed_since(self.accept_ts))
     }
 
-    /// Total lifetime of the connection.
     pub fn total_duration(&self) -> Option<Duration> {
         self.finished_ts
-            .map(|f| f.elapsed_since(&self.accept_ts))
+            .map(|f| f.elapsed_since(self.accept_ts))
     }
 
-    /// Time from accept to DNS resolved (for DNS connections).
     pub fn dns_resolve_latency(&self) -> Option<Duration> {
         self.dns_resolved_ts
-            .map(|r| r.elapsed_since(&self.accept_ts))
+            .map(|r| r.elapsed_since(self.accept_ts))
     }
 
-    /// True if this is a DNS connection (UDP that handled a DNS query).
     pub fn is_dns(&self) -> bool {
         self.dns_query.is_some()
     }
 }
 
-/// Rolling window of accept-loop timings.
 #[derive(Debug, Default)]
 pub struct LoopStats {
-    /// Recent accept durations (microseconds).
     pub recent: VecDeque<u64>,
     pub max_window: usize,
 }
@@ -95,8 +82,6 @@ impl LoopStats {
     }
 }
 
-/// Format a duration in microseconds into a human-friendly string,
-/// picking the most readable unit automatically.
 pub fn format_duration_us(us: f64) -> String {
     let secs = us / 1_000_000.0;
     if us < 1_000.0 {
@@ -117,14 +102,11 @@ pub fn format_duration_us(us: f64) -> String {
     }
 }
 
-/// Accumulator that processes a stream of `DiagEvent` into queryable state.
 #[derive(Debug, Default)]
 pub struct DiagAccumulator {
     pub conns: HashMap<ConnId, ConnStats>,
-    /// Ordered list of connection IDs for display.
     pub conn_order: VecDeque<ConnId>,
     pub loop_stats: LoopStats,
-    /// Maximum connections to keep in rolling window.
     pub max_conns: usize,
 }
 
@@ -138,7 +120,6 @@ impl DiagAccumulator {
         }
     }
 
-    /// Ingest a single event.
     pub fn ingest(&mut self, event: &DiagEvent) {
         match event {
             DiagEvent::Accept { id, ts, kind, src, dst } => {
@@ -153,8 +134,8 @@ impl DiagAccumulator {
                     connected_ts: None,
                     finished_ts: None,
                     error: None,
-                    bytes_up: 0,
-                    bytes_down: 0,
+                    bytes_up: 0.0,
+                    bytes_down: 0.0,
                     dns_query: None,
                     dns_response: None,
                     dns_resolved_ts: None,
@@ -218,8 +199,8 @@ impl DiagAccumulator {
                     connected_ts: None,
                     finished_ts: None,
                     error: None,
-                    bytes_up: 0,
-                    bytes_down: 0,
+                    bytes_up: 0.0,
+                    bytes_down: 0.0,
                     dns_query: None,
                     dns_response: None,
                     dns_resolved_ts: None,
@@ -235,11 +216,16 @@ impl DiagAccumulator {
             DiagEvent::WaitEnded { id, ts } => {
                 if let Some(c) = self.conns.get_mut(id) {
                     c.finished_ts = Some(*ts);
-                    let wait_us = ts.elapsed_since(&c.accept_ts).as_micros() as u64;
+                    let wait_us = ts.elapsed_since(c.accept_ts).as_micros() as u64;
                     c.dispatch_us = wait_us;
                     c.route = "acceptor: resumed".to_string();
                 }
             }
+            DiagEvent::HotConfigReloaded { .. }
+            | DiagEvent::HotConfigSnapshot { .. }
+            | DiagEvent::DnsState { .. }
+            | DiagEvent::RoutingState { .. }
+            | DiagEvent::UplinkStatsSnapshot { .. } => {}
         }
     }
 }
