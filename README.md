@@ -29,29 +29,13 @@ It is an identity separation tool like Whonix for the paranoid, but much more pr
 
 For releases, I use `release_upx.sh` which is a compressed `opt=3` binary.
 
-## _nswrap_, securely contain links opened by Vscode
+## ongoing refactor
 
-The security assumption is _faulty proxy handling but not malicious_, which happens to be the case for most applications and workflow. Nearly all programs can not pick up SOCKS5 environment variables, and even firefox leaked DNS. All of that would not happen in nsproxy.
+nsproxy is going through significant refactor to incorporate features that firejail/bubblejail has
 
-Nsproxy isolates traffic of an entire process tree, as how kernel namespace is designed, in the same way Docker makes containers. Applications may escape the net-ns through dBus or various other IPC, systemd, etc. In cases such as browsers, nswrap handles the escape.
+a lot of bugs are getting fixed and Clash is no longer neeeded for upstream proxy.
 
-![](./vscodeprompt.png)
-
-
-```sh
-Usage: sproxy wrap [OPTIONS] --bin <BIN>
-
-Options:
-  -b, --bin <BIN>  The executable to hook
-  -u, --undo       
-  -h, --help       Print help
-```
-
-## minimal configuration state
-
-No `/etc/`, `/usr/`, `$xdg`, and such hierarchy of fallbacks that serve no purpose but confusion. 
-
-Nsproxy only takes command line arguments, one hot-reloaded config file, reads procfs and communicates with kernel through netlink.
+branch v3 is usable. you can just compile. readme is outdated.
 
 ## virtual DNS and files served through a TUN 
 
