@@ -21,7 +21,8 @@ use socks5_impl::protocol::WireAddress;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::RwLock,
+    sync::{RwLock, watch},
+    time,
 };
 use tracing::{debug, error, info, trace, warn};
 use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
@@ -112,7 +113,7 @@ pub struct Router {
     /// Channel for serving files over TCP
     file_server_tx: Option<flume::Sender<(PathBuf, IpStackTcpStream)>>,
     /// Explicit name mappings etc
-    conf: Arc<RwLock<HotConfig>>,
+    conf: Arc<watch::Receiver<HotConfig>>,
 }
 
 pub struct RouterConfig {
@@ -140,7 +141,7 @@ impl Router {
         config: RouterConfig,
         uplink: UplinkHub,
         file_server_tx: Option<flume::Sender<(PathBuf, IpStackTcpStream)>>,
-        conf: Arc<RwLock<HotConfig>>,
+        conf: Arc<watch::Receiver<HotConfig>>,
     ) -> Result<Self> {
         let dns = VirtDNSAsync::default(65535)?;
 
@@ -190,6 +191,11 @@ impl Router {
         }
     }
 
+    /// Clone the diagnostic server handle for emitting events externally.
+    pub fn diag_handle(&self) -> DiagServer {
+        self.diag.clone()
+    }
+
     /// Take the control-command receiver out of the router.
     /// Returns `None` if diag was not started or already taken.
     pub fn take_cmd_rx(&mut self) -> Option<mpsc::Receiver<ControlCommand>> {
@@ -222,6 +228,11 @@ impl Router {
     pub async fn run(mut self) -> Result<()> {
         info!("Router started, entering main loop");
 
+        let mut stats_tick = time::interval(Duration::from_secs(60));
+        stats_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        // consume the first immediate tick
+        stats_tick.tick().await;
+
         loop {
             let wait_id = next_conn_id();
             self.diag.emit(DiagEvent::Wait {
@@ -229,19 +240,28 @@ impl Router {
                 ts: Timestamp::now(),
             });
 
-            let stream = self.stack.accept().await?;
-
-            self.diag.emit(DiagEvent::WaitEnded {
-                id: wait_id,
-                ts: Timestamp::now(),
-            });
-
-            match stream {
-                IpStackStream::Tcp(tcp) => {
-                    self.handle_tcp(tcp).await;
+            tokio::select! {
+                _ = stats_tick.tick() => {
+                    if let Err(e) = self.uplink.write().await.save_stats() {
+                        warn!("periodic stats save failed: {e}");
+                    }
+                    self.diag.emit(DiagEvent::WaitEnded { id: wait_id, ts: Timestamp::now() });
+                    continue;
                 }
-                IpStackStream::Udp(udp) => {
-                    self.handle_udp(udp).await;
+                result = self.stack.accept() => {
+                    let stream = result?;
+                    self.diag.emit(DiagEvent::WaitEnded {
+                        id: wait_id,
+                        ts: Timestamp::now(),
+                    });
+                    match stream {
+                        IpStackStream::Tcp(tcp) => {
+                            self.handle_tcp(tcp).await;
+                        }
+                        IpStackStream::Udp(udp) => {
+                            self.handle_udp(udp).await;
+                        }
+                    }
                 }
             }
         }
@@ -283,8 +303,8 @@ impl Router {
                     id: conn_id,
                     ts: Timestamp::now(),
                     error: Some(format!("{:?}", e)),
-                    bytes_up: 0,
-                    bytes_down: 0,
+                    bytes_up: 0.0,
+                    bytes_down: 0.0,
                 });
             }
         });
@@ -297,12 +317,12 @@ impl Router {
         diag: DiagServer,
         conn_id: ConnId,
         file_tx: Option<flume::Sender<(PathBuf, IpStackTcpStream)>>,
-        conf: Arc<RwLock<HotConfig>>,
+        conf: Arc<watch::Receiver<HotConfig>>,
     ) -> Result<()> {
         let peer = tcp.peer_addr();
         let local = tcp.local_addr();
 
-        let dns_result = dns_handle.process(peer);
+        let dns_result = dns_handle.preprocess(peer);
 
         let mut ctx = RoutingContext {
             target_ip: peer.ip(),
@@ -378,6 +398,8 @@ impl Router {
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
 
+                    let connect_start = std::time::Instant::now();
+
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
                             TrojanAdapter::connect_tcp(
@@ -397,11 +419,14 @@ impl Router {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
+                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             continue;
                         }
                     };
+
+                    let latency_ms = connect_start.elapsed().as_millis() as u64;
 
                     let proxy_stream = match conn {
                         ProxyConnection::Tcp(ref mut stream) => stream.as_mut(),
@@ -415,6 +440,12 @@ impl Router {
                         ts: Timestamp::now(),
                     });
 
+                    {
+                        let mut hub = uplink.write().await;
+                        let s = hub.stats.entry(id.clone()).or_default();
+                        s.record_latency_ms(latency_ms);
+                    }
+
                     match Self::relay_tcp_with_cause(
                         &mut tcp,
                         proxy_stream,
@@ -424,6 +455,12 @@ impl Router {
                     .await
                     {
                         Ok((up, down)) => {
+                            {
+                                let mut hub = uplink.write().await;
+                                let s = hub.stats.entry(id.clone()).or_default();
+                                s.record_attempt(true);
+                                s.record_traffic(up, down);
+                            }
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
@@ -438,14 +475,15 @@ impl Router {
                                 "proxy {:?} relay failed for {peer}: {relay_err:?}, retrying",
                                 id
                             );
+                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: Some(relay_err.to_string()),
-                                bytes_up: 0,
-                                bytes_down: 0,
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
                             });
                             continue;
                         }
@@ -470,13 +508,13 @@ impl Router {
         tunnel: &mut dyn crate::uplink::proxy_adapters::UdpLike,
         udp: &mut IpStackUdpStream,
         peer: SocketAddr,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(f32, f32)> {
         use socks5_impl::protocol::WireAddress;
         use tokio::io::AsyncReadExt;
 
         let dst = WireAddress::SocketAddress(peer);
-        let mut bytes_up: u64 = 0;
-        let mut bytes_down: u64 = 0;
+        let mut bytes_up: f32 = 0.0;
+        let mut bytes_down: f32 = 0.0;
         let mut buf = vec![0u8; 65535];
 
         loop {
@@ -489,14 +527,14 @@ impl Router {
                     }
                     tunnel.send_to(&buf[..n], dst.clone()).await
                         .map_err(|e| anyhow::anyhow!("UDP send_to failed: {}", e))?;
-                    bytes_up += n as u64;
+                    bytes_up += n as f32;
                 }
                 // tunnel -> TUN (downstream)
                 result = tunnel.recv_from() => {
                     let pkt = result.map_err(|e| anyhow::anyhow!("UDP recv_from failed: {}", e))?;
                     let n = pkt.data.len();
                     udp.write_all(&pkt.data).await?;
-                    bytes_down += n as u64;
+                    bytes_down += n as f32;
                 }
             }
         }
@@ -509,7 +547,7 @@ impl Router {
         right: &mut B,
         left_to_right_flow: &'static str,
         right_to_left_flow: &'static str,
-    ) -> std::result::Result<(u64, u64), RelayError>
+    ) -> std::result::Result<(f32, f32), RelayError>
     where
         A: AsyncRead + AsyncWrite + Unpin + ?Sized,
         B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -540,7 +578,7 @@ impl Router {
                     });
                 }
             }
-            Ok::<u64, RelayError>(copied)
+            Ok::<f32, RelayError>(copied as f32)
         };
 
         let down = async {
@@ -566,7 +604,7 @@ impl Router {
                     });
                 }
             }
-            Ok::<u64, RelayError>(copied)
+            Ok::<f32, RelayError>(copied as f32)
         };
 
         tokio::try_join!(up, down)
@@ -603,8 +641,8 @@ impl Router {
                     id: conn_id,
                     ts: Timestamp::now(),
                     error: Some(relay_err.to_string()),
-                    bytes_up: 0,
-                    bytes_down: 0,
+                    bytes_up: 0.0,
+                    bytes_down: 0.0,
                 });
                 Err(anyhow::Error::new(relay_err))
             }
@@ -638,8 +676,8 @@ impl Router {
                     id: conn_id,
                     ts: Timestamp::now(),
                     error: Some(format!("{:?}", e)),
-                    bytes_up: 0,
-                    bytes_down: 0,
+                    bytes_up: 0.0,
+                    bytes_down: 0.0,
                 });
             }
         });
@@ -651,17 +689,17 @@ impl Router {
         dns_handle: VirtDNSHandle,
         diag: DiagServer,
         conn_id: ConnId,
-        conf: Arc<RwLock<HotConfig>>,
+        conf: Arc<watch::Receiver<HotConfig>>,
     ) -> Result<()> {
         let peer = udp.peer_addr();
         let local = udp.local_addr();
 
         // Check if this is DNS traffic destined for a captured range
-        if peer.port() == DNS_PORT && conf.read().await.captures_dns(local.ip()) {
+        if peer.port() == DNS_PORT && conf.borrow().captures_dns(local.ip()) {
             return Self::handle_dns(udp, dns_handle, diag, conn_id).await;
         }
 
-        let dns_result = dns_handle.process(peer);
+        let dns_result = dns_handle.preprocess(peer);
 
         let mut ctx = RoutingContext {
             target_ip: peer.ip(),
@@ -713,8 +751,8 @@ impl Router {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: Some(e.to_string()),
-                                bytes_up: 0,
-                                bytes_down: 0,
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
                             });
                             continue;
                         }
@@ -726,8 +764,8 @@ impl Router {
                         id: conn_id,
                         ts: Timestamp::now(),
                         error: None,
-                        bytes_up: 0,
-                        bytes_down: 0,
+                        bytes_up: 0.0,
+                        bytes_down: 0.0,
                     });
                     break;
                 }
@@ -763,6 +801,8 @@ impl Router {
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
 
+                    let connect_start = std::time::Instant::now();
+
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
                             TrojanAdapter::connect_udp(
@@ -780,11 +820,14 @@ impl Router {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
+                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             continue;
                         }
                     };
+
+                    let latency_ms = connect_start.elapsed().as_millis() as u64;
 
                     let tunnel = match conn.as_udp_mut() {
                         Some(t) => t,
@@ -796,8 +839,19 @@ impl Router {
                         ts: Timestamp::now(),
                     });
 
+                    {
+                        let mut hub = uplink.write().await;
+                        hub.stats.entry(id.clone()).or_default().record_latency_ms(latency_ms);
+                    }
+
                     match Self::relay_udp(tunnel, &mut udp, peer).await {
                         Ok((up, down)) => {
+                            {
+                                let mut hub = uplink.write().await;
+                                let s = hub.stats.entry(id.clone()).or_default();
+                                s.record_attempt(true);
+                                s.record_traffic(up, down);
+                            }
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
@@ -812,14 +866,15 @@ impl Router {
                                 "proxy {:?} UDP relay failed for {peer}: {e:?}, retrying",
                                 id
                             );
+                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: Some(e.to_string()),
-                                bytes_up: 0,
-                                bytes_down: 0,
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
                             });
                             continue;
                         }
@@ -900,9 +955,9 @@ impl Router {
     async fn extract_domain(
         dns_result: &VDNSRES,
         target_ip: IpAddr,
-        conf: &Arc<RwLock<HotConfig>>,
+        conf: &Arc<watch::Receiver<HotConfig>>,
     ) -> Option<String> {
-        let config = conf.read().await;
+        let config = conf.borrow();
         for (domain, ip_str) in &config.dns {
             if let Ok(mapped_ip) = ip_str.parse::<IpAddr>() {
                 if mapped_ip == target_ip {

@@ -20,3 +20,5 @@ Specifically, nsproxy should handle the environment through kernel namespaces, b
 In the base system, the browser launch can not leak my secret identity because the profile folder is not mounted.
 
 Some basic anonymization. Anonymized user name, root directory paths for containers.
+
+UplinkHub should track the IP quality of proxies. Blocked by google or not, and other sites.

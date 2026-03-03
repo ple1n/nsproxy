@@ -21,3 +21,4 @@ tracing = "0.1.41"
 socks5-impl = { path = "../socks5-impl" }
 blake3 = "1.5"
 hex = "0.4"
+rangemap = { version = "1", features = ["serde1"] }

@@ -44,6 +44,8 @@ use tracing::warn;
 use uzers::os::unix::UserExt;
 
 use std::{mem::size_of, os::fd::RawFd};
+use std::os::unix::fs::PermissionsExt; // for setting file modes
+
 
 use anyhow::Result;
 use nix::{
@@ -270,18 +272,20 @@ pub fn mount_bind(source: &Path, dst: &Path) -> Result<()> {
 
 pub fn ensure_mount_target(src: &Path, dst: &Path) -> Result<()> {
     info!("ensure_mount_target: src={:?}, dst={:?}", src, dst);
-    
-    let meta = std::fs::metadata(src).map_err(|e| {
-        anyhow::anyhow!("Failed to stat source {:?}: {}", src, e)
-    })?;
-    
-    info!("  source exists, is_dir={}, is_file={}", meta.is_dir(), meta.is_file());
-    
+
+    let meta = std::fs::metadata(src)
+        .map_err(|e| anyhow::anyhow!("Failed to stat source {:?}: {}", src, e))?;
+
+    info!(
+        "  source exists, is_dir={}, is_file={}",
+        meta.is_dir(),
+        meta.is_file()
+    );
+
     if meta.is_dir() {
         info!("  creating target directory: {:?}", dst);
-        create_dir_all(dst).map_err(|e| {
-            anyhow::anyhow!("Failed to create target directory {:?}: {}", dst, e)
-        })?;
+        create_dir_all(dst)
+            .map_err(|e| anyhow::anyhow!("Failed to create target directory {:?}: {}", dst, e))?;
     } else {
         if let Some(parent) = dst.parent() {
             info!("  checking if parent exists: {:?}", parent);
@@ -309,20 +313,34 @@ pub fn ensure_mount_target(src: &Path, dst: &Path) -> Result<()> {
         } else {
             info!("  no parent directory for {:?}", dst);
         }
-        
+
         // Check if target already exists
         match std::fs::metadata(dst) {
             Ok(m) => {
-                info!("  target already exists! type={:?}, skipping creation", m.file_type());
+                info!(
+                    "  target already exists! type={:?}, skipping creation",
+                    m.file_type()
+                );
                 // Target already exists, no need to create it
             }
             Err(_) => {
-                info!("  target doesn't exist yet, creating target file: {:?}", dst);
+                info!(
+                    "  target doesn't exist yet, creating target file: {:?}",
+                    dst
+                );
                 File::create(dst).map_err(|e| {
                     // Additional context about the error
-                    let parent_readable = dst.parent().and_then(|p| std::fs::read_dir(p).ok()).is_some();
-                    anyhow::anyhow!("Failed to create target file {:?}: {} (errno: {:?}, parent_readable: {})", 
-                        dst, e, e.raw_os_error(), parent_readable)
+                    let parent_readable = dst
+                        .parent()
+                        .and_then(|p| std::fs::read_dir(p).ok())
+                        .is_some();
+                    anyhow::anyhow!(
+                        "Failed to create target file {:?}: {} (errno: {:?}, parent_readable: {})",
+                        dst,
+                        e,
+                        e.raw_os_error(),
+                        parent_readable
+                    )
                 })?;
             }
         }
@@ -335,15 +353,19 @@ pub fn ensure_mount_target(src: &Path, dst: &Path) -> Result<()> {
 pub fn mount_bind_rw_explicit(source: &Path, dst: &Path, recursive: bool) -> Result<()> {
     warn!("bind mounting {:?} onto {:?}", source, dst);
     ensure_mount_target(source, dst).map_err(|e| {
-        anyhow::anyhow!("Failed to ensure mount target for {:?} -> {:?}: {}", source, dst, e)
+        anyhow::anyhow!(
+            "Failed to ensure mount target for {:?} -> {:?}: {}",
+            source,
+            dst,
+            e
+        )
     })?;
     let mut flags = MsFlags::MS_BIND;
     if recursive {
         flags |= MsFlags::MS_REC;
     }
-    mount(Some(source), dst, None::<&str>, flags, None::<&str>).map_err(|e| {
-        anyhow::anyhow!("Failed to bind mount {:?} -> {:?}: {}", source, dst, e)
-    })?;
+    mount(Some(source), dst, None::<&str>, flags, None::<&str>)
+        .map_err(|e| anyhow::anyhow!("Failed to bind mount {:?} -> {:?}: {}", source, dst, e))?;
 
     Ok(())
 }
@@ -414,34 +436,42 @@ pub fn rm_mount(dst: &Path) -> Result<()> {
 /// Write content to /tmp and bind mount it to the target path as read-only
 pub fn mount_file_content(content: &[u8], target: &Path) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     // Generate a unique filename in /tmp
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let tmp_path = PathBuf::from(format!("/tmp/nsproxy_mount_{}.tmp", timestamp));
-    
+
     // Write content to temporary file
     let mut tmp_file = File::create(&tmp_path)?;
     tmp_file.write_all(content)?;
     tmp_file.flush()?;
-    
+
+    // ensure the temp file has sensible permissions (rw-r--r--)
+    let perms = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(&tmp_path, perms)?;
+
     // Ensure the target parent directory exists
     if let Some(parent) = target.parent() {
         create_dir_all(parent)?;
     }
-    
+
     // Create the target file if it doesn't exist
     if !target.exists() {
         File::create(target)?;
     }
-    
+
     // Bind mount the temporary file to the target as read-only
     mount_bind_ro_explicit(&tmp_path, target, false)?;
-    
+
     info!("mounted {:?} to {:?}", tmp_path, target);
-    
+
+    // make sure the target also has appropriate permissions
+    let perms = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(target, perms)?;
+
     Ok(())
 }
 
@@ -457,7 +487,18 @@ pub fn mount_resolv_conf(nameserver: &str) -> Result<()> {
 /// Mount nsswitch.conf for DNS resolution via glibc's libnss_dns
 /// Errors if repeated mounted
 pub fn mount_nsswitch_conf() -> Result<()> {
-    let content = b"hosts: files dns\n";
+    let content = b"passwd:         files\n
+group:          files\n
+shadow:         files\n
+gshadow:        files\n
+
+hosts:          files dns\n
+networks:       files\n
+
+protocols:      files\n
+services:       files\n
+ethers:         files\n
+rpc:            files\n";
     mount_file_content(content, Path::new("/etc/nsswitch.conf"))?;
     info!("mounted nsswitch.conf for DNS resolution");
     Ok(())

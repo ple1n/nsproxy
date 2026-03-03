@@ -5,6 +5,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
 };
 
 use anyhow::{Result, anyhow};
@@ -31,6 +32,13 @@ use crate::{
     tokio_netlink_conn,
 };
 use nsproxy_common::routing::{DropReason, RoutingDecision};
+use diag::{DiagEvent, DiagServer, Timestamp};
+
+#[derive(Clone, Copy, Debug)]
+pub enum HotReloadTrigger {
+    FileChange,
+    DirectReload,
+}
 
 fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
     let (mut tx, rx) = tokio::sync::mpsc::channel(1);
@@ -52,6 +60,7 @@ fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<(
 
     Ok((watcher, rx))
 }
+
 
 struct ServerItem {
     marked: bool,
@@ -135,6 +144,9 @@ pub async fn watch_hot(
     child_pid: u32,
     mut tx: tokio::net::UnixStream,
     veths: Option<VethIps>,
+    diag: DiagServer,
+    mut reload_rx: sync::mpsc::Receiver<HotReloadTrigger>,
+    hot_tx: sync::watch::Sender<HotConfig>,
 ) -> Result<()> {
     let mut warps: HashMap<PathBuf, ServerItem> = HashMap::new();
     let vdns: Option<Option<VirtDNSHandle>> = vdns_rx.next().await;
@@ -169,7 +181,9 @@ pub async fn watch_hot(
             let acceptor = acceptor.clone();
             let prev_conf = &mut prev_conf_;
             let tx = &mut tx;
-            let o = async move {
+            let diag = diag.clone();
+            let hot_tx = hot_tx.clone();
+            let reload = |source: &'static str| async move {
                 warn!("config hot reload");
 
                 let mut futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
@@ -178,6 +192,13 @@ pub async fn watch_hot(
                     Ok(newconf) => {
                         let cloned = newconf.clone();
                         if prev_conf.is_some() && prev_conf.as_ref().unwrap() == &cloned {
+                            diag.emit(DiagEvent::HotConfigReloaded {
+                                ts: Timestamp::now(),
+                                ok: true,
+                                changed: false,
+                                source: source.to_string(),
+                                error: None,
+                            });
                             return Ok(futs);
                         }
 
@@ -265,10 +286,25 @@ pub async fn watch_hot(
                         info!("localhost forward {}", newconf.locals.len());
                         info!("received and spawned TCP listener tasks");
 
-                        *prev_conf = Some(cloned);
+                        *prev_conf = Some(cloned.clone());
+                        let _ = hot_tx.send(cloned);
+                        diag.emit(DiagEvent::HotConfigReloaded {
+                            ts: Timestamp::now(),
+                            ok: true,
+                            changed: true,
+                            source: source.to_string(),
+                            error: None,
+                        });
                     }
                     _ => {
                         warn!("config changed, but is invalid");
+                        diag.emit(DiagEvent::HotConfigReloaded {
+                            ts: Timestamp::now(),
+                            ok: false,
+                            changed: false,
+                            source: source.to_string(),
+                            error: Some("parse error".to_string()),
+                        });
                     }
                 }
 
@@ -279,11 +315,21 @@ pub async fn watch_hot(
             futs = select! {
                 k = rx.recv() => {
                     if k.is_some() {
-                        o.await?
+                        reload("file").await?
                     } else {
                         break;
                     }
                 },
+                Some(trigger) = reload_rx.recv() => {
+                    match trigger {
+                        HotReloadTrigger::DirectReload => {
+                            reload("direct").await?
+                        }
+                        HotReloadTrigger::FileChange => {
+                            reload("file").await?
+                        }
+                    }
+                }
                 _ = join_all(futs), if !futs.is_empty() => {
                     Vec::new()
                 }

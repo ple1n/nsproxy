@@ -55,14 +55,16 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
+use nsproxy_common::crdt::CRDT;
 use nsproxy_common::routing::{
     DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled,
     VDNSRES,
 };
+use nsproxy_common::stats::{ChronoData, ProxyStats, Timestamp};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use tracing::{info, warn};
@@ -104,7 +106,7 @@ fn ensure_rustls_crypto_provider() -> Result<()> {
 
 // IPs are not ever deleted here.
 // Because its expected sometimes DNS servers pollute the records with junk
-pub type DomainsSolved = BTreeMap<Domain, BTreeMap<u64, DNSResponse>>;
+pub type DomainsSolved = BTreeMap<Domain, BTreeMap<Timestamp, DNSResponse>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -168,17 +170,11 @@ impl ProfileSolved {
         }
     }
 
-    /// Add a resolved IP for a domain with current timestamp
     pub fn add_resolution(&mut self, domain: Domain, ips: BTreeSet<IpAddr>) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
         self.domains
             .entry(domain)
-            .or_insert_with(BTreeMap::new)
-            .insert(timestamp, DNSResponse { ips });
+            .or_default()
+            .insert(Timestamp::now(), DNSResponse { ips });
     }
 
     /// Get the most recent IPs for a domain
@@ -433,30 +429,11 @@ pub struct UplinkHub {
     routing_fn: RoutingFunction,
     /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
     pub clash: Option<clash::ClashState>,
-    pub stats: HashMap<ProxyID, LinkStats>,
+    pub stats: HashMap<ProxyID, ProxyStats>,
+    pub stats_clear: Timestamp,
     /// Map from proxy pseudonym (nym) to ProxyID for O(1) lookup
     pub nym_map: HashMap<ProxyNym, ProxyID>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LinkStats {
-    pub latency: LatencyCheck,
-    pub last_conn: LinkConnCheck,
-    /// Unix timestamp (seconds) of the last connection check
-    pub last_conn_time: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LatencyCheck {
-    /// time to first byte, in milliseconds
-    TTFB(u64),
-    None,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LinkConnCheck {
-    Fail,
-    Success,
+    pub found_ips: ChronoData,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -543,89 +520,78 @@ impl UplinkHub {
             }),
             clash: None,
             stats: HashMap::new(),
+            stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
+            found_ips: ChronoData::default(),
         }
     }
     pub fn update_link_ttfb(&mut self, id: &ProxyID, latency: Duration) {
-        use std::collections::hash_map::Entry;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        match self.stats.entry(id.clone()) {
-            Entry::Vacant(v) => {
-                v.insert(LinkStats {
-                    latency: LatencyCheck::TTFB(latency.as_millis() as u64),
-                    last_conn: LinkConnCheck::Success,
-                    last_conn_time: now,
-                });
-            }
-            Entry::Occupied(mut occ) => {
-                let s = occ.get_mut();
-                s.latency = LatencyCheck::TTFB(latency.as_millis() as u64);
-            }
-        }
+        self.stats
+            .entry(id.clone())
+            .or_default()
+            .record_latency_ms(latency.as_millis() as u64);
     }
 
     pub fn update_link_conn_check(&mut self, id: &ProxyID, success: bool) {
-        use std::collections::hash_map::Entry;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        match self.stats.entry(id.clone()) {
-            Entry::Vacant(v) => {
-                v.insert(LinkStats {
-                    latency: LatencyCheck::None,
-                    last_conn: if success {
-                        LinkConnCheck::Success
-                    } else {
-                        LinkConnCheck::Fail
-                    },
-                    last_conn_time: now,
-                });
-            }
-            Entry::Occupied(mut occ) => {
-                let s = occ.get_mut();
-
-                s.last_conn = if success {
-                    LinkConnCheck::Success
-                } else {
-                    LinkConnCheck::Fail
-                };
-                s.last_conn_time = now;
-            }
-        }
+        self.stats
+            .entry(id.clone())
+            .or_default()
+            .record_attempt(success);
     }
 
-    /// Get a copy of link stats for an id, if present
-    pub fn get_link_stats(&self, id: &ProxyID) -> Option<LinkStats> {
+    pub fn get_link_stats(&self, id: &ProxyID) -> Option<ProxyStats> {
         self.stats.get(id).cloned()
     }
 
+    pub fn clear_stats(&mut self) {
+        self.stats.clear();
+        self.stats_clear = Timestamp::now();
+    }
+
     /// Persist current in-memory stats to uplink/stats.json.
-    pub fn save_stats(&self) -> Result<()> {
-        let state = UplinkStatsState {
-            stats: self
-                .stats
-                .iter()
-                .map(|(id, s)| (id.nym(), s.clone()))
-                .collect(),
+    /// Loads the file first and merges to preserve stats from other processes.
+    pub fn save_stats(&mut self) -> Result<()> {
+        let persisted = UplinkStatsState::load_or_default()?;
+
+        // A newer clear signal was already persisted by another process.
+        // Discard local pre-clear data and adopt persisted state; skip saving.
+        if persisted.clear > self.stats_clear {
+            self.stats = persisted.stats;
+            self.stats_clear = persisted.clear;
+            return Ok(());
+        }
+
+        let current = UplinkStatsState {
+            stats: self.stats.clone(),
+            clear: self.stats_clear,
         };
-        state.save_atomic()
+        let mut merged = persisted.merge(current);
+        merged.compact_for_save();
+        merged.save_atomic()?;
+
+        // Keep in-memory copy synchronized with persisted merged state.
+        self.stats = merged.stats;
+        self.stats_clear = merged.clear;
+        Ok(())
     }
 
     /// Load persisted stats from uplink/stats.json and merge into in-memory state.
     /// In-memory entries take precedence over persisted ones.
     pub fn load_stats(&mut self) -> Result<()> {
         let state = UplinkStatsState::load_or_default()?;
-        for (nym, stats) in state.stats {
-            // Only fill in entries that are not already present in-memory.
-            if let Some(id) = self.nym_map.get(&nym) {
-                self.stats.entry(id.clone()).or_insert(stats);
-            }
+
+        if state.clear > self.stats_clear {
+            self.stats = state.stats;
+            self.stats_clear = state.clear;
+            return Ok(());
+        }
+
+        if state.clear < self.stats_clear {
+            return Ok(());
+        }
+
+        for (id, stats) in state.stats {
+            self.stats.entry(id).or_insert(stats);
         }
         Ok(())
     }
@@ -637,7 +603,9 @@ impl UplinkHub {
             routing_fn,
             clash: None,
             stats: HashMap::new(),
+            stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
+            found_ips: ChronoData::default(),
         }
     }
 
@@ -743,11 +711,7 @@ impl UplinkHub {
         UplinkSnapshot {
             clash: self.clash.clone(),
             remote_proxies,
-            stats: self
-                .stats
-                .iter()
-                .map(|(id, s)| (id.nym(), s.clone()))
-                .collect(),
+            stats: self.stats.clone(),
         }
     }
 
@@ -770,10 +734,8 @@ impl UplinkHub {
 
         hub.load_clash_proxies()?;
 
-        for (nym, stats) in snapshot.stats {
-            if let Some(id) = hub.nym_map.get(&nym) {
-                hub.stats.entry(id.clone()).or_insert(stats);
-            }
+        for (id, stats) in snapshot.stats {
+            hub.stats.entry(id).or_insert(stats);
         }
 
         Ok(hub)
@@ -813,22 +775,53 @@ impl UplinkHub {
     }
 }
 
-impl std::fmt::Display for LinkStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.latency {
-            LatencyCheck::TTFB(ms) => {
-                write!(f, "ttfb={}ms conn={:?}", ms, self.last_conn)
-            }
-            LatencyCheck::None => write!(f, "ttfb=none conn={:?}", self.last_conn),
-        }
-    }
-}
 
 /// Serializable snapshot of all per-proxy link stats, stored at uplink/stats.json.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UplinkStatsState {
-    /// Maps proxy nym (short hex string) to its recorded stats.
-    pub stats: HashMap<ProxyNym, LinkStats>,
+    pub stats: HashMap<ProxyID, ProxyStats>,
+    #[serde(default)]
+    pub clear: Timestamp,
+}
+
+impl UplinkStatsState {
+    /// Compact per-proxy timeseries only when beneficial for persistence.
+    /// Returns number of proxies that were simplified.
+    pub fn compact_for_save(&mut self) -> usize {
+        let mut simplified = 0;
+        for stats in self.stats.values_mut() {
+            if stats.simplify_if_needed() {
+                simplified += 1;
+            }
+        }
+        simplified
+    }
+
+    /// Clear all accumulated statistics.
+    pub fn clear_all(&mut self) {
+        self.stats.clear();
+        self.clear = Timestamp::now();
+    }
+}
+
+impl CRDT for UplinkStatsState {
+    fn merge(mut self, other: Self) -> Self {
+        if other.clear > self.clear {
+            return other;
+        }
+
+        if other.clear < self.clear {
+            return self;
+        }
+
+        for (id, stats) in other.stats {
+            self.stats
+                .entry(id)
+                .and_modify(|e| *e = e.clone().merge(stats.clone()))
+                .or_insert(stats);
+        }
+        self
+    }
 }
 
 /// Portable, fully serializable snapshot of an `UplinkHub`.
@@ -845,8 +838,8 @@ pub struct UplinkSnapshot {
     pub clash: Option<clash::ClashState>,
     /// Saved remote proxies (SOCKS5 / HTTP, …)
     pub remote_proxies: Vec<ArgProxy>,
-    /// Per-proxy link statistics keyed by nym
-    pub stats: HashMap<ProxyNym, LinkStats>,
+    /// Per-proxy link statistics keyed by proxy ID
+    pub stats: HashMap<ProxyID, ProxyStats>,
 }
 
 impl PersistentState for UplinkStatsState {
@@ -1873,5 +1866,121 @@ impl RoutingBuilder {
 impl Default for RoutingBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_uplink_stats_state_serde_with_hex_proxy_id() {
+        // Create some ProxyIDs using different constructors
+        let trojan_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443);
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 1080);
+        let file_path = PathBuf::from("/tmp/test.sock");
+
+        let trojan_id = ProxyID::for_trojan(trojan_addr, "example.com", "password123");
+        let remote_id = ProxyID::for_remote(remote_addr);
+        let file_id = ProxyID::for_file(&file_path);
+
+        // Create ProxyStats entries
+        let mut stats1 = ProxyStats::default();
+        stats1.record_latency_ms(100);
+        stats1.record_attempt(true);
+        stats1.record_traffic(1024.0, 2048.0);
+
+        let mut stats2 = ProxyStats::default();
+        stats2.record_latency_ms(200);
+        stats2.record_attempt(false);
+
+        let mut stats3 = ProxyStats::default();
+        stats3.record_traffic(512.0, 1024.0);
+
+        // Build UplinkStatsState
+        let mut state = UplinkStatsState::default();
+        state.stats.insert(trojan_id.clone(), stats1);
+        state.stats.insert(remote_id.clone(), stats2);
+        state.stats.insert(file_id.clone(), stats3);
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&state).expect("Failed to serialize");
+        
+        // Verify JSON structure: keys should be hex strings
+        println!("Serialized JSON:\n{}", json);
+        
+        // Parse as generic JSON to verify keys are strings
+        let json_value: serde_json::Value = serde_json::from_str(&json).expect("Invalid JSON");
+        let stats_obj = json_value.get("stats").expect("Missing stats field");
+        let stats_map = stats_obj.as_object().expect("stats should be an object");
+        
+        // Verify we have 3 entries
+        assert_eq!(stats_map.len(), 3, "Should have 3 proxy stats entries");
+        
+        // Verify keys are hex strings (64 characters for 32 bytes)
+        for (key, _) in stats_map {
+            assert_eq!(key.len(), 64, "ProxyID should serialize as 64-char hex string");
+            assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "Key should be valid hex: {}", key);
+        }
+
+        // Deserialize back
+        let deserialized: UplinkStatsState = serde_json::from_str(&json)
+            .expect("Failed to deserialize");
+
+        // Verify deserialized data
+        assert_eq!(deserialized.stats.len(), 3, "Should have 3 entries after deserialization");
+        assert!(deserialized.stats.contains_key(&trojan_id), "Should contain trojan proxy");
+        assert!(deserialized.stats.contains_key(&remote_id), "Should contain remote proxy");
+        assert!(deserialized.stats.contains_key(&file_id), "Should contain file proxy");
+
+        // Verify stats data is preserved (check one entry in detail)
+        let trojan_stats = deserialized.stats.get(&trojan_id).expect("Trojan stats missing");
+        assert!(!trojan_stats.data.is_empty(), "Trojan stats should have data");
+    }
+
+    #[test]
+    fn test_proxy_id_roundtrip() {
+        // Test individual ProxyID serialization/deserialization
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let id = ProxyID::for_remote(addr);
+
+        let json = serde_json::to_string(&id).expect("Failed to serialize ProxyID");
+        
+        // Should be a quoted hex string
+        assert!(json.starts_with('"'), "Should be a JSON string");
+        assert!(json.ends_with('"'), "Should be a JSON string");
+        
+        let hex_value = json.trim_matches('"');
+        assert_eq!(hex_value.len(), 64, "Should be 64 hex characters");
+
+        let deserialized: ProxyID = serde_json::from_str(&json)
+            .expect("Failed to deserialize ProxyID");
+        
+        assert_eq!(id, deserialized, "ProxyID should round-trip correctly");
+    }
+
+    #[test]
+    fn test_proxy_id_as_json_object_key() {
+        // Demonstrate that ProxyID works as a JSON object key
+        let mut map: HashMap<ProxyID, String> = HashMap::new();
+        
+        let id1 = ProxyID::for_remote("127.0.0.1:1080".parse().unwrap());
+        let id2 = ProxyID::for_remote("127.0.0.1:1081".parse().unwrap());
+        
+        map.insert(id1.clone(), "proxy1".to_string());
+        map.insert(id2.clone(), "proxy2".to_string());
+
+        let json = serde_json::to_string(&map).expect("Failed to serialize map");
+        
+        // JSON object keys must be strings - verify it's an object, not an array
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.is_object(), "Should serialize as JSON object");
+        
+        let deserialized: HashMap<ProxyID, String> = serde_json::from_str(&json)
+            .expect("Failed to deserialize");
+        
+        assert_eq!(deserialized.get(&id1), Some(&"proxy1".to_string()));
+        assert_eq!(deserialized.get(&id2), Some(&"proxy2".to_string()));
     }
 }

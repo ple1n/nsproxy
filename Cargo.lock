@@ -2231,6 +2231,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_plot"
+version = "0.34.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67fc9b427a837264e55381a5cade6e28fe83ac5b165a61b9c888548c732a9c95"
+dependencies = [
+ "ahash",
+ "egui 0.33.3",
+ "emath 0.33.3",
+]
+
+[[package]]
 name = "either"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3431,6 +3442,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "index-set"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d03cdd616e5f029ecfa40759159d582f2d4a09744071d29dddba5faecdba58f"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4455,6 +4472,7 @@ dependencies = [
  "nix 0.27.1",
  "owo-colors",
  "pidfd 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rangemap",
  "serde",
  "socks5-impl",
  "thiserror 1.0.63",
@@ -4471,6 +4489,7 @@ dependencies = [
  "atty",
  "base64 0.21.7",
  "bimap",
+ "bincode",
  "blake3",
  "bytes 1.10.1",
  "capctl",
@@ -4547,16 +4566,23 @@ dependencies = [
 name = "nsproxy-ui"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
+ "diag",
  "eframe 0.33.3",
  "egui 0.33.3",
  "egui_extras 0.33.3",
  "egui_json_tree",
+ "egui_plot",
  "flume",
+ "libc",
+ "nix 0.27.1",
  "nsproxy-common",
  "nsproxy-core",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7271,6 +7297,7 @@ dependencies = [
  "futures",
  "httparse",
  "id_alloc",
+ "index-set",
  "ipstack",
  "lru",
  "nsproxy-common",

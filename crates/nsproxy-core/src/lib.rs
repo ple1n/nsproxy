@@ -261,6 +261,7 @@ mod tests {
                 locals: HashMap::new(),
                 dns_capture: Default::default(),
                 mounts: Vec::new(),
+                daemons: Vec::new(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -268,6 +269,7 @@ mod tests {
                 gids: Vec::new(),
                 shell: None,
                 cwd: Some(PathBuf::from("@/cwd")),
+                args: Vec::new(),
             },
             browser_profile: None,
         };
@@ -637,7 +639,7 @@ impl Default for TunMaker {
     fn default() -> Self {
         Self {
             name: "tun1".to_owned(),
-            ipv4: "100.68.0.1/24".try_into().unwrap(),
+            ipv4: tun2socks5::dns::VIRT_TUN_IP4.try_into().unwrap(),
             ipv6: "fe80::bc2e:4aff:fe02:c223/64".try_into().unwrap(),
             mtu: 1500,
         }
@@ -751,7 +753,7 @@ fn test_untag() {
 
     let sx: Namespace = toml_edit::de::from_str(
         r#"
-            user = 3 
+            user = 3
             net = "/path/"
      "#,
     )
@@ -865,6 +867,9 @@ pub struct HotConfig {
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
+    /// Daemon processes to run inside the container on startup or reload.
+    #[serde(default)]
+    pub daemons: Vec<ShellArgs>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1085,6 +1090,23 @@ pub struct TemplateConfig {
     pub browser_profile: Option<String>,
 }
 
+impl Default for TemplateConfig {
+    fn default() -> Self {
+        Self {
+            schema: 1,
+            sandbox_mode: SandboxMode::Overlay,
+            mounts: Vec::new(),
+            chmod: Vec::new(),
+            env: HashMap::new(),
+            inherit_env: true,
+            hot: PathBuf::from("@/hot.json"),
+            hot_init: Some(HotConfig::default()),
+            sargs: ShellArgs::default(),
+            browser_profile: None,
+        }
+    }
+}
+
 fn default_inherit_env() -> bool {
     true
 }
@@ -1246,6 +1268,7 @@ impl TemplateConfig {
                 gids: gids,
                 shell: Some(shell_str),
                 cwd: Some(user.home_dir().to_path_buf()),
+                args: Vec::new(),
             },
             chmod: Vec::new(),
             browser_profile: None,
@@ -1513,7 +1536,7 @@ use clap::{
 
 /// NSProxy V3
 /// Manage netns redirection with SOCKS5 proxy configuration
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
     #[arg(short, long)]
@@ -1537,7 +1560,7 @@ pub enum NsInput {
     New,
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum MainCommand {
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
@@ -1632,6 +1655,7 @@ pub enum MainCommand {
         #[arg(short, long)]
         no_default: bool,
         #[arg(short, long)]
+        #[serde(with = "level_filter_serde")]
         log: Option<LevelFilter>,
         /// Use Clash uplink profile for all TUN connections
         #[arg(long)]
@@ -1649,6 +1673,7 @@ pub enum MainCommand {
         #[arg(long)]
         veth_name: Option<String>,
         #[arg(short, long)]
+        #[serde(with = "level_filter_serde")]
         log: Option<LevelFilter>,
     },
     /// Operations about basis network namespace, ie. the namespace where your system boots with
@@ -1672,9 +1697,11 @@ pub enum MainCommand {
         #[command(flatten)]
         sargs: ShellArgs,
     },
+    /// Accept args as a serialized file
+    File { path: PathBuf },
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum UplinkCommand {
     Clash {
         #[command(subcommand)]
@@ -1703,7 +1730,7 @@ pub enum UplinkCommand {
     },
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum RemoteOps {
     /// Add a remote proxy by URL, e.g. socks5://127.0.0.1:1080
     Add { url: String },
@@ -1713,12 +1740,12 @@ pub enum RemoteOps {
     List,
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum UplinkInstanceCommand {
     Test,
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum ClashOps {
     /// Import Clash config data into global clash state for a group
     ConfigAdd {
@@ -1752,7 +1779,7 @@ pub enum ClashOps {
 
 pub mod uplink;
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum BasisCommand {
     /// Mount the basis network namespace
     Mount {},
@@ -1783,4 +1810,172 @@ impl std::str::FromStr for NsInput {
 
 pub fn to_cstr(f: &str) -> CString {
     CString::from_str(f).unwrap()
+}
+
+/// Serde helpers for `Option<LevelFilter>` (stored/transmitted as an optional string).
+mod level_filter_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tracing::level_filters::LevelFilter;
+
+    pub fn serialize<S: Serializer>(v: &Option<LevelFilter>, s: S) -> Result<S::Ok, S::Error> {
+        v.as_ref().map(|lf| lf.to_string()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<LevelFilter>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(s) => s
+                .parse::<LevelFilter>()
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Encode a [`Cli`] value to a file-descriptor as a length-prefixed bincode frame.
+/// The caller retains ownership of `fd`; this function does **not** close it.
+pub fn encode_cli_to_fd(cli: &Cli, fd: std::os::fd::RawFd) -> anyhow::Result<()> {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: fd is valid and caller retains ownership; ManuallyDrop prevents drop/close.
+    let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    bincode::serialize_into(&mut *file, cli)?;
+    Ok(())
+}
+
+/// Decode a [`Cli`] value from a file-descriptor (reads from current position).
+/// The caller retains ownership of `fd`; this function does **not** close it.
+pub fn decode_cli_from_fd(fd: std::os::fd::RawFd) -> anyhow::Result<Cli> {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    Ok(bincode::deserialize_from(&mut *file)?)
+}
+
+/// Serialize a [`Cli`] into a fresh `memfd`, seeked back to offset 0.
+/// Returns the `OwnedFd`; pass its raw fd number to a child process as `sp <fd>`.
+pub fn cli_to_memfd(cli: &Cli) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    let raw = unsafe { libc::memfd_create(c"nsp-cli-args".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(anyhow::anyhow!(
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fresh fd from memfd_create
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    bincode::serialize_into(&mut file, cli)?;
+    file.seek(SeekFrom::Start(0))?;
+    // Convert back to OwnedFd without closing
+    let owned = unsafe { OwnedFd::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(file)) };
+    Ok(owned)
+}
+
+/// Serialize a [`Cli`] into a non-`CLOEXEC` memfd so it is inherited across `exec`.
+/// Returns the **raw fd number**; the caller is responsible for `close()`ing it after
+/// the child has been spawned.  Use this when passing the fd to a subprocess via
+/// `Command::arg(fd.to_string())`.
+pub fn cli_to_inheritable_fd(cli: &Cli) -> anyhow::Result<std::os::fd::RawFd> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::io::FromRawFd;
+    // MFD_CLOEXEC intentionally omitted — the child process must inherit the fd.
+    let raw = unsafe { libc::memfd_create(c"nsp-cli-inh".as_ptr(), 0) };
+    if raw < 0 {
+        return Err(anyhow::anyhow!(
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    bincode::serialize_into(&mut file, cli)?;
+    file.seek(SeekFrom::Start(0))?;
+    // Leak the File — caller owns the fd lifetime.
+    std::mem::forget(file);
+    Ok(raw)
+}
+
+#[cfg(test)]
+mod cli_fd_tests {
+    use std::os::fd::IntoRawFd;
+
+    use tracing::level_filters::LevelFilter;
+
+    use super::*;
+
+    fn roundtrip(cli: Cli) {
+        let owned_fd = cli_to_memfd(&cli).expect("cli_to_memfd failed");
+        let raw = owned_fd.into_raw_fd();
+        let decoded = decode_cli_from_fd(raw).expect("decode_cli_from_fd failed");
+        // Close the fd now (we own it after the ManuallyDrop dance is done).
+        unsafe { libc::close(raw) };
+
+        // Compare by re-serialising both sides to JSON — Cli doesn't impl PartialEq
+        // because clap derives only Debug, but all inner types do serialise deterministically.
+        let orig = serde_json::to_string(&cli).unwrap();
+        let got = serde_json::to_string(&decoded).unwrap();
+        assert_eq!(orig, got, "roundtrip mismatch");
+    }
+
+    #[test]
+    fn roundtrip_serve() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            cmd: MainCommand::Serve {
+                profile: "myvpn".into(),
+                tun_name: Some("tun42".into()),
+                simple: Some(nsproxy_common::routing::ProxyNym("geph".into())),
+                no_default: false,
+                log: Some(LevelFilter::DEBUG),
+                clash: None,
+                no_dns_capture: true,
+            },
+        });
+    }
+
+    #[test]
+    fn roundtrip_up() {
+        roundtrip(Cli {
+            conf: None,
+            root: Some("/nsp3".into()),
+            no_wrap_check: true,
+            cmd: MainCommand::Up {
+                profile: "myprofile".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn roundtrip_veth_with_log_none() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            cmd: MainCommand::Veth {
+                profile: "p1".into(),
+                veth_name: None,
+                log: None,
+            },
+        });
+    }
+
+    #[test]
+    fn roundtrip_veth_with_log_some() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            cmd: MainCommand::Veth {
+                profile: "p2".into(),
+                veth_name: Some("v_custom".into()),
+                log: Some(LevelFilter::WARN),
+            },
+        });
+    }
 }

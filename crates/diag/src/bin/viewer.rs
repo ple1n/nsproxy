@@ -651,7 +651,7 @@ fn main() -> eframe::Result<()> {
                         if let Some(ref err) = c.error {
                             ui.colored_label(egui::Color32::RED, format!("error: {}", err));
                         }
-                        ui.label(format!("bytes_up: {}  bytes_down: {}", c.bytes_up, c.bytes_down));
+                        ui.label(format!("bytes_up: {:.0}  bytes_down: {:.0}", c.bytes_up, c.bytes_down));
                     } else {
                         ui.label("Selected connection not found");
                     }

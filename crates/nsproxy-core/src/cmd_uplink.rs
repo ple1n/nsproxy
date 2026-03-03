@@ -40,7 +40,7 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
 }
 
 fn cmd_stats() -> Result<()> {
-    use crate::uplink::{UplinkStatsState, LatencyCheck, LinkConnCheck};
+    use crate::uplink::UplinkStatsState;
     use crate::state_blueprint::PersistentState;
 
     let mut hub = crate::uplink::UplinkHub::new();
@@ -59,14 +59,15 @@ fn cmd_stats() -> Result<()> {
         .map(|(id, proxy)| {
             let nym = id.nym().to_string();
             let proxy_display = proxy.to_string();
-            let (has_stats, latency_s, conn_s) = if let Some(s) = stats_state.stats.get(&id.nym()) {
-                let lat = match s.latency {
-                    LatencyCheck::TTFB(ms) => format!("{}ms", ms),
-                    LatencyCheck::None => "-".to_string(),
-                };
-                let conn = match s.last_conn {
-                    LinkConnCheck::Success => "ok".green().to_string(),
-                    LinkConnCheck::Fail => "fail".red().to_string(),
+            let (has_stats, latency_s, conn_s) = if let Some(s) = stats_state.stats.get(id) {
+                let h = s.past_hour();
+                let lat = h.avg_latency_ms()
+                    .map(|ms| format!("{:.0}ms", ms))
+                    .unwrap_or_else(|| "-".to_string());
+                let conn = match h.success_rate() {
+                    Some(p) if p >= 0.5 => format!("{:.0}%", p * 100.0).green().to_string(),
+                    Some(p) => format!("{:.0}%", p * 100.0).red().to_string(),
+                    None => "?".dimmed().to_string(),
                 };
                 (true, lat, conn)
             } else {
@@ -932,6 +933,7 @@ fn cmd_import(path: std::path::PathBuf) -> Result<()> {
 
     let stats_state = crate::uplink::UplinkStatsState {
         stats: snapshot.stats.clone(),
+        clear: nsproxy_common::stats::Timestamp::default(),
     };
     stats_state
         .save_atomic()

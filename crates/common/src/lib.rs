@@ -25,8 +25,10 @@ use nix::{libc::pid_t, unistd::getpid};
 use owo_colors::OwoColorize;
 use serde::{de::Visitor, Deserialize, Serialize};
 
+pub mod crdt;
 pub mod routing;
 pub mod rpc;
+pub mod stats;
 
 pub const UID_HINT_VAR: &str = "NSPROXY_UID";
 
@@ -142,11 +144,13 @@ pub mod state_paths {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct NsAlive {
     pub browser_profile: Option<String>,
     pub bind_mount: PathBuf,
     pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub serve_pid: Option<u32>,
 }
 
 /// Represents an NS anchored to a process, or a file
