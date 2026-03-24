@@ -1546,8 +1546,71 @@ pub struct Cli {
     pub root: Option<PathBuf>,
     #[arg(short, long)]
     pub no_wrap_check: bool,
+    /// UI control socket path.  When set the process connects to this socket on
+    /// startup and sends a `ControlSocketGreeting` frame so the UI can receive
+    /// events without waiting to poll its own outgoing connection.
+    #[arg(long, hide = true)]
+    pub control_socket: Option<PathBuf>,
     #[command(subcommand)]
     pub cmd: MainCommand,
+}
+
+/// Spawn arguments representation suitable for CLI (mirrors `diag::SpawnArgs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliSpawnArgs {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub exec: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub gids: Vec<u32>,
+    pub args: Vec<String>,
+}
+
+impl Default for CliSpawnArgs {
+    fn default() -> Self {
+        CliSpawnArgs {
+            uid: None,
+            gid: None,
+            exec: None,
+            cwd: None,
+            gids: Vec::new(),
+            args: Vec::new(),
+        }
+    }
+}
+
+/// Lightweight CLI form of `DaemonRequest` used for `--cmd` parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CliDaemonRequest {
+    Spawn { args: CliSpawnArgs },
+    /// Provide a JSON `Cli` payload as text; it will be bincode-serialized
+    /// and sent as the raw payload (converts to `DaemonRequest::SpawnCli`).
+    SpawnCli { cli_json: String },
+    /// Liveness ping
+    Ping,
+    GetProcessList,
+    Kill { pid: u32 },
+    Stop,
+}
+
+impl std::str::FromStr for CliDaemonRequest {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        match t.to_ascii_lowercase().as_str() {
+            "stop" => Ok(CliDaemonRequest::Stop),
+            "ping" => Ok(CliDaemonRequest::Ping),
+            "get" | "getprocesslist" | "get_process_list" | "processlist" => Ok(CliDaemonRequest::GetProcessList),
+            other => {
+                // Try JSON fallback for more complex forms
+                if other.starts_with('{') || other.starts_with('[') {
+                    serde_json::from_str::<CliDaemonRequest>(s).map_err(|e| e.to_string())
+                } else {
+                    Err(format!("unknown daemon cmd: {}", s))
+                }
+            }
+        }
+    }
 }
 
 /// Representation of a namespace input (PID or Path)
@@ -1633,6 +1696,9 @@ pub enum MainCommand {
     Up {
         /// Profile name (resolves to /nsp3/{name})
         profile: String,
+        /// Optional daemon request to send to the `up` daemon. Provide JSON matching `CliDaemonRequest`.
+        #[arg(long)]
+        cmd: Option<CliDaemonRequest>,
     },
     /// Tear down a profile: kill the keeper process and remove the namespace bind mount.
     Down {
@@ -1728,6 +1794,16 @@ pub enum UplinkCommand {
         /// Path to the snapshot JSON file
         path: PathBuf,
     },
+    /// Export only DNS backup cache to a JSON file
+    DnsBackup {
+        /// Path to write DNS backup JSON to
+        path: PathBuf,
+    },
+    /// Import only DNS backup cache from JSON file
+    DnsImport {
+        /// Path to read DNS backup JSON from
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
@@ -1768,6 +1844,9 @@ pub enum ClashOps {
         direct: bool,
         #[arg(long)]
         refresh: bool,
+        /// Optional DNS backup JSON file to pre-load cache before resolve
+        #[arg(long)]
+        backup: Option<PathBuf>,
     },
     /// Test the DNS resolution for one host
     TestResolve {

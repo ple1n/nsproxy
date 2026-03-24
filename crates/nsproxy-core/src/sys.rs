@@ -470,7 +470,7 @@ pub fn mount_file_content(content: &[u8], target: &Path) -> Result<()> {
 
     // make sure the target also has appropriate permissions
     let perms = std::fs::Permissions::from_mode(0o644);
-    std::fs::set_permissions(target, perms)?;
+    // std::fs::set_permissions(target, perms)?;
 
     Ok(())
 }

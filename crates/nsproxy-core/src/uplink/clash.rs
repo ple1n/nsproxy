@@ -824,9 +824,7 @@ impl ClashState {
         }
 
         for proxy in &profile.trojan_proxies {
-            let unresolved =
-                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), proxy.port);
-            let proxy_id = ProxyID::for_trojan(unresolved, &proxy.server, &proxy.password);
+            let proxy_id = ProxyID::for_trojan_domain(&proxy.server, proxy.port, &proxy.password);
             if self
                 .trojan_proxies
                 .insert(proxy_id, proxy.clone())

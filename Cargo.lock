@@ -388,6 +388,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a07d1f37ff60921c83bdfc7407723bdefe89b44b98a9b772f225c8f9d67141a6"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,8 +1822,11 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "socks5-impl",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uzers",
 ]
 
 [[package]]
@@ -2076,6 +2088,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3b2838620355debaeb7fa3cc331a1d8ab77e6387d40e65686fa468c229dbf63"
+dependencies = [
+ "egui 0.33.3",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,6 +2176,15 @@ dependencies = [
  "web-time",
  "webbrowser",
  "winit",
+]
+
+[[package]]
+name = "egui_code_editor"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70addd812d64b30d2adabdc4598c648f4fb38cac5df641260b1996efdf22851f"
+dependencies = [
+ "egui 0.33.3",
 ]
 
 [[package]]
@@ -2239,6 +2269,16 @@ dependencies = [
  "ahash",
  "egui 0.33.3",
  "emath 0.33.3",
+]
+
+[[package]]
+name = "egui_sgr"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a56361b61786e5bf671d06288a999dbcf4a32564613f416c35a66c96ee421b29"
+dependencies = [
+ "egui 0.33.3",
+ "regex",
 ]
 
 [[package]]
@@ -4472,8 +4512,10 @@ dependencies = [
  "nix 0.27.1",
  "owo-colors",
  "pidfd 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.8.5",
  "rangemap",
  "serde",
+ "serde_json",
  "socks5-impl",
  "thiserror 1.0.63",
  "tracing",
@@ -4484,6 +4526,7 @@ name = "nsproxy-core"
 version = "3.4.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-recursion",
  "async-trait",
  "atty",
@@ -4567,22 +4610,29 @@ name = "nsproxy-ui"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "diag",
  "eframe 0.33.3",
  "egui 0.33.3",
+ "egui-phosphor",
+ "egui_code_editor",
  "egui_extras 0.33.3",
  "egui_json_tree",
  "egui_plot",
+ "egui_sgr",
  "flume",
+ "futures",
  "libc",
  "nix 0.27.1",
  "nsproxy-common",
  "nsproxy-core",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "which 8.0.0",
 ]
 
 [[package]]
@@ -6262,14 +6312,15 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.143"
+version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d401abef1d108fbd9cbaebc3e46611f4b1021f714a0597a71f41ee463f5f4a5a"
+checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
  "itoa",
  "memchr",
- "ryu",
  "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -9167,6 +9218,12 @@ name = "zeroize"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ced3678a2879b30306d323f4542626697a464a97c0a07c9aebf7ebca65cd4dde"
+
+[[package]]
+name = "zmij"
+version = "1.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zvariant"

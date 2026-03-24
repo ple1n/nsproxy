@@ -225,7 +225,11 @@ impl DiagAccumulator {
             | DiagEvent::HotConfigSnapshot { .. }
             | DiagEvent::DnsState { .. }
             | DiagEvent::RoutingState { .. }
-            | DiagEvent::UplinkStatsSnapshot { .. } => {}
+            | DiagEvent::UplinkStatsSnapshot { .. }
+            | DiagEvent::Log(_)
+            | DiagEvent::RecentLogs(_)
+            | DiagEvent::RecentDiagEvents(_)
+            | DiagEvent::ConnsStateSnapshot { .. } => {}
         }
     }
 }

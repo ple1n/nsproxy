@@ -12,31 +12,32 @@
 //! Server → client carries [`DiagEvent`]; client → server carries [`ControlCommand`].
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Result;
 use nsproxy_common::routing::{ProxyID, RoutingResovled};
+use socks5_impl::protocol::WireAddress;
 pub use nsproxy_common::stats::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
 };
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::Layer;
 
 pub mod summary;
 
 // ── Wire protocol types ──────────────────────────────────────────────
 
-
-
 /// Unique connection identifier assigned in the accept loop.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnId(pub u64);
 
 /// The kind of stream accepted from the TUN device.
@@ -61,10 +62,7 @@ pub enum DiagEvent {
     /// Emitted once at the end of each loop iteration.
     /// From .accept to the end of the loop body, which includes routing and spawning the proxy task.
     /// Should be very fast
-    Dispatched {
-        id: ConnId,
-        dispatch_us: u64,
-    },
+    Dispatched { id: ConnId, dispatch_us: u64 },
     /// Routing decision made for this connection.
     Route {
         id: ConnId,
@@ -72,10 +70,7 @@ pub enum DiagEvent {
         route: RoutingResovled,
     },
     /// Connection to the proxy/remote server established.
-    Connected {
-        id: ConnId,
-        ts: Timestamp,
-    },
+    Connected { id: ConnId, ts: Timestamp },
     /// Connection finished (successfully or with error).
     Finished {
         id: ConnId,
@@ -98,15 +93,9 @@ pub enum DiagEvent {
         query: String,
     },
     /// Acceptor loop waiting for new connection (before ip_stack.accept()).
-    Wait {
-        id: ConnId,
-        ts: Timestamp,
-    },
+    Wait { id: ConnId, ts: Timestamp },
     /// Wait was terminated and connection accepted.
-    WaitEnded {
-        id: ConnId,
-        ts: Timestamp,
-    },
+    WaitEnded { id: ConnId, ts: Timestamp },
     /// HotConfig reload completed (from file watcher or direct request).
     HotConfigReloaded {
         ts: Timestamp,
@@ -123,20 +112,37 @@ pub enum DiagEvent {
         error: Option<String>,
     },
     /// Current DNS state snapshot.
-    DnsState {
-        ts: Timestamp,
-        state: DnsState,
-    },
+    DnsState { ts: Timestamp, state: DnsState },
     /// Current routing selection snapshot.
-    RoutingState {
-        ts: Timestamp,
-        state: RoutingState,
-    },
+    RoutingState { ts: Timestamp, state: RoutingState },
     /// Per-proxy uplink stats snapshot.
     UplinkStatsSnapshot {
         ts: Timestamp,
         stats: std::collections::HashMap<ProxyID, nsproxy_common::stats::ProxyStats>,
     },
+    /// A tracing log record forwarded from the running process.
+    Log(LogEntry),
+    /// Historical log entries from the server-side ring buffer.
+    /// Sent in response to `ControlCommand::QueryRecentLogs`.
+    RecentLogs(Vec<LogEntry>),
+    /// Historical diag events from the server-side ring buffer.
+    /// Sent in response to `ControlCommand::QueryRecentDiagEvents`.
+    RecentDiagEvents(Vec<DiagEvent>),
+    /// Snapshot of the current live connection-tracking state.
+    /// Sent in response to [`ControlCommand::QueryConnsState`].
+    ConnsStateSnapshot { ts: Timestamp, state: ConnsState },
+}
+
+/// A single tracing log record, usable across multiple transport protocols.
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct LogEntry {
+    pub ts: Timestamp,
+    /// Tracing level string: "TRACE", "DEBUG", "INFO", "WARN", or "ERROR".
+    pub level: String,
+    /// The tracing target (usually the module path).
+    pub target: String,
+    /// The formatted log message.
+    pub message: String,
 }
 
 // ── Control commands (client → server) ─────────────────────────────
@@ -159,13 +165,27 @@ pub enum ControlCommand {
     /// Request current hotconfig content snapshot.
     QueryHotConfig,
     /// Apply a new HotConfig JSON payload.
-    ApplyHotConfig {
-        content: String,
-    },
+    ApplyHotConfig { content: String },
     /// Request per-proxy uplink stats from the running hub.
     QueryUplinkStats,
     /// Clear all accumulated uplink stats data.
     ClearStats,
+    /// Request the most-recent `limit` log entries from the server-side ring buffer.
+    /// The server responds with `DiagEvent::RecentLogs`.
+    QueryRecentLogs { limit: usize },
+    /// Request the most-recent `limit` diag events from the server-side ring buffer.
+    /// The server responds immediately with `DiagEvent::RecentDiagEvents`.
+    QueryRecentDiagEvents { limit: usize },
+    /// Enable or disable live connection tracking in the server.
+    /// Mirrors [`DiagServer::track_conns`] at runtime.
+    SetTrackConns { enabled: bool },
+    /// Reset the live connection-tracking state (clears both `active` and `pending`).
+    ResetConnsState,
+    /// Request a full snapshot of the current live connection-tracking state.
+    /// The server responds with [`DiagEvent::ConnsStateSnapshot`].
+    /// Intended for infrequent polling; prefer consuming live events via
+    /// [`ConnsState::apply_event`] for real-time client-side reconstruction.
+    QueryConnsState,
 }
 
 /// Snapshot of DNS state derived from the VirtDNS handle.
@@ -183,6 +203,227 @@ pub struct RoutingState {
     pub selected_proxy: Option<ProxyID>,
 }
 
+// ── Control socket (reversed-role connections) ────────────────────────
+//
+// When the UI passes `--control-socket` to a spawned process, the process
+// connects TO the UI's socket instead of the UI connecting to the process.
+// The first frame sent by the connecting process is a `ControlSocketGreeting`
+// so the UI knows which profile and protocol type to use.  After the greeting,
+// the wire format is identical to the normal socket protocols (just with the
+// connection direction reversed).
+
+/// First frame sent by a spawned process over the UI control socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ControlSocketGreeting {
+    /// The `sp up` daemon is connecting; subsequent frames are `DaemonEvent` / `DaemonRequest`.
+    UpDaemon { name: String },
+    /// The `sp serve` process is connecting; subsequent frames are `DiagEvent` / `ControlCommand`.
+    ServeDaemon { name: String },
+}
+
+/// Encode a [`ControlSocketGreeting`] as a length-prefixed bincode frame ready to write.
+pub fn encode_control_greeting(greeting: &ControlSocketGreeting) -> Result<Vec<u8>> {
+    encode_frame(greeting)
+}
+
+/// Read a [`ControlSocketGreeting`] from the *unsplit* stream.  Returns `None` on clean EOF.
+pub async fn read_control_greeting(stream: &mut UnixStream) -> Result<Option<ControlSocketGreeting>> {
+    read_frame(stream).await
+}
+
+// ── Connection-tracking types ────────────────────────────────────────
+
+/// Per-destination routing-decision counters for active connections.
+///
+/// The inner map key is the routing resolution chosen for that connection;
+/// the value is the number of currently-active connections using that route.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConnsSummary(pub BTreeMap<RoutingResovled, u64>);
+
+// ── Connection-tracking types ────────────────────────────────────────
+
+/// A single tracked connection entry retained in [`ConnsState`].
+///
+/// Entries are created on [`DiagEvent::Accept`] and updated inline as subsequent
+/// events arrive.  Finished entries (where `finished_at` is `Some`) are retained
+/// for [`DiagServer::conn_persist`] before being garbage-collected by a
+/// [`ConnsActor`] GC tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnEntry {
+    /// Resolved destination address.
+    pub dst: WireAddress,
+    /// Last-seen routing decision for this connection (set on [`DiagEvent::Route`]).
+    pub route: Option<RoutingResovled>,
+    /// Timestamp when the connection was accepted.
+    pub accepted_at: Timestamp,
+    /// Timestamp when the upstream connection was established.
+    pub connected_at: Option<Timestamp>,
+    /// Timestamp when the connection finished; `None` means still active.
+    pub finished_at: Option<Timestamp>,
+    /// Error string if the connection finished with an error.
+    pub error: Option<String>,
+    /// Bytes transferred upstream (set on [`DiagEvent::Finished`]).
+    pub bytes_up: Option<f32>,
+    /// Bytes transferred downstream (set on [`DiagEvent::Finished`]).
+    pub bytes_down: Option<f32>,
+}
+
+/// Live connection-tracking state owned by [`ConnsActor`] and delivered to
+/// clients as a snapshot in response to [`ControlCommand::QueryConnsState`].
+///
+/// All connections — pending setup, active, and recently-finished — are stored
+/// in a single flat map keyed by [`ConnId`].  Finished entries are retained for
+/// [`DiagServer::conn_persist`] and then evicted by the actor's GC timer.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ConnsState {
+    /// All tracked connections (pending, active, and recently-finished).
+    pub conns: BTreeMap<ConnId, ConnEntry>,
+}
+
+impl ConnsState {
+    /// Apply a single [`DiagEvent`] to this state.
+    ///
+    /// Called both server-side (inside [`ConnsActor`]) and client-side
+    /// (in the supervisor) to keep a local reconstruction up-to-date.
+    pub fn apply_event(&mut self, event: &DiagEvent) {
+        match event {
+            DiagEvent::Accept { id, dst, ts, .. } => {
+                if let Ok(addr) = WireAddress::try_from(dst.as_str()) {
+                    self.conns.insert(
+                        *id,
+                        ConnEntry {
+                            dst: addr,
+                            route: None,
+                            accepted_at: *ts,
+                            connected_at: None,
+                            finished_at: None,
+                            error: None,
+                            bytes_up: None,
+                            bytes_down: None,
+                        },
+                    );
+                }
+            }
+            DiagEvent::Route { id, route, .. } => {
+                if let Some(entry) = self.conns.get_mut(id) {
+                    entry.route = Some(route.clone());
+                }
+            }
+            DiagEvent::Connected { id, ts } => {
+                if let Some(entry) = self.conns.get_mut(id) {
+                    entry.connected_at = Some(*ts);
+                }
+            }
+            DiagEvent::DnsResolved { id, ts, .. } => {
+                // DNS connections are handled internally; mark as finished so they
+                // enter the persistence window rather than accumulating as active.
+                if let Some(entry) = self.conns.get_mut(id) {
+                    if entry.finished_at.is_none() {
+                        entry.finished_at = Some(*ts);
+                    }
+                }
+            }
+            DiagEvent::Finished {
+                id,
+                ts,
+                error,
+                bytes_up,
+                bytes_down,
+                ..
+            } => {
+                if let Some(entry) = self.conns.get_mut(id) {
+                    entry.finished_at = Some(*ts);
+                    entry.error = error.clone();
+                    entry.bytes_up = Some(*bytes_up);
+                    entry.bytes_down = Some(*bytes_down);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Clear all tracked connections.
+    pub fn reset(&mut self) {
+        self.conns.clear();
+    }
+
+    /// Remove finished entries whose age exceeds `max_age`.
+    /// Active (unfinished) entries are never removed by this method.
+    pub fn gc(&mut self, max_age: Duration) {
+        let now_us = Timestamp::now().0;
+        let max_age_us = max_age.as_micros() as u64;
+        self.conns.retain(|_, entry| {
+            entry
+                .finished_at
+                .map(|ts| now_us.saturating_sub(ts.0) < max_age_us)
+                .unwrap_or(true) // keep all non-finished (active) entries
+        });
+    }
+}
+
+// ── ConnsActor ───────────────────────────────────────────────────────
+
+/// Command sent to the [`ConnsActor`] task.
+pub enum ConnsCmd {
+    /// Apply a diag event to the tracked connection state.
+    Event(DiagEvent),
+    /// Clear all tracked connections.
+    Reset,
+    /// Request a snapshot; the response is sent on the provided oneshot channel.
+    Query(oneshot::Sender<ConnsState>),
+}
+
+/// How often the actor checks for stale finished entries to garbage-collect.
+const GC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Async actor that exclusively owns [`ConnsState`] and drives its GC loop.
+///
+/// All mutation goes through the [`mpsc`] channel so there is no shared-mutex
+/// contention on the hot emit path.
+struct ConnsActor {
+    state: ConnsState,
+    conn_persist: Duration,
+    rx: mpsc::Receiver<ConnsCmd>,
+}
+
+impl ConnsActor {
+    /// Spawn the actor task and return its command sender.
+    fn spawn(conn_persist: Duration) -> mpsc::Sender<ConnsCmd> {
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(
+            Self {
+                state: ConnsState::default(),
+                conn_persist,
+                rx,
+            }
+            .run(),
+        );
+        tx
+    }
+
+    async fn run(mut self) {
+        let mut gc_interval = tokio::time::interval(GC_INTERVAL);
+        gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = gc_interval.tick() => {
+                    self.state.gc(self.conn_persist);
+                }
+                msg = self.rx.recv() => {
+                    match msg {
+                        Some(ConnsCmd::Event(ev)) => self.state.apply_event(&ev),
+                        Some(ConnsCmd::Reset) => self.state.reset(),
+                        Some(ConnsCmd::Query(resp)) => {
+                            let _ = resp.send(self.state.clone());
+                        }
+                        None => break, // all senders dropped — shut down
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Server (tun2socks5 side) ─────────────────────────────────────────
 
 /// Broadcaster that tun2socks5 uses to emit events.
@@ -192,12 +433,29 @@ pub struct DiagServer {
     /// Pre-encoded bincode frames (len-prefix + payload) ready to write.
     tx: broadcast::Sender<Arc<Vec<u8>>>,
     cmd_tx: mpsc::Sender<ControlCommand>,
+    /// Rolling ring buffer of the most-recent [`DIAG_EVENT_RING_CAP`] emitted events.
+    event_ring: Arc<Mutex<VecDeque<DiagEvent>>>,
+    /// Channel to the [`ConnsActor`] that owns connection-tracking state.
+    conns_tx: mpsc::Sender<ConnsCmd>,
+    /// When `false`, all connection-tracking logic in [`Self::emit`] is skipped.
+    /// Shared across clones; may be toggled at runtime via [`Self::set_track_conns`]
+    /// or the [`ControlCommand::SetTrackConns`] wire command.
+    track_conns: Arc<AtomicBool>,
+    /// Duration to retain finished connection entries before garbage-collecting them.
+    /// Default: [`DEFAULT_CONN_PERSIST`]. Set at construction time via [`DiagServer::start`].
+    pub conn_persist: Duration,
 }
 
 /// Capacity of the broadcast channel (rolling window for slow readers).
 const BROADCAST_CAP: usize = 4096;
 /// Capacity of the control-command mpsc channel.
 const CMD_CAP: usize = 64;
+/// Number of [`DiagEvent`]s retained in the server-side ring buffer.
+pub const DIAG_EVENT_RING_CAP: usize = 50;
+/// Default value of [`DiagServer::track_conns`] when created via [`DiagServer::start`] or [`DiagServer::noop`].
+pub const DEFAULT_TRACK_CONNS: bool = true;
+/// Default duration finished connection entries are retained before GC.
+pub const DEFAULT_CONN_PERSIST: Duration = Duration::from_secs(60);
 
 impl DiagServer {
     /// Create a new `DiagServer` and spawn the UNIX listener task.
@@ -205,13 +463,21 @@ impl DiagServer {
     /// The socket and its parent directory are made world-accessible (0o777 / 0o666)
     /// so that a non-root EGUI viewer can connect.
     ///
+    /// `conn_persist` controls how long finished connection entries are retained
+    /// before the [`ConnsActor`] GC tick removes them.  Pass [`DEFAULT_CONN_PERSIST`]
+    /// for the default 60-second window.
+    ///
     /// Returns `(server, cmd_rx)`.  Poll `cmd_rx` to receive [`ControlCommand`]s sent
     /// by any connected client.
-    pub async fn start(sock_path: &Path) -> Result<(Self, mpsc::Receiver<ControlCommand>)> {
+    pub async fn start(
+        sock_path: &Path,
+        conn_persist: Duration,
+    ) -> Result<(Self, mpsc::Receiver<ControlCommand>)> {
         // Ensure parent directory exists and is world-accessible
         if let Some(parent) = sock_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).await
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+                .await
                 .unwrap_or_else(|e| warn!("diag: could not chmod parent dir: {}", e));
         }
         // Remove stale socket
@@ -226,7 +492,18 @@ impl DiagServer {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CAP);
-        let server = DiagServer { tx: tx.clone(), cmd_tx: cmd_tx.clone() };
+        let event_ring: Arc<Mutex<VecDeque<DiagEvent>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(DIAG_EVENT_RING_CAP)));
+        let track_conns = Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS));
+        let conns_tx = ConnsActor::spawn(conn_persist);
+        let server = DiagServer {
+            tx: tx.clone(),
+            cmd_tx: cmd_tx.clone(),
+            event_ring: event_ring.clone(),
+            conns_tx: conns_tx.clone(),
+            track_conns: track_conns.clone(),
+            conn_persist,
+        };
 
         // Spawn acceptor
         let tx2 = tx.clone();
@@ -236,7 +513,14 @@ impl DiagServer {
                     Ok((stream, _addr)) => {
                         info!("diag: client connected");
                         let rx = tx2.subscribe();
-                        tokio::spawn(serve_client(stream, rx, cmd_tx.clone()));
+                        tokio::spawn(serve_client(
+                            stream,
+                            rx,
+                            cmd_tx.clone(),
+                            event_ring.clone(),
+                            track_conns.clone(),
+                            conns_tx.clone(),
+                        ));
                     }
                     Err(e) => {
                         error!("diag: accept error: {}", e);
@@ -250,7 +534,23 @@ impl DiagServer {
 
     /// Emit a diagnostic event. Non-blocking; if no clients are connected the
     /// event is silently dropped.
+    ///
+    /// The event is also appended to the internal ring buffer (capped at
+    /// [`DIAG_EVENT_RING_CAP`]) and, when [`Self::track_conns`] is `true`,
+    /// forwarded to the [`ConnsActor`] for live connection-tracking.
     pub fn emit(&self, event: DiagEvent) {
+        // 1. Push to the rolling ring buffer.
+        if let Ok(mut ring) = self.event_ring.lock() {
+            if ring.len() >= DIAG_EVENT_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(event.clone());
+        }
+        // 2. Forward to the ConnsActor (fire-and-forget; never blocks the caller).
+        if self.track_conns.load(Ordering::Relaxed) {
+            let _ = self.conns_tx.try_send(ConnsCmd::Event(event.clone()));
+        }
+        // 3. Broadcast pre-encoded frame to connected clients.
         if let Ok(frame) = encode_frame(&event) {
             let _ = self.tx.send(Arc::new(frame));
         } else {
@@ -258,11 +558,68 @@ impl DiagServer {
         }
     }
 
+    /// Get the current value of the connection-tracking flag.
+    pub fn track_conns(&self) -> bool {
+        self.track_conns.load(Ordering::Relaxed)
+    }
+
+    /// Set the connection-tracking flag. Takes effect immediately across all clones.
+    pub fn set_track_conns(&self, enabled: bool) {
+        self.track_conns.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Install this server's broadcast channel as the process-global serve log sink.
+    ///
+    /// After calling this, [`DiagTracingLayer`] will forward all log records from tasks
+    /// that are *not* running inside a [`DiagServer::scope`] to this server's diag socket
+    /// as [`DiagEvent::Log`] frames.  Call once after [`DiagServer::start`] in `sp serve`.
+    pub fn install_as_global(&self) {
+        let _ = SERVE_LOG_TX.set(self.tx.clone());
+    }
+
     /// Returns a no-op stub that silently discards all events and commands.
     pub fn noop() -> Self {
         let (tx, _) = broadcast::channel(1);
         let (cmd_tx, _) = mpsc::channel(1);
-        DiagServer { tx, cmd_tx }
+        let (conns_tx, _) = mpsc::channel(1); // no receiver — messages are dropped
+        DiagServer {
+            tx,
+            cmd_tx,
+            event_ring: Arc::new(Mutex::new(VecDeque::new())),
+            conns_tx,
+            track_conns: Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS)),
+            conn_persist: DEFAULT_CONN_PERSIST,
+        }
+    }
+
+    /// Register a reversed-role connection as a diag client.
+    ///
+    /// In the normal flow the UI connects to the server's socket; with a reversed
+    /// connection the spawned process connected to the UI's control socket.  From
+    /// the wire perspective the roles are identical — the server still broadcasts
+    /// `DiagEvent` frames and the client still sends `ControlCommand` frames — so
+    /// we can reuse `serve_client` unchanged.
+    pub fn add_reversed_client(&self, stream: UnixStream) {
+        let rx = self.tx.subscribe();
+        let cmd_tx = self.cmd_tx.clone();
+        let ring = self.event_ring.clone();
+        let track_conns = self.track_conns.clone();
+        let conns_tx = self.conns_tx.clone();
+        tokio::spawn(serve_client(stream, rx, cmd_tx, ring, track_conns, conns_tx));
+    }
+
+    /// Run `fut` inside a task-local scope so that all `tracing` log records
+    /// emitted during its execution are forwarded to this server's diag socket.
+    ///
+    /// Use this to wrap the top-level async block of a profile's serve task:
+    /// ```ignore
+    /// rt.block_on(diag_srv.scope(async move { ... }))
+    /// ```
+    pub fn scope<F: std::future::Future>(
+        &self,
+        fut: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        TASK_DIAG.scope(Some(self.tx.clone()), fut)
     }
 }
 
@@ -274,6 +631,9 @@ async fn serve_client(
     stream: UnixStream,
     mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
     cmd_tx: mpsc::Sender<ControlCommand>,
+    event_ring: Arc<Mutex<VecDeque<DiagEvent>>>,
+    track_conns: Arc<AtomicBool>,
+    conns_tx: mpsc::Sender<ConnsCmd>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -300,6 +660,47 @@ async fn serve_client(
             // Inbound: client-sent control command → server
             result = read_frame::<ControlCommand, _>(&mut read_half) => {
                 match result {
+                    Ok(Some(ControlCommand::QueryRecentDiagEvents { limit })) => {
+                        // Handled directly here; do not forward to the application.
+                        let events: Vec<DiagEvent> = match event_ring.lock() {
+                            Ok(guard) => {
+                                let skip = guard.len().saturating_sub(limit);
+                                guard.iter().skip(skip).cloned().collect()
+                            }
+                            Err(_) => vec![],
+                        };
+                        if let Ok(frame) = encode_frame(&DiagEvent::RecentDiagEvents(events)) {
+                            if write_half.write_all(&frame).await.is_err() {
+                                debug!("diag: client disconnected (write response)");
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Some(ControlCommand::SetTrackConns { enabled })) => {
+                        track_conns.store(enabled, Ordering::Relaxed);
+                        debug!("diag: track_conns set to {}", enabled);
+                    }
+                    Ok(Some(ControlCommand::ResetConnsState)) => {
+                        let _ = conns_tx.send(ConnsCmd::Reset).await;
+                        debug!("diag: conns state reset");
+                    }
+                    Ok(Some(ControlCommand::QueryConnsState)) => {
+                        let (resp_tx, resp_rx) = oneshot::channel();
+                        if conns_tx.send(ConnsCmd::Query(resp_tx)).await.is_ok() {
+                            if let Ok(state) = resp_rx.await {
+                                let event = DiagEvent::ConnsStateSnapshot {
+                                    ts: Timestamp::now(),
+                                    state,
+                                };
+                                if let Ok(frame) = encode_frame(&event) {
+                                    if write_half.write_all(&frame).await.is_err() {
+                                        debug!("diag: client disconnected (write conns snapshot)");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Ok(Some(cmd)) => {
                         debug!("diag: received control command: {:?}", cmd);
                         if cmd_tx.send(cmd).await.is_err() {
@@ -355,8 +756,7 @@ where
 /// Connect to a running tun2socks5 diag socket.
 pub async fn connect(sock_path: &Path) -> Result<DiagEventStream> {
     let stream = UnixStream::connect(sock_path).await?;
-    let (read_half, write_half) = stream.into_split();
-    Ok(DiagEventStream { read_half, write_half })
+    Ok(DiagEventStream::from_stream(stream))
 }
 
 pub struct DiagEventStream {
@@ -364,7 +764,18 @@ pub struct DiagEventStream {
     write_half: tokio::net::unix::OwnedWriteHalf,
 }
 
+impl std::fmt::Debug for DiagEventStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiagEventStream").finish_non_exhaustive()
+    }
+}
+
 impl DiagEventStream {
+    /// Construct from an already-established stream (reversed connection).
+    pub fn from_stream(stream: UnixStream) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        DiagEventStream { read_half, write_half }
+    }
     /// Read the next [`DiagEvent`] from the stream. Returns `None` on EOF.
     pub async fn next(&mut self) -> Result<Option<DiagEvent>> {
         read_frame(&mut self.read_half).await
@@ -422,7 +833,163 @@ impl DiagEventWriter {
 /// Derive the canonical diag socket path for a named instance.
 /// `/nsp3/{name}/tun_diag.sock`
 pub fn diag_sock_path(instance_name: &str) -> PathBuf {
-    PathBuf::from("/nsp3").join(instance_name).join("tun_diag.sock")
+    PathBuf::from("/nsp3")
+        .join(instance_name)
+        .join("tun_diag.sock")
+}
+
+/// Derive the canonical `sp up` daemon socket path for a named instance.
+/// `/nsp3/{name}/up.sock`
+pub fn up_sock_path(instance_name: &str) -> PathBuf {
+    PathBuf::from("/nsp3").join(instance_name).join("up.sock")
+}
+
+// ── Task-local diag sender + tracing layer ────────────────────────────
+
+tokio::task_local! {
+    /// When set, tracing log records are forwarded to this broadcast sender,
+    /// which corresponds to the `DiagServer` for the currently-active profile.
+    /// Use [`DiagServer::scope`] to install it for a given async scope.
+    static TASK_DIAG: Option<broadcast::Sender<Arc<Vec<u8>>>>;
+}
+
+/// Global broadcast channel for the `sp up` daemon's log forwarding.
+/// Initialised once by [`init_up_log_broadcast`] when the up daemon starts.
+/// [`DiagTracingLayer`] forwards log records here whenever no per-task diag scope is active.
+static UP_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sync::OnceLock::new();
+
+/// Global broadcast channel for the `sp serve` diag log forwarding.
+/// Installed once via [`DiagServer::install_as_global`] after the diag server is created.
+/// [`DiagTracingLayer`] forwards log records here (as [`DiagEvent::Log`] frames) for tasks
+/// that are not running inside a [`DiagServer::scope`].
+static SERVE_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sync::OnceLock::new();
+
+/// Initialise the global up-daemon log broadcast channel.
+/// Safe to call multiple times; only the first call takes effect.
+pub fn init_up_log_broadcast() {
+    let (tx, _) = broadcast::channel(1024);
+    let _ = UP_LOG_TX.set(tx);
+}
+
+/// Subscribe to the up-daemon log broadcast, receiving pre-encoded `DaemonEvent::Log` frames.
+/// Returns `None` if [`init_up_log_broadcast`] has not been called yet.
+pub fn subscribe_up_logs() -> Option<broadcast::Receiver<Arc<Vec<u8>>>> {
+    UP_LOG_TX.get().map(|tx| tx.subscribe())
+}
+
+// ── In-process log ring buffer ────────────────────────────────────────
+
+/// Maximum number of `LogEntry` items retained in the per-process ring buffer.
+pub const LOG_RING_CAP: usize = 2000;
+
+/// The per-process log ring buffer. Shared by all paths (`sp serve` and `sp up` each run in
+/// their own process and therefore have their own instance).
+static LOG_RING: std::sync::OnceLock<Arc<Mutex<VecDeque<LogEntry>>>> =
+    std::sync::OnceLock::new();
+
+fn log_ring() -> &'static Arc<Mutex<VecDeque<LogEntry>>> {
+    LOG_RING.get_or_init(|| {
+        Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_CAP)))
+    })
+}
+
+/// Append a log entry to the in-process ring buffer.
+/// The oldest entry is discarded when the buffer reaches `LOG_RING_CAP`.
+fn push_log_ring(entry: &LogEntry) {
+    if let Ok(mut guard) = log_ring().lock() {
+        if guard.len() >= LOG_RING_CAP {
+            guard.pop_front();
+        }
+        guard.push_back(entry.clone());
+    }
+}
+
+/// Query the in-process ring buffer, returning up to `limit` most-recent entries (oldest first).
+///
+/// Use this to serve `ControlCommand::QueryRecentLogs` / `DaemonRequest::QueryRecentLogs`.
+pub fn query_recent_logs(limit: usize) -> Vec<LogEntry> {
+    match log_ring().lock() {
+        Ok(guard) => {
+            let skip = guard.len().saturating_sub(limit);
+            guard.iter().skip(skip).cloned().collect()
+        }
+        Err(_) => vec![],
+    }
+}
+
+/// A [`tracing_subscriber::Layer`] that forwards every log record to the
+/// per-task [`DiagServer`] installed via [`DiagServer::scope`].
+///
+/// Register once at subscriber init; it is a no-op when no task-local is set.
+pub struct DiagTracingLayer;
+
+impl<S> Layer<S> for DiagTracingLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // Collect the message field from the event once.
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+
+        let entry = LogEntry {
+            ts: Timestamp::now(),
+            level: event.metadata().level().to_string(),
+            target: event.metadata().target().to_string(),
+            message: visitor.0,
+        };
+
+        // Always push to the in-process ring buffer so clients can query history.
+        push_log_ring(&entry);
+
+        // Forward to the per-task diag socket when inside a serve scope.
+        let sent_to_diag = TASK_DIAG
+            .try_with(|opt| {
+                if let Some(tx) = opt.as_ref() {
+                    if let Ok(frame) = encode_frame(&DiagEvent::Log(entry.clone())) {
+                        let _ = tx.send(Arc::new(frame));
+                        return true;
+                    }
+                }
+                false
+            })
+            .unwrap_or(false);
+
+        // Outside a diag scope, forward to the serve-global channel when in a serve process,
+        // otherwise fall back to the up daemon broadcast channel.
+        if !sent_to_diag {
+            if let Some(tx) = SERVE_LOG_TX.get() {
+                if let Ok(frame) = encode_frame(&DiagEvent::Log(entry)) {
+                    let _ = tx.send(Arc::new(frame));
+                }
+            } else if let Some(tx) = UP_LOG_TX.get() {
+                if let Ok(frame) = encode_frame(&DaemonEvent::Log(entry)) {
+                    let _ = tx.send(Arc::new(frame));
+                }
+            }
+        }
+    }
+}
+
+/// Minimal `tracing::field::Visit` impl that collects the `message` field.
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{:?}", value);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_owned();
+        }
+    }
 }
 
 // ── Atomic connection-id generator ───────────────────────────────────
@@ -431,4 +998,200 @@ static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub fn next_conn_id() -> ConnId {
     ConnId(NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Exact process spawn arguments sent over the `sp up` daemon wire protocol.
+/// This struct must stay deterministic and avoid runtime inference.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnArgs {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub exec: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub gids: Vec<u32>,
+    pub args: Vec<String>,
+}
+
+impl SpawnArgs {
+    pub fn exec_program_hint(&self) -> Option<String> {
+        self.exec.clone()
+    }
+
+    pub fn shell_cwd_hint(&self) -> Option<PathBuf> {
+        self.cwd.clone()
+    }
+}
+
+// ── `sp up` daemon protocol (controller ↔ parent process) ───────────
+
+/// Requests sent to the `sp up` daemon from controller
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonRequest {
+    /// Spawn a new child process with given preferences
+    Spawn {
+        args: SpawnArgs,
+    },
+    /// Spawn `nsproxy` with a bincode-encoded `Cli` payload.
+    /// The receiver should pass it via inheritable fd and invoke `sp <fd>`.
+    SpawnCli {
+        cli_bincode: Vec<u8>,
+    },
+    /// Request current process list snapshot
+    GetProcessList,
+    /// Kill a child process by PID
+    Kill {
+        pid: u32,
+    },
+    /// Ping the daemon and expect a Pong response (useful for liveness checks)
+    Ping,
+    Stop,
+    /// Request the most-recent `limit` log entries from the up-daemon ring buffer.
+    /// The server responds immediately with `DaemonEvent::RecentLogs`.
+    QueryRecentLogs { limit: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnCliType {
+    pub cli_bincode: Vec<u8>,
+    pub is_serve: bool,
+}
+
+/// Snapshot of all managed processes transmitted on state change
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonEvent {
+    /// Child process was spawned
+    Spawned { pid: u32 },
+    /// Child process exited
+    ProcessExit { pid: u32 },
+    /// Snapshot of all managed processes (live and dead)
+    ProcessListSnapshot(ProcessListSnapshot),
+    /// Error response
+    Error { msg: String },
+    /// Response to Ping
+    Pong,
+    /// Daemon process stopping
+    Stopping,
+    /// A tracing log record forwarded from the running `sp up` process.
+    Log(LogEntry),
+    /// Historical log entries from the up-daemon ring buffer.
+    /// Sent in response to `DaemonRequest::QueryRecentLogs`.
+    RecentLogs(Vec<LogEntry>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ProcessStatus {
+    Alive(u32),
+    Terminating(u32),
+    Killed(u32),
+    #[default]
+    Vacant,
+}
+
+impl ProcessStatus {
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            ProcessStatus::Alive(pid)
+            | ProcessStatus::Terminating(pid)
+            | ProcessStatus::Killed(pid) => Some(*pid),
+            ProcessStatus::Vacant => None,
+        }
+    }
+}
+
+/// Information about a spawned process (may be dead)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessEntry {
+    pub meta: SpawnedEntry,
+    pub spawned_at: SystemTime,
+    pub status: ProcessStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpawnedEntry {
+    Args(SpawnArgs),
+    Cli(SpawnCliType),
+}
+
+/// Snapshot of the process list sent in `DaemonEvent::ProcessListSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessListSnapshot {
+    pub procs: BTreeMap<u32, ProcessEntry>,
+    /// PID in procs
+    pub serve: u32,
+}
+
+/// In-memory snapshot of all managed processes (pid -> entry)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessList {
+    pub processes: BTreeMap<u32, ProcessEntry>,
+}
+
+pub struct UpDaemonStream {
+    read_half: tokio::net::unix::OwnedReadHalf,
+    write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl std::fmt::Debug for UpDaemonStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpDaemonStream").finish_non_exhaustive()
+    }
+}
+
+pub struct UpDaemonReader {
+    read_half: tokio::net::unix::OwnedReadHalf,
+}
+
+impl UpDaemonReader {
+    pub async fn next_event(&mut self) -> Result<Option<DaemonEvent>> {
+        read_frame(&mut self.read_half).await
+    }
+}
+
+pub struct UpDaemonWriter {
+    write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl UpDaemonWriter {
+    pub async fn send_request(&mut self, req: &DaemonRequest) -> Result<()> {
+        let frame = encode_frame(req)?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+}
+
+pub async fn connect_up_daemon(sock_path: &Path) -> Result<UpDaemonStream> {
+    let stream = UnixStream::connect(sock_path).await?;
+    Ok(UpDaemonStream::from_stream(stream))
+}
+
+impl UpDaemonStream {
+    /// Construct from an already-established stream (e.g. a reversed connection where
+    /// the remote end connected to us rather than us connecting to it).
+    pub fn from_stream(stream: UnixStream) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        UpDaemonStream { read_half, write_half }
+    }
+}
+
+impl UpDaemonStream {
+    pub async fn next_event(&mut self) -> Result<Option<DaemonEvent>> {
+        read_frame(&mut self.read_half).await
+    }
+
+    pub async fn send_request(&mut self, req: &DaemonRequest) -> Result<()> {
+        let frame = encode_frame(req)?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub fn split(self) -> (UpDaemonReader, UpDaemonWriter) {
+        (
+            UpDaemonReader {
+                read_half: self.read_half,
+            },
+            UpDaemonWriter {
+                write_half: self.write_half,
+            },
+        )
+    }
 }

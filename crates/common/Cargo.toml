@@ -22,3 +22,7 @@ socks5-impl = { path = "../socks5-impl" }
 blake3 = "1.5"
 hex = "0.4"
 rangemap = { version = "1", features = ["serde1"] }
+
+[dev-dependencies]
+serde_json = "1.0.149"
+rand = "0.8"

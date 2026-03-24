@@ -149,10 +149,6 @@ pub fn global_state_tree() -> StateNode {
                         "uplink_profile_dir",
                         state_paths::uplink_profile_dir("{kind}", "{profile}"),
                     ),
-                    StateNode::leaf(
-                        "clash_profile_config (template)",
-                        state_paths::uplink_profile_config("clash", "{profile}"),
-                    ),
                 ],
             ),
         ],

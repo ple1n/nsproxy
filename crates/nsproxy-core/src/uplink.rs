@@ -51,6 +51,7 @@
 // We will route resolution of proxy servers' domains through anonymous channels once we have any; never take the direct path when more secure and anonymous ones are at hand.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -64,7 +65,9 @@ use nsproxy_common::routing::{
     DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled,
     VDNSRES,
 };
-use nsproxy_common::stats::{ChronoData, ProxyStats, Timestamp};
+use nsproxy_common::stats::{
+    default_udp_expectation, ChronoData, ProxyProtocol, ProxyStats, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
 use tracing::{info, warn};
@@ -74,6 +77,7 @@ use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 use crate::{state_blueprint::PersistentState, state_paths};
 
 pub mod router;
+pub mod backup;
 
 /// Maximum number of concurrent virtual DNS entries (mirrors tun2socks5 default)
 const POOL_SIZE: usize = 65_535;
@@ -415,9 +419,10 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
                 target: WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port)),
                 id: ProxyID::for_file(path.as_path()),
             },
-            VDNSRES::Opine(RoutingDecision::Drop(_)) | VDNSRES::ERR => {
-                RoutingResovled::Drop(DropReason::Preprocess)
-            }
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => RoutingResovled::Drop(reason.clone()),
+            VDNSRES::ERR => RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
+                "vdns error",
+            ))),
         }
     })
 }
@@ -510,13 +515,32 @@ impl std::fmt::Display for UplinkProxy {
     }
 }
 
+pub fn uplink_proxy_protocol(proxy: &UplinkProxy) -> ProxyProtocol {
+    match proxy {
+        UplinkProxy::Trojan(_) => ProxyProtocol::Trojan,
+        UplinkProxy::Geph => ProxyProtocol::Geph,
+        UplinkProxy::File(_) => ProxyProtocol::File,
+        UplinkProxy::Remote(arg) => match arg.proxy_type {
+            tun2socks5::ProxyType::Socks4 => ProxyProtocol::Socks4,
+            tun2socks5::ProxyType::Socks5 => ProxyProtocol::Socks5,
+            tun2socks5::ProxyType::Http => ProxyProtocol::Http,
+        },
+    }
+}
+
+pub fn uplink_proxy_default_udp_expected(proxy: &UplinkProxy) -> bool {
+    default_udp_expectation(uplink_proxy_protocol(proxy))
+}
+
 impl UplinkHub {
     /// Create a new UplinkHub with a default routing function
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
             routing_fn: Arc::new(|_ctx: &RoutingContext, _hub: &UplinkHub| {
-                RoutingResovled::Drop(DropReason::Preprocess)
+                RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
+                    "no routing function set",
+                )))
             }),
             clash: None,
             stats: HashMap::new(),
@@ -553,25 +577,21 @@ impl UplinkHub {
     pub fn save_stats(&mut self) -> Result<()> {
         let persisted = UplinkStatsState::load_or_default()?;
 
-        // A newer clear signal was already persisted by another process.
-        // Discard local pre-clear data and adopt persisted state; skip saving.
         if persisted.clear > self.stats_clear {
             self.stats = persisted.stats;
             self.stats_clear = persisted.clear;
             return Ok(());
         }
 
-        let current = UplinkStatsState {
+        let mut state = UplinkStatsState {
             stats: self.stats.clone(),
             clear: self.stats_clear,
         };
-        let mut merged = persisted.merge(current);
-        merged.compact_for_save();
-        merged.save_atomic()?;
+        state.compact_for_save();
+        state.save_atomic()?;
 
-        // Keep in-memory copy synchronized with persisted merged state.
-        self.stats = merged.stats;
-        self.stats_clear = merged.clear;
+        self.stats = state.stats;
+        self.stats_clear = state.clear;
         Ok(())
     }
 
@@ -761,10 +781,11 @@ impl UplinkHub {
                     password: cfg.password.clone(),
                 };
 
-                let id = ProxyID::for_trojan(
-                    runtime.server_addr,
-                    &runtime.server_name,
-                    &runtime.password,
+                // Prefer domain-based ProxyID for stable identity across DNS changes
+                let id = ProxyID::for_trojan_domain(
+                    &cfg.server,
+                    cfg.port,
+                    &cfg.password,
                 );
                 self.add_proxy(id, UplinkProxy::Trojan(runtime));
                 count += 1;
@@ -1889,14 +1910,14 @@ mod tests {
         let mut stats1 = ProxyStats::default();
         stats1.record_latency_ms(100);
         stats1.record_attempt(true);
-        stats1.record_traffic(1024.0, 2048.0);
+        stats1.record_traffic(1024, 2048);
 
         let mut stats2 = ProxyStats::default();
         stats2.record_latency_ms(200);
         stats2.record_attempt(false);
 
         let mut stats3 = ProxyStats::default();
-        stats3.record_traffic(512.0, 1024.0);
+        stats3.record_traffic(512, 1024);
 
         // Build UplinkStatsState
         let mut state = UplinkStatsState::default();

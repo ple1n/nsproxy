@@ -29,7 +29,7 @@ use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 
 use crate::{
     HotConfig,
-    uplink::{UplinkHub, UplinkProxy},
+    uplink::{UplinkHub, UplinkProxy, uplink_proxy_default_udp_expected},
 };
 
 // based off crates/tun2socks5/src/lib.rs
@@ -177,7 +177,7 @@ impl Router {
     /// Initialize diagnostic monitoring.
     /// After calling this, use [`Router::take_cmd_rx`] to obtain the control-command receiver.
     pub async fn init_diag(&mut self, sock_path: &PathBuf) -> Result<()> {
-        match DiagServer::start(sock_path.as_path()).await {
+        match DiagServer::start(sock_path.as_path(), diag::DEFAULT_CONN_PERSIST).await {
             Ok((srv, cmd_rx)) => {
                 info!("diag server started at {:?}", sock_path);
                 self.diag = srv;
@@ -398,6 +398,8 @@ impl Router {
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
 
+                    let expected_udp = uplink_proxy_default_udp_expected(&proxy);
+
                     let connect_start = std::time::Instant::now();
 
                     let conn_result = match &proxy {
@@ -419,7 +421,10 @@ impl Router {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
-                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
+                            let mut hub = uplink.write().await;
+                            let stats = hub.stats.entry(id.clone()).or_default();
+                            stats.set_expected_udp_default(expected_udp);
+                            stats.record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             continue;
@@ -443,6 +448,7 @@ impl Router {
                     {
                         let mut hub = uplink.write().await;
                         let s = hub.stats.entry(id.clone()).or_default();
+                        s.set_expected_udp_default(expected_udp);
                         s.record_latency_ms(latency_ms);
                     }
 
@@ -458,6 +464,7 @@ impl Router {
                             {
                                 let mut hub = uplink.write().await;
                                 let s = hub.stats.entry(id.clone()).or_default();
+                                s.set_expected_udp_default(expected_udp);
                                 s.record_attempt(true);
                                 s.record_traffic(up, down);
                             }
@@ -465,8 +472,8 @@ impl Router {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: None,
-                                bytes_up: up,
-                                bytes_down: down,
+                                bytes_up: up as f32,
+                                bytes_down: down as f32,
                             });
                             break;
                         }
@@ -475,7 +482,10 @@ impl Router {
                                 "proxy {:?} relay failed for {peer}: {relay_err:?}, retrying",
                                 id
                             );
-                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
+                            let mut hub = uplink.write().await;
+                            let stats = hub.stats.entry(id.clone()).or_default();
+                            stats.set_expected_udp_default(expected_udp);
+                            stats.record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
@@ -508,13 +518,13 @@ impl Router {
         tunnel: &mut dyn crate::uplink::proxy_adapters::UdpLike,
         udp: &mut IpStackUdpStream,
         peer: SocketAddr,
-    ) -> Result<(f32, f32)> {
+    ) -> Result<(u128, u128)> {
         use socks5_impl::protocol::WireAddress;
         use tokio::io::AsyncReadExt;
 
         let dst = WireAddress::SocketAddress(peer);
-        let mut bytes_up: f32 = 0.0;
-        let mut bytes_down: f32 = 0.0;
+        let mut bytes_up: u128 = 0;
+        let mut bytes_down: u128 = 0;
         let mut buf = vec![0u8; 65535];
 
         loop {
@@ -527,14 +537,14 @@ impl Router {
                     }
                     tunnel.send_to(&buf[..n], dst.clone()).await
                         .map_err(|e| anyhow::anyhow!("UDP send_to failed: {}", e))?;
-                    bytes_up += n as f32;
+                    bytes_up += n as u128;
                 }
                 // tunnel -> TUN (downstream)
                 result = tunnel.recv_from() => {
                     let pkt = result.map_err(|e| anyhow::anyhow!("UDP recv_from failed: {}", e))?;
                     let n = pkt.data.len();
                     udp.write_all(&pkt.data).await?;
-                    bytes_down += n as f32;
+                    bytes_down += n as u128;
                 }
             }
         }
@@ -547,7 +557,7 @@ impl Router {
         right: &mut B,
         left_to_right_flow: &'static str,
         right_to_left_flow: &'static str,
-    ) -> std::result::Result<(f32, f32), RelayError>
+    ) -> std::result::Result<(u128, u128), RelayError>
     where
         A: AsyncRead + AsyncWrite + Unpin + ?Sized,
         B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -578,7 +588,7 @@ impl Router {
                     });
                 }
             }
-            Ok::<f32, RelayError>(copied as f32)
+            Ok::<u128, RelayError>(copied as u128)
         };
 
         let down = async {
@@ -604,7 +614,7 @@ impl Router {
                     });
                 }
             }
-            Ok::<f32, RelayError>(copied as f32)
+            Ok::<u128, RelayError>(copied as u128)
         };
 
         tokio::try_join!(up, down)
@@ -630,8 +640,8 @@ impl Router {
                     id: conn_id.clone(),
                     ts: Timestamp::now(),
                     error: None,
-                    bytes_up: up,
-                    bytes_down: down,
+                    bytes_up: up as f32,
+                    bytes_down: down as f32,
                 });
                 debug!("TCP {:?} done: {} up, {} down", conn_id, up, down);
                 Ok(())
@@ -739,8 +749,8 @@ impl Router {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: None,
-                                bytes_up: up,
-                                bytes_down: down,
+                                bytes_up: up as f32,
+                                bytes_down: down as f32,
                             });
                             break;
                         }
@@ -801,6 +811,8 @@ impl Router {
                         ProxyConnection, RemoteAdapter, TrojanAdapter,
                     };
 
+                    let expected_udp = uplink_proxy_default_udp_expected(&proxy);
+
                     let connect_start = std::time::Instant::now();
 
                     let conn_result = match &proxy {
@@ -820,7 +832,11 @@ impl Router {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("proxy {:?} connect failed for {peer}: {e:?}, retrying", id);
-                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
+                            let mut hub = uplink.write().await;
+                            let stats = hub.stats.entry(id.clone()).or_default();
+                            stats.set_expected_udp_default(expected_udp);
+                            stats.observe_udp_ability(Timestamp::now(), false);
+                            stats.record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             continue;
@@ -841,7 +857,9 @@ impl Router {
 
                     {
                         let mut hub = uplink.write().await;
-                        hub.stats.entry(id.clone()).or_default().record_latency_ms(latency_ms);
+                        let stats = hub.stats.entry(id.clone()).or_default();
+                        stats.set_expected_udp_default(expected_udp);
+                        stats.record_latency_ms(latency_ms);
                     }
 
                     match Self::relay_udp(tunnel, &mut udp, peer).await {
@@ -849,6 +867,8 @@ impl Router {
                             {
                                 let mut hub = uplink.write().await;
                                 let s = hub.stats.entry(id.clone()).or_default();
+                                s.set_expected_udp_default(expected_udp);
+                                s.observe_udp_ability(Timestamp::now(), true);
                                 s.record_attempt(true);
                                 s.record_traffic(up, down);
                             }
@@ -856,8 +876,8 @@ impl Router {
                                 id: conn_id,
                                 ts: Timestamp::now(),
                                 error: None,
-                                bytes_up: up,
-                                bytes_down: down,
+                                bytes_up: up as f32,
+                                bytes_down: down as f32,
                             });
                             break;
                         }
@@ -866,7 +886,11 @@ impl Router {
                                 "proxy {:?} UDP relay failed for {peer}: {e:?}, retrying",
                                 id
                             );
-                            uplink.write().await.stats.entry(id.clone()).or_default().record_attempt(false);
+                            let mut hub = uplink.write().await;
+                            let stats = hub.stats.entry(id.clone()).or_default();
+                            stats.set_expected_udp_default(expected_udp);
+                            stats.observe_udp_ability(Timestamp::now(), false);
+                            stats.record_attempt(false);
                             ctx.tried_proxies.insert(id);
                             ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
