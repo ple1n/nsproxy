@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::SocketAddr;
@@ -50,7 +51,7 @@ pub enum RoutingDecision {
 }
 
 /// Result of routing decision — always carries a concrete target when proxying
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RoutingResovled {
     /// Warning: the connection is made by TUN process, which exists in SRC NS
     NATByTUN(SocketAddr),
@@ -64,10 +65,10 @@ pub enum RoutingResovled {
     Drop(DropReason),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DropReason {
     MaxRetry,
-    Preprocess,
+    Preprocess(Cow<'static, str>),
 }
 
 #[derive(Hash, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,9 +157,27 @@ impl ProxyID {
         ])
     }
 
+    /// Create ProxyID for Trojan using domain name (preferred over resolved IP)
+    /// Domain should always be used when available for stable identity across DNS changes
+    pub fn for_trojan_domain(domain: &str, port: u16, password: &str) -> Self {
+        let port_str = port.to_string();
+        Self::hash_chunks(&[
+            b"trojan",
+            domain.as_bytes(),
+            port_str.as_bytes(),
+            password.as_bytes(),
+        ])
+    }
+
     pub fn for_remote(addr: SocketAddr) -> Self {
         let addr = addr.to_string();
         Self::hash_chunks(&[b"remote", addr.as_bytes()])
+    }
+
+    /// Create ProxyID for remote proxy using domain when available (preferred over resolved IP)
+    pub fn for_remote_domain(domain: &str, port: u16) -> Self {
+        let port_str = port.to_string();
+        Self::hash_chunks(&[b"remote", domain.as_bytes(), port_str.as_bytes()])
     }
 
     pub fn for_file(path: &Path) -> Self {

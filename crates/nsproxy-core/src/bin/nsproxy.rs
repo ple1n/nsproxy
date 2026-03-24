@@ -8,7 +8,7 @@ use clap::{
     builder::{TypedValueParser, ValueParser, ValueParserFactory},
 };
 use clap_complete::{generate, shells::Fish};
-use futures::stream::TryStreamExt;
+use futures::stream::{FuturesUnordered, TryStreamExt};
 use futures::{
     AsyncWriteExt, SinkExt, StreamExt,
     channel::{
@@ -31,7 +31,10 @@ use libc::KERN_HOTPLUG;
 use nix::{
     mount::{MsFlags, mount as nix_mount},
     sched::{CloneFlags, unshare},
-    unistd::{Gid, Pid, Uid, chown, getresgid, getresuid},
+    unistd::{
+        ForkResult, Gid, Pid, Uid, chdir, chown, execve, fork, getresgid, getresuid, setgroups,
+        setresgid, setresuid,
+    },
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
@@ -70,7 +73,7 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
@@ -93,7 +96,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -107,6 +110,12 @@ use tun2socks5::{
 };
 
 fn main() -> anyhow::Result<()> {
+    // Ignore SIGPIPE so logging to a closed pipe does not kill the daemon.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
     // Fast path: `sp <fd_num>` — read a bincode-encoded `Cli` directly from the fd.
     // This lets callers (e.g. the GUI) pass structured args without string conversion.
     let mut cli = {
@@ -132,7 +141,10 @@ fn main() -> anyhow::Result<()> {
             .with_filter(LevelFilter::INFO),
     );
     // https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/trait.Layer.html
-    tracing_subscriber::registry().with(layer).init();
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(diag::DiagTracingLayer)
+        .init();
 
     let pid = nix::unistd::Pid::this();
 
@@ -327,7 +339,10 @@ fn main() -> anyhow::Result<()> {
                         let mut buf = Vec::new();
                         generate(Fish, &mut cmd, bin_name, &mut buf);
                         let path = dir.join(format!("{}.fish", bin_name));
-                        info!("Installing fish completion for '{}' at {:?}", bin_name, path);
+                        info!(
+                            "Installing fish completion for '{}' at {:?}",
+                            bin_name, path
+                        );
                         std::fs::write(&path, &buf)?;
                     }
                 } else {
@@ -693,7 +708,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Hot config: {:?}", new_profile.hot);
             }
         }
-        MainCommand::Up { profile } => {
+        MainCommand::Up { profile, cmd } => {
             let profile_path = state_paths::profile_config(&profile);
             if !profile_path.exists() {
                 bail!(
@@ -702,6 +717,45 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let profile_conf = TemplateConfig::load(&profile_path)?;
+
+            // If a CLI-specified daemon request was provided, translate and
+            // send it to the already-running `up` daemon for this profile.
+            if let Some(cli_req) = cmd {
+                // Translate CLI request into `diag::DaemonRequest`.
+                let req = match cli_req {
+                    CliDaemonRequest::GetProcessList => diag::DaemonRequest::GetProcessList,
+                    CliDaemonRequest::Ping => diag::DaemonRequest::Ping,
+                    CliDaemonRequest::Kill { pid } => diag::DaemonRequest::Kill { pid },
+                    CliDaemonRequest::Stop => diag::DaemonRequest::Stop,
+                    CliDaemonRequest::Spawn { args } => {
+                        let dra = diag::SpawnArgs {
+                            uid: args.uid,
+                            gid: args.gid,
+                            exec: args.exec,
+                            cwd: args.cwd,
+                            gids: args.gids,
+                            args: args.args,
+                        };
+                        diag::DaemonRequest::Spawn { args: dra }
+                    }
+                    CliDaemonRequest::SpawnCli { cli_json } => {
+                        // Parse provided JSON into `Cli` and bincode-serialize it.
+                        let cli_struct: Cli = serde_json::from_str(&cli_json)
+                            .map_err(|e| anyhow!("failed to parse cli JSON: {}", e))?;
+                        let b = bincode::serialize(&cli_struct)?;
+                        diag::DaemonRequest::SpawnCli { cli_bincode: b }
+                    }
+                };
+
+                // Send over the profile's up.sock and print a single response if any.
+                let sock_path = diag::up_sock_path(&profile);
+                let mut stream = UnixStream::connect(&sock_path)?;
+                write_bincode_frame(&mut stream, &req)?;
+                if let Some(evt) = read_bincode_frame::<diag::DaemonEvent>(&mut stream)? {
+                    println!("{:?}", evt);
+                }
+                return Ok(());
+            }
 
             let bind_mount = state_paths::profile_netns_bind(&profile);
             if let Some(parent) = bind_mount.parent() {
@@ -753,14 +807,22 @@ fn main() -> anyhow::Result<()> {
                         mount_ns(&path, &bind_mount)?;
 
                         info!("Updating NS metadata at {:?}", &ns_meta);
+                        let up_pid = std::process::id();
                         update_ns_alive(&ns_meta, |ns_alive| {
                             ns_alive.browser_profile = profile_conf.browser_profile.clone();
                             ns_alive.bind_mount = bind_mount.clone();
                             ns_alive.child_pid = Some(child_pid as u32);
+                            ns_alive.up_pid = Some(up_pid);
                         })?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
                         tx.write(&[0])?;
+
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(run_up_daemon(&profile, ns_meta, child_pid as u32, cli.control_socket.clone()))?;
+                        std::process::exit(0);
                     }
                 },
                 Err(er) => report_clone3_err(&er)?,
@@ -776,15 +838,14 @@ fn main() -> anyhow::Result<()> {
                     if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
                         if let Some(pid) = ns_alive.child_pid {
                             let proc_path = PathBuf::from("/proc").join(pid.to_string());
-                            if proc_path.exists() {
-                                warn!("killing keeper process pid={}", pid);
-                                let _ = nix::sys::signal::kill(
-                                    nix::unistd::Pid::from_raw(pid as i32),
-                                    nix::sys::signal::Signal::SIGKILL,
-                                );
-                            } else {
-                                info!("keeper process pid={} is already gone", pid);
+                        if proc_path.exists() {
+                            warn!("killing keeper process pid={}", pid);
+                            if !kill_and_wait_for_exit(pid, Duration::from_secs(5)) {
+                                warn!("keeper pid {} did not exit within 5 seconds", pid);
                             }
+                        } else {
+                            info!("keeper process pid={} is already gone", pid);
+                        }
                         }
                     }
                 }
@@ -802,7 +863,10 @@ fn main() -> anyhow::Result<()> {
                     info!("removed bind mount {:?}", bind_mount);
                 }
             } else {
-                warn!("bind mount {:?} does not exist, nothing to unmount", bind_mount);
+                warn!(
+                    "bind mount {:?} does not exist, nothing to unmount",
+                    bind_mount
+                );
             }
 
             warn!("profile '{}' is down", profile);
@@ -823,6 +887,7 @@ fn main() -> anyhow::Result<()> {
             log,
             clash,
             no_dns_capture,
+            cli.control_socket.clone(),
             &mut |level| {
                 reload_handle.modify(|k| *k.filter_mut() = level)?;
                 Ok(())
@@ -1102,6 +1167,7 @@ fn cmd_serve(
     log: Option<LevelFilter>,
     _clash: Option<String>,
     no_dns_capture: bool,
+    control_socket: Option<PathBuf>,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
 ) -> Result<()> {
     let ns_meta = state_paths::profile_ns_meta(&profile);
@@ -1247,14 +1313,14 @@ fn cmd_serve(
                 if let Some(log) = log {
                     set_log(log)?;
                 }
-                
+
                 // Record this process's PID as the serve process
                 let serve_pid = std::process::id();
                 update_ns_alive(&ns_meta, |ns_alive| {
                     ns_alive.serve_pid = Some(serve_pid);
                 })?;
                 info!("recorded serve_pid={} to {:?}", serve_pid, &ns_meta);
-                
+
                 rt.spawn(async move {
                     let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
                     let _ = fd.into_future().await?;
@@ -1336,6 +1402,28 @@ fn cmd_serve(
 
                     router.init_diag(&diag_path).await?;
 
+                    // If the UI passed a control socket, connect to it now (after the diag
+                    // server is ready) and register the reversed connection as a diag client.
+                    if let Some(ref ctrl_path) = control_socket {
+                        match connect_and_greet_serve(ctrl_path, &profile).await {
+                            Ok(stream) => {
+                                info!("sp serve: connected to UI control socket as reversed diag client");
+                                router.diag_handle().add_reversed_client(stream);
+                            }
+                            Err(e) => warn!("sp serve: failed to connect to control socket {:?}: {}", ctrl_path, e),
+                        }
+                    }
+
+                    // Forward tracing logs to this profile's diag socket for the lifetime
+                    // of this serve task and all explicitly-scoped spawned children.
+                    let diag_srv_scope = router.diag_handle();
+                    // Also register as the process-global sink so that tasks spawned without
+                    // an explicit scope (e.g. router-internal tokio::spawn) forward logs here.
+                    diag_srv_scope.install_as_global();
+                    let scope_for_cmd = diag_srv_scope.clone();
+                    let scope_for_watch = diag_srv_scope.clone();
+                    diag_srv_scope.scope(async move {
+
                     // Drive the control-command loop emitted by diag clients.
                     if let Some(mut cmd_rx) = router.take_cmd_rx() {
                         let uplink_cmd = router.uplink.clone();
@@ -1345,7 +1433,7 @@ fn cmd_serve(
                         let diag_srv = router.diag_handle();
                         let dns_handle = router.dns_handle();
                         let mut selected_proxy = selected_proxy.clone();
-                        tokio::spawn(async move {
+                        tokio::spawn(scope_for_cmd.scope(async move {
                             while let Some(cmd) = cmd_rx.recv().await {
                                 match cmd {
                                     diag::ControlCommand::ReloadUplink => {
@@ -1498,16 +1586,25 @@ fn cmd_serve(
                                             stats: hub.stats.clone(),
                                         });
                                     }
+                                    diag::ControlCommand::QueryRecentLogs { limit } => {
+                                        let entries = diag::query_recent_logs(limit);
+                                        diag_srv.emit(diag::DiagEvent::RecentLogs(entries));
+                                    }
+                                    // Handled directly inside serve_client; should never reach here.
+                                    diag::ControlCommand::QueryRecentDiagEvents { .. } => {}
+                                    diag::ControlCommand::SetTrackConns { .. } => {}
+                                    diag::ControlCommand::ResetConnsState => {}
+                                    diag::ControlCommand::QueryConnsState => {}
                                 }
                             }
-                        });
+                        }));
                     }
 
                     let _ = vdns_sx.send(Some(router.dns_handle())).await;
 
                     let diag_srv = router.diag_handle();
                     let hot_tx_spawn = hot_tx.clone();
-                    tokio::spawn(async move {
+                    tokio::spawn(scope_for_watch.scope(async move {
                         let x = watch_hot(
                             vdns_rx,
                             Some(hot_conf),
@@ -1521,7 +1618,7 @@ fn cmd_serve(
                         )
                         .await;
                         warn!("out-ns, watcher exited {:?}", x);
-                    });
+                    }));
 
                     router.run().await?;
                     warn!("router exited");
@@ -1529,6 +1626,7 @@ fn cmd_serve(
 
                     std::future::pending::<()>().await;
                     aok!()
+                    }).await
                 })?;
             }
         },
@@ -1539,6 +1637,17 @@ fn cmd_serve(
 }
 
 use anyhow::{Result, anyhow, bail};
+use arc_swap::ArcSwap;
+
+/// Shared mutable state for the `sp up` daemon.
+#[derive(Clone)]
+struct UpDaemonState {
+    process_list: diag::ProcessList,
+    /// PID of the currently-tracked `sp serve` process (0 = none).
+    /// The corresponding entry in `process_list.processes` carries the
+    /// live `ProcessStatus`; this field is the look-up key.
+    serve_pid: u32,
+}
 
 pub fn try_resolve_nsinput(nsi: NsInput) -> Result<Option<ExactNS>> {
     match nsi {
@@ -1605,6 +1714,700 @@ where
     }
 
     Ok(())
+}
+
+/// Accept loop for the `sp up` daemon socket.
+///
+/// Always accepts new connections. When a new client connects it aborts the
+/// previous connection handler so the daemon is never stuck on a stale client.
+/// The shared `UpDaemonState` is passed as `Arc<ArcSwap<…>>` so each handler
+/// can do lock-free load/store updates without a mutex.
+async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control_socket: Option<PathBuf>) -> Result<()> {
+    let sock_path = diag::up_sock_path(profile);
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    std::fs::set_permissions(&sock_path, Permissions::from_mode(0o666))?;
+    info!("up-daemon listening on {:?}", sock_path);
+
+    // Initialise the global log broadcast so DiagTracingLayer can forward
+    // tracing events from outside any serve scope to the connected UI client.
+    diag::init_up_log_broadcast();
+
+    let state: Arc<ArcSwap<UpDaemonState>> = Arc::new(ArcSwap::new(Arc::new(UpDaemonState {
+        process_list: diag::ProcessList {
+            processes: BTreeMap::new(),
+        },
+        serve_pid: 0,
+    })));
+
+    // If the UI passed a control socket path, connect to it immediately and serve it
+    // as a reversed-role client.  This is event-triggered: the UI doesn't need to
+    // poll our socket; we initiate the connection and it receives DaemonEvent frames
+    // just as if it had connected to us.
+    if let Some(ref ctrl_path) = control_socket {
+        let ctrl_path = ctrl_path.clone();
+        let profile_name = profile.to_string();
+        let state2 = state.clone();
+        let ns_meta2 = ns_meta.clone();
+        let log_rx2 = diag::subscribe_up_logs()
+            .expect("up log broadcast must be initialised before control socket connect");
+        tokio::spawn(async move {
+            match connect_and_greet_up(&ctrl_path, &profile_name).await {
+                Ok(stream) => {
+                    info!("up daemon: connected to UI control socket, serving reversed connection");
+                    if let Err(e) = handle_up_client(stream, state2, ns_meta2, keeper_pid, log_rx2).await {
+                        warn!("up daemon reversed client error: {}", e);
+                    }
+                }
+                Err(e) => warn!("up daemon: failed to connect to control socket {:?}: {}", ctrl_path, e),
+            }
+        });
+    }
+
+    let mut current_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+
+        // New connection: kick out the old client if any.
+        if let Some(task) = current_task.take() {
+            task.abort();
+        }
+
+        let state = state.clone();
+        let ns_meta = ns_meta.clone();
+        // Subscribe to the log broadcast for this new connection.
+        let log_rx = diag::subscribe_up_logs()
+            .expect("up log broadcast must be initialised before accept loop");
+        current_task = Some(tokio::spawn(async move {
+            if let Err(e) = handle_up_client(stream, state, ns_meta, keeper_pid, log_rx).await {
+                warn!("up daemon client error: {}", e);
+            }
+        }));
+    }
+}
+
+/// Per-connection handler for the `sp up` daemon.
+async fn handle_up_client(
+    stream: tokio::net::UnixStream,
+    state: Arc<ArcSwap<UpDaemonState>>,
+    ns_meta: PathBuf,
+    keeper_pid: u32,
+    mut log_rx: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let (mut read_half, mut write_half) = stream.into_split();
+    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    loop {
+        tokio::select! {
+            req_result = read_bincode_frame_async::<diag::DaemonRequest, _>(&mut read_half) => {
+                let Some(req) = req_result? else {
+                    break;
+                };
+
+                match req {
+                    diag::DaemonRequest::GetProcessList => {
+                        let s = state.load();
+                        let evt = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                    }
+                    diag::DaemonRequest::Kill { pid } => {
+                        let _ = nix::sys::signal::kill(
+                            Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                        let mut new = (*state.load_full()).clone();
+                        if let Some(entry) = new.process_list.processes.get_mut(&pid) {
+                            entry.status = diag::ProcessStatus::Terminating(pid);
+                        }
+                        state.store(Arc::new(new));
+                        let s = state.load();
+                        let evt = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                    }
+                    diag::DaemonRequest::Spawn { args } => {
+                        let ns_alive = read_ns_alive(&ns_meta)?;
+                        let child = spawn_daemon_process(&args, &ns_alive)?;
+                        let child_pid = match child {
+                            Clone3Result::Parent { child_pid, .. } => child_pid as u32,
+                            _ => {
+                                let evt = diag::DaemonEvent::Error {
+                                    msg: "spawn daemon in child context".to_string(),
+                                };
+                                write_bincode_frame_async(&mut write_half, &evt).await?;
+                                reap_dead_children_into_state(&state);
+                                continue;
+                            }
+                        };
+                        let mut new = (*state.load_full()).clone();
+                        new.process_list.processes.insert(
+                            child_pid,
+                            diag::ProcessEntry {
+                                meta: diag::SpawnedEntry::Args(args),
+                                spawned_at: SystemTime::now(),
+                                status: diag::ProcessStatus::Alive(child_pid),
+                            },
+                        );
+                        state.store(Arc::new(new));
+
+                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        write_bincode_frame_async(&mut write_half, &spawned).await?;
+                        let s = state.load();
+                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_bincode_frame_async(&mut write_half, &snapshot).await?;
+
+                        let exit_tx2 = exit_tx.clone();
+                        tokio::spawn(async move {
+                            wait_for_child_exit_async(child_pid).await;
+                            let _ = exit_tx2.send(child_pid);
+                        });
+                    }
+                    diag::DaemonRequest::SpawnCli { cli_bincode } => {
+                        let cli = match bincode::deserialize::<Cli>(&cli_bincode) {
+                            Ok(cli) => cli,
+                            Err(err) => {
+                                let evt = diag::DaemonEvent::Error {
+                                    msg: format!("invalid cli payload: {err}"),
+                                };
+                                write_bincode_frame_async(&mut write_half, &evt).await?;
+                                reap_dead_children_into_state(&state);
+                                continue;
+                            }
+                        };
+                        let is_serve = matches!(&cli.cmd, MainCommand::Serve { .. });
+                        let child_pid = match spawn_cli_process(&cli)? {
+                            Some(pid) => pid,
+                            None => {
+                                reap_dead_children_into_state(&state);
+                                continue;
+                            }
+                        };
+                        let cli_bytes = bincode::serialize(&cli)?;
+                        let mut new = (*state.load_full()).clone();
+                        new.process_list.processes.insert(
+                            child_pid,
+                            diag::ProcessEntry {
+                                meta: diag::SpawnedEntry::Cli(diag::SpawnCliType {
+                                    cli_bincode: cli_bytes,
+                                    is_serve,
+                                }),
+                                spawned_at: SystemTime::now(),
+                                status: diag::ProcessStatus::Alive(child_pid),
+                            },
+                        );
+                        if is_serve {
+                            new.serve_pid = child_pid;
+                        }
+                        state.store(Arc::new(new));
+
+                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        write_bincode_frame_async(&mut write_half, &spawned).await?;
+                        let s = state.load();
+                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_bincode_frame_async(&mut write_half, &snapshot).await?;
+
+                        let exit_tx2 = exit_tx.clone();
+                        tokio::spawn(async move {
+                            wait_for_child_exit_async(child_pid).await;
+                            let _ = exit_tx2.send(child_pid);
+                        });
+                    }
+                    diag::DaemonRequest::Stop => {
+                        let evt = diag::DaemonEvent::Stopping;
+                        let _ = write_bincode_frame_async(&mut write_half, &evt).await;
+
+                        {
+                            let s = state.load();
+                            // serve is tracked in process_list.processes under its PID,
+                            // so .keys() already covers it — no extra chain needed.
+                            for pid in s.process_list.processes.keys().copied() {
+                                let _ = nix::sys::signal::kill(
+                                    Pid::from_raw(pid as i32),
+                                    nix::sys::signal::Signal::SIGTERM,
+                                );
+                            }
+                        }
+
+                        let keeper_dead = kill_and_wait_for_exit_async(keeper_pid, Duration::from_secs(5)).await;
+
+                        if !keeper_dead {
+                            warn!("keeper pid {} did not exit within 5 seconds", keeper_pid);
+                            reap_dead_children_into_state(&state);
+                            continue;
+                        }
+
+                        reap_dead_children_into_state(&state);
+                        wait_all_children_async(&state, Duration::from_secs(5)).await;
+                        if any_child_alive(&state) {
+                            info!(
+                                "keeper is dead but child processes are still alive; keep socket loop running"
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            "keeper pid {} dead and no child processes alive; exiting",
+                            keeper_pid
+                        );
+                        std::process::exit(0);
+                    }
+                    diag::DaemonRequest::Ping => {
+                        let evt = diag::DaemonEvent::Pong;
+                        let _ = write_bincode_frame_async(&mut write_half, &evt).await;
+                    }
+                    diag::DaemonRequest::QueryRecentLogs { limit } => {
+                        let entries = diag::query_recent_logs(limit);
+                        let evt = diag::DaemonEvent::RecentLogs(entries);
+                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                    }
+                }
+
+                reap_dead_children_into_state(&state);
+            }
+
+            exited_pid = exit_rx.recv() => {
+                if let Some(pid) = exited_pid {
+                    let mut new = (*state.load_full()).clone();
+                    if let Some(entry) = new.process_list.processes.get_mut(&pid) {
+                        entry.status = diag::ProcessStatus::Killed(pid);
+                    }
+                    if new.serve_pid == pid {
+                        new.serve_pid = 0;
+                    }
+                    state.store(Arc::new(new));
+                    info!("child pid {} exited", pid);
+                    let exit_evt = diag::DaemonEvent::ProcessExit { pid };
+                    write_bincode_frame_async(&mut write_half, &exit_evt).await?;
+                    let s = state.load();
+                    let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                        procs: s.process_list.processes.clone(),
+                        serve: s.serve_pid,
+                    });
+                    write_bincode_frame_async(&mut write_half, &snapshot).await?;
+                }
+            }
+
+            log_result = log_rx.recv() => {
+                match log_result {
+                    Ok(frame) => {
+                        write_half.write_all(&frame).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("up daemon log channel lagged, dropped {} log frames", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if any process recorded in `state` is still alive according to the OS.
+/// `Killed` entries are skipped to avoid unnecessary syscalls — they are kept in the map
+/// for history but are known dead.
+fn any_child_alive(state: &Arc<ArcSwap<UpDaemonState>>) -> bool {
+    let s = state.load();
+    s.process_list
+        .processes
+        .iter()
+        .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed(_)))
+        .any(|(&pid, _)| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 })
+}
+
+/// Wait asynchronously for a child process to exit using `pidfd`.
+///
+/// Opens a `pidfd` for the process and registers it with Tokio's I/O reactor
+/// via `AsyncFd`.  A pidfd becomes `EPOLLIN`-readable the instant the process
+/// exits — no polling, no sleep loops.  `waitpid(WNOHANG)` reaps the zombie
+/// after the fd fires.
+async fn wait_for_child_exit_async(pid: u32) {
+    use std::os::unix::io::AsRawFd as _;
+    use tokio::io::unix::AsyncFd;
+    use tokio::io::Interest;
+
+    let pidfd = unsafe { pidfd::PidFd::open(pid as libc::pid_t, 0) }
+        .expect("pidfd_open failed");
+    // O_NONBLOCK is required by tokio's AsyncFd.
+    unsafe {
+        let flags = libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL, 0);
+        libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let async_fd = AsyncFd::with_interest(pidfd, Interest::READABLE)
+        .expect("AsyncFd creation failed");
+    let mut guard = async_fd.readable().await
+        .expect("AsyncFd readable wait failed");
+    guard.retain_ready();
+    // Reap the zombie.
+    let _ = nix::sys::wait::waitpid(
+        Pid::from_raw(pid as i32),
+        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+    );
+}
+
+fn reap_dead_children_into_state(state: &Arc<ArcSwap<UpDaemonState>>) {
+    let mut dead_pids: Vec<u32> = Vec::new();
+    loop {
+        match nix::sys::wait::waitpid(
+            Pid::from_raw(-1),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+        ) {
+            Ok(nix::sys::wait::WaitStatus::Exited(pid, _))
+            | Ok(nix::sys::wait::WaitStatus::Signaled(pid, _, _)) => {
+                if pid.as_raw() > 0 {
+                    dead_pids.push(pid.as_raw() as u32);
+                }
+            }
+            _ => break,
+        }
+    }
+    if !dead_pids.is_empty() {
+        let mut new = (*state.load_full()).clone();
+        for dead in &dead_pids {
+            // Mark the entry as Killed rather than removing it so that the UI
+            // can see the full process history in the snapshot.
+            if let Some(entry) = new.process_list.processes.get_mut(dead) {
+                entry.status = diag::ProcessStatus::Killed(*dead);
+            }
+            // Reset the serve tracker when serve exits.
+            if new.serve_pid == *dead {
+                new.serve_pid = 0;
+            }
+        }
+        state.store(Arc::new(new));
+    }
+}
+
+fn spawn_cli_process(cli: &Cli) -> Result<Option<u32>> {
+    let exe = std::env::current_exe()?;
+    let fd_file = cli_to_inheritable_fd(cli)?;
+    let fd = fd_file.as_raw_fd();
+
+    match unsafe { fork()? } {
+        ForkResult::Parent { child } => Ok(Some(child.as_raw() as u32)),
+        ForkResult::Child => {
+            let fd_str = fd.to_string();
+            let exe_s = exe.to_string_lossy();
+            let argv = [to_cstr(exe_s.as_ref()), to_cstr(&fd_str)];
+            let envs: Vec<_> = std::env::vars()
+                .map(|(k, v)| {
+                    let mut s = k;
+                    s.push('=');
+                    s.push_str(&v);
+                    to_cstr(&s)
+                })
+                .collect();
+
+            let _ = execve(&to_cstr(exe_s.as_ref()), &argv, &envs);
+            std::process::exit(127);
+        }
+    }
+}
+
+/// Connect to the UI control socket, send a `ControlSocketGreeting::UpDaemon` frame,
+/// and return the stream ready for `handle_up_client`.
+async fn connect_and_greet_up(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
+    let greeting = diag::ControlSocketGreeting::UpDaemon { name: profile.to_string() };
+    let frame = diag::encode_control_greeting(&greeting)?;
+    stream.write_all(&frame).await?;
+    Ok(stream)
+}
+
+/// Connect to the UI control socket, send a `ControlSocketGreeting::ServeDaemon` frame,
+/// and return the stream ready to be handed to `DiagServer::add_reversed_client`.
+async fn connect_and_greet_serve(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
+    let greeting = diag::ControlSocketGreeting::ServeDaemon { name: profile.to_string() };
+    let frame = diag::encode_control_greeting(&greeting)?;
+    stream.write_all(&frame).await?;
+    Ok(stream)
+}
+
+fn spawn_daemon_process(
+    args: &diag::SpawnArgs,
+    ns_alive: &nsproxy_core::NsAlive,
+) -> Result<Clone3Result> {
+    let exec = args
+        .exec
+        .clone()
+        .ok_or_else(|| anyhow!("spawn args missing exec"))?;
+    let cmd = std::ffi::CString::new(exec.as_str())?;
+
+    let mut argv: Vec<std::ffi::CString> = if args.args.is_empty() {
+        vec![std::ffi::CString::new(exec.as_str())?]
+    } else {
+        args.args
+            .iter()
+            .map(|a| std::ffi::CString::new(a.as_str()))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    if argv.is_empty() {
+        argv.push(std::ffi::CString::new(exec.as_str())?);
+    }
+
+    let profile_val = ns_alive
+        .browser_profile
+        .clone()
+        .unwrap_or_else(|| "UNSPEC".to_string());
+    let ns_val = ns_alive.bind_mount.to_string_lossy().to_string();
+    unsafe {
+        std::env::set_var(ENV_PROFILE, &profile_val);
+        std::env::set_var(ENV_NS, &ns_val);
+    }
+
+    let mut env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    env_pairs.retain(|(k, _)| k != ENV_PROFILE && k != ENV_NS);
+    env_pairs.push((ENV_PROFILE.to_string(), profile_val));
+    env_pairs.push((ENV_NS.to_string(), ns_val));
+    let env_c: Vec<std::ffi::CString> = env_pairs
+        .into_iter()
+        .map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let clone = nsproxy_core::sys::clone3::<false>(false, false)?;
+    match &clone {
+        Clone3Result::IsChild { .. } => {
+            if !args.gids.is_empty() {
+                setgroups(
+                    &args
+                        .gids
+                        .iter()
+                        .map(|g| Gid::from_raw(*g))
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+
+            if let Some(gid) = args.gid {
+                let g = Gid::from_raw(gid);
+                setresgid(g, g, g)?;
+            }
+
+            if let Some(uid) = args.uid {
+                let u = Uid::from_raw(uid);
+                setresuid(u, u, u)?;
+            }
+
+            if let Some(cwd) = &args.cwd {
+                chdir(cwd)?;
+            }
+
+            match execve(cmd.as_c_str(), &argv, &env_c) {
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    error!("daemon spawn execve failed: {}", e);
+                    std::process::exit(127);
+                }
+            }
+        }
+        Clone3Result::Parent { .. } => {}
+    }
+
+    Ok(clone)
+}
+
+fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    let target = Pid::from_raw(pid as i32);
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if let Err(e) = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL) {
+            match e {
+                nix::errno::Errno::ESRCH => {
+                    info!("pid {} is gone (no such process)", pid);
+                    return true;
+                }
+                _ => {
+                    warn!("failed to send SIGKILL to pid {}: {}", pid, e);
+                }
+            }
+        }
+
+        match nix::sys::wait::waitpid(target, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                // still running
+            }
+            Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+            | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                info!("pid {} reaped", pid);
+                return true;
+            }
+            Ok(_) => {
+                info!("pid {} ended", pid);
+                return true;
+            }
+            Err(nix::errno::Errno::ECHILD) => {
+                info!("pid {} ended (ECHILD)", pid);
+                return true;
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                info!("pid {} is gone (ESRCH)", pid);
+                return true;
+            }
+            Err(e) => {
+                warn!("waitpid for pid {} failed: {}", pid, e);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    false
+}
+
+async fn kill_and_wait_for_exit_async(pid: u32, timeout: Duration) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    let target = Pid::from_raw(pid as i32);
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if let Err(e) = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL) {
+            match e {
+                nix::errno::Errno::ESRCH => {
+                    info!("pid {} is gone (no such process)", pid);
+                    return true;
+                }
+                _ => {
+                    warn!("failed to send SIGKILL to pid {}: {}", pid, e);
+                }
+            }
+        }
+
+        match nix::sys::wait::waitpid(target, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                // still running
+            }
+            Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+            | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                info!("pid {} reaped", pid);
+                return true;
+            }
+            Ok(_) => {
+                info!("pid {} ended", pid);
+                return true;
+            }
+            Err(nix::errno::Errno::ECHILD) => {
+                info!("pid {} ended (ECHILD)", pid);
+                return true;
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                info!("pid {} is gone (ESRCH)", pid);
+                return true;
+            }
+            Err(e) => {
+                warn!("waitpid for pid {} failed: {}", pid, e);
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    false
+}
+
+/// Wait for all tracked child processes to exit, driving each with
+/// `kill_and_wait_for_exit_async` concurrently via `FuturesUnordered`.
+/// Updates `state` by reaping dead children when done.
+async fn wait_all_children_async(state: &Arc<ArcSwap<UpDaemonState>>, timeout: Duration) {
+    use futures::StreamExt as _;
+
+    let pids: Vec<u32> = {
+        let s = state.load();
+        // serve is stored in process_list.processes under its own PID;
+        // no extra chain required.
+        s.process_list
+            .processes
+            .iter()
+            .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed(_)))
+            .map(|(&pid, _)| pid)
+            .collect()
+    };
+
+    if pids.is_empty() {
+        return;
+    }
+
+    let mut futs: FuturesUnordered<_> = pids
+        .into_iter()
+        .map(|pid| kill_and_wait_for_exit_async(pid, timeout))
+        .collect();
+
+    while futs.next().await.is_some() {}
+
+    reap_dead_children_into_state(state);
+}
+
+fn write_bincode_frame<T: Serialize>(stream: &mut UnixStream, val: &T) -> Result<()> {
+    let payload = bincode::serialize(val)?;
+    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
+    stream.write_all(&payload)?;
+    Ok(())
+}
+
+fn read_bincode_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<Option<T>> {
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok(Some(bincode::deserialize(&payload)?))
+}
+
+async fn write_bincode_frame_async<T: Serialize, W: tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    val: &T,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let payload = bincode::serialize(val)?;
+    stream.write_all(&(payload.len() as u32).to_le_bytes()).await?;
+    stream.write_all(&payload).await?;
+    Ok(())
+}
+
+async fn read_bincode_frame_async<T: for<'de> Deserialize<'de>, R: tokio::io::AsyncReadExt + Unpin>(
+    stream: &mut R,
+) -> Result<Option<T>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    Ok(Some(bincode::deserialize(&payload)?))
 }
 
 /// Watch a HotConfig JSON file for changes and apply mount operations.

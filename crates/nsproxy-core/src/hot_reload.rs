@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, hash_map::Entry},
     future::{Future, ready},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -160,12 +161,12 @@ pub async fn watch_hot(
         vdns.pin(
             Some(veth.vout),
             "veth.host.".to_owned(),
-            RoutingDecision::Drop(DropReason::Preprocess),
+            RoutingDecision::Drop(DropReason::Preprocess(Cow::Borrowed("veth host"))),
         );
         vdns.pin(
             Some(veth.vin),
             "veth.peer.".to_owned(),
-            RoutingDecision::Drop(DropReason::Preprocess),
+            RoutingDecision::Drop(DropReason::Preprocess(Cow::Borrowed("veth peer"))),
         );
     }
 
@@ -210,7 +211,9 @@ pub async fn watch_hot(
 
                         if let Some(vdns) = &vdns {
                             for (domain, ip) in newconf.dns {
-                                let target = RoutingDecision::Drop(DropReason::Preprocess);
+                                let target = RoutingDecision::Drop(DropReason::Preprocess(
+                                    Cow::Borrowed("dns config"),
+                                ));
                                 if let Ok(addr) = ip.parse::<Ipv4Addr>() {
                                     info!("DNS {} -> {}", &domain, addr);
                                     vdns.pin(Some(addr), domain, target)?;

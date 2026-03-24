@@ -1,28 +1,40 @@
+use diag::{LogEntry, Timestamp};
 use eframe::egui;
 use eframe::egui::Color32;
+use egui::{RichText, Vec2};
+use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 use egui_extras::{Column, TableBuilder};
-use egui_json_tree::{DefaultExpand, JsonTree};
+use egui_phosphor::regular;
 use egui_plot::{GridInput, GridMark, Line, LineStyle, PlotPoints};
 use nsproxy_common::crdt::CRDT;
+use nsproxy_common::normalize_domain;
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::stats::ProxyStats;
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::state_blueprint::PersistentState as _;
 use nsproxy_core::uplink::clash::{ClashState, GroupId};
-use nsproxy_core::uplink::{UplinkHub, UplinkProxy, UplinkStatsState};
-use nsproxy_core::{state_paths, HotConfig, NsAlive, TemplateConfig};
+use nsproxy_core::uplink::{
+    uplink_proxy_default_udp_expected, UplinkHub, UplinkProxy, UplinkStatsState,
+};
+use nsproxy_core::{
+    state_paths, HotConfig, NsAlive, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 mod profile_loader;
 mod supervisor;
 
 use profile_loader::ProfileInfo;
-use supervisor::{daemon_unit_id, ProfileName, SupervisorCommand, SupervisorHandle, UnitId};
+use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
 
 const HOTCONFIG_EXAMPLE: &str = r#"{}"#;
 
@@ -56,12 +68,12 @@ struct ProxyItem {
     nym: String,
     name: String,
     url: String,
-    udp_capable: bool,
-    status: String,
+    udp_expected: bool,
+    udp_ability: Option<bool>,
     enabled_globally: bool,
     latency_ms: Option<u64>,
     conn_ok: Option<bool>,
-    resolved_ip: Option<IpAddr>,
+    resolved_ips: Vec<IpAddr>,
     groups: HashSet<GroupId>,
 }
 
@@ -103,16 +115,240 @@ impl ProxyType {
 enum RightTab {
     Proxies,
     Processes,
-    Diagnostics,
+    Traffic,
     Dns,
     Hotconfig,
     ProfileEditor,
 }
 
-#[derive(Clone, Default)]
+/// Sub-view toggle inside the Traffic tab.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+enum TrafficSubview {
+    #[default]
+    Connections,
+    Logs,
+}
+
+// ── Viewer (ported from nsp-diag viewer.rs) ──────────────────────────────────
+
+static VIEWER_QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Default)]
+struct ViewerPingState {
+    last_domain: Option<String>,
+    last_sent_us: Option<u64>,
+    last_accept_delta_us: Option<u64>,
+    last_accept_ts: Option<u64>,
+    last_conn_id: Option<u64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ViewerMassPingState {
+    last_batch: Option<u64>,
+    started_ts: Option<u64>,
+    finished_ts: Option<u64>,
+    duration_us: Option<u64>,
+    rtt_avg_us: Option<u64>,
+    rtt_min_us: Option<u64>,
+    rtt_max_us: Option<u64>,
+    rtt_samples: u64,
+    requested: u64,
+    in_flight: u64,
+    completed: u64,
+    errors: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ViewerBurstTestResult {
+    size: u64,
+    requested: u64,
+    completed: u64,
+    errors: u64,
+    failure_rate: f64,
+    latency_us_min: u64,
+    latency_us_max: u64,
+    latency_us_avg: u64,
+}
+
+#[derive(Debug)]
+struct ViewerBurstTestState {
+    running: bool,
+    started_ts: Option<u64>,
+    finished_ts: Option<u64>,
+    results: Vec<ViewerBurstTestResult>,
+    threshold_size: Option<u64>,
+    last_error: Option<String>,
+    max_batch_size: u64,
+}
+
+impl Default for ViewerBurstTestState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            started_ts: None,
+            finished_ts: None,
+            results: Vec::new(),
+            threshold_size: None,
+            last_error: None,
+            max_batch_size: 65536,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ViewerBurstTestStats {
+    test_count: u64,
+    failure_rates: std::collections::VecDeque<f64>,
+    durations_ms: std::collections::VecDeque<f64>,
+    max_failure_rate: f64,
+    threshold_hits: u64,
+    max_window: usize,
+}
+
+impl ViewerBurstTestStats {
+    fn new(window: usize) -> Self {
+        Self {
+            test_count: 0,
+            failure_rates: std::collections::VecDeque::with_capacity(window),
+            durations_ms: std::collections::VecDeque::with_capacity(window),
+            max_failure_rate: 0.0,
+            threshold_hits: 0,
+            max_window: window,
+        }
+    }
+
+    fn add_test(&mut self, failure_rate: f64, duration_ms: f64, hit_threshold: bool) {
+        self.test_count += 1;
+        if self.failure_rates.len() >= self.max_window {
+            self.failure_rates.pop_front();
+        }
+        if self.durations_ms.len() >= self.max_window {
+            self.durations_ms.pop_front();
+        }
+        self.failure_rates.push_back(failure_rate);
+        self.durations_ms.push_back(duration_ms);
+        self.max_failure_rate = self.max_failure_rate.max(failure_rate);
+        if hit_threshold {
+            self.threshold_hits += 1;
+        }
+    }
+
+    fn avg_failure_rate(&self) -> f64 {
+        if self.failure_rates.is_empty() {
+            0.0
+        } else {
+            self.failure_rates.iter().sum::<f64>() / self.failure_rates.len() as f64
+        }
+    }
+
+    fn avg_duration_ms(&self) -> f64 {
+        if self.durations_ms.is_empty() {
+            0.0
+        } else {
+            self.durations_ms.iter().sum::<f64>() / self.durations_ms.len() as f64
+        }
+    }
+}
+
+enum ViewerPingRequest {
+    Single(String, String),
+    Batch(Vec<String>, String),
+    BurstTest(String),
+}
+
+fn viewer_now_epoch_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn viewer_build_dns_query(domain: &str, id: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&id.to_be_bytes());
+    buf.extend_from_slice(&0x0100u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    let name = domain.trim_end_matches('.');
+    for label in name.split('.') {
+        let len = label.len().min(63);
+        buf.push(len as u8);
+        buf.extend_from_slice(&label.as_bytes()[..len]);
+    }
+    buf.push(0);
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf
+}
+
+async fn viewer_send_dns_ping_async(target: &str, domain: String) -> anyhow::Result<u64> {
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let id = (VIEWER_QUERY_ID_COUNTER.fetch_add(1, Ordering::SeqCst) & 0xFFFF) as u16;
+    let query = viewer_build_dns_query(&domain, id);
+    let start = tokio::time::Instant::now();
+    let _ = sock.send_to(&query, target).await?;
+    let mut buf = [0u8; 512];
+    let _ = tokio::time::timeout(Duration::from_millis(20_000), sock.recv_from(&mut buf)).await??;
+    Ok(start.elapsed().as_micros() as u64)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SortColumn {
+    None,
+    Latency,
+    FailRate,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SortFrequency {
+    Manual,
+    Every1s,
+    Every2s,
+    Every5s,
+}
+
+impl SortFrequency {
+    fn duration(&self) -> Option<Duration> {
+        match self {
+            SortFrequency::Manual => None,
+            SortFrequency::Every1s => Some(Duration::from_secs(1)),
+            SortFrequency::Every2s => Some(Duration::from_secs(2)),
+            SortFrequency::Every5s => Some(Duration::from_secs(5)),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ProxyFilters {
     selected_groups: HashSet<GroupId>,
     selected_types: HashSet<ProxyType>,
+    sort_column: SortColumn,
+    sort_direction: SortDirection,
+    sort_frequency: SortFrequency,
+}
+
+impl Default for ProxyFilters {
+    fn default() -> Self {
+        ProxyFilters {
+            selected_groups: HashSet::new(),
+            selected_types: HashSet::new(),
+            sort_column: SortColumn::FailRate,
+            sort_direction: SortDirection::Ascending,
+            sort_frequency: SortFrequency::Manual,
+        }
+    }
 }
 
 struct LoadResult {
@@ -127,8 +363,21 @@ struct DaemonForm {
     cwd: String,
 }
 
+#[derive(Clone)]
+struct StringMapEditorState {
+    pairs: Vec<(String, String)>,
+    snapshot: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct U32MapEditorState {
+    pairs: Vec<(u32, u32)>,
+    snapshot: Vec<(u32, u32)>,
+    text_buffers: std::collections::HashMap<usize, (String, String)>,
+}
+
 struct App {
-    selected_profile: Option<ProfileName>,
+    selected_profile: Option<ContainerName>,
     right_tab: RightTab,
     proxies: BTreeMap<ProxyID, ProxyItem>,
     nym_to_id: BTreeMap<String, ProxyID>,
@@ -145,10 +394,40 @@ struct App {
     daemon_form: DaemonForm,
     hide_secret: bool,
     cover_text: String,
-    tokio_rt: Runtime,
+    tokio_rt: Option<Runtime>,
     detail_proxy_id: Option<ProxyID>,
+    expanded_ip_rows: HashSet<ProxyID>,
+    last_sort_time: Instant,
     /// Number of upcoming frames that should force-fit/reset detail plots.
     detail_fit_frames_left: u8,
+    profile_editor_target: Option<ContainerName>,
+    profile_editor_template: TemplateConfig,
+    profile_editor_json: String,
+    profile_editor_json_error: Option<String>,
+    profile_editor_hot_init_json: String,
+    profile_editor_hot_init_error: Option<String>,
+    profile_editor_create_name: String,
+    profile_editor_status: Option<String>,
+    hotconfig_editor_target: Option<ContainerName>,
+    hotconfig_editor_value: HotConfig,
+    hotconfig_editor_json: String,
+    hotconfig_editor_error: Option<String>,
+    hotconfig_editor_status: Option<String>,
+    selected_traffic_conn: Option<diag::ConnId>,
+    traffic_subview: TrafficSubview,
+    // Viewer sub-view state (ported from nsp-diag viewer.rs)
+    viewer_ping_tx: flume::Sender<ViewerPingRequest>,
+    viewer_dns_config: Arc<Mutex<String>>,
+    viewer_ping_state: Arc<Mutex<ViewerPingState>>,
+    viewer_mass_ping_state: Arc<Mutex<ViewerMassPingState>>,
+    viewer_burst_test_state: Arc<Mutex<ViewerBurstTestState>>,
+    viewer_burst_test_stats: Arc<Mutex<ViewerBurstTestStats>>,
+    viewer_selected_conn: Option<diag::ConnId>,
+    ui_frame_seq: u64,
+    last_frame_progress_log: Instant,
+    last_frame_elapsed_ms: u128,
+    /// ANSI-render cache keyed by raw log message string.
+    cached_log: HashMap<String, Vec<egui::RichText>>,
 }
 
 fn load_proxies_from_persisted() -> ProxySnapshot {
@@ -181,21 +460,32 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
             (None, None)
         };
 
-        let (name, url, udp_capable) = match proxy {
+        let (name, url, proxy_domain) = match proxy {
             UplinkProxy::Trojan(t) => (
                 t.name.clone(),
                 format!("trojan://{}:{}", t.server_name, t.server_addr.port()),
-                false,
+                Some(t.server_name.as_str()),
             ),
-            UplinkProxy::Remote(a) => (nym.clone(), format!("{}://{}", a.proxy_type, a.addr), true),
-            UplinkProxy::Geph => (nym.clone(), "geph://".into(), false),
-            UplinkProxy::File(p) => (nym.clone(), format!("file://{}", p.display()), false),
+            UplinkProxy::Remote(a) => (nym.clone(), format!("{}://{}", a.proxy_type, a.addr), None),
+            UplinkProxy::Geph => (nym.clone(), "geph://".into(), None),
+            UplinkProxy::File(p) => (nym.clone(), format!("file://{}", p.display()), None),
         };
 
-        // Get resolved IP from clash state if available
-        let resolved_ip: Option<IpAddr> = clash_state
-            .get_latest_proxy_ips(&nym)
-            .and_then(|ips| ips.iter().next().copied());
+        let (udp_expected, udp_ability) = if let Some(s) = stats_state.stats.get(id) {
+            (
+                s.expected_udp
+                    .unwrap_or(uplink_proxy_default_udp_expected(proxy)),
+                s.udp_ability,
+            )
+        } else {
+            (uplink_proxy_default_udp_expected(proxy), None)
+        };
+
+        // Get resolved proxy-domain IPs from clash state if available.
+        let resolved_ips: Vec<IpAddr> = proxy_domain
+            .and_then(|domain| clash_state.get_latest_proxy_ips(domain))
+            .map(|ips| ips.iter().copied().collect())
+            .unwrap_or_default();
 
         // Get groups for this proxy from clash state
         let groups: HashSet<GroupId> = clash_state
@@ -212,12 +502,12 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
                 nym,
                 name,
                 url,
-                udp_capable,
-                status: "idle".into(),
+                udp_expected,
+                udp_ability,
                 enabled_globally: false,
                 latency_ms,
                 conn_ok,
-                resolved_ip,
+                resolved_ips,
                 groups,
             },
         );
@@ -285,6 +575,7 @@ fn build_shell_args(form: &DaemonForm) -> Option<ShellArgs> {
 
 impl App {
     pub fn new(ectx: egui::Context) -> Self {
+        info!("initializing nsproxy-ui app state");
         let snapshot = load_proxies_from_persisted();
         let proxies = snapshot.proxies.clone();
         let nym_to_id = snapshot.nym_to_id.clone();
@@ -302,11 +593,19 @@ impl App {
         let (reload_tx, reload_rx) = flume::bounded::<()>(1);
         let (proxy_tx, proxy_rx) = flume::bounded::<ProxySnapshot>(1);
         thread::spawn(move || {
+            info!("proxy reload worker started");
             while reload_rx.recv().is_ok() {
+                let started = Instant::now();
+                info!("proxy reload requested");
                 let updated = load_proxies_from_persisted();
-                eprintln!("uplink reloaded: {} proxies", updated.proxies.len());
+                info!(
+                    proxies = updated.proxies.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "proxy reload completed"
+                );
                 let _ = proxy_tx.send(updated); // drop error if GUI has exited
             }
+            info!("proxy reload worker exiting");
         });
 
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
@@ -318,6 +617,179 @@ impl App {
 
         // Initialize supervisor: discover and load all profiles
         supervisor.send(supervisor::SupervisorCommand::Init);
+
+        // Viewer DNS ping background task
+        let (viewer_ping_tx, viewer_ping_rx) = flume::unbounded::<ViewerPingRequest>();
+        let viewer_dns_config = Arc::new(Mutex::new("8.8.8.8:53".to_string()));
+        let viewer_ping_state = Arc::new(Mutex::new(ViewerPingState::default()));
+        let viewer_mass_ping_state = Arc::new(Mutex::new(ViewerMassPingState::default()));
+        let viewer_burst_test_state = Arc::new(Mutex::new(ViewerBurstTestState::default()));
+        let viewer_burst_test_stats = Arc::new(Mutex::new(ViewerBurstTestStats::new(50)));
+        {
+            use futures::stream::FuturesUnordered;
+            use futures::StreamExt as FuturesStreamExt;
+            let ping_state_bg = viewer_ping_state.clone();
+            let mass_state_bg = viewer_mass_ping_state.clone();
+            let burst_state_bg = viewer_burst_test_state.clone();
+            tokio_rt.spawn(async move {
+                while let Ok(req) = viewer_ping_rx.recv_async().await {
+                    match req {
+                        ViewerPingRequest::Single(domain, dns_addr) => {
+                            if let Err(err) = viewer_send_dns_ping_async(&dns_addr, domain).await {
+                                ping_state_bg.lock().unwrap().last_error =
+                                    Some(format!("dns ping error: {}", err));
+                            }
+                        }
+                        ViewerPingRequest::BurstTest(dns_addr) => {
+                            let started = viewer_now_epoch_us();
+                            let max_batch_size = {
+                                let mut burst = burst_state_bg.lock().unwrap();
+                                burst.running = true;
+                                burst.started_ts = Some(started);
+                                burst.finished_ts = None;
+                                burst.results.clear();
+                                burst.threshold_size = None;
+                                burst.last_error = None;
+                                burst.max_batch_size
+                            };
+                            let mut test_sizes = Vec::new();
+                            let mut power = 4u32;
+                            loop {
+                                let size = 1u64 << power;
+                                if size > max_batch_size {
+                                    break;
+                                }
+                                test_sizes.push(size);
+                                power += 1;
+                            }
+                            if test_sizes.is_empty()
+                                || *test_sizes.last().unwrap() != max_batch_size
+                            {
+                                test_sizes.push(max_batch_size);
+                            }
+                            let mut threshold_found = false;
+                            for size in test_sizes {
+                                let now_us = viewer_now_epoch_us();
+                                let domains: Vec<String> = (0..size)
+                                    .map(|i| format!("burst-{}-{}.diag", now_us, i))
+                                    .collect();
+                                let mut tasks: FuturesUnordered<_> = domains
+                                    .into_iter()
+                                    .map(|d| {
+                                        let dns = dns_addr.clone();
+                                        async move { viewer_send_dns_ping_async(&dns, d).await }
+                                    })
+                                    .collect();
+                                let mut errs = 0u64;
+                                let mut done = 0u64;
+                                let mut lat_sum_us = 0u64;
+                                let mut lat_min_us = u64::MAX;
+                                let mut lat_max_us = 0u64;
+                                while let Some(res) = tasks.next().await {
+                                    done += 1;
+                                    match res {
+                                        Ok(lat) => {
+                                            lat_sum_us = lat_sum_us.saturating_add(lat);
+                                            lat_min_us = lat_min_us.min(lat);
+                                            lat_max_us = lat_max_us.max(lat);
+                                        }
+                                        Err(_) => errs += 1,
+                                    }
+                                }
+                                let failure_rate = if done > 0 {
+                                    errs as f64 / done as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let ok = done.saturating_sub(errs);
+                                let lat_avg_us = if ok > 0 { lat_sum_us / ok } else { 0 };
+                                let result = ViewerBurstTestResult {
+                                    size,
+                                    requested: size,
+                                    completed: done,
+                                    errors: errs,
+                                    failure_rate,
+                                    latency_us_min: if ok > 0 { lat_min_us } else { 0 },
+                                    latency_us_max: lat_max_us,
+                                    latency_us_avg: lat_avg_us,
+                                };
+                                {
+                                    let mut burst = burst_state_bg.lock().unwrap();
+                                    burst.results.push(result);
+                                    if !threshold_found && failure_rate > 5.0 {
+                                        burst.threshold_size = Some(size);
+                                        threshold_found = true;
+                                    }
+                                }
+                                if threshold_found {
+                                    break;
+                                }
+                            }
+                            let finished = viewer_now_epoch_us();
+                            let mut burst = burst_state_bg.lock().unwrap();
+                            burst.running = false;
+                            burst.finished_ts = Some(finished);
+                        }
+                        ViewerPingRequest::Batch(domains, dns_addr) => {
+                            let batch_started = viewer_now_epoch_us();
+                            let mut tasks: FuturesUnordered<_> = domains
+                                .into_iter()
+                                .map(|d| {
+                                    let dns = dns_addr.clone();
+                                    async move { viewer_send_dns_ping_async(&dns, d).await }
+                                })
+                                .collect();
+                            let mut errs = 0u64;
+                            let mut done = 0u64;
+                            let mut rtt_sum_us = 0u64;
+                            let mut rtt_min_us = u64::MAX;
+                            let mut rtt_max_us = 0u64;
+                            let mut rtt_samples = 0u64;
+                            while let Some(res) = tasks.next().await {
+                                done += 1;
+                                match res {
+                                    Ok(rtt) => {
+                                        rtt_samples += 1;
+                                        rtt_sum_us = rtt_sum_us.saturating_add(rtt);
+                                        rtt_min_us = rtt_min_us.min(rtt);
+                                        rtt_max_us = rtt_max_us.max(rtt);
+                                    }
+                                    Err(_) => errs += 1,
+                                }
+                            }
+                            let batch_finished = viewer_now_epoch_us();
+                            let mut mass = mass_state_bg.lock().unwrap();
+                            mass.completed = done;
+                            mass.errors = errs;
+                            mass.in_flight = 0;
+                            mass.finished_ts = Some(batch_finished);
+                            mass.duration_us = Some(batch_finished.saturating_sub(batch_started));
+                            if rtt_samples > 0 {
+                                mass.rtt_avg_us = Some(rtt_sum_us / rtt_samples);
+                                mass.rtt_min_us = Some(rtt_min_us);
+                                mass.rtt_max_us = Some(rtt_max_us);
+                                mass.rtt_samples = rtt_samples;
+                            } else {
+                                mass.rtt_avg_us = None;
+                                mass.rtt_min_us = None;
+                                mass.rtt_max_us = None;
+                                mass.rtt_samples = 0;
+                            }
+                            mass.last_error = if errs > 0 {
+                                Some(format!("{} errors", errs))
+                            } else {
+                                None
+                            };
+                        }
+                    }
+                }
+            });
+        }
+
+        info!(
+            initial_proxy_count = proxies.len(),
+            "nsproxy-ui app initialized"
+        );
 
         Self {
             selected_profile: None,
@@ -340,19 +812,1333 @@ impl App {
             daemon_form: DaemonForm::default(),
             hide_secret: false,
             cover_text: "redacted".to_string(),
-            tokio_rt,
+            tokio_rt: Some(tokio_rt),
             detail_proxy_id: None,
+            expanded_ip_rows: HashSet::new(),
+            last_sort_time: Instant::now(),
             detail_fit_frames_left: 0,
+            profile_editor_target: None,
+            profile_editor_template: TemplateConfig::default(),
+            profile_editor_json: default_profile_text(),
+            profile_editor_json_error: None,
+            profile_editor_hot_init_json: default_hotconfig_text(),
+            profile_editor_hot_init_error: None,
+            profile_editor_create_name: String::new(),
+            profile_editor_status: None,
+            hotconfig_editor_target: None,
+            hotconfig_editor_value: HotConfig::default(),
+            hotconfig_editor_json: default_hotconfig_text(),
+            hotconfig_editor_error: None,
+            hotconfig_editor_status: None,
+            selected_traffic_conn: None,
+            traffic_subview: TrafficSubview::default(),
+            viewer_ping_tx,
+            viewer_dns_config,
+            viewer_ping_state,
+            viewer_mass_ping_state,
+            viewer_burst_test_state,
+            viewer_burst_test_stats,
+            viewer_selected_conn: None,
+            ui_frame_seq: 0,
+            last_frame_progress_log: Instant::now(),
+            last_frame_elapsed_ms: 0,
+            cached_log: HashMap::new(),
         }
     }
 
-    fn get_selected_profile(&self) -> Option<&supervisor::ProfileSnapshot> {
+    fn right_tab_label(&self) -> &'static str {
+        match self.right_tab {
+            RightTab::Proxies => "Proxies",
+            RightTab::Processes => "Processes",
+            RightTab::Traffic => "Traffic",
+            RightTab::Dns => "Dns",
+            RightTab::Hotconfig => "Hotconfig",
+            RightTab::ProfileEditor => "ProfileEditor",
+        }
+    }
+
+    fn is_valid_path(path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+
+        let path_buf = std::path::PathBuf::from(path);
+
+        if path == "@" || path.starts_with("@/") || path.starts_with('@') {
+            return true;
+        }
+
+        if path == "~" || path.starts_with("~/") {
+            return true;
+        }
+
+        if path.starts_with('/') {
+            if let Ok(home) = std::env::var("HOME") {
+                let home_path = std::path::PathBuf::from(home);
+                let expanded = if path.starts_with("~/") {
+                    home_path.join(&path[2..])
+                } else {
+                    path_buf.clone()
+                };
+                return expanded.exists();
+            }
+            return path_buf.exists();
+        }
+
+        false
+    }
+
+    fn is_valid_domain(domain: &str) -> bool {
+        if domain.is_empty() {
+            return false;
+        }
+
+        if !domain.ends_with('.') {
+            return false;
+        }
+
+        !domain.contains(char::is_whitespace)
+            && domain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    }
+
+    fn is_valid_ipv4(ip: &str) -> bool {
+        ip.parse::<std::net::Ipv4Addr>().is_ok()
+    }
+
+    fn is_valid_port(port: u32) -> bool {
+        port > 0 && port <= 65535
+    }
+
+    fn is_valid_mode(mode: u32) -> bool {
+        mode <= 0o7777
+    }
+
+    fn snapshot_string_map(map: &HashMap<String, String>) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    fn snapshot_u32_map(map: &HashMap<u32, u32>) -> Vec<(u32, u32)> {
+        let mut pairs: Vec<(u32, u32)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    fn snapshot_path_map(
+        map: &HashMap<std::path::PathBuf, std::path::PathBuf>,
+    ) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = map
+            .iter()
+            .map(|(k, v)| (k.display().to_string(), v.display().to_string()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    fn path_text_edit_with_validation(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+        let is_valid = Self::is_valid_path(value);
+        let bg_color = if is_valid {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        };
+
+        let mut text_edit = egui::TextEdit::singleline(value);
+        text_edit = text_edit.frame(true);
+        let visuals = ui.visuals_mut();
+        let old_bg = visuals.extreme_bg_color;
+        visuals.extreme_bg_color = bg_color;
+        let response = ui.add(text_edit);
+        ui.visuals_mut().extreme_bg_color = old_bg;
+        response
+    }
+
+    fn domain_text_edit_with_validation(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+        let is_valid = {
+            if Self::is_valid_domain(value) {
+                true
+            } else {
+                let mut normalized = value.clone();
+                normalize_domain(&mut normalized);
+                Self::is_valid_domain(&normalized)
+            }
+        };
+        let bg_color = if is_valid {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        };
+
+        let mut text_edit = egui::TextEdit::singleline(value);
+        text_edit = text_edit.frame(true);
+        let visuals = ui.visuals_mut();
+        let old_bg = visuals.extreme_bg_color;
+        visuals.extreme_bg_color = bg_color;
+        let mut response = ui.add(text_edit);
+        ui.visuals_mut().extreme_bg_color = old_bg;
+        if response.lost_focus() {
+            let before = value.clone();
+            normalize_domain(value);
+            if *value != before {
+                response.mark_changed();
+            }
+        }
+        response
+    }
+
+    fn ip_text_edit_with_validation(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+        let is_valid = Self::is_valid_ipv4(value);
+        let bg_color = if is_valid {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        };
+
+        let mut text_edit = egui::TextEdit::singleline(value);
+        text_edit = text_edit.frame(true);
+        let visuals = ui.visuals_mut();
+        let old_bg = visuals.extreme_bg_color;
+        visuals.extreme_bg_color = bg_color;
+        let response = ui.add(text_edit);
+        ui.visuals_mut().extreme_bg_color = old_bg;
+        response
+    }
+
+    fn refresh_hotconfig_editor_target(&mut self) {
+        if self.hotconfig_editor_target == self.selected_profile {
+            return;
+        }
+
+        self.hotconfig_editor_target = self.selected_profile.clone();
+        self.hotconfig_editor_status = None;
+        self.hotconfig_editor_error = None;
+
+        if let Some(profile_name) = self.selected_profile.as_ref() {
+            if let Some(snapshot) = self.snapshot.profiles.get(profile_name) {
+                self.hotconfig_editor_value = snapshot.hotconfig.clone();
+            } else {
+                self.hotconfig_editor_value = HotConfig::default();
+            }
+        } else {
+            self.hotconfig_editor_value = HotConfig::default();
+        }
+        self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
+            .unwrap_or_else(|_| "{}".to_string());
+    }
+
+    fn save_hotconfig_editor(&mut self) {
+        let Some(profile_name) = self.selected_profile.clone() else {
+            self.hotconfig_editor_status = Some("Select a profile to save hotconfig.".to_string());
+            return;
+        };
+
+        if self.hotconfig_editor_error.is_some() {
+            self.hotconfig_editor_status = Some("Fix JSON errors before saving.".to_string());
+            return;
+        }
+
+        let path = state_paths::hot_config(profile_name.as_str());
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                self.hotconfig_editor_status = Some(format!("Create dir failed: {err}"));
+                return;
+            }
+        }
+
+        let content = match serde_json::to_string_pretty(&self.hotconfig_editor_value) {
+            Ok(content) => content,
+            Err(err) => {
+                self.hotconfig_editor_status = Some(format!("Serialize failed: {err}"));
+                return;
+            }
+        };
+
+        if let Err(err) = std::fs::write(&path, content) {
+            self.hotconfig_editor_status = Some(format!("Save failed: {err}"));
+            return;
+        }
+
+        self.supervisor
+            .send(SupervisorCommand::ReloadHotconfig(profile_name.clone()));
+        self.supervisor
+            .send(SupervisorCommand::LoadProfile(profile_name.clone()));
+        self.hotconfig_editor_status = Some(format!("Saved hotconfig for {}", profile_name));
+    }
+
+    fn refresh_profile_editor_target(&mut self) {
+        if self.profile_editor_target == self.selected_profile {
+            return;
+        }
+
+        self.profile_editor_target = self.selected_profile.clone();
+        self.profile_editor_status = None;
+        self.profile_editor_json_error = None;
+        self.profile_editor_hot_init_error = None;
+
+        if let Some(profile_name) = self.selected_profile.as_ref() {
+            if let Some(snapshot) = self.snapshot.profiles.get(profile_name) {
+                self.profile_editor_template = snapshot.template.clone();
+                self.profile_editor_create_name = profile_name.clone();
+            } else {
+                self.profile_editor_template = TemplateConfig::default();
+            }
+        } else {
+            self.profile_editor_template = TemplateConfig::default();
+        }
+        self.refresh_profile_editor_json_from_template();
+        self.refresh_hot_init_json_from_template();
+    }
+
+    fn refresh_profile_editor_json_from_template(&mut self) {
+        self.profile_editor_json = serde_json::to_string_pretty(&self.profile_editor_template)
+            .unwrap_or_else(|_| "{}".to_string());
+    }
+
+    fn refresh_hot_init_json_from_template(&mut self) {
+        if let Some(hot) = self.profile_editor_template.hot_init.as_ref() {
+            self.profile_editor_hot_init_json =
+                serde_json::to_string_pretty(hot).unwrap_or_else(|_| "{}".to_string());
+        } else {
+            self.profile_editor_hot_init_json = default_hotconfig_text();
+        }
+    }
+
+    fn save_profile_editor(&mut self) {
+        let Some(profile_name) = self.selected_profile.clone() else {
+            self.profile_editor_status = Some("Select a profile to save.".to_string());
+            return;
+        };
+
+        if self.profile_editor_json_error.is_some() || self.profile_editor_hot_init_error.is_some()
+        {
+            self.profile_editor_status = Some("Fix JSON errors before saving.".to_string());
+            return;
+        }
+
+        let path = state_paths::profile_config(profile_name.as_str());
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                self.profile_editor_status = Some(format!("Create dir failed: {err}"));
+                return;
+            }
+        }
+
+        let content = match serde_json::to_string_pretty(&self.profile_editor_template) {
+            Ok(content) => content,
+            Err(err) => {
+                self.profile_editor_status = Some(format!("Serialize failed: {err}"));
+                return;
+            }
+        };
+
+        if let Err(err) = std::fs::write(&path, content) {
+            self.profile_editor_status = Some(format!("Save failed: {err}"));
+            return;
+        }
+
+        self.supervisor
+            .send(SupervisorCommand::ReloadProfile(profile_name.clone()));
+        self.supervisor
+            .send(SupervisorCommand::LoadProfile(profile_name.clone()));
+        self.profile_editor_status = Some(format!("Saved {}", profile_name));
+    }
+
+    fn create_profile_from_editor(&mut self) {
+        let name = self.profile_editor_create_name.trim().to_string();
+        if name.is_empty() {
+            self.profile_editor_status = Some("Enter a profile name first.".to_string());
+            return;
+        }
+        if name.contains('/') {
+            self.profile_editor_status = Some("Profile name must not contain '/'.".to_string());
+            return;
+        }
+        if self.profile_editor_json_error.is_some() || self.profile_editor_hot_init_error.is_some()
+        {
+            self.profile_editor_status = Some("Fix JSON errors before creating.".to_string());
+            return;
+        }
+
+        let profile_dir = state_paths::profile_dir(name.as_str());
+        if profile_dir.exists() {
+            self.profile_editor_status = Some(format!("Profile '{}' already exists.", name));
+            return;
+        }
+
+        if let Err(err) = std::fs::create_dir_all(&profile_dir) {
+            self.profile_editor_status = Some(format!("Create profile dir failed: {err}"));
+            return;
+        }
+
+        let profile_path = state_paths::profile_config(name.as_str());
+        let profile_content = match serde_json::to_string_pretty(&self.profile_editor_template) {
+            Ok(content) => content,
+            Err(err) => {
+                self.profile_editor_status = Some(format!("Serialize failed: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = std::fs::write(&profile_path, profile_content) {
+            self.profile_editor_status = Some(format!("Write profile.json failed: {err}"));
+            return;
+        }
+
+        if let Some(hot) = self.profile_editor_template.hot_init.as_ref() {
+            let hot_path = state_paths::hot_config(name.as_str());
+            if !hot_path.exists() {
+                if let Ok(hot_content) = serde_json::to_string_pretty(hot) {
+                    let _ = std::fs::write(hot_path, hot_content);
+                }
+            }
+        }
+
+        self.selected_profile = Some(name.clone());
+        self.profile_editor_target = None;
+        self.supervisor.send(SupervisorCommand::Init);
+        self.supervisor
+            .send(SupervisorCommand::LoadProfile(name.clone()));
+        self.profile_editor_status = Some(format!("Created profile '{}'", name));
+    }
+
+    fn render_optional_u32(ui: &mut egui::Ui, label: &str, value: &mut Option<u32>) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let mut enabled = value.is_some();
+            if ui.checkbox(&mut enabled, label).changed() {
+                changed = true;
+                if enabled && value.is_none() {
+                    *value = Some(0);
+                }
+                if !enabled {
+                    *value = None;
+                }
+            }
+            if enabled {
+                if let Some(v) = value.as_mut() {
+                    let mut text = v.to_string();
+                    if label == "mode" {
+                        let is_valid = Self::is_valid_mode(*v) && !text.is_empty();
+                        let bg_color = if text.is_empty() {
+                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                        } else if is_valid {
+                            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                        };
+                        let visuals = ui.visuals_mut();
+                        let old_bg = visuals.extreme_bg_color;
+                        visuals.extreme_bg_color = bg_color;
+                        let resp = ui.text_edit_singleline(&mut text);
+                        ui.visuals_mut().extreme_bg_color = old_bg;
+                        if resp.lost_focus() {
+                            if text.is_empty() {
+                                *value = None;
+                                changed = true;
+                            } else if let Ok(parsed) = text.parse::<u32>() {
+                                *v = parsed;
+                                changed = true;
+                            }
+                        }
+                    } else {
+                        let is_valid = text.parse::<u32>().is_ok() && !text.is_empty();
+                        let bg_color = if text.is_empty() {
+                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                        } else if is_valid {
+                            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                        };
+                        let visuals = ui.visuals_mut();
+                        let old_bg = visuals.extreme_bg_color;
+                        visuals.extreme_bg_color = bg_color;
+                        let resp = ui.text_edit_singleline(&mut text);
+                        ui.visuals_mut().extreme_bg_color = old_bg;
+                        if resp.lost_focus() {
+                            if text.is_empty() {
+                                *value = None;
+                                changed = true;
+                            } else if let Ok(parsed) = text.parse::<u32>() {
+                                *v = parsed;
+                                changed = true;
+                            }
+                        }
+                    }
+                } else {
+                    let mut text = String::new();
+                    let bg_color = egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25);
+                    let visuals = ui.visuals_mut();
+                    let old_bg = visuals.extreme_bg_color;
+                    visuals.extreme_bg_color = bg_color;
+                    let resp = ui.text_edit_singleline(&mut text);
+                    ui.visuals_mut().extreme_bg_color = old_bg;
+                    if resp.lost_focus() && !text.is_empty() {
+                        if let Ok(parsed) = text.parse::<u32>() {
+                            *value = Some(parsed);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        });
+        changed
+    }
+
+    fn render_optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<String>) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let mut enabled = value.is_some();
+            if ui.checkbox(&mut enabled, label).changed() {
+                changed = true;
+                if enabled && value.is_none() {
+                    *value = Some(String::new());
+                }
+                if !enabled {
+                    *value = None;
+                }
+            }
+            if let Some(text) = value.as_mut() {
+                if ui.text_edit_singleline(text).changed() {
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn render_path_field(
+        ui: &mut egui::Ui,
+        label: &str,
+        path: &mut std::path::PathBuf,
+        id_salt: impl std::hash::Hash,
+    ) -> bool {
+        let mut changed = false;
+        let mut value = path.display().to_string();
+        ui.horizontal(|ui| {
+            ui.push_id(("path-field", label, &id_salt), |ui| {
+                ui.label(label);
+                if Self::path_text_edit_with_validation(ui, &mut value).changed() {
+                    *path = value.clone().into();
+                    changed = true;
+                }
+            });
+        });
+        changed
+    }
+
+    fn render_mount_list(ui: &mut egui::Ui, mounts: &mut Vec<ProfileMount>, title: &str) -> bool {
+        let mut changed = false;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong(title);
+                if ui.button("+ Add").clicked() {
+                    mounts.push(ProfileMount {
+                        source: "/".into(),
+                        target: "/".into(),
+                        read_only: false,
+                        recursive: true,
+                    });
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, mount) in mounts.iter_mut().enumerate() {
+                ui.push_id(("mount-row", i), |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}", i + 1));
+                    });
+                    if Self::render_path_field(ui, "source", &mut mount.source, i * 2) {
+                        changed = true;
+                    }
+                    if Self::render_path_field(ui, "target", &mut mount.target, i * 2 + 1) {
+                        changed = true;
+                    }
+                    if ui.checkbox(&mut mount.read_only, "read_only").changed() {
+                        changed = true;
+                    }
+                    if ui.checkbox(&mut mount.recursive, "recursive").changed() {
+                        changed = true;
+                    }
+                    if mount.source.to_string_lossy().is_empty()
+                        || mount.target.to_string_lossy().is_empty()
+                    {
+                        remove_ixs.push(i);
+                    }
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                mounts.remove(ix);
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    fn render_chmod_list(ui: &mut egui::Ui, chmod: &mut Vec<ProfileChmod>) -> bool {
+        let mut changed = false;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("chmod");
+                if ui.button("+ Add").clicked() {
+                    chmod.push(ProfileChmod {
+                        path: "/".into(),
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                    });
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, op) in chmod.iter_mut().enumerate() {
+                ui.push_id(("chmod-row", i), |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}", i + 1));
+                    });
+                    if Self::render_path_field(ui, "path", &mut op.path, i) {
+                        changed = true;
+                    }
+                    if Self::render_optional_u32(ui, "mode", &mut op.mode) {
+                        changed = true;
+                    }
+                    if Self::render_optional_u32(ui, "uid", &mut op.uid) {
+                        changed = true;
+                    }
+                    if Self::render_optional_u32(ui, "gid", &mut op.gid) {
+                        changed = true;
+                    }
+                    if op.path.to_string_lossy().is_empty() {
+                        remove_ixs.push(i);
+                    }
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                chmod.remove(ix);
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    fn render_env_map(ui: &mut egui::Ui, env: &mut HashMap<String, String>) -> bool {
+        let mut changed = false;
+        let state_id = ui.make_persistent_id("env-map-editor-state");
+        let snapshot = Self::snapshot_string_map(env);
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<StringMapEditorState>(state_id))
+            .unwrap_or_else(|| StringMapEditorState {
+                pairs: snapshot.clone(),
+                snapshot: snapshot.clone(),
+            });
+        if state.snapshot != snapshot {
+            state.pairs = snapshot.clone();
+            state.snapshot = snapshot.clone();
+        }
+        let mut pairs = state.pairs;
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("env");
+                if ui.button("+ Add").clicked() {
+                    pairs.push(("KEY".to_string(), "value".to_string()));
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, (k, v)) in pairs.iter_mut().enumerate() {
+                ui.push_id(("env-row", i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if ui.text_edit_singleline(k).changed() {
+                            changed = true;
+                        }
+                        if ui.text_edit_singleline(v).changed() {
+                            changed = true;
+                        }
+                    });
+                    if k.is_empty() || v.is_empty() {
+                        remove_ixs.push(i);
+                    }
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                pairs.remove(ix);
+                changed = true;
+            }
+        });
+
+        if changed {
+            env.clear();
+            let mut ordered_pairs = Vec::new();
+            for (k, v) in pairs {
+                if !k.trim().is_empty() {
+                    ordered_pairs.push((k.clone(), v.clone()));
+                    env.insert(k, v);
+                }
+            }
+            state.snapshot = Self::snapshot_string_map(env);
+            state.pairs = ordered_pairs;
+        } else {
+            state.pairs = pairs;
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        changed
+    }
+
+    fn render_string_map(
+        ui: &mut egui::Ui,
+        title: &str,
+        map: &mut HashMap<String, String>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        let state_id = ui.make_persistent_id((id_prefix, title, "string-map-editor-state"));
+        let snapshot = Self::snapshot_string_map(map);
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<StringMapEditorState>(state_id))
+            .unwrap_or_else(|| StringMapEditorState {
+                pairs: snapshot.clone(),
+                snapshot: snapshot.clone(),
+            });
+        if state.snapshot != snapshot {
+            state.pairs = snapshot.clone();
+            state.snapshot = snapshot.clone();
+        }
+        let mut pairs = state.pairs;
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong(title);
+                if ui.button("+ Add").clicked() {
+                    pairs.push(("key".to_string(), "value".to_string()));
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, (k, v)) in pairs.iter_mut().enumerate() {
+                ui.push_id((id_prefix, title, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if title == "dns" {
+                            if Self::domain_text_edit_with_validation(ui, k).changed() {
+                                changed = true;
+                            }
+                            if Self::ip_text_edit_with_validation(ui, v).changed() {
+                                changed = true;
+                            }
+                        } else {
+                            if ui.text_edit_singleline(k).changed() {
+                                changed = true;
+                            }
+                            if ui.text_edit_singleline(v).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                    if k.is_empty() || v.is_empty() {
+                        remove_ixs.push(i);
+                    }
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                pairs.remove(ix);
+                changed = true;
+            }
+        });
+
+        if changed {
+            map.clear();
+            let mut ordered_pairs = Vec::new();
+            for (k, v) in pairs {
+                if !k.trim().is_empty() {
+                    ordered_pairs.push((k.clone(), v.clone()));
+                    map.insert(k, v);
+                }
+            }
+            state.snapshot = Self::snapshot_string_map(map);
+            state.pairs = ordered_pairs;
+        } else {
+            state.pairs = pairs;
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        changed
+    }
+
+    fn render_u32_map(
+        ui: &mut egui::Ui,
+        title: &str,
+        map: &mut HashMap<u32, u32>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        let state_id = ui.make_persistent_id((id_prefix, title, "u32-map-editor-state"));
+        let snapshot = Self::snapshot_u32_map(map);
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<U32MapEditorState>(state_id))
+            .unwrap_or_else(|| U32MapEditorState {
+                pairs: snapshot.clone(),
+                snapshot: snapshot.clone(),
+                text_buffers: std::collections::HashMap::new(),
+            });
+        if state.snapshot != snapshot {
+            state.pairs = snapshot.clone();
+            state.snapshot = snapshot.clone();
+            state.text_buffers.clear();
+        }
+        let mut pairs = state.pairs;
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong(title);
+                if ui.button("+ Add").clicked() {
+                    pairs.push((0, 0));
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, (k, v)) in pairs.iter_mut().enumerate() {
+                ui.push_id((id_prefix, title, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+
+                        let (mut k_str, mut v_str) = state
+                            .text_buffers
+                            .entry(i)
+                            .or_insert_with(|| (k.to_string(), v.to_string()))
+                            .clone();
+
+                        if title == "locals" {
+                            let k_valid = Self::is_valid_port(*k);
+                            let k_bg_color = if k_str.is_empty() {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            } else if k_valid {
+                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            };
+                            let visuals = ui.visuals_mut();
+                            let old_k_bg = visuals.extreme_bg_color;
+                            visuals.extreme_bg_color = k_bg_color;
+                            let k_resp = ui.text_edit_singleline(&mut k_str);
+                            ui.visuals_mut().extreme_bg_color = old_k_bg;
+                            if k_resp.lost_focus() {
+                                if k_str.is_empty() {
+                                    remove_ixs.push(i);
+                                    changed = true;
+                                } else if let Ok(parsed) = k_str.parse::<u32>() {
+                                    *k = parsed;
+                                    changed = true;
+                                }
+                            }
+
+                            let v_valid = Self::is_valid_port(*v);
+                            let v_bg_color = if v_str.is_empty() {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            } else if v_valid {
+                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            };
+                            let visuals = ui.visuals_mut();
+                            let old_v_bg = visuals.extreme_bg_color;
+                            visuals.extreme_bg_color = v_bg_color;
+                            let v_resp = ui.text_edit_singleline(&mut v_str);
+                            ui.visuals_mut().extreme_bg_color = old_v_bg;
+                            if v_resp.lost_focus() {
+                                if v_str.is_empty() {
+                                    remove_ixs.push(i);
+                                    changed = true;
+                                } else if let Ok(parsed) = v_str.parse::<u32>() {
+                                    *v = parsed;
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            let k_bg_color = if k_str.is_empty() {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            } else if k_str.parse::<u32>().is_ok() {
+                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            };
+                            let visuals = ui.visuals_mut();
+                            let old_k_bg = visuals.extreme_bg_color;
+                            visuals.extreme_bg_color = k_bg_color;
+                            let k_resp = ui.text_edit_singleline(&mut k_str);
+                            ui.visuals_mut().extreme_bg_color = old_k_bg;
+                            if k_resp.lost_focus() {
+                                if k_str.is_empty() {
+                                    remove_ixs.push(i);
+                                    changed = true;
+                                } else if let Ok(parsed) = k_str.parse::<u32>() {
+                                    *k = parsed;
+                                    changed = true;
+                                }
+                            }
+
+                            let v_bg_color = if v_str.is_empty() {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            } else if v_str.parse::<u32>().is_ok() {
+                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                            };
+                            let visuals = ui.visuals_mut();
+                            let old_v_bg = visuals.extreme_bg_color;
+                            visuals.extreme_bg_color = v_bg_color;
+                            let v_resp = ui.text_edit_singleline(&mut v_str);
+                            ui.visuals_mut().extreme_bg_color = old_v_bg;
+                            if v_resp.lost_focus() {
+                                if v_str.is_empty() {
+                                    remove_ixs.push(i);
+                                    changed = true;
+                                } else if let Ok(parsed) = v_str.parse::<u32>() {
+                                    *v = parsed;
+                                    changed = true;
+                                }
+                            }
+                        }
+
+                        state.text_buffers.insert(i, (k_str, v_str));
+                    });
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                pairs.remove(ix);
+                changed = true;
+            }
+            // Clear text buffers after any deletions to sync with new pair indices
+            if !remove_ixs.is_empty() {
+                state.text_buffers.clear();
+            }
+        });
+
+        if changed {
+            map.clear();
+            let mut ordered_pairs = Vec::new();
+            for (k, v) in pairs {
+                ordered_pairs.push((k, v));
+                map.insert(k, v);
+            }
+            state.snapshot = Self::snapshot_u32_map(map);
+            state.pairs = ordered_pairs;
+        } else {
+            state.pairs = pairs;
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        changed
+    }
+
+    fn render_path_map(
+        ui: &mut egui::Ui,
+        title: &str,
+        map: &mut HashMap<std::path::PathBuf, std::path::PathBuf>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        let state_id = ui.make_persistent_id((id_prefix, title, "path-map-editor-state"));
+        let snapshot = Self::snapshot_path_map(map);
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<StringMapEditorState>(state_id))
+            .unwrap_or_else(|| StringMapEditorState {
+                pairs: snapshot.clone(),
+                snapshot: snapshot.clone(),
+            });
+        if state.snapshot != snapshot {
+            state.pairs = snapshot.clone();
+            state.snapshot = snapshot.clone();
+        }
+        let mut pairs = state.pairs;
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong(title);
+                if ui.button("+ Add").clicked() {
+                    pairs.push(("/source".to_string(), "/target".to_string()));
+                    changed = true;
+                }
+            });
+
+            let mut remove_ixs = Vec::new();
+            for (i, (src, dst)) in pairs.iter_mut().enumerate() {
+                ui.push_id((id_prefix, title, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if Self::path_text_edit_with_validation(ui, src).changed() {
+                            changed = true;
+                        }
+                        if Self::path_text_edit_with_validation(ui, dst).changed() {
+                            changed = true;
+                        }
+                    });
+                    if src.is_empty() || dst.is_empty() {
+                        remove_ixs.push(i);
+                    }
+                });
+            }
+            for &ix in remove_ixs.iter().rev() {
+                pairs.remove(ix);
+                changed = true;
+            }
+        });
+
+        if changed {
+            map.clear();
+            let mut ordered_pairs = Vec::new();
+            for (src, dst) in pairs {
+                if !src.trim().is_empty() {
+                    ordered_pairs.push((src.clone(), dst.clone()));
+                    map.insert(src.into(), dst.into());
+                }
+            }
+            state.snapshot = Self::snapshot_path_map(map);
+            state.pairs = ordered_pairs;
+        } else {
+            state.pairs = pairs;
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        changed
+    }
+
+    fn render_shell_args_list(
+        ui: &mut egui::Ui,
+        list: &mut Vec<ShellArgs>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("daemons");
+                if ui.button("+ Add").clicked() {
+                    list.push(ShellArgs::default());
+                    changed = true;
+                }
+            });
+
+            let mut remove_ix = None;
+            for (i, args) in list.iter_mut().enumerate() {
+                ui.push_id((id_prefix, "daemon", i), |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}", i + 1));
+                        if ui.button("Remove").clicked() {
+                            remove_ix = Some(i);
+                        }
+                    });
+                    if Self::render_shell_args(ui, args, "shell args") {
+                        changed = true;
+                    }
+                });
+            }
+            if let Some(ix) = remove_ix {
+                list.remove(ix);
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    fn render_hotconfig_form(ui: &mut egui::Ui, id_prefix: &str, hot: &mut HotConfig) -> bool {
+        let mut changed = false;
+
+        if Self::render_string_map(ui, "dns", &mut hot.dns, id_prefix) {
+            changed = true;
+        }
+        if Self::render_string_map(ui, "devs", &mut hot.devs, id_prefix) {
+            changed = true;
+        }
+        if Self::render_u32_map(ui, "locals", &mut hot.locals, id_prefix) {
+            changed = true;
+        }
+        if Self::render_path_map(ui, "mnt", &mut hot.mnt, id_prefix) {
+            changed = true;
+        }
+        if Self::render_mount_list(ui, &mut hot.mounts, "mounts") {
+            changed = true;
+        }
+        if Self::render_shell_args_list(ui, &mut hot.daemons, id_prefix) {
+            changed = true;
+        }
+
+        ui.group(|ui| {
+            ui.strong("tun");
+            ui.small("Edit via JSON panel (right) for arbitrary nested values.");
+            ui.small(format!("entries: {}", hot.tun.len()));
+        });
+
+        ui.group(|ui| {
+            ui.strong("dns_capture");
+            ui.small("Edit via JSON panel (right) for exact network set semantics.");
+            ui.small(format!("entries: {}", hot.dns_capture.len()));
+        });
+
+        changed
+    }
+
+    fn render_hotconfig_editor_split(
+        ui: &mut egui::Ui,
+        id_prefix: &str,
+        hot: &mut HotConfig,
+        json_text: &mut String,
+        json_error: &mut Option<String>,
+    ) -> bool {
+        let mut changed = false;
+        ui.columns(2, |columns| {
+            columns[0].heading("Form");
+            egui::ScrollArea::vertical()
+                .id_salt(format!("{}-form-scroll", id_prefix))
+                .show(&mut columns[0], |ui| {
+                    if Self::render_hotconfig_form(ui, id_prefix, hot) {
+                        *json_text =
+                            serde_json::to_string_pretty(hot).unwrap_or_else(|_| "{}".to_string());
+                        *json_error = None;
+                        changed = true;
+                    }
+                });
+
+            columns[1].heading("Formatted JSON");
+            egui::ScrollArea::vertical()
+                .id_salt(format!("{}-json-scroll", id_prefix))
+                .show(&mut columns[1], |ui| {
+                    let mut editor = CodeEditor::default()
+                        .id_source(format!("{}-json-editor", id_prefix))
+                        .with_rows(28)
+                        .with_theme(ColorTheme::GRUVBOX)
+                        .with_syntax(json_syntax())
+                        .with_numlines(true)
+                        .with_ui_fontsize(ui);
+                    let output = editor.show(ui, json_text);
+                    if output.response.changed() {
+                        match serde_json::from_str::<HotConfig>(json_text) {
+                            Ok(parsed) => {
+                                *hot = parsed;
+                                *json_error = None;
+                                changed = true;
+                            }
+                            Err(err) => {
+                                *json_error = Some(format!("JSON error: {err}"));
+                            }
+                        }
+                    }
+                    if let Some(err) = json_error.as_ref() {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    }
+                });
+        });
+        changed
+    }
+
+    fn render_shell_args(ui: &mut egui::Ui, sargs: &mut ShellArgs, title: &str) -> bool {
+        let mut changed = false;
+        ui.group(|ui| {
+            ui.strong(title);
+            if Self::render_optional_u32(ui, "uid", &mut sargs.uid) {
+                changed = true;
+            }
+            if Self::render_optional_u32(ui, "gid", &mut sargs.gid) {
+                changed = true;
+            }
+            if Self::render_optional_text(ui, "shell", &mut sargs.shell) {
+                changed = true;
+            }
+
+            let mut cwd_string = sargs
+                .cwd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                let mut enabled = sargs.cwd.is_some();
+                if ui.checkbox(&mut enabled, "cwd").changed() {
+                    changed = true;
+                    if enabled && sargs.cwd.is_none() {
+                        sargs.cwd = Some("/".into());
+                        cwd_string = "/".to_string();
+                    }
+                    if !enabled {
+                        sargs.cwd = None;
+                    }
+                }
+                if enabled && ui.text_edit_singleline(&mut cwd_string).changed() {
+                    sargs.cwd = Some(cwd_string.clone().into());
+                    changed = true;
+                }
+            });
+
+            let mut gids_csv = sargs
+                .gids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            ui.horizontal(|ui| {
+                ui.label("gids csv");
+                if ui.text_edit_singleline(&mut gids_csv).changed() {
+                    let parsed = gids_csv
+                        .split(',')
+                        .filter_map(|s| {
+                            let t = s.trim();
+                            if t.is_empty() {
+                                None
+                            } else {
+                                t.parse::<u32>().ok()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    sargs.gids = parsed;
+                    changed = true;
+                }
+            });
+
+            let mut args_text = sargs.args.join(" ");
+            ui.horizontal(|ui| {
+                ui.label("args");
+                if ui.text_edit_singleline(&mut args_text).changed() {
+                    sargs.args = args_text
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    changed = true;
+                }
+            });
+        });
+        changed
+    }
+
+    fn render_template_form(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label("schema");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.profile_editor_template.schema)
+                        .clamp_range(1..=u32::MAX),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("sandbox_mode");
+            if ui
+                .radio_value(
+                    &mut self.profile_editor_template.sandbox_mode,
+                    SandboxMode::Overlay,
+                    "Overlay",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .radio_value(
+                    &mut self.profile_editor_template.sandbox_mode,
+                    SandboxMode::Pivot,
+                    "Pivot",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+        });
+
+        if Self::render_mount_list(ui, &mut self.profile_editor_template.mounts, "mounts") {
+            changed = true;
+        }
+        if Self::render_chmod_list(ui, &mut self.profile_editor_template.chmod) {
+            changed = true;
+        }
+        if Self::render_env_map(ui, &mut self.profile_editor_template.env) {
+            changed = true;
+        }
+
+        if ui
+            .checkbox(&mut self.profile_editor_template.inherit_env, "inherit_env")
+            .changed()
+        {
+            changed = true;
+        }
+        if Self::render_path_field(ui, "hot", &mut self.profile_editor_template.hot, "hot") {
+            changed = true;
+        }
+
+        let mut refresh_hot_init_json = false;
+        ui.group(|ui| {
+            let mut enabled = self.profile_editor_template.hot_init.is_some();
+            if ui.checkbox(&mut enabled, "hot_init").changed() {
+                changed = true;
+                if enabled && self.profile_editor_template.hot_init.is_none() {
+                    self.profile_editor_template.hot_init = Some(HotConfig::default());
+                    refresh_hot_init_json = true;
+                }
+                if !enabled {
+                    self.profile_editor_template.hot_init = None;
+                    self.profile_editor_hot_init_error = None;
+                }
+            }
+
+            if enabled {
+                ui.separator();
+                ui.label("hot_init (same form as Hotconfig tab)");
+                let mut hot_init = self
+                    .profile_editor_template
+                    .hot_init
+                    .clone()
+                    .unwrap_or_default();
+                if Self::render_hotconfig_form(ui, "profile-hot-init", &mut hot_init) {
+                    self.profile_editor_template.hot_init = Some(hot_init);
+                    self.profile_editor_hot_init_json = self
+                        .profile_editor_template
+                        .hot_init
+                        .as_ref()
+                        .and_then(|h| serde_json::to_string_pretty(h).ok())
+                        .unwrap_or_else(|| default_hotconfig_text());
+                    self.profile_editor_hot_init_error = None;
+                    changed = true;
+                }
+                if let Some(err) = &self.profile_editor_hot_init_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
+            }
+        });
+        if refresh_hot_init_json {
+            self.refresh_hot_init_json_from_template();
+        }
+
+        if Self::render_shell_args(ui, &mut self.profile_editor_template.sargs, "sargs") {
+            changed = true;
+        }
+        if Self::render_optional_text(
+            ui,
+            "browser_profile",
+            &mut self.profile_editor_template.browser_profile,
+        ) {
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn get_selected_profile(&self) -> Option<&supervisor::ContainerState> {
         self.selected_profile
             .as_ref()
             .and_then(|name| self.snapshot.profiles.get(name))
     }
 
-    fn get_selected_profile_mut(&mut self) -> Option<&mut supervisor::ProfileSnapshot> {
+    fn get_selected_profile_mut(&mut self) -> Option<&mut supervisor::ContainerState> {
         if let Some(name) = self.selected_profile.clone() {
             self.snapshot.profiles.get_mut(&name)
         } else {
@@ -363,12 +2149,19 @@ impl App {
     fn reload_all_ns_alive(&self) {
         let profiles: Vec<_> = self.snapshot.profiles.keys().cloned().collect();
         if !profiles.is_empty() {
+            info!(
+                profile_count = profiles.len(),
+                "requesting status reload for all profiles"
+            );
             self.supervisor
                 .send(supervisor::SupervisorCommand::LoadProfiles(profiles));
         }
     }
 
     fn apply_filters(&mut self) {
+        let now = Instant::now();
+
+        // First, filter proxies
         self.filtered_proxy_ids = self
             .proxies
             .iter()
@@ -396,6 +2189,98 @@ impl App {
             })
             .map(|(id, _)| id.clone())
             .collect();
+
+        // Then, apply sorting if interval has elapsed or sort mode changed
+        let should_resort =
+            if let Some(freq_duration) = self.proxy_filters.sort_frequency.duration() {
+                now.elapsed() >= freq_duration
+            } else {
+                false
+            };
+
+        if should_resort || self.proxy_filters.sort_column != SortColumn::None {
+            self.sort_filtered_proxies();
+            self.last_sort_time = now;
+        }
+    }
+
+    fn sort_filtered_proxies(&mut self) {
+        let proxies = &self.proxies;
+        let sort_column = self.proxy_filters.sort_column;
+        let sort_direction = self.proxy_filters.sort_direction;
+
+        let live_stats: HashMap<ProxyID, ProxyStats> = self
+            .selected_profile
+            .as_ref()
+            .and_then(|p| self.snapshot.profiles.get(p))
+            .map(|p| p.proxy_stats.clone())
+            .unwrap_or_default();
+
+        self.filtered_proxy_ids.sort_by(|a, b| {
+            let item_a = match proxies.get(a) {
+                Some(item) => item,
+                None => return std::cmp::Ordering::Equal,
+            };
+            let item_b = match proxies.get(b) {
+                Some(item) => item,
+                None => return std::cmp::Ordering::Equal,
+            };
+
+            let order = match sort_column {
+                SortColumn::None => std::cmp::Ordering::Equal,
+                SortColumn::Latency => {
+                    let lat_a = item_a.latency_ms.unwrap_or(u64::MAX);
+                    let lat_b = item_b.latency_ms.unwrap_or(u64::MAX);
+                    lat_a.cmp(&lat_b)
+                }
+                SortColumn::FailRate => {
+                    let success_a = live_stats
+                        .get(a)
+                        .and_then(|s| s.past_hour().success_rate())
+                        .unwrap_or(1.);
+                    let success_b = live_stats
+                        .get(b)
+                        .and_then(|s| s.past_hour().success_rate())
+                        .unwrap_or(1.);
+                    success_a
+                        .partial_cmp(&success_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+
+            if sort_direction == SortDirection::Descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+    }
+
+    fn on_sort_column_clicked(&mut self, column: SortColumn) {
+        if self.proxy_filters.sort_column == column {
+            // Clicking the same column toggles direction
+            self.proxy_filters.sort_direction = match self.proxy_filters.sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            // Clicking a new column switches to that column with ascending order
+            self.proxy_filters.sort_column = column;
+            self.proxy_filters.sort_direction = SortDirection::Ascending;
+        }
+        // Always sort immediately on header click
+        self.sort_filtered_proxies();
+        self.last_sort_time = Instant::now();
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        info!("app drop started; shutting down tokio runtime in background");
+        if let Some(rt) = self.tokio_rt.take() {
+            rt.shutdown_background();
+        }
+        info!("app drop finished");
     }
 }
 
@@ -405,6 +2290,13 @@ fn default_hotconfig_text() -> String {
 
 fn default_profile_text() -> String {
     serde_json::to_string_pretty(&TemplateConfig::default()).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn json_syntax() -> Syntax {
+    Syntax::new("json")
+        .with_case_sensitive(true)
+        .with_comment("//")
+        .with_keywords(["true", "false", "null"])
 }
 
 fn load_profile_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>) -> LoadResult {
@@ -453,25 +2345,8 @@ fn load_hotconfig_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>
     }
 }
 
-fn profile_unit_ids(profile: &ProfileName) -> (UnitId, UnitId) {
-    (
-        UnitId::new(format!("{}:up", profile.as_str())),
-        UnitId::new(format!("{}:serve", profile.as_str())),
-    )
-}
-
-fn unit_running(snapshot: &supervisor::SupervisorSnapshot, unit_id: &UnitId) -> bool {
-    snapshot
-        .profiles
-        .values()
-        .flat_map(|profile| profile.units.iter())
-        .find(|u| &u.id == unit_id)
-        .map(|u| matches!(u.status, supervisor::UnitStatus::Running))
-        .unwrap_or(false)
-}
-
 fn load_scope_from_disk<FH, FP>(
-    profile: &ProfileName,
+    profile: &ContainerName,
     fallback_hot: Option<FH>,
     fallback_profile: Option<FP>,
 ) -> (String, String, Option<String>, Option<String>)
@@ -494,8 +2369,27 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::Color32;
 
+        let frame_started = Instant::now();
+        self.ui_frame_seq = self.ui_frame_seq.wrapping_add(1);
+        if self.last_frame_progress_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                frame = self.ui_frame_seq,
+                tab = self.right_tab_label(),
+                profile = self.selected_profile.as_deref().unwrap_or("<global>"),
+                profiles = self.snapshot.profiles.len(),
+                proxies = self.proxies.len(),
+                "ui frame heartbeat"
+            );
+            self.last_frame_progress_log = Instant::now();
+        }
+
         // Drain any reload results pushed by the background thread.
         if let Ok(updated) = self.proxy_rx.try_recv() {
+            info!(
+                frame = self.ui_frame_seq,
+                proxies = updated.proxies.len(),
+                "applying proxy reload snapshot"
+            );
             self.proxies = updated.proxies.clone();
             self.nym_to_id = updated.nym_to_id.clone();
             self.proxy_groups = updated.proxy_groups.clone();
@@ -511,8 +2405,18 @@ impl eframe::App for App {
         }
 
         // Update snapshot from supervisor (single source of truth)
+        let mut drained_snapshots = 0usize;
         while let Some(snapshot) = self.supervisor.try_recv_snapshot() {
+            drained_snapshots += 1;
             self.snapshot = snapshot;
+        }
+        if drained_snapshots > 0 {
+            info!(
+                frame = self.ui_frame_seq,
+                drained_snapshots,
+                profiles = self.snapshot.profiles.len(),
+                "applied supervisor snapshot updates"
+            );
         }
 
         egui::SidePanel::left("left_sidebar")
@@ -556,19 +2460,21 @@ impl eframe::App for App {
                     for (profile_name, profile_snapshot) in &self.snapshot.profiles {
                         let is_selected = self.selected_profile.as_ref() == Some(profile_name);
 
-                        // Determine if units are running
-                        let (up_id, serve_id) = profile_unit_ids(profile_name);
-                        let running = profile_snapshot.units.iter().any(|u| {
-                            (u.id == up_id || u.id == serve_id)
-                                && matches!(u.status, supervisor::UnitStatus::Running)
-                        });
+                        let running = profile_snapshot.container_lifecycle.is_active()
+                            || profile_snapshot.serve_alive;
 
                         let status_color = if running {
                             Color32::LIGHT_GREEN
                         } else {
                             Color32::LIGHT_RED
                         };
-                        let status_text = if running { "running" } else { "stopped" };
+                        let status_text = match profile_snapshot.container_lifecycle {
+                            supervisor::ContainerLifecycleState::Stopped => "stopped",
+                            supervisor::ContainerLifecycleState::Starting => "starting",
+                            supervisor::ContainerLifecycleState::Running => "running",
+                            supervisor::ContainerLifecycleState::Stopping { .. } => "stopping",
+                            supervisor::ContainerLifecycleState::Killing { .. } => "killing",
+                        };
 
                         if sidebar_box(
                             ui,
@@ -604,6 +2510,13 @@ impl eframe::App for App {
                         self.hide_secret = !self.hide_secret;
                     }
                 });
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("frame: {}ms", self.last_frame_elapsed_ms))
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                );
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -629,15 +2542,15 @@ impl eframe::App for App {
                     self.right_tab = RightTab::Processes;
                 }
                 if ui
-                    .selectable_label(self.right_tab == RightTab::Diagnostics, "Diagnostics")
+                    .selectable_label(self.right_tab == RightTab::Traffic, "Traffic")
                     .clicked()
                 {
-                    self.right_tab = RightTab::Diagnostics;
+                    self.right_tab = RightTab::Traffic;
                     if let Some(profile_name) = &self.selected_profile {
                         self.supervisor
                             .send(supervisor::SupervisorCommand::OnTabOpen {
                                 profile: profile_name.clone(),
-                                tab: supervisor::TabKind::Diagnostics,
+                                tab: supervisor::TabKind::Traffic,
                             });
                     }
                 }
@@ -681,21 +2594,35 @@ impl eframe::App for App {
                     }
                 }
 
-                let diag_status = self
+                let profile_state = self
                     .selected_profile
                     .as_ref()
-                    .and_then(|profile| self.snapshot.profiles.get(profile))
-                    .map(|profile| profile.diag_connected);
+                    .and_then(|profile| self.snapshot.profiles.get(profile));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(status) = diag_status {
-                        let (label, color) = if status {
-                            ("Diag: connected", Color32::LIGHT_GREEN)
+                    if let Some(ps) = profile_state {
+                        let mut hover_text = None;
+                        let (label, color) = if ps.template_error.is_some() {
+                            ("misconfigured", Color32::from_rgb(220, 120, 60))
+                        } else if ps.up_connection == supervisor::ConnectionState::Connecting
+                            || ps.diag_connection == supervisor::ConnectionState::Connecting
+                        {
+                            ("connecting", Color32::from_rgb(220, 180, 90))
+                        } else if ps.child_alive && !ps.up_connected {
+                            hover_text = ps.up_error.clone();
+                            ("container disconnected", Color32::from_rgb(220, 120, 60))
+                        } else if ps.serve_alive && !ps.diag_connected {
+                            hover_text = ps.diag_error.clone();
+                            ("serve disconnected", Color32::from_rgb(220, 120, 60))
+                        } else if ps.diag_connected {
+                            ("connected", Color32::LIGHT_GREEN)
                         } else {
-                            ("Diag: disconnected", Color32::LIGHT_RED)
+                            ("disconnected", Color32::LIGHT_RED)
                         };
-                        ui.colored_label(color, label);
-                    } else if self.selected_profile.is_some() {
-                        ui.colored_label(Color32::from_gray(140), "Diag: unknown");
+                        let mut resp = ui.colored_label(color, label);
+                        if let Some(text) = hover_text {
+                            resp = resp.on_hover_text(text);
+                        }
+                        let _ = resp;
                     }
                 });
             });
@@ -707,7 +2634,7 @@ impl eframe::App for App {
             match self.right_tab {
                 RightTab::Proxies => self.render_proxies_tab(ui),
                 RightTab::Processes => self.render_processes_tab(ui),
-                RightTab::Diagnostics => self.render_diagnostics_tab(ui),
+                RightTab::Traffic => self.render_traffic_tab(ui),
                 RightTab::Dns => self.render_dns_tab(ui),
                 RightTab::Hotconfig => self.render_hotconfig_tab(ui),
                 RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
@@ -715,6 +2642,18 @@ impl eframe::App for App {
         });
 
         self.render_proxy_detail_window(ctx);
+
+        let frame_elapsed = frame_started.elapsed();
+        self.last_frame_elapsed_ms = frame_elapsed.as_millis();
+        if frame_elapsed >= Duration::from_millis(100) {
+            info!(
+                frame = self.ui_frame_seq,
+                elapsed_ms = frame_elapsed.as_millis(),
+                tab = self.right_tab_label(),
+                profile = self.selected_profile.as_deref().unwrap_or("<global>"),
+                "slow ui frame"
+            );
+        }
     }
 }
 
@@ -726,9 +2665,8 @@ impl App {
             }
             if ui.button("Clear Stats").clicked() {
                 if let Some(profile_name) = self.selected_profile.clone() {
-                    let serve_id = UnitId::new(format!("{}:serve", profile_name.as_str()));
                     self.supervisor.send(SupervisorCommand::Ctrl {
-                        unit_id: serve_id,
+                        profile: profile_name,
                         cmd: diag::ControlCommand::ClearStats,
                     });
                 }
@@ -860,12 +2798,45 @@ impl App {
                 }
             });
         }
+
+        ui.add_space(6.0);
+        ui.label("Sort Frequency:");
+        ui.horizontal(|ui| {
+            let freq_options = [
+                ("Manual", SortFrequency::Manual),
+                ("Every 1s", SortFrequency::Every1s),
+                ("Every 2s", SortFrequency::Every2s),
+                ("Every 5s", SortFrequency::Every5s),
+            ];
+
+            for (label, freq) in &freq_options {
+                let is_selected = self.proxy_filters.sort_frequency == *freq;
+                if ui.selectable_label(is_selected, *label).clicked() {
+                    self.proxy_filters.sort_frequency = *freq;
+                    self.last_sort_time = Instant::now();
+                }
+            }
+        });
+
+        if self.proxy_filters.sort_column != SortColumn::None {
+            ui.label(format!(
+                "Current sort: {:?} ({:?})",
+                self.proxy_filters.sort_column, self.proxy_filters.sort_direction
+            ));
+        }
     }
 
     fn render_proxies_table(&mut self, ui: &mut egui::Ui) {
         let header_h = 28.0;
-        let row_h = 96.0;
+        let row_h = if self.expanded_ip_rows.is_empty() {
+            96.0
+        } else {
+            132.0
+        };
         let mut next_hovered_proxy: Option<usize> = None;
+
+        ui.ctx()
+            .options_mut(|options| options.input_options.line_scroll_speed = 150.);
 
         let selected_proxy_id = self.selected_profile.as_ref().and_then(|profile_name| {
             self.snapshot
@@ -882,57 +2853,105 @@ impl App {
             .map(|p| p.proxy_stats.clone())
             .unwrap_or_default();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            TableBuilder::new(ui)
-                .striped(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                // name width, proxy URL made modest (not using remainder)
-                .column(Column::exact(160.0))
-                .column(Column::exact(200.0))
-                .column(Column::exact(80.0))
-                .column(Column::exact(140.0))
-                // let status column expand to fill remaining width
-                .column(Column::remainder())
-                .header(header_h, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("Name");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Proxy URL");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Latency");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Stats");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Status");
-                    });
-                })
-                .body(|mut body| {
-                    let widths = body.widths().to_vec();
-                    let spacing_x = body.ui_mut().spacing().item_spacing.x;
-                    let row_width = widths.iter().sum::<f32>()
-                        + spacing_x * (widths.len().saturating_sub(1) as f32);
+        egui::ScrollArea::vertical()
+            .wheel_scroll_multiplier(Vec2::new(15., 15.))
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    // name width, proxy URL made modest (not using remainder)
+                    .column(Column::exact(160.0))
+                    .column(Column::exact(200.0))
+                    .column(Column::exact(100.0))
+                    .column(Column::exact(140.0))
+                    // let status column expand to fill remaining width
+                    .column(Column::remainder())
+                    .header(header_h, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("Name");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Proxy URL");
+                        });
+                        header.col(|ui| {
+                            let latency_sorted =
+                                self.proxy_filters.sort_column == SortColumn::Latency;
+                            let mut label = "Latency".to_string();
+                            if latency_sorted {
+                                label.push(
+                                    if self.proxy_filters.sort_direction == SortDirection::Ascending
+                                    {
+                                        ' '
+                                    } else {
+                                        ' '
+                                    },
+                                );
+                                label.push(
+                                    if self.proxy_filters.sort_direction == SortDirection::Ascending
+                                    {
+                                        '▲'
+                                    } else {
+                                        '▼'
+                                    },
+                                );
+                            }
+                            if ui.button(&label).clicked() {
+                                self.on_sort_column_clicked(SortColumn::Latency);
+                            }
+                        });
+                        header.col(|ui| {
+                            let stats_sorted =
+                                self.proxy_filters.sort_column == SortColumn::FailRate;
+                            let mut label = "Fails".to_string();
+                            if stats_sorted {
+                                label.push(
+                                    if self.proxy_filters.sort_direction == SortDirection::Ascending
+                                    {
+                                        ' '
+                                    } else {
+                                        ' '
+                                    },
+                                );
+                                label.push(
+                                    if self.proxy_filters.sort_direction == SortDirection::Ascending
+                                    {
+                                        '▲'
+                                    } else {
+                                        '▼'
+                                    },
+                                );
+                            }
+                            if ui.button(&label).clicked() {
+                                self.on_sort_column_clicked(SortColumn::FailRate);
+                            }
+                        });
+                        header.col(|ui| {
+                            ui.strong("Status");
+                        });
+                    })
+                    .body(|mut body| {
+                        let widths = body.widths().to_vec();
+                        let spacing_x = body.ui_mut().spacing().item_spacing.x;
+                        let row_width = widths.iter().sum::<f32>()
+                            + spacing_x * (widths.len().saturating_sub(1) as f32);
 
-                    body.rows(row_h, self.filtered_proxy_ids.len(), |mut row| {
-                        let i = row.index();
-                        if i >= self.filtered_proxy_ids.len() {
-                            return;
-                        }
+                        body.rows(row_h, self.filtered_proxy_ids.len(), |mut row| {
+                            let i = row.index();
+                            if i >= self.filtered_proxy_ids.len() {
+                                return;
+                            }
 
-                        self.render_proxy_row(
-                            &mut row,
-                            i,
-                            row_width,
-                            selected_proxy_id.as_ref(),
-                            &live_stats,
-                            &mut next_hovered_proxy,
-                        );
+                            self.render_proxy_row(
+                                &mut row,
+                                i,
+                                row_width,
+                                selected_proxy_id.as_ref(),
+                                &live_stats,
+                                &mut next_hovered_proxy,
+                            );
+                        });
                     });
-                });
-        });
+            });
 
         self.hovered_proxy = next_hovered_proxy;
     }
@@ -999,11 +3018,14 @@ impl App {
                 is_hover = row_hot || self.hovered_proxy == Some(i);
 
                 if is_hover {
-                    ui.small(format!("Status: {}", proxy_item.status));
-                } else if proxy_item.udp_capable {
-                    ui.small("UDP + TCP");
                 } else {
-                    ui.small("TCP only");
+                    let udp_label = match proxy_item.udp_ability {
+                        Some(true) => "UDP ok + TCP",
+                        Some(false) => "UDP fail + TCP",
+                        None if proxy_item.udp_expected => "UDP + TCP",
+                        None => "TCP only",
+                    };
+                    ui.small(udp_label);
                 }
 
                 if !proxy_item.groups.is_empty() {
@@ -1025,8 +3047,27 @@ impl App {
                 };
                 ui.label(displayed_url);
 
-                if let Some(ip) = proxy_item.resolved_ip {
-                    ui.small(format!("IP: {}", ip));
+                if let Some(first_ip) = proxy_item.resolved_ips.first() {
+                    let has_more_ips = proxy_item.resolved_ips.len() > 1;
+                    let trunc = if has_more_ips { "…" } else { "" };
+                    ui.small(format!("{}{}", first_ip, trunc));
+
+                    if has_more_ips {
+                        let expanded = self.expanded_ip_rows.contains(&proxy_id);
+                        let toggle = if expanded { "IPs ▾" } else { "IPs ▸" };
+                        if ui.small_button(toggle).clicked() {
+                            if expanded {
+                                self.expanded_ip_rows.remove(&proxy_id);
+                            } else {
+                                self.expanded_ip_rows.insert(proxy_id.clone());
+                            }
+                        }
+                        if expanded {
+                            for ip in proxy_item.resolved_ips.iter().skip(1) {
+                                ui.small(format!("  {}", ip));
+                            }
+                        }
+                    }
                 }
 
                 if is_hover {
@@ -1034,10 +3075,8 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Select proxy").clicked() {
                             if let Some(profile_name) = self.selected_profile.clone() {
-                                let serve_id =
-                                    UnitId::new(format!("{}:serve", profile_name.as_str()));
                                 self.supervisor.send(SupervisorCommand::Ctrl {
-                                    unit_id: serve_id,
+                                    profile: profile_name,
                                     cmd: diag::ControlCommand::SetSimpleRouting {
                                         proxy_id: proxy_id.clone(),
                                     },
@@ -1049,10 +3088,8 @@ impl App {
                             self.detail_fit_frames_left = 3;
                             // Immediately request fresh stats from the running serve unit.
                             if let Some(profile_name) = self.selected_profile.clone() {
-                                let serve_id =
-                                    UnitId::new(format!("{}:serve", profile_name.as_str()));
                                 self.supervisor.send(SupervisorCommand::Ctrl {
-                                    unit_id: serve_id,
+                                    profile: profile_name,
                                     cmd: diag::ControlCommand::QueryUplinkStats,
                                 });
                             }
@@ -1097,18 +3134,10 @@ impl App {
         });
 
         row.col(|ui| {
-            let status = &proxy_item.status;
             let (status_color, status_text) = match display_conn_ok {
                 Some(true) => (egui::Color32::LIGHT_GREEN, "ok".to_owned()),
                 Some(false) => (egui::Color32::LIGHT_RED, "fail".to_owned()),
-                None => (
-                    if status.contains("OK") {
-                        egui::Color32::LIGHT_GREEN
-                    } else {
-                        egui::Color32::from_gray(160)
-                    },
-                    status.clone(),
-                ),
+                None => (egui::Color32::from_gray(160), "".to_owned()),
             };
             ui.vertical(|ui| {
                 ui.colored_label(status_color, &status_text);
@@ -1124,7 +3153,6 @@ impl App {
                     } else {
                         "off"
                     };
-                    ui.small(format!("Global: {}", enabled));
                 }
             });
         });
@@ -1156,59 +3184,205 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            self.render_hotconfig_daemons_section(ui, profile);
             self.render_run_command_section(ui, profile);
         }
     }
 
-    fn render_process_controls(&mut self, ui: &mut egui::Ui, profile_name: &ProfileName) {
-        let (up_id, serve_id) = profile_unit_ids(profile_name);
-        let up_running = unit_running(&self.snapshot, &up_id);
-        let serve_running = unit_running(&self.snapshot, &serve_id);
+    fn render_process_controls(&mut self, ui: &mut egui::Ui, profile_name: &ContainerName) {
+        let (
+            container_lifecycle,
+            up_running,
+            serve_running,
+            template_error,
+            child_pid,
+            up_connected,
+            up_connection,
+            up_error,
+            serve_diag_connected,
+            diag_connection,
+            diag_error,
+        ) = self
+            .snapshot
+            .profiles
+            .get(profile_name)
+            .map(|p| {
+                (
+                    p.container_lifecycle,
+                    p.child_alive,
+                    p.serve_alive,
+                    p.template_error.clone(),
+                    p.child_pid,
+                    p.up_connected,
+                    p.up_connection,
+                    p.up_error.clone(),
+                    p.diag_connected,
+                    p.diag_connection,
+                    p.diag_error.clone(),
+                )
+            })
+            .unwrap_or((
+                supervisor::ContainerLifecycleState::Stopped,
+                false,
+                false,
+                None,
+                None,
+                false,
+                supervisor::ConnectionState::Disconnected,
+                None,
+                false,
+                supervisor::ConnectionState::Disconnected,
+                None,
+            ));
 
         ui.horizontal(|ui| {
             let spacing = ui.spacing().item_spacing.x;
             let width_each = (ui.available_width() - spacing).max(0.0) / 2.0;
 
-            let (up_title, up_subtitle) = if up_running {
-                ("Stop Container", "sp up")
+            let up_disabled = !up_running && template_error.is_some();
+            let up_subtitle = if up_disabled {
+                template_error.as_deref().unwrap_or("invalid").to_string()
             } else {
-                ("Start Container", "sp up")
+                match container_lifecycle {
+                    supervisor::ContainerLifecycleState::Stopped => "down".to_string(),
+                    supervisor::ContainerLifecycleState::Starting => {
+                        child_pid.map_or("starting".to_string(), |p| format!("starting  pid={p}"))
+                    }
+                    supervisor::ContainerLifecycleState::Running => {
+                        if up_connection == supervisor::ConnectionState::Connecting {
+                            child_pid.map_or("connecting".to_string(), |p| {
+                                format!("connecting  pid={p}")
+                            })
+                        } else if up_connected {
+                            child_pid
+                                .map_or("connected".to_string(), |p| format!("connected  pid={p}"))
+                        } else {
+                            child_pid.map_or("disconnected".to_string(), |p| {
+                                format!("disconnected  pid={p}")
+                            })
+                        }
+                    }
+                    supervisor::ContainerLifecycleState::Stopping { attempt } => child_pid
+                        .map_or(format!("stop attempt {attempt}"), |p| {
+                            format!("stop attempt {attempt}  pid={p}")
+                        }),
+                    supervisor::ContainerLifecycleState::Killing { attempt } => child_pid
+                        .map_or(format!("kill attempt {attempt}"), |p| {
+                            format!("kill attempt {attempt}  pid={p}")
+                        }),
+                }
             };
-            let up_color = if up_running {
+            let up_title = match container_lifecycle {
+                supervisor::ContainerLifecycleState::Stopped => "Start Container",
+                supervisor::ContainerLifecycleState::Starting
+                | supervisor::ContainerLifecycleState::Running => "Stop Container",
+                supervisor::ContainerLifecycleState::Stopping { .. }
+                | supervisor::ContainerLifecycleState::Killing { .. } => "Kill Container",
+            };
+            let up_color = if up_disabled {
+                egui::Color32::from_rgb(160, 80, 80)
+            } else if matches!(
+                container_lifecycle,
+                supervisor::ContainerLifecycleState::Starting
+            ) {
+                egui::Color32::from_rgb(200, 165, 90)
+            } else if up_running && up_connection == supervisor::ConnectionState::Connecting {
+                egui::Color32::from_rgb(200, 165, 90)
+            } else if matches!(
+                container_lifecycle,
+                supervisor::ContainerLifecycleState::Stopping { .. }
+            ) {
+                egui::Color32::from_rgb(190, 110, 90)
+            } else if matches!(
+                container_lifecycle,
+                supervisor::ContainerLifecycleState::Killing { .. }
+            ) {
+                egui::Color32::from_rgb(200, 70, 70)
+            } else if up_running && up_connected {
                 egui::Color32::from_rgb(80, 160, 220)
+            } else if up_running {
+                egui::Color32::from_rgb(190, 110, 90)
             } else {
                 egui::Color32::from_rgb(180, 180, 180)
             };
 
-            if sidebar_box_width(
+            let mut up_resp = sidebar_box_width(
                 ui,
                 up_title,
-                up_subtitle,
+                &up_subtitle,
                 up_running,
                 up_color,
                 Some(width_each),
-            )
-            .clicked()
-            {
-                self.supervisor
-                    .send(SupervisorCommand::EnsureUnit(supervisor::build_up_unit(
-                        profile_name,
-                    )));
+            );
+            if up_disabled {
+                if let Some(ref err) = template_error {
+                    up_resp =
+                        up_resp.on_hover_text(format!("TemplateConfig invalid or missing: {err}"));
+                }
+            } else if let Some(ref err) = up_error {
+                up_resp = up_resp.on_hover_text(format!("sp up: {err}"));
             }
 
-            let (serve_title, serve_subtitle) = if serve_running {
-                ("Stop TUN", "sp serve")
-            } else {
-                ("Start TUN", "sp serve")
-            };
-            let serve_color = if serve_running {
-                egui::Color32::from_rgb(120, 200, 140)
-            } else {
-                egui::Color32::from_rgb(180, 180, 180)
-            };
+            if !up_disabled && up_resp.clicked() {
+                match container_lifecycle {
+                    supervisor::ContainerLifecycleState::Stopped => {
+                        info!(
+                            profile = profile_name.as_str(),
+                            "ui clicked Start Container"
+                        );
+                        self.supervisor.send(SupervisorCommand::StartUp {
+                            profile: profile_name.clone(),
+                        });
+                    }
+                    supervisor::ContainerLifecycleState::Starting
+                    | supervisor::ContainerLifecycleState::Running => {
+                        info!(
+                            profile = profile_name.as_str(),
+                            child_pid, "ui clicked Stop Container"
+                        );
+                        self.supervisor.send(SupervisorCommand::StopContainer {
+                            profile: profile_name.clone(),
+                        });
+                    }
+                    supervisor::ContainerLifecycleState::Stopping { .. }
+                    | supervisor::ContainerLifecycleState::Killing { .. } => {
+                        info!(
+                            profile = profile_name.as_str(),
+                            child_pid, "ui clicked Kill Container"
+                        );
+                        self.supervisor.send(SupervisorCommand::KillContainer {
+                            profile: profile_name.clone(),
+                        });
+                    }
+                }
+            }
 
-            sidebar_box_width(
+            let serve_subtitle =
+                if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
+                    "connecting"
+                } else if serve_running && serve_diag_connected {
+                    "connected"
+                } else if serve_running {
+                    "disconnected"
+                } else {
+                    "down"
+                };
+            let serve_title = if serve_running {
+                "Stop TUN"
+            } else {
+                "Start TUN"
+            };
+            let serve_color =
+                if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
+                    egui::Color32::from_rgb(200, 165, 90)
+                } else if serve_running && serve_diag_connected {
+                    egui::Color32::from_rgb(120, 200, 140)
+                } else if serve_running {
+                    egui::Color32::from_rgb(190, 110, 90)
+                } else {
+                    egui::Color32::from_rgb(180, 180, 180)
+                };
+
+            let mut serve_resp = sidebar_box_width(
                 ui,
                 serve_title,
                 serve_subtitle,
@@ -1216,140 +3390,258 @@ impl App {
                 serve_color,
                 Some(width_each),
             );
-        });
-    }
-
-    fn render_units_table(&self, ui: &mut egui::Ui, profile_name: &Option<ProfileName>) {
-        let mut rows: Vec<&supervisor::UnitState> = Vec::new();
-        if let Some(profile) = profile_name {
-            if let Some(profile_snapshot) = self.snapshot.profiles.get(profile) {
-                rows.extend(profile_snapshot.units.iter());
+            if let Some(ref err) = diag_error {
+                serve_resp = serve_resp.on_hover_text(format!("diag: {err}"));
             }
-        } else {
-            for profile_snapshot in self.snapshot.profiles.values() {
-                rows.extend(profile_snapshot.units.iter());
-            }
-        }
-
-        if rows.is_empty() {
-            ui.label("No supervisor data available yet.");
-        } else {
-            TableBuilder::new(ui)
-                .striped(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .column(Column::auto())
-                .header(20.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("Unit");
+            if serve_resp.clicked() {
+                if serve_running {
+                    info!(profile = profile_name.as_str(), "ui clicked Stop TUN");
+                    self.supervisor.send(SupervisorCommand::StopServe {
+                        profile: profile_name.clone(),
                     });
-                    header.col(|ui| {
-                        ui.strong("Status");
-                    });
-                    header.col(|ui| {
-                        ui.strong("PID");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Desired");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Diag");
-                    });
-                })
-                .body(|mut body| {
-                    for unit in rows {
-                        body.row(20.0, |mut row| {
-                            row.col(|ui| {
-                                ui.label(format!("{} ({:?})", unit.id.as_str(), unit.kind));
-                            });
-                            row.col(|ui| {
-                                ui.label(format!("{:?}", unit.status));
-                            });
-                            row.col(|ui| {
-                                ui.label(
-                                    unit.pid
-                                        .map(|p| p.to_string())
-                                        .unwrap_or_else(|| "-".into()),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.label(format!("{:?}", unit.desired));
-                            });
-                            row.col(|ui| {
-                                if let Some(profile_name) = profile_name {
-                                    if let Some(prof_snap) =
-                                        self.snapshot.profiles.get(profile_name)
-                                    {
-                                        if prof_snap.diag_connected {
-                                            if let Some(summary) = &prof_snap.diag_summary {
-                                                ui.label(format!(
-                                                    "active {} / total {}",
-                                                    summary.active_conns, summary.total_conns
-                                                ));
-                                            } else {
-                                                ui.label("connected");
-                                            }
-                                        } else {
-                                            ui.label("disconnected");
-                                        }
-                                    } else {
-                                        ui.label("-");
-                                    }
-                                } else {
-                                    ui.label("-");
-                                }
-                            });
-                        });
-                    }
-                });
-        }
-    }
-
-    fn render_hotconfig_daemons_section(&mut self, ui: &mut egui::Ui, profile: &ProfileName) {
-        ui.heading("Hotconfig Daemons");
-        ui.horizontal(|ui| {
-            if ui.button("Load Hotconfig").clicked() {
-                self.supervisor
-                    .send(supervisor::SupervisorCommand::ReloadHotconfig(
-                        profile.clone(),
-                    ));
-            }
-            if ui.button("Start All Daemons").clicked() {
-                self.supervisor
-                    .send(supervisor::SupervisorCommand::StartHotconfigDaemons {
-                        profile: profile.clone(),
-                    });
-            }
-        });
-
-        if let Some(pstate) = self.snapshot.profiles.get(profile) {
-            let daemon_units: Vec<_> = pstate
-                .units
-                .iter()
-                .filter(|u| u.kind == supervisor::UnitKind::Daemon)
-                .collect();
-
-            if daemon_units.is_empty() {
-                ui.label("No daemons running. Use 'Load Hotconfig' to start them.");
-            } else {
-                for unit in daemon_units {
-                    ui.horizontal(|ui| {
-                        ui.label(unit.id.as_str());
-                        ui.label(format!("{:?}", unit.status));
-                        if ui.button("Stop").clicked() {
-                            self.supervisor
-                                .send(supervisor::SupervisorCommand::StopUnit(unit.id.clone()));
-                        }
+                } else {
+                    info!(profile = profile_name.as_str(), "ui clicked Start TUN");
+                    self.supervisor.send(SupervisorCommand::StartServe {
+                        profile: profile_name.clone(),
                     });
                 }
             }
+        });
+
+        ui.add_space(6.0);
+        let entries: &[Arc<LogEntryOf>] = self
+            .snapshot
+            .profiles
+            .get(profile_name)
+            .map(|p| p.merged_logs.as_slice())
+            .unwrap_or(&[]);
+
+        let total_rows = entries.len();
+        let cached_log = &mut self.cached_log;
+
+        egui::Frame::none()
+            .fill(Color32::from_gray(18))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
+                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("log_panel_{}", profile_name))
+                    .max_height(500.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show_rows(ui, row_h, total_rows, |ui, row_range| {
+                        if total_rows == 0 {
+                            ui.colored_label(
+                                Color32::from_gray(110),
+                                "no logs yet — start the container to see output",
+                            );
+                            return;
+                        }
+                        for i in row_range {
+                            let entry = &entries[i];
+                            let is_serve = matches!(entry.src, LogSource::Serve);
+                            // Retrieve cached ANSI-parsed parts; compute and cache on miss.
+                            let ansi_parts = if let Some(p) = cached_log.get(&entry.log.message) {
+                                p.clone()
+                            } else {
+                                let p = egui_sgr::ansi_to_rich_text(&entry.log.message);
+                                cached_log.insert(entry.log.message.clone(), p.clone());
+                                p
+                            };
+                            ui.horizontal(|ui| {
+                                let (badge_text, badge_color) = if is_serve {
+                                    ("serve", Color32::from_rgb(100, 180, 130))
+                                } else {
+                                    ("up", Color32::from_rgb(100, 150, 210))
+                                };
+                                ui.colored_label(badge_color, badge_text);
+
+                                let level_color = match entry.log.level.as_str() {
+                                    "ERROR" => Color32::from_rgb(220, 80, 80),
+                                    "WARN" => Color32::from_rgb(210, 160, 60),
+                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                    _ => Color32::from_gray(200),
+                                };
+                                ui.colored_label(level_color, &entry.log.level);
+
+                                ui.colored_label(
+                                    Color32::from_gray(100),
+                                    format!("[{}]", entry.log.target),
+                                );
+
+                                for part in ansi_parts {
+                                    ui.label(part);
+                                }
+                            });
+                        }
+                    });
+            });
+    }
+
+    fn render_units_table(&mut self, ui: &mut egui::Ui, profile_name: &Option<ContainerName>) {
+        // Collect owned rows so we don't borrow self.snapshot across the mutable send below.
+        let rows: Vec<(ContainerName, u32, diag::ProcessEntry)> = {
+            let mut v = Vec::new();
+            if let Some(profile) = profile_name {
+                if let Some(profile_snapshot) = self.snapshot.profiles.get(profile) {
+                    if let Some(diag::ProcessListSnapshot { procs, .. }) =
+                        profile_snapshot.process_list_snapshot.as_ref()
+                    {
+                        v.extend(
+                            procs
+                                .iter()
+                                .map(|(pid, entry)| (profile.clone(), *pid, entry.clone())),
+                        );
+                    }
+                }
+            } else {
+                for (pname, profile_snapshot) in &self.snapshot.profiles {
+                    if let Some(diag::ProcessListSnapshot { procs, .. }) =
+                        profile_snapshot.process_list_snapshot.as_ref()
+                    {
+                        v.extend(
+                            procs
+                                .iter()
+                                .map(|(pid, entry)| (pname.clone(), *pid, entry.clone())),
+                        );
+                    }
+                }
+            }
+            v
+        };
+
+        if rows.is_empty() {
+            ui.label("No daemon processes reported by sp up.");
+            return;
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut kill_request: Option<(ContainerName, u32)> = None;
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::auto()) // Profile
+            .column(Column::exact(58.0)) // PID
+            .column(Column::exact(80.0)) // State
+            .column(Column::auto()) // Program
+            .column(Column::exact(42.0)) // UID
+            .column(Column::auto()) // Spawned
+            .column(Column::exact(46.0)) // Kill
+            .header(22.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Profile");
+                });
+                header.col(|ui| {
+                    ui.strong("PID");
+                });
+                header.col(|ui| {
+                    ui.strong("State");
+                });
+                header.col(|ui| {
+                    ui.strong("Program");
+                });
+                header.col(|ui| {
+                    ui.strong("UID");
+                });
+                header.col(|ui| {
+                    ui.strong("Spawned");
+                });
+                header.col(|ui| { /* Kill */ });
+            })
+            .body(|mut body| {
+                for (row_profile, slot_pid, entry) in &rows {
+                    body.row(22.0, |mut row| {
+                        // Profile
+                        row.col(|ui| {
+                            ui.label(row_profile.as_str());
+                        });
+
+                        // PID (prefer the live pid from status)
+                        let live_pid = entry.status.pid().unwrap_or(*slot_pid);
+                        row.col(|ui| {
+                            ui.label(live_pid.to_string());
+                        });
+
+                        // State — colored
+                        row.col(|ui| {
+                            let (label, color) = match &entry.status {
+                                diag::ProcessStatus::Alive(_) => ("running", Color32::LIGHT_GREEN),
+                                diag::ProcessStatus::Terminating(_) => {
+                                    ("stopping", Color32::from_rgb(220, 165, 60))
+                                }
+                                diag::ProcessStatus::Killed(_) => {
+                                    ("killed", Color32::from_rgb(200, 80, 80))
+                                }
+                                diag::ProcessStatus::Vacant => ("vacant", Color32::from_gray(130)),
+                            };
+                            ui.colored_label(color, label);
+                        });
+
+                        // Program + UID extraction
+                        let (prog, uid_str) = match &entry.meta {
+                            diag::SpawnedEntry::Args(a) => {
+                                let prog = a.exec_program_hint().unwrap_or_else(|| "-".to_string());
+                                let uid = a
+                                    .uid
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                (prog, uid)
+                            }
+                            diag::SpawnedEntry::Cli(cli_meta) => {
+                                let prog = if cli_meta.is_serve {
+                                    "sp serve".to_string()
+                                } else {
+                                    "sp spawncli".to_string()
+                                };
+                                (prog, "-".to_string())
+                            }
+                        };
+
+                        row.col(|ui| {
+                            ui.label(&prog);
+                        });
+                        row.col(|ui| {
+                            ui.label(&uid_str);
+                        });
+
+                        // Spawned — relative age
+                        row.col(|ui| {
+                            let age = now.duration_since(entry.spawned_at).unwrap_or_default();
+                            let age_str = if age.as_secs() < 60 {
+                                format!("{}s ago", age.as_secs())
+                            } else if age.as_secs() < 3600 {
+                                format!("{}m ago", age.as_secs() / 60)
+                            } else {
+                                format!("{}h ago", age.as_secs() / 3600)
+                            };
+                            ui.label(age_str);
+                        });
+
+                        // Kill button — only for alive/terminating processes
+                        row.col(|ui| {
+                            if matches!(
+                                &entry.status,
+                                diag::ProcessStatus::Alive(_) | diag::ProcessStatus::Terminating(_)
+                            ) {
+                                if ui.small_button("Kill").clicked() {
+                                    kill_request = Some((row_profile.clone(), live_pid));
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+
+        if let Some((profile, pid)) = kill_request {
+            self.supervisor
+                .send(SupervisorCommand::KillManagedProcess { profile, pid });
         }
     }
 
-    fn render_run_command_section(&mut self, ui: &mut egui::Ui, profile: &ProfileName) {
+    fn render_run_command_section(&mut self, ui: &mut egui::Ui, profile: &ContainerName) {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -1377,37 +3669,703 @@ impl App {
         }
     }
 
-    fn render_diagnostics_tab(&self, ui: &mut egui::Ui) {
+    fn render_traffic_tab(&mut self, ui: &mut egui::Ui) {
         if self.selected_profile.is_none() {
-            ui.heading("Diagnostics — Global");
+            ui.heading("Traffic — Global");
             ui.label(format!("Profiles: {}", self.snapshot.profiles.len()));
             let running = self
                 .snapshot
                 .profiles
                 .values()
-                .flat_map(|p| &p.units)
-                .filter(|u| matches!(u.status, supervisor::UnitStatus::Running))
-                .count();
+                .map(|p| {
+                    let daemon_count = match p.process_list_snapshot.as_ref() {
+                        Some(diag::ProcessListSnapshot { procs, .. }) => procs.len(),
+                        _ => 0,
+                    };
+                    (p.child_alive as usize) + (p.serve_alive as usize) + daemon_count
+                })
+                .sum::<usize>();
             ui.label(format!("Running: {}", running));
-        } else if let Some(profile_name) = self.selected_profile.as_ref() {
-            if let Some(profile) = self.snapshot.profiles.get(profile_name) {
-                ui.heading(format!("Diagnostics — {}", profile_name.as_str()));
-                if let Some(dns) = &profile.dns_state {
-                    ui.add_space(6.0);
-                    ui.label(format!(
-                        "DNS: domains={}, v4={}, v6={}, aaaa_only={}",
-                        dns.domain_count, dns.ip4_count, dns.ip6_count, dns.aaaa_only
-                    ));
-                }
-                if let Some(routing) = &profile.routing_state {
-                    ui.add_space(6.0);
-                    if let Some(proxy_id) = &routing.selected_proxy {
-                        ui.label(format!("Routing: selected proxy {}", proxy_id));
-                    } else {
-                        ui.label("Routing: no proxy selected");
-                    }
+            return;
+        }
+
+        let profile_name = match self.selected_profile.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let profile = match self.snapshot.profiles.get(&profile_name) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let traffic = &profile.traffic;
+
+        // Header: connection status + loop stats
+        ui.horizontal(|ui| {
+            ui.heading(format!("Traffic — {}", profile_name));
+            ui.separator();
+            if profile.diag_connected {
+                ui.colored_label(Color32::GREEN, "connected");
+            } else {
+                ui.colored_label(Color32::LIGHT_RED, "disconnected");
+                if let Some(err) = &profile.diag_error {
+                    ui.label(err.as_str());
                 }
             }
+        });
+
+        ui.horizontal(|ui| {
+            use diag::summary::format_duration_us;
+            ui.label(format!(
+                "loop body — avg: {}  max: {}  min: {}  samples: {}",
+                format_duration_us(traffic.loop_avg_us),
+                format_duration_us(traffic.loop_max_us as f64),
+                format_duration_us(traffic.loop_min_us as f64),
+                traffic.loop_samples,
+            ));
+            ui.separator();
+            ui.label(format!("connections tracked: {}", traffic.conns.len()));
+        });
+
+        if let Some(err) = &profile.up_error {
+            ui.colored_label(Color32::from_rgb(220, 120, 60), format!("sp up: {err}"));
+        }
+        if let Some(dns) = &profile.dns_state {
+            ui.label(format!(
+                "DNS: domains={}, v4={}, v6={}, aaaa_only={}",
+                dns.domain_count, dns.ip4_count, dns.ip6_count, dns.aaaa_only
+            ));
+        }
+        if let Some(routing) = &profile.routing_state {
+            if let Some(proxy_id) = &routing.selected_proxy {
+                ui.label(format!("Routing: selected proxy {}", proxy_id));
+            } else {
+                ui.label("Routing: no proxy selected");
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Sub-view toggle: Connections | Logs
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(
+                    self.traffic_subview == TrafficSubview::Connections,
+                    "Connections",
+                )
+                .clicked()
+            {
+                self.traffic_subview = TrafficSubview::Connections;
+            }
+            if ui
+                .selectable_label(self.traffic_subview == TrafficSubview::Logs, "Logs")
+                .clicked()
+            {
+                self.traffic_subview = TrafficSubview::Logs;
+            }
+        });
+        ui.add_space(4.0);
+
+        // ── Logs sub-view (ported from nsp-diag viewer.rs) ───────────────────
+        if self.traffic_subview == TrafficSubview::Logs {
+            // DNS server + ping toolbar
+            ui.horizontal(|ui| {
+                ui.label("DNS Server:");
+                {
+                    let mut dns_addr = self.viewer_dns_config.lock().unwrap();
+                    ui.text_edit_singleline(&mut *dns_addr);
+                }
+                if ui.button("Random IP").clicked() {
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    let ip = format!(
+                        "{}.{}.{}.{}:53",
+                        rng.gen_range(1u8..=254),
+                        rng.gen_range(0u8..=255),
+                        rng.gen_range(0u8..=255),
+                        rng.gen_range(1u8..=254)
+                    );
+                    *self.viewer_dns_config.lock().unwrap() = ip;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("DNS ping").clicked() {
+                    let now_us = viewer_now_epoch_us();
+                    let domain = format!("ping-{}.diag", now_us);
+                    let dns_addr = self.viewer_dns_config.lock().unwrap().clone();
+                    {
+                        let mut ping = self.viewer_ping_state.lock().unwrap();
+                        ping.last_domain = Some(domain.clone());
+                        ping.last_sent_us = Some(now_us);
+                        ping.last_accept_delta_us = None;
+                        ping.last_accept_ts = None;
+                        ping.last_conn_id = None;
+                        ping.last_error = None;
+                    }
+                    let _ = self
+                        .viewer_ping_tx
+                        .send(ViewerPingRequest::Single(domain, dns_addr));
+                }
+
+                let burst_running = self.viewer_burst_test_state.lock().unwrap().running;
+                ui.add_enabled_ui(!burst_running, |ui| {
+                    ui.label("Max batch:");
+                    let mut burst = self.viewer_burst_test_state.lock().unwrap();
+                    let mut log_value = (burst.max_batch_size as f64).log2();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut log_value, 4.0..=20.0)
+                                .custom_formatter(|n, _| {
+                                    let val = 2_f64.powf(n).round() as u64;
+                                    if val >= 1_048_576 {
+                                        format!("{}M", val / 1_048_576)
+                                    } else if val >= 1_024 {
+                                        format!("{}k", val / 1_024)
+                                    } else {
+                                        format!("{}", val)
+                                    }
+                                })
+                                .custom_parser(|s| {
+                                    let s = s.trim().to_lowercase();
+                                    if let Some(s) = s.strip_suffix('m') {
+                                        s.parse::<f64>().ok().map(|v| (v * 1_048_576.0).log2())
+                                    } else if let Some(s) = s.strip_suffix('k') {
+                                        s.parse::<f64>().ok().map(|v| (v * 1_024.0).log2())
+                                    } else {
+                                        s.parse::<f64>().ok().map(|v| v.log2())
+                                    }
+                                }),
+                        )
+                        .changed()
+                    {
+                        burst.max_batch_size = 2_f64.powf(log_value).round() as u64;
+                    }
+                    let max_batch = burst.max_batch_size;
+                    drop(burst);
+                    if ui
+                        .button("Burst Test")
+                        .on_hover_text(format!(
+                            "Test burst sizes (log scale up to {}) to find >5% failure rate",
+                            max_batch
+                        ))
+                        .clicked()
+                    {
+                        let dns_addr = self.viewer_dns_config.lock().unwrap().clone();
+                        let _ = self
+                            .viewer_ping_tx
+                            .send(ViewerPingRequest::BurstTest(dns_addr));
+                    }
+                });
+
+                if ui.button("DNS ping x100").clicked() {
+                    let now_us = viewer_now_epoch_us();
+                    let domains: Vec<String> = (0..100u64)
+                        .map(|i| format!("ping-{}-{}.diag", now_us, i))
+                        .collect();
+                    let dns_addr = self.viewer_dns_config.lock().unwrap().clone();
+                    {
+                        let mut mass = self.viewer_mass_ping_state.lock().unwrap();
+                        mass.last_batch = Some(now_us);
+                        mass.started_ts = Some(now_us);
+                        mass.finished_ts = None;
+                        mass.duration_us = None;
+                        mass.rtt_avg_us = None;
+                        mass.rtt_min_us = None;
+                        mass.rtt_max_us = None;
+                        mass.rtt_samples = 0;
+                        mass.requested = 100;
+                        mass.in_flight = 100;
+                        mass.completed = 0;
+                        mass.errors = 0;
+                        mass.last_error = None;
+                    }
+                    let _ = self
+                        .viewer_ping_tx
+                        .send(ViewerPingRequest::Batch(domains, dns_addr));
+                }
+
+                let ping = self.viewer_ping_state.lock().unwrap();
+                if let Some(ref domain) = ping.last_domain {
+                    ui.label(format!("last: {}", domain));
+                }
+                if let Some(delta) = ping.last_accept_delta_us {
+                    use diag::summary::format_duration_us;
+                    ui.label(format!("accept Δ: {}", format_duration_us(delta as f64)));
+                } else if ping.last_domain.is_some() {
+                    ui.label("accept Δ: …");
+                }
+                if let Some(err) = ping.last_error.as_ref() {
+                    ui.colored_label(Color32::RED, err);
+                }
+            });
+
+            // Mass ping / batch results
+            ui.horizontal(|ui| {
+                let mass = self.viewer_mass_ping_state.lock().unwrap();
+                if let Some(ts) = mass.last_batch {
+                    ui.label(format!("batch: {}", ts));
+                }
+                ui.label(format!(
+                    "requested: {}  in_flight: {}  completed: {}",
+                    mass.requested, mass.in_flight, mass.completed
+                ));
+                if let Some(dur) = mass.duration_us {
+                    use diag::summary::format_duration_us;
+                    ui.label(format!("duration: {}", format_duration_us(dur as f64)));
+                    if mass.completed > 0 {
+                        let rps = (mass.completed as f64) / (dur as f64 / 1_000_000.0);
+                        ui.label(format!("rate: {:.1}/s", rps));
+                    }
+                } else if mass.in_flight > 0 {
+                    if let Some(started) = mass.started_ts {
+                        use diag::summary::format_duration_us;
+                        ui.label(format!(
+                            "elapsed: {}",
+                            format_duration_us(viewer_now_epoch_us().saturating_sub(started) as f64)
+                        ));
+                    }
+                }
+                if let Some(avg) = mass.rtt_avg_us {
+                    use diag::summary::format_duration_us;
+                    ui.label(format!(
+                        "rtt avg/min/max: {} / {} / {} (n={})",
+                        format_duration_us(avg as f64),
+                        format_duration_us(mass.rtt_min_us.unwrap_or(avg) as f64),
+                        format_duration_us(mass.rtt_max_us.unwrap_or(avg) as f64),
+                        mass.rtt_samples
+                    ));
+                }
+                if mass.errors > 0 {
+                    ui.colored_label(Color32::RED, format!("errors: {}", mass.errors));
+                }
+                if let Some(err) = mass.last_error.as_ref() {
+                    ui.colored_label(Color32::RED, err);
+                }
+            });
+
+            // Burst test results
+            {
+                let burst = self.viewer_burst_test_state.lock().unwrap();
+                let is_running = burst.running;
+                let has_results = !burst.results.is_empty();
+                let last_error = burst.last_error.clone();
+                let results = burst.results.clone();
+                let threshold_size = burst.threshold_size;
+                let started_ts = burst.started_ts;
+                let finished_ts = burst.finished_ts;
+                drop(burst);
+
+                if is_running {
+                    ui.horizontal(|ui| {
+                        ui.label("⏳ Burst test running...");
+                        if let Some(started) = started_ts {
+                            use diag::summary::format_duration_us;
+                            ui.label(format!(
+                                "elapsed: {}",
+                                format_duration_us(
+                                    viewer_now_epoch_us().saturating_sub(started) as f64
+                                )
+                            ));
+                        }
+                    });
+                } else if has_results {
+                    let finished = finished_ts.unwrap_or(0);
+                    let started = started_ts.unwrap_or(0);
+                    let duration_ms = finished.saturating_sub(started) as f64 / 1000.0;
+                    let overall_fr =
+                        results.iter().map(|r| r.failure_rate).sum::<f64>() / results.len() as f64;
+                    let hit_threshold = threshold_size.is_some();
+
+                    egui::ScrollArea::horizontal()
+                        .id_salt(format!("burst_results_{}", profile_name))
+                        .show(ui, |ui| {
+                            egui::Grid::new(format!("burst_grid_{}", profile_name))
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label("Batch");
+                                    ui.label("Success/Req");
+                                    ui.label("Failure %");
+                                    ui.label("Min RTT");
+                                    ui.label("Avg RTT");
+                                    ui.label("Max RTT");
+                                    ui.end_row();
+                                    for r in &results {
+                                        ui.label(format!("n={}", r.size));
+                                        ui.label(format!(
+                                            "{}/{}",
+                                            r.completed.saturating_sub(r.errors),
+                                            r.requested
+                                        ));
+                                        let color = if r.failure_rate > 5.0 {
+                                            Color32::RED
+                                        } else if r.failure_rate > 1.0 {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::GREEN
+                                        };
+                                        ui.colored_label(color, format!("{:.1}%", r.failure_rate));
+                                        use diag::summary::format_duration_us;
+                                        ui.label(format_duration_us(r.latency_us_min as f64));
+                                        ui.label(format_duration_us(r.latency_us_avg as f64));
+                                        ui.label(format_duration_us(r.latency_us_max as f64));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                    ui.horizontal(|ui| {
+                        if let Some(threshold) = threshold_size {
+                            ui.colored_label(
+                                Color32::RED,
+                                format!("⚠ Threshold: >5% failures at n={}", threshold),
+                            );
+                        } else {
+                            ui.colored_label(Color32::GREEN, "✓ All tests passed (<5% failures)");
+                        }
+                        {
+                            let mut stats = self.viewer_burst_test_stats.lock().unwrap();
+                            if stats.test_count < results.len() as u64 {
+                                stats.add_test(overall_fr, duration_ms, hit_threshold);
+                            }
+                        }
+                        if let Some(err) = last_error.as_ref() {
+                            ui.colored_label(Color32::RED, err);
+                        }
+                    });
+                } else if let Some(err) = last_error {
+                    ui.colored_label(Color32::RED, &err);
+                }
+            }
+
+            // ── Selected connection details ────────────────────────────────
+            ui.separator();
+            let selected = self.viewer_selected_conn;
+            if let Some(id) = selected {
+                if let Some(c) = profile.traffic.conns.get(&id) {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("Conn {}", c.id.0));
+                        ui.label(format!("kind: {}  src: {}  dst: {}", c.kind, c.src, c.dst));
+                        if !c.route.is_empty() {
+                            ui.label(format!("route: {}", c.route));
+                        }
+                        if let Some(ref q) = c.dns_query {
+                            if let Some(ref r) = c.dns_response {
+                                ui.label(format!("dns: {} → {}", q, r));
+                            } else {
+                                ui.label(format!("dns: {} → …", q));
+                            }
+                        }
+                        ui.label(format!(
+                            "dispatch: {}µs  ↑{:.0}B ↓{:.0}B",
+                            c.dispatch_us, c.bytes_up, c.bytes_down
+                        ));
+                        if let Some(ref err) = c.error {
+                            ui.colored_label(Color32::RED, format!("err: {}", err));
+                        }
+                    });
+                } else {
+                    ui.colored_label(
+                        Color32::from_gray(120),
+                        "selected connection no longer tracked",
+                    );
+                }
+            } else {
+                ui.colored_label(
+                    Color32::from_gray(100),
+                    "click a row to see connection details",
+                );
+            }
+
+            // ── Connection table ───────────────────────────────────────────
+            let conn_order: Vec<diag::ConnId> =
+                profile.traffic.conn_order.iter().cloned().collect();
+            let conns = profile.traffic.conns.clone();
+            let selected_cell = std::cell::Cell::new(self.viewer_selected_conn);
+            let row_height = 18.0_f32;
+
+            egui::ScrollArea::horizontal()
+                .id_salt(format!("viewer_conns_{}", profile_name))
+                .show(ui, |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().at_least(60.0))
+                        .column(Column::auto().at_least(80.0))
+                        .column(Column::auto().at_least(120.0))
+                        .column(Column::remainder().at_least(160.0))
+                        .column(Column::remainder().at_least(140.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(90.0))
+                        .column(Column::auto().at_least(80.0))
+                        .column(Column::exact(12.0))
+                        .header(row_height, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("ID");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Kind");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Src");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Dst / Route");
+                            });
+                            header.col(|ui| {
+                                ui.strong("DNS");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Dispatch");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Connect").on_hover_text("Accepted to Connected");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Duration");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Status");
+                            });
+                            header.col(|_ui| {});
+                        })
+                        .body(|mut body| {
+                            body.rows(row_height, conn_order.len(), |mut row| {
+                                let cid = conn_order[row.index()];
+                                if let Some(c) = conns.get(&cid) {
+                                    let is_sel = selected_cell.get() == Some(c.id);
+                                    row.col(|ui| {
+                                        if ui
+                                            .selectable_label(is_sel, format!("{}", c.id.0))
+                                            .clicked()
+                                        {
+                                            selected_cell.set(Some(c.id));
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&c.kind);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&c.src);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(if c.route.is_empty() {
+                                            &c.dst
+                                        } else {
+                                            &c.route
+                                        });
+                                    });
+                                    row.col(|ui| match (&c.dns_query, &c.dns_response) {
+                                        (Some(q), Some(r)) => {
+                                            ui.label(format!("{} -> {}", q, r));
+                                        }
+                                        (Some(q), None) => {
+                                            ui.label(format!("{} -> …", q));
+                                        }
+                                        _ => {}
+                                    });
+                                    row.col(|ui| {
+                                        use diag::summary::format_duration_us;
+                                        let color = if c.kind == "Wait" {
+                                            Color32::LIGHT_BLUE
+                                        } else if c.dispatch_us > 1000 {
+                                            Color32::RED
+                                        } else if c.dispatch_us > 100 {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::GREEN
+                                        };
+                                        ui.colored_label(
+                                            color,
+                                            format_duration_us(c.dispatch_us as f64),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        use diag::summary::format_duration_us;
+                                        let lat = if c.is_dns() {
+                                            c.dns_resolve_latency()
+                                        } else {
+                                            c.connect_latency()
+                                        };
+                                        if let Some(d) = lat {
+                                            let us = d.as_secs_f64() * 1_000_000.0;
+                                            let color = if us > 500_000.0 {
+                                                Color32::RED
+                                            } else if us > 100_000.0 {
+                                                Color32::YELLOW
+                                            } else {
+                                                Color32::GREEN
+                                            };
+                                            ui.colored_label(color, format_duration_us(us));
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        if !c.is_dns() {
+                                            if let Some(dur) = c.total_duration() {
+                                                use diag::summary::format_duration_us;
+                                                ui.label(format_duration_us(
+                                                    dur.as_secs_f64() * 1_000_000.0,
+                                                ));
+                                            } else {
+                                                ui.label("active");
+                                            }
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        if let Some(ref err) = c.error {
+                                            ui.colored_label(
+                                                Color32::RED,
+                                                format!("{}", &err[..err.len().min(40)]),
+                                            );
+                                        } else if c.is_dns() {
+                                            if let Some(ref resp) = c.dns_response {
+                                                if resp.starts_with("err:") {
+                                                    ui.colored_label(Color32::RED, "error");
+                                                } else {
+                                                    ui.colored_label(Color32::GREEN, "resolved");
+                                                }
+                                            }
+                                        } else if c.finished_ts.is_some() {
+                                            ui.colored_label(Color32::GREEN, "OK");
+                                        }
+                                    });
+                                    row.col(|_ui| {});
+                                }
+                            });
+                        });
+                });
+
+            self.viewer_selected_conn = selected_cell.get();
+            return;
+        }
+
+        // ── Connections sub-view ──────────────────────────────────────────────
+        let conns = &profile.conns_state;
+        let row_height = 18.0_f32;
+
+        // BTreeMap<ConnId, _> is ordered by ascending ConnId (monotonically assigned),
+        // so .rev() gives newest-first with no sort needed.
+        let active_entries: Vec<(&diag::ConnId, &diag::ConnEntry)> = conns
+            .conns
+            .iter()
+            .rev()
+            .filter(|(_, e)| e.finished_at.is_none())
+            .collect();
+        let finished_entries: Vec<(&diag::ConnId, &diag::ConnEntry)> = conns
+            .conns
+            .iter()
+            .rev()
+            .filter(|(_, e)| e.finished_at.is_some())
+            .collect();
+
+        if conns.conns.is_empty() {
+            ui.colored_label(Color32::from_gray(110), "no active connections");
+        }
+
+        let render_conn_table = |ui: &mut egui::Ui,
+                                 id_salt: String,
+                                 entries: &[(&diag::ConnId, &diag::ConnEntry)],
+                                 show_status: bool| {
+            egui::ScrollArea::horizontal()
+                .id_salt(id_salt.clone())
+                .show(ui, |ui| {
+                    let mut builder = TableBuilder::new(ui)
+                        .id_salt(format!("{}_tbl", id_salt))
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().at_least(70.0)) // ID
+                        .column(Column::remainder().at_least(140.0)) // Route
+                        .column(Column::remainder().at_least(160.0)); // Dst
+                    if show_status {
+                        builder = builder
+                            .column(Column::auto().at_least(55.0)) // Status
+                            .column(Column::auto().at_least(70.0)); // Duration
+                    }
+                    builder
+                        .header(row_height, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("ID");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Route");
+                            });
+                            if show_status {
+                                header.col(|ui| {
+                                    ui.strong("Duration");
+                                });
+                            }
+                            header.col(|ui| {
+                                ui.strong("Destination");
+                            });
+                            if show_status {
+                                header.col(|ui| {
+                                    ui.strong("Status");
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            body.rows(row_height, entries.len(), |mut row| {
+                                let (id, entry) = &entries[row.index()];
+                                row.col(|ui| {
+                                    ui.colored_label(Color32::LIGHT_BLUE, format!("{}", id.0));
+                                });
+                                row.col(|ui| match &entry.route {
+                                    Some(r) => {
+                                        ui.label(format!("{:?}", r));
+                                    }
+                                    None => {}
+                                });
+                                if show_status {
+                                    row.col(|ui| {
+                                        if let Some(fin) = entry.finished_at {
+                                            let us =
+                                                fin.elapsed_since(entry.accepted_at).as_micros()
+                                                    as f64;
+                                            ui.label(diag::summary::format_duration_us(us));
+                                        }
+                                    });
+                                }
+                                row.col(|ui| {
+                                    ui.label(format!("{}", entry.dst));
+                                });
+                                if show_status {
+                                    row.col(|ui| match &entry.error {
+                                        Some(e) => {
+                                            ui.colored_label(Color32::RED, "error")
+                                                .on_hover_text(e.as_str());
+                                        }
+                                        None => {
+                                            ui.colored_label(Color32::LIGHT_GREEN, "OK");
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                });
+        };
+
+        if !active_entries.is_empty() {
+            ui.label(egui::RichText::new("Active").strong());
+            render_conn_table(
+                ui,
+                format!("conns_active_{}", profile_name),
+                &active_entries,
+                false,
+            );
+            ui.add_space(4.0);
+        }
+
+        if !finished_entries.is_empty() {
+            ui.label(egui::RichText::new("Recently Finished").strong());
+            render_conn_table(
+                ui,
+                format!("conns_finished_{}", profile_name),
+                &finished_entries,
+                true,
+            );
         }
     }
 
@@ -1416,54 +4374,127 @@ impl App {
         ui.label("DNS settings are not implemented yet (placeholder).");
     }
 
-    fn render_hotconfig_tab(&self, ui: &mut egui::Ui) {
-        if let Some(profile_name) = self.selected_profile.clone() {
-            if let Some(profile_snapshot) = self.snapshot.profiles.get(&profile_name) {
-                ui.horizontal(|ui| {
-                    ui.heading("Hotconfig");
-                    ui.add_space(8.0);
-                    if ui.button("Reload").clicked() {
-                        self.supervisor
-                            .send(SupervisorCommand::ReloadHotconfig(profile_name.clone()));
-                    }
-                });
-                ui.add_space(6.0);
+    fn render_hotconfig_tab(&mut self, ui: &mut egui::Ui) {
+        self.refresh_hotconfig_editor_target();
 
-                JsonTree::new(
-                    format!("hotconfig-{}", profile_name.as_str()),
-                    &profile_snapshot.hotconfig_value,
-                )
-                .default_expand(DefaultExpand::All)
-                .show(ui);
-            }
-        } else {
+        if self.selected_profile.is_none() {
             ui.label("Select a profile to edit Hotconfig");
+            return;
+        }
+
+        let profile_name = self.selected_profile.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.heading(format!("Hotconfig - {}", profile_name));
+            if ui.button("Reload").clicked() {
+                self.supervisor
+                    .send(SupervisorCommand::ReloadHotconfig(profile_name.clone()));
+                self.supervisor
+                    .send(SupervisorCommand::LoadProfile(profile_name.clone()));
+                self.hotconfig_editor_target = None;
+            }
+            if ui.button("Save").clicked() {
+                self.save_hotconfig_editor();
+            }
+        });
+        if let Some(status) = &self.hotconfig_editor_status {
+            ui.label(status);
+        }
+        ui.add_space(6.0);
+
+        let changed = Self::render_hotconfig_editor_split(
+            ui,
+            "hotconfig-tab",
+            &mut self.hotconfig_editor_value,
+            &mut self.hotconfig_editor_json,
+            &mut self.hotconfig_editor_error,
+        );
+        if changed {
+            self.hotconfig_editor_status = None;
         }
     }
 
-    fn render_profile_editor_tab(&self, ui: &mut egui::Ui) {
-        if let Some(profile_name) = self.selected_profile.clone() {
-            if let Some(profile_snapshot) = self.snapshot.profiles.get(&profile_name) {
-                ui.horizontal(|ui| {
-                    ui.heading("Profile JSON");
-                    ui.add_space(8.0);
-                    if ui.button("Reload").clicked() {
-                        self.supervisor
-                            .send(SupervisorCommand::ReloadProfile(profile_name.clone()));
+    fn render_profile_editor_tab(&mut self, ui: &mut egui::Ui) {
+        self.refresh_profile_editor_target();
+
+        ui.horizontal(|ui| {
+            match self.selected_profile.as_ref() {
+                Some(profile_name) => ui.heading(format!("Profile - {}", profile_name)),
+                None => ui.heading("Profile - New Container"),
+            };
+
+            if ui.button("Reload").clicked() {
+                if let Some(profile_name) = self.selected_profile.clone() {
+                    self.supervisor
+                        .send(SupervisorCommand::ReloadProfile(profile_name.clone()));
+                    self.supervisor
+                        .send(SupervisorCommand::LoadProfile(profile_name));
+                    self.profile_editor_target = None;
+                } else {
+                    self.supervisor.send(SupervisorCommand::Init);
+                    self.profile_editor_target = None;
+                }
+            }
+
+            if ui.button("Save").clicked() {
+                self.save_profile_editor();
+            }
+
+            ui.separator();
+            ui.label("Create name");
+            ui.text_edit_singleline(&mut self.profile_editor_create_name);
+            if ui.button("Create").clicked() {
+                self.create_profile_from_editor();
+            }
+        });
+
+        if let Some(status) = &self.profile_editor_status {
+            ui.label(status);
+        }
+        ui.add_space(6.0);
+
+        ui.columns(2, |columns| {
+            columns[0].heading("Form");
+            egui::ScrollArea::vertical()
+                .id_salt("profile-editor-form-scroll")
+                .show(&mut columns[0], |ui| {
+                    let form_changed = self.render_template_form(ui);
+                    if form_changed {
+                        self.refresh_profile_editor_json_from_template();
+                        self.profile_editor_json_error = None;
                     }
                 });
-                ui.add_space(6.0);
 
-                JsonTree::new(
-                    format!("profile-{}", profile_name),
-                    &profile_snapshot.template_value,
-                )
-                .default_expand(DefaultExpand::All)
-                .show(ui);
-            }
-        } else {
-            ui.label("Select a profile to edit Profile JSON");
-        }
+            columns[1].heading("Formatted JSON");
+            egui::ScrollArea::vertical()
+                .id_salt("profile-editor-json-scroll")
+                .show(&mut columns[1], |ui| {
+                    let mut editor = CodeEditor::default()
+                        .id_source("profile-editor-template-json")
+                        .with_rows(42)
+                        .with_theme(ColorTheme::GRUVBOX)
+                        .with_syntax(json_syntax())
+                        .with_numlines(true)
+                        .with_ui_fontsize(ui);
+                    let output = editor.show(ui, &mut self.profile_editor_json);
+                    if output.response.changed() {
+                        match serde_json::from_str::<TemplateConfig>(&self.profile_editor_json) {
+                            Ok(parsed) => {
+                                self.profile_editor_template = parsed;
+                                self.profile_editor_json_error = None;
+                                self.profile_editor_hot_init_error = None;
+                                self.refresh_hot_init_json_from_template();
+                            }
+                            Err(err) => {
+                                self.profile_editor_json_error = Some(format!("JSON error: {err}"));
+                            }
+                        }
+                    }
+
+                    if let Some(err) = &self.profile_editor_json_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    }
+                });
+        });
     }
 
     fn render_proxy_detail_window(&mut self, ctx: &egui::Context) {
@@ -1502,8 +4533,11 @@ impl App {
                         };
                         ui.label(egui::RichText::new(url).monospace());
                     });
-                    if let Some(ip) = item.resolved_ip {
-                        ui.label(format!("Resolved IP: {}", ip));
+                    if !item.resolved_ips.is_empty() {
+                        ui.label("Resolved IPs:");
+                        for ip in &item.resolved_ips {
+                            ui.label(egui::RichText::new(ip.to_string()).monospace());
+                        }
                     }
                     ui.separator();
                 }
@@ -1564,7 +4598,7 @@ impl App {
                         render_detail_attempts_plot(ui, stats, &detail_id, fit);
 
                         ui.add_space(10.0);
-                        ui.heading("Traffic (KB) — past hour");
+                        ui.heading("Traffic — past hour");
                         render_detail_traffic_plot(ui, stats, &detail_id, fit);
                     });
                 } else {
@@ -1705,36 +4739,48 @@ fn bucket_timeseries(
     now: nsproxy_common::stats::Timestamp,
     extract: impl Fn(&nsproxy_common::stats::SlotData) -> f64,
 ) -> Vec<TsPoint> {
+    use nsproxy_common::stats::{DAY_US, HOUR_US, MINUTE_US};
+
     let bucket_us = (window_us / num_buckets as u64).max(1);
     let window_start_us = now.0.saturating_sub(window_us);
 
     let mut buckets = vec![0.0_f64; num_buckets];
 
-    for (range, data) in stats.data.iter() {
-        let r_start = range.start().0;
-        let r_end = range.end().0;
-        if r_end < window_start_us || r_start > now.0 {
-            continue;
-        }
-        let r_start_clipped = r_start.max(window_start_us);
-        let r_end_clipped = r_end.min(now.0);
-        if r_end_clipped < r_start_clipped {
-            continue;
-        }
-        let stored_span = (r_end - r_start + 1) as f64;
-        let val = extract(data);
+    let mut process_entry =
+        |ts: u64, data: &nsproxy_common::stats::SlotData, granularity_us: u64| {
+            if ts < window_start_us || ts > now.0 {
+                return;
+            }
+            let r_start = ts;
+            let r_end = ts + granularity_us - 1;
+            let r_start_clipped = r_start.max(window_start_us);
+            let r_end_clipped = r_end.min(now.0);
+            if r_end_clipped < r_start_clipped {
+                return;
+            }
+            let stored_span = (r_end - r_start + 1) as f64;
+            let val = extract(data);
 
-        // Determine which buckets this range overlaps.
-        let first_bucket = ((r_start_clipped - window_start_us) / bucket_us) as usize;
-        let last_bucket = ((r_end_clipped - window_start_us) / bucket_us) as usize;
-        for b in first_bucket..=last_bucket.min(num_buckets - 1) {
-            let b_start_us = window_start_us + b as u64 * bucket_us;
-            let b_end_us = b_start_us + bucket_us - 1;
-            let overlap_start = r_start.max(b_start_us) as f64;
-            let overlap_end = (r_end.min(b_end_us) + 1) as f64;
-            let overlap = (overlap_end - overlap_start).max(0.0);
-            buckets[b] += val * overlap / stored_span;
-        }
+            let first_bucket = ((r_start_clipped - window_start_us) / bucket_us) as usize;
+            let last_bucket = ((r_end_clipped - window_start_us) / bucket_us) as usize;
+            for b in first_bucket..=last_bucket.min(num_buckets - 1) {
+                let b_start_us = window_start_us + b as u64 * bucket_us;
+                let b_end_us = b_start_us + bucket_us - 1;
+                let overlap_start = r_start.max(b_start_us) as f64;
+                let overlap_end = (r_end.min(b_end_us) + 1) as f64;
+                let overlap = (overlap_end - overlap_start).max(0.0);
+                buckets[b] += val * overlap / stored_span;
+            }
+        };
+
+    for (ts, data) in stats.minute_data.iter() {
+        process_entry(ts.0, data, MINUTE_US);
+    }
+    for (ts, data) in stats.hour_data.iter() {
+        process_entry(ts.0, data, HOUR_US);
+    }
+    for (ts, data) in stats.day_data.iter() {
+        process_entry(ts.0, data, DAY_US);
     }
 
     // x is negative seconds relative to now: 0 = now, -window_secs = oldest bucket.
@@ -1757,8 +4803,12 @@ fn bucket_avg_latency(
     num_buckets: usize,
     now: nsproxy_common::stats::Timestamp,
 ) -> Vec<Option<TsPoint>> {
-    let sum_pts = bucket_timeseries(stats, window_us, num_buckets, now, |d| d.latency_sum_ms as f64);
-    let cnt_pts = bucket_timeseries(stats, window_us, num_buckets, now, |d| d.latency_count as f64);
+    let sum_pts = bucket_timeseries(stats, window_us, num_buckets, now, |d| {
+        d.latency_sum_ms as f64
+    });
+    let cnt_pts = bucket_timeseries(stats, window_us, num_buckets, now, |d| {
+        d.latency_count as f64
+    });
     sum_pts
         .into_iter()
         .zip(cnt_pts)
@@ -1790,7 +4840,7 @@ fn ts_to_plot(pts: &[TsPoint]) -> PlotPoints {
 
 fn render_mini_sparkline(ui: &mut egui::Ui, stats: &ProxyStats, proxy_id: &ProxyID) {
     use nsproxy_common::stats::Timestamp;
-    
+
     let hour_us: u64 = 3_600 * 1_000_000;
     let num_buckets = 20;
     let now = Timestamp::now();
@@ -1908,6 +4958,111 @@ fn render_mini_sparkline(ui: &mut egui::Ui, stats: &ProxyStats, proxy_id: &Proxy
         });
 }
 
+/// Render a single `DiagEvent` as a compact horizontal row for the Traffic Logs sub-view.
+fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
+    ui.horizontal(|ui| match event {
+        diag::DiagEvent::Accept {
+            id, kind, src, dst, ..
+        } => {
+            ui.colored_label(Color32::from_rgb(100, 180, 220), "Accept");
+            ui.label(format!("#{} {:?} {} → {}", id.0, kind, src, dst));
+        }
+        diag::DiagEvent::Route { id, route, .. } => {
+            ui.colored_label(Color32::from_rgb(180, 220, 100), "Route");
+            ui.label(format!("#{} → {:?}", id.0, route));
+        }
+        diag::DiagEvent::Connected { id, .. } => {
+            ui.colored_label(Color32::LIGHT_GREEN, "Connected");
+            ui.label(format!("#{}", id.0));
+        }
+        diag::DiagEvent::Finished {
+            id,
+            error,
+            bytes_up,
+            bytes_down,
+            ..
+        } => {
+            if error.is_some() {
+                ui.colored_label(Color32::LIGHT_RED, "Finished");
+            } else {
+                ui.colored_label(Color32::from_gray(160), "Finished");
+            }
+            let err_str = error.as_deref().unwrap_or("ok");
+            ui.label(format!(
+                "#{} {} ↑{:.0} ↓{:.0}",
+                id.0, err_str, bytes_up, bytes_down
+            ));
+        }
+        diag::DiagEvent::DnsQuery { id, query, .. } => {
+            ui.colored_label(Color32::from_rgb(200, 200, 100), "DNS?");
+            ui.label(format!("#{} {}", id.0, query));
+        }
+        diag::DiagEvent::DnsResolved {
+            id, domain, result, ..
+        } => {
+            ui.colored_label(Color32::from_rgb(200, 200, 100), "DNS✓");
+            ui.label(format!("#{} {} → {}", id.0, domain, result));
+        }
+        diag::DiagEvent::Dispatched { id, dispatch_us } => {
+            ui.colored_label(Color32::from_gray(130), "Dispatch");
+            ui.label(format!("#{} {}µs", id.0, dispatch_us));
+        }
+        diag::DiagEvent::HotConfigReloaded {
+            ok, source, error, ..
+        } => {
+            let color = if *ok {
+                Color32::LIGHT_GREEN
+            } else {
+                Color32::LIGHT_RED
+            };
+            ui.colored_label(color, "HotConfig");
+            let detail = error.as_deref().unwrap_or(source.as_str());
+            ui.label(detail);
+        }
+        diag::DiagEvent::Log(entry) => {
+            let level_color = match entry.level.as_str() {
+                "ERROR" => Color32::from_rgb(220, 80, 80),
+                "WARN" => Color32::from_rgb(210, 160, 60),
+                "DEBUG" | "TRACE" => Color32::from_gray(120),
+                _ => Color32::from_gray(200),
+            };
+            ui.colored_label(level_color, &entry.level);
+            ui.colored_label(Color32::from_gray(100), format!("[{}]", entry.target));
+            ui.horizontal_wrapped(|ui| {
+                for part in egui_sgr::ansi_to_rich_text(&entry.message) {
+                    ui.label(part);
+                }
+            });
+        }
+        other => {
+            ui.colored_label(Color32::from_gray(120), diag_event_kind_label(other));
+        }
+    });
+}
+
+fn diag_event_kind_label(ev: &diag::DiagEvent) -> &'static str {
+    match ev {
+        diag::DiagEvent::Accept { .. } => "Accept",
+        diag::DiagEvent::Dispatched { .. } => "Dispatched",
+        diag::DiagEvent::Route { .. } => "Route",
+        diag::DiagEvent::Connected { .. } => "Connected",
+        diag::DiagEvent::Finished { .. } => "Finished",
+        diag::DiagEvent::DnsResolved { .. } => "DnsResolved",
+        diag::DiagEvent::DnsQuery { .. } => "DnsQuery",
+        diag::DiagEvent::Wait { .. } => "Wait",
+        diag::DiagEvent::WaitEnded { .. } => "WaitEnded",
+        diag::DiagEvent::HotConfigReloaded { .. } => "HotConfigReloaded",
+        diag::DiagEvent::HotConfigSnapshot { .. } => "HotConfigSnapshot",
+        diag::DiagEvent::DnsState { .. } => "DnsState",
+        diag::DiagEvent::RoutingState { .. } => "RoutingState",
+        diag::DiagEvent::UplinkStatsSnapshot { .. } => "UplinkStatsSnapshot",
+        diag::DiagEvent::Log(_) => "Log",
+        diag::DiagEvent::RecentLogs(_) => "RecentLogs",
+        diag::DiagEvent::RecentDiagEvents(_) => "RecentDiagEvents",
+        diag::DiagEvent::ConnsStateSnapshot { .. } => "ConnsStateSnapshot",
+    }
+}
+
 fn render_detail_latency_plot(
     ui: &mut egui::Ui,
     stats: &ProxyStats,
@@ -1915,7 +5070,7 @@ fn render_detail_latency_plot(
     fit: bool,
 ) {
     use nsproxy_common::stats::Timestamp;
-    
+
     let hour_us: u64 = 3_600 * 1_000_000;
     let num_buckets = 60;
     const WINDOW_SECS: f64 = 3600.0;
@@ -1973,7 +5128,7 @@ fn render_detail_attempts_plot(
     fit: bool,
 ) {
     use nsproxy_common::stats::Timestamp;
-    
+
     let hour_us: u64 = 3_600 * 1_000_000;
     let num_buckets = 60;
     let now = Timestamp::now();
@@ -2071,21 +5226,44 @@ fn render_detail_traffic_plot(
     fit: bool,
 ) {
     use nsproxy_common::stats::Timestamp;
-    
+
     let hour_us: u64 = 3_600 * 1_000_000;
     let num_buckets = 60;
     let now = Timestamp::now();
 
-    let up_pts = bucket_timeseries(stats, hour_us, num_buckets, now, |d| d.bytes_up as f64 / 1024.0);
-    let down_pts = bucket_timeseries(stats, hour_us, num_buckets, now, |d| {
-        d.bytes_down as f64 / 1024.0
-    });
+    let up_pts_raw = bucket_timeseries(stats, hour_us, num_buckets, now, |d| d.bytes_up as f64);
+    let down_pts_raw = bucket_timeseries(stats, hour_us, num_buckets, now, |d| d.bytes_down as f64);
 
-    let has_data = up_pts.iter().chain(down_pts.iter()).any(|p| p.val > 0.0);
+    let has_data = up_pts_raw
+        .iter()
+        .chain(down_pts_raw.iter())
+        .any(|p| p.val > 0.0);
     if !has_data {
         ui.label("No traffic data for the past hour.");
         return;
     }
+
+    let max_bytes = up_pts_raw
+        .iter()
+        .chain(down_pts_raw.iter())
+        .map(|p| p.val)
+        .fold(0.0, f64::max);
+    let (divisor, unit) = determine_byte_unit(max_bytes);
+
+    let up_pts: Vec<TsPoint> = up_pts_raw
+        .iter()
+        .map(|p| TsPoint {
+            x: p.x,
+            val: p.val / divisor,
+        })
+        .collect();
+    let down_pts: Vec<TsPoint> = down_pts_raw
+        .iter()
+        .map(|p| TsPoint {
+            x: p.x,
+            val: p.val / divisor,
+        })
+        .collect();
 
     // Use Option so zero-traffic buckets become dashed gaps.
     let up_opt: Vec<Option<TsPoint>> = up_pts
@@ -2111,7 +5289,7 @@ fn render_detail_traffic_plot(
         .height(160.0)
         .x_axis_formatter(|mark, _| format_age_label(mark.value, WINDOW_SECS_TRF))
         .x_grid_spacer(time_grid_spacer_1h())
-        .y_axis_label("KB")
+        .y_axis_label(unit)
         .set_margin_fraction(egui::Vec2::new(0.0, 0.15));
     if fit {
         plot = plot.reset().auto_bounds(egui::Vec2b::new(true, true));
@@ -2121,7 +5299,7 @@ fn render_detail_traffic_plot(
     plot.show(ui, |plot_ui| {
         for (i, seg) in up_solid.into_iter().enumerate() {
             let name = if i == 0 {
-                "Upload (KB)".to_string()
+                format!("Upload ({})", unit)
             } else {
                 format!("up_s_{}", i)
             };
@@ -2137,7 +5315,7 @@ fn render_detail_traffic_plot(
         }
         for (i, seg) in down_solid.into_iter().enumerate() {
             let name = if i == 0 {
-                "Download (KB)".to_string()
+                format!("Download ({})", unit)
             } else {
                 format!("down_s_{}", i)
             };
@@ -2154,15 +5332,107 @@ fn render_detail_traffic_plot(
     });
 }
 
-fn format_bytes(bytes: f32) -> String {
-    if bytes < 1024.0 {
-        format!("{:.0}B", bytes)
-    } else if bytes < 1024.0 * 1024.0 {
+fn render_ansi_line(ui: &mut egui::Ui, line: &str) {
+    use egui::text::{LayoutJob, TextFormat};
+    let mono = egui::FontId::monospace(12.0);
+    let default_fg = Color32::from_gray(220);
+    let mut job = LayoutJob::default();
+    let mut fg = default_fg;
+    let mut remaining = line;
+    while !remaining.is_empty() {
+        match remaining.find('\x1b') {
+            Some(0) => {
+                if remaining.starts_with("\x1b[") {
+                    let rest = &remaining[2..];
+                    if let Some(m_pos) = rest.find('m') {
+                        let params = &rest[..m_pos];
+                        remaining = &rest[m_pos + 1..];
+                        for seg in params.split(';') {
+                            fg = ansi_sgr_color(seg.trim(), fg, default_fg);
+                        }
+                        continue;
+                    }
+                }
+                remaining = &remaining[1..];
+            }
+            Some(esc_pos) => {
+                job.append(
+                    &remaining[..esc_pos],
+                    0.0,
+                    TextFormat {
+                        font_id: mono.clone(),
+                        color: fg,
+                        ..Default::default()
+                    },
+                );
+                remaining = &remaining[esc_pos..];
+            }
+            None => {
+                job.append(
+                    remaining,
+                    0.0,
+                    TextFormat {
+                        font_id: mono.clone(),
+                        color: fg,
+                        ..Default::default()
+                    },
+                );
+                break;
+            }
+        }
+    }
+    if job.sections.is_empty() {
+        ui.label(egui::RichText::new(" ").font(mono));
+    } else {
+        ui.label(job);
+    }
+}
+
+fn ansi_sgr_color(code: &str, current: Color32, default_fg: Color32) -> Color32 {
+    match code.parse::<u32>().unwrap_or(0) {
+        0 => default_fg,
+        30 => Color32::from_gray(30),
+        31 => Color32::from_rgb(205, 49, 49),
+        32 => Color32::from_rgb(13, 188, 121),
+        33 => Color32::from_rgb(229, 229, 16),
+        34 => Color32::from_rgb(36, 114, 200),
+        35 => Color32::from_rgb(188, 63, 188),
+        36 => Color32::from_rgb(17, 168, 205),
+        37 => Color32::from_gray(229),
+        39 => default_fg,
+        90 => Color32::from_gray(102),
+        91 => Color32::from_rgb(241, 76, 76),
+        92 => Color32::from_rgb(35, 209, 139),
+        93 => Color32::from_rgb(245, 245, 67),
+        94 => Color32::from_rgb(59, 142, 234),
+        95 => Color32::from_rgb(214, 112, 214),
+        96 => Color32::from_rgb(41, 184, 219),
+        97 => Color32::WHITE,
+        _ => current,
+    }
+}
+
+fn format_bytes(bytes: u128) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
         format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024.0 * 1024.0 * 1024.0 {
+    } else if bytes < 1024 * 1024 * 1024 {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn determine_byte_unit(max_bytes: f64) -> (f64, &'static str) {
+    if max_bytes < 1024.0 {
+        (1.0, "B")
+    } else if max_bytes < 1024.0 * 1024.0 {
+        (1024.0, "KB")
+    } else if max_bytes < 1024.0 * 1024.0 * 1024.0 {
+        (1024.0 * 1024.0, "MB")
+    } else {
+        (1024.0 * 1024.0 * 1024.0, "GB")
     }
 }
 
@@ -2273,6 +5543,9 @@ fn sidebar_box_width(
 fn setup_cjk_font(ctx: &egui::Context) {
     use std::path::Path;
 
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+
     // Common Noto CJK / Source Han / WQY font locations across major Linux distros.
     let candidates = [
         // Fedora (google-noto-sans-cjk-fonts)
@@ -2337,7 +5610,6 @@ fn setup_cjk_font(ctx: &egui::Context) {
 
     for path in existing {
         if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
             fonts
                 .font_data
                 .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
@@ -2352,13 +5624,26 @@ fn setup_cjk_font(ctx: &egui::Context) {
                 .entry(egui::FontFamily::Monospace)
                 .or_default()
                 .push("cjk".to_owned());
-            ctx.set_fonts(fonts);
-            return;
+            break;
         }
     }
+
+    ctx.set_fonts(fonts);
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_line_number(true)
+        .try_init();
+
+    info!("starting nsproxy-ui");
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "nsproxy - dashboard",
@@ -2375,7 +5660,9 @@ fn main() {
                     egui::TextStyle::Button,
                     egui::TextStyle::Small,
                 ] {
-                    style.text_styles.insert(ts.clone(), egui::FontId::proportional(16.0));
+                    style
+                        .text_styles
+                        .insert(ts.clone(), egui::FontId::proportional(16.0));
                 }
             });
             Ok(Box::new(App::new(ctx)))

@@ -36,6 +36,8 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
         UplinkCommand::Stats => cmd_stats(),
         UplinkCommand::Export { path } => cmd_export(path),
         UplinkCommand::Import { path } => cmd_import(path),
+        UplinkCommand::DnsBackup { path } => cmd_dns_backup(path),
+        UplinkCommand::DnsImport { path } => cmd_dns_import(path),
     }
 }
 
@@ -121,7 +123,11 @@ fn cmd_clash(cmd: ClashOps) -> Result<()> {
         } => clash_config_add(group_id, path),
         ClashOps::List => clash_list(),
         ClashOps::ConfigExplain { path } => clash_config_explain(path),
-        ClashOps::Resolve { direct, refresh } => clash_resolve(direct, refresh),
+        ClashOps::Resolve {
+            direct,
+            refresh,
+            backup,
+        } => clash_resolve(direct, refresh, backup),
         ClashOps::TestResolve { direct, query } => clash_test_resolve(direct, query),
     }
 }
@@ -202,7 +208,7 @@ fn clash_list() -> Result<()> {
     Ok(())
 }
 
-fn clash_resolve(direct: bool, refresh: bool) -> Result<()> {
+fn clash_resolve(direct: bool, refresh: bool, backup: Option<std::path::PathBuf>) -> Result<()> {
     use crate::uplink::clash::GroupId;
 
     println!("Resolving Clash groups and updating resolved state...");
@@ -228,68 +234,90 @@ fn clash_resolve(direct: bool, refresh: bool) -> Result<()> {
         );
 
         let mut state = hub.load_clash_state()?.clone();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_task_flag = Arc::clone(&cancel_flag);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancel_task_flag.store(true, Ordering::SeqCst);
-            }
-        });
+
+        let backup_only = if let Some(backup_path) = &backup {
+            let json = std::fs::read_to_string(backup_path)
+                .with_context(|| format!("Failed to read DNS backup from {:?}", backup_path))?;
+            let dns_backup: crate::uplink::backup::UplinkBackup = serde_json::from_str(&json)
+                .context("Failed to parse DNS backup JSON")?;
+            dns_backup.merge_into_clash_state(&mut state);
+            println!(
+                "Preloaded DNS backup from {:?} (domains={})",
+                backup_path,
+                dns_backup.dns.len()
+            );
+            println!("Backup-only mode: skipping DNS resolver calls");
+            true
+        } else {
+            false
+        };
 
         let mut interrupted = false;
 
-        for group_id in group_ids {
-            if cancel_flag.load(Ordering::Relaxed) {
-                println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
-                interrupted = true;
-                break;
-            }
-
-            let unresolved_before = state
-                .domain_group
-                .iter()
-                .filter(|(domain, gid)| gid == &&group_id && state.get_latest_proxy_ips(domain.as_str()).is_none())
-                .count();
-
-            println!(
-                "Resolving group: {} (unresolved proxy domains before resolve: {})",
-                group_id.as_str(),
-                unresolved_before
-            );
-
-            match state
-                .resolve_group(
-                    &group_id,
-                    Some(&hub),
-                    Some(cancel_flag.as_ref()),
-                    direct,
-                    refresh,
-                )
-                .await
-            {
-                Ok(report) => {
-                    println!("  resolved_domains={}", report.solved.domains.len());
-                    println!(
-                        "  metrics cache_hits={} proxied_tier2={} proxied_tier1={} direct_tier2={} direct_tier1={} unresolved={}",
-                        report.metrics.cache_hits,
-                        report.metrics.resolved_proxy_tier2,
-                        report.metrics.resolved_proxy_tier1,
-                        report.metrics.resolved_direct_tier2,
-                        report.metrics.resolved_direct_tier1,
-                        report.metrics.unresolved
-                    );
+        if !backup_only {
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let cancel_task_flag = Arc::clone(&cancel_flag);
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    cancel_task_flag.store(true, Ordering::SeqCst);
                 }
-                Err(e) => {
-                    println!("  Failed to resolve group {}: {}", group_id.as_str(), e);
+            });
+
+            for group_id in group_ids {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
+                    interrupted = true;
+                    break;
                 }
-            }
-            
-            if cancel_flag.load(Ordering::Relaxed) {
-                println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
-                interrupted = true;
-                break;
+
+                let unresolved_before = state
+                    .domain_group
+                    .iter()
+                    .filter(|(domain, gid)| gid == &&group_id && state.get_latest_proxy_ips(domain.as_str()).is_none())
+                    .count();
+
+                println!(
+                    "Resolving group: {} (unresolved proxy domains before resolve: {})",
+                    group_id.as_str(),
+                    unresolved_before
+                );
+
+                match state
+                    .resolve_group(
+                        &group_id,
+                        Some(&hub),
+                        Some(cancel_flag.as_ref()),
+                        direct,
+                        refresh,
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        println!("  resolved_domains={}", report.solved.domains.len());
+                        println!(
+                            "  metrics cache_hits={} proxied_tier2={} proxied_tier1={} direct_tier2={} direct_tier1={} unresolved={}",
+                            report.metrics.cache_hits,
+                            report.metrics.resolved_proxy_tier2,
+                            report.metrics.resolved_proxy_tier1,
+                            report.metrics.resolved_direct_tier2,
+                            report.metrics.resolved_direct_tier1,
+                            report.metrics.unresolved
+                        );
+                    }
+                    Err(e) => {
+                        println!("  Failed to resolve group {}: {}", group_id.as_str(), e);
+                    }
+                }
+
+                if cancel_flag.load(Ordering::Relaxed) {
+                    println!("\\nInterrupt received (Ctrl+C). Saving current resolved state...");
+                    interrupted = true;
+                    break;
+                }
             }
         }
+
+        state.remove_private_ips();
 
         hub.set_clash_state(state)?;
 
@@ -941,5 +969,45 @@ fn cmd_import(path: std::path::PathBuf) -> Result<()> {
     println!("  ✓ Stats written ({} entries)", snapshot.stats.len());
 
     println!("✓ Import complete — run 'sp uplink clash resolve' to refresh proxy IPs if needed");
+    Ok(())
+}
+
+fn cmd_dns_backup(path: std::path::PathBuf) -> Result<()> {
+    let state = crate::uplink::clash::ClashState::load_or_default()
+        .context("Failed to load clash state for DNS backup")?;
+    let backup = crate::uplink::backup::UplinkBackup::from_clash_state(&state);
+    let json = serde_json::to_string_pretty(&backup)
+        .context("Failed to serialize UplinkBackup")?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .context("Failed to create parent directory for DNS backup file")?;
+    }
+
+    std::fs::write(&path, &json)
+        .with_context(|| format!("Failed to write DNS backup to {:?}", path))?;
+
+    println!("✓ Exported DNS backup to {:?}", path);
+    println!("  cached domains: {}", backup.dns.len());
+    Ok(())
+}
+
+fn cmd_dns_import(path: std::path::PathBuf) -> Result<()> {
+    use crate::state_blueprint::PersistentState;
+
+    let json = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read DNS backup from {:?}", path))?;
+    let backup: crate::uplink::backup::UplinkBackup =
+        serde_json::from_str(&json).context("Failed to parse UplinkBackup JSON")?;
+
+    let mut state = crate::uplink::clash::ClashState::load_or_default()
+        .context("Failed to load clash state for DNS import")?;
+    backup.merge_into_clash_state(&mut state);
+    state
+        .save_atomic()
+        .context("Failed to persist clash state after DNS import")?;
+
+    println!("✓ Imported DNS backup from {:?}", path);
+    println!("  cached domains: {}", backup.dns.len());
     Ok(())
 }

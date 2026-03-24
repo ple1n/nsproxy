@@ -107,12 +107,6 @@ pub mod state_paths {
         uplink_dir(kind).join(profile)
     }
 
-    /// Get config file path for an uplink profile
-    /// Returns /nsp3/uplink/{kind}/{profile}/config.yaml
-    pub fn uplink_profile_config(kind: &str, profile: &str) -> PathBuf {
-        uplink_profile_dir(kind, profile).join("config.yaml")
-    }
-
     /// Global wrapped binaries config path
     /// Returns /nsp3/wrapped_binaries.json
     pub fn wrapped_binaries_config() -> PathBuf {
@@ -148,9 +142,13 @@ pub mod state_paths {
 pub struct NsAlive {
     pub browser_profile: Option<String>,
     pub bind_mount: PathBuf,
+    /// keeper process within netns
     pub child_pid: Option<u32>,
     #[serde(default)]
     pub serve_pid: Option<u32>,
+    /// sp up daemon, socket server
+    #[serde(default)]
+    pub up_pid: Option<u32>,
 }
 
 /// Represents an NS anchored to a process, or a file
@@ -501,5 +499,15 @@ pub enum DNSHost {
         /// Must be Some, unless this is passed to proxies capable of DNS resolution
         socket: Option<SocketAddr>,
     },
-    Tier2IP(SocketAddr)
+    Tier2IP(SocketAddr),
+}
+
+/// DNS domain normalization: ensures trailing dot per RFC 1034/1035
+pub fn normalize_domain(domain: &mut String) {
+    let trimmed = domain.trim().to_string();
+    if !trimmed.is_empty() && !trimmed.ends_with('.') {
+        *domain = format!("{}.", trimmed);
+    } else {
+        *domain = trimmed;
+    }
 }
