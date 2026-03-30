@@ -32,12 +32,12 @@ use nix::{
     mount::{MsFlags, mount as nix_mount},
     sched::{CloneFlags, unshare},
     unistd::{
-        ForkResult, Gid, Pid, Uid, chdir, chown, execve, fork, getresgid, getresuid, setgroups,
-        setresgid, setresuid,
+        ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, getresuid, pipe,
+        setgroups, setresgid, setresuid,
     },
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use nsproxy_common::{ExactNS, NSFrom, NSSource, PidPath, UniqueFile, forever};
+use nsproxy_common::{ExactNS, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile, forever};
 use nsproxy_core::{
     BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
     SandboxMode, TemplateConfig, TunMaker,
@@ -60,7 +60,7 @@ use nsproxy_core::{
 };
 use nsproxy_core::{
     cmd_uplink::{cmd_uplink, load_saved_uplink_hub},
-    env::ENV_PROFILE,
+    env::{ENV_CONTAINER, ENV_PROFILE},
     *,
 };
 use owo_colors::OwoColorize;
@@ -73,7 +73,8 @@ use rtnetlink::packet_route::{
 use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
+    sync::Mutex,
     convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
@@ -150,10 +151,12 @@ fn main() -> anyhow::Result<()> {
 
     use rlimit as rl;
     let (soft, hard) = rl::Resource::NOFILE.get()?;
-    info!(
-        "open file limits, soft={}, hard={}. trying to raise soft limit to max",
-        soft, hard
-    );
+    if !matches!(&cli.cmd, MainCommand::Id { .. }) {
+        info!(
+            "open file limits, soft={}, hard={}. trying to raise soft limit to max",
+            soft, hard
+        );
+    }
     rl::Resource::NOFILE.set(hard, hard)?;
 
     match cli.cmd {
@@ -183,53 +186,296 @@ fn main() -> anyhow::Result<()> {
             rm_mount(&file)?;
         }
         MainCommand::Id { pid } => {
-            let profile = std::env::var(ENV_PROFILE);
-            println!("Browser profile {} {:?}", ENV_PROFILE, profile);
-            let ns = std::env::var(ENV_NS);
-            println!("Network namespace {} {:?}", ENV_NS, ns);
+            // Keep this command output clean and human-focused.
+            let _ = reload_handle.modify(|k| *k.filter_mut() = LevelFilter::WARN);
 
-            let proc = if let Some(pid) = pid {
-                let ns_proc = ExactNS::from_source((PidPath::N(pid as i32), "net"))?;
-                Some(ns_proc)
+            let env_value = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+            let fmt_env = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+
+            let container = env_value(ENV_CONTAINER);
+            let browser = env_value(ENV_PROFILE);
+            let netns = env_value(ENV_NS);
+
+            let target_pid = pid;
+            let target_ns = if let Some(pid) = target_pid {
+                Some(ProfileNamespaces {
+                    mnt: ExactNS::from_source((PidPath::N(pid as i32), "mnt"))?,
+                    net: ExactNS::from_source((PidPath::N(pid as i32), "net"))?,
+                    pid: ExactNS::from_source((PidPath::N(pid as i32), "pid"))?,
+                })
             } else {
                 None
             };
 
-            if let Ok(ns) = ns {
-                if ns != "UNSPEC" {
-                    let path = PathBuf::from(ns);
-                    let ns = ExactNS::from_source(path)?;
-                    let ns_self = ExactNS::from_source((PidPath::Selfproc, "net"))?;
-                    println!("env={} proc_self={}", ns.unique, ns_self.unique);
-                    if ns.unique == ns_self.unique {
-                        println!("network namespace matches claim");
+            let self_ns = ProfileNamespaces {
+                mnt: ExactNS::from_source((PidPath::Selfproc, "mnt"))?,
+                net: ExactNS::from_source((PidPath::Selfproc, "net"))?,
+                pid: ExactNS::from_source((PidPath::Selfproc, "pid"))?,
+            };
+
+            let print_divider = |widths: &[usize]| {
+                print!("+");
+                for &w in widths {
+                    print!("{}+", "-".repeat(w + 2));
+                }
+                println!();
+            };
+
+            let status_width = "MISSING".len();
+
+            println!("{}", "NSPROXY ID".bold().bright_cyan());
+            println!(
+                "{} {}={}  {}={}  {}={}",
+                "env".bold().bright_black(),
+                "container".bright_blue(),
+                fmt_env(container.clone()).bright_white(),
+                "browser".bright_blue(),
+                fmt_env(browser).bright_white(),
+                "netns".bright_blue(),
+                fmt_env(netns).bright_white()
+            );
+
+            let self_rows = [
+                ("mnt", self_ns.mnt.unique.to_string()),
+                ("net", self_ns.net.unique.to_string()),
+                ("pid", self_ns.pid.unique.to_string()),
+            ];
+            let self_kind_w = self_rows
+                .iter()
+                .map(|(k, _)| k.len())
+                .max()
+                .unwrap_or(4)
+                .max("kind".len());
+            let self_ns_w = self_rows
+                .iter()
+                .map(|(_, v)| v.len())
+                .max()
+                .unwrap_or(4)
+                .max("self".len());
+
+            println!();
+            println!("{}", "self".bold().bright_magenta());
+            let self_widths = [self_kind_w, self_ns_w];
+            print_divider(&self_widths);
+            println!(
+                "| {:<kind_w$} | {:<ns_w$} |",
+                "kind".bold(),
+                "self".bold(),
+                kind_w = self_kind_w,
+                ns_w = self_ns_w
+            );
+            print_divider(&self_widths);
+            for (kind, val) in &self_rows {
+                println!(
+                    "| {:<kind_w$} | {:<ns_w$} |",
+                    kind,
+                    val,
+                    kind_w = self_kind_w,
+                    ns_w = self_ns_w
+                );
+            }
+            print_divider(&self_widths);
+
+            if let Some(container_name) = container.as_deref().filter(|c| *c != "UNSPEC") {
+                println!();
+                println!(
+                    "{} {}",
+                    "claim".bold().bright_magenta(),
+                    format!("profile={}", container_name).bright_white()
+                );
+                let registry = NamespacesRegistry::load_locked()?;
+                let mut claim_rows: Vec<(String, String, String, bool, bool)> = Vec::new();
+                if let Some(declared) = registry.profiles.get(container_name) {
+                    for (label, declared_ns, self_actual) in [
+                        ("mnt", &declared.mnt, &self_ns.mnt),
+                        ("net", &declared.net, &self_ns.net),
+                        ("pid", &declared.pid, &self_ns.pid),
+                    ] {
+                        claim_rows.push((
+                            label.to_string(),
+                            declared_ns.unique.to_string(),
+                            self_actual.unique.to_string(),
+                            declared_ns.unique == self_actual.unique,
+                            false,
+                        ));
+                    }
+                } else {
+                    claim_rows.push((
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        false,
+                        true,
+                    ));
+                }
+
+                let claim_kind_w = claim_rows
+                    .iter()
+                    .map(|r| r.0.len())
+                    .max()
+                    .unwrap_or(4)
+                    .max("kind".len());
+                let claim_declared_w = claim_rows
+                    .iter()
+                    .map(|r| r.1.len())
+                    .max()
+                    .unwrap_or(8)
+                    .max("declared".len());
+                let claim_self_w = claim_rows
+                    .iter()
+                    .map(|r| r.2.len())
+                    .max()
+                    .unwrap_or(4)
+                    .max("self".len());
+                let claim_widths = [claim_kind_w, claim_declared_w, claim_self_w, status_width];
+
+                print_divider(&claim_widths);
+                println!(
+                    "| {:<kind_w$} | {:<decl_w$} | {:<self_w$} | {:<status_w$} |",
+                    "kind".bold(),
+                    "declared".bold(),
+                    "self".bold(),
+                    "status".bold(),
+                    kind_w = claim_kind_w,
+                    decl_w = claim_declared_w,
+                    self_w = claim_self_w,
+                    status_w = status_width
+                );
+                print_divider(&claim_widths);
+                for (kind, declared_val, self_val, ok, missing) in claim_rows {
+                    let status_plain = if missing {
+                        "MISSING"
+                    } else if ok {
+                        "OK"
                     } else {
-                        warn!("netns mismatch");
-                    }
-
-                    if let Some(proc) = proc {
-                        println!("PID-{} -> {}", pid.unwrap(), proc.unique);
-                        if proc.unique == ns_self.unique {
-                            println!("PID-{} = this process, regarding net-ns", pid.unwrap());
-                        } else {
-                            println!(
-                                "PID-{} does NOT match this process, regarding net-ns",
-                                pid.unwrap()
-                            );
-                        }
-                    }
-
-                    let mnt = sandbox::assert_mount_ns_isolated();
+                        "DIFF"
+                    };
+                    let status_padded = format!("{:<width$}", status_plain, width = status_width);
+                    let status_colored = if missing {
+                        format!("{}", status_padded.yellow().bold())
+                    } else if ok {
+                        format!("{}", status_padded.green().bold())
+                    } else {
+                        format!("{}", status_padded.red().bold())
+                    };
                     println!(
-                        "mount namespace is {}",
-                        if mnt.is_ok() {
-                            "isolated"
+                        "| {:<kind_w$} | {:<decl_w$} | {:<self_w$} | {} |",
+                        kind,
+                        declared_val,
+                        self_val,
+                        status_colored,
+                        kind_w = claim_kind_w,
+                        decl_w = claim_declared_w,
+                        self_w = claim_self_w
+                    );
+                }
+                print_divider(&claim_widths);
+            }
+
+            if let Some(proc) = target_ns {
+                let target_pid = target_pid.expect("pid must exist when proc namespaces were built");
+                println!();
+                println!(
+                    "{} {}",
+                    "pid".bold().bright_magenta(),
+                    format!("{} vs self", target_pid).bright_white()
+                );
+                let mut pid_rows: Vec<(String, String, String, bool)> = Vec::new();
+                for (label, theirs, ours) in [
+                    ("mnt", &proc.mnt, &self_ns.mnt),
+                    ("net", &proc.net, &self_ns.net),
+                    ("pid", &proc.pid, &self_ns.pid),
+                ] {
+                    pid_rows.push((
+                        label.to_string(),
+                        theirs.unique.to_string(),
+                        ours.unique.to_string(),
+                        theirs.unique == ours.unique,
+                    ));
+                }
+
+                let pid_kind_w = pid_rows
+                    .iter()
+                    .map(|r| r.0.len())
+                    .max()
+                    .unwrap_or(4)
+                    .max("kind".len());
+                let pid_target_w = pid_rows
+                    .iter()
+                    .map(|r| r.1.len())
+                    .max()
+                    .unwrap_or(6)
+                    .max("target".len());
+                let pid_self_w = pid_rows
+                    .iter()
+                    .map(|r| r.2.len())
+                    .max()
+                    .unwrap_or(4)
+                    .max("self".len());
+                let pid_widths = [pid_kind_w, pid_target_w, pid_self_w, status_width];
+
+                print_divider(&pid_widths);
+                println!(
+                    "| {:<kind_w$} | {:<target_w$} | {:<self_w$} | {:<status_w$} |",
+                    "kind".bold(),
+                    "target".bold(),
+                    "self".bold(),
+                    "status".bold(),
+                    kind_w = pid_kind_w,
+                    target_w = pid_target_w,
+                    self_w = pid_self_w,
+                    status_w = status_width
+                );
+                print_divider(&pid_widths);
+                for (kind, target_val, self_val, ok) in pid_rows {
+                    let status_plain = if ok { "OK" } else { "DIFF" };
+                    let status_padded = format!("{:<width$}", status_plain, width = status_width);
+                    let status_colored = if ok {
+                        format!("{}", status_padded.green().bold())
+                    } else {
+                        format!("{}", status_padded.red().bold())
+                    };
+                    println!(
+                        "| {:<kind_w$} | {:<target_w$} | {:<self_w$} | {} |",
+                        kind,
+                        target_val,
+                        self_val,
+                        status_colored,
+                        kind_w = pid_kind_w,
+                        target_w = pid_target_w,
+                        self_w = pid_self_w
+                    );
+                }
+                print_divider(&pid_widths);
+            }
+
+            let mount_ns = (std::fs::metadata("/proc/self/ns/mnt"), std::fs::metadata("/proc/1/ns/mnt"));
+            println!();
+            match mount_ns {
+                (Ok(self_mnt), Ok(init_mnt)) => {
+                    let isolated = self_mnt.dev() != init_mnt.dev() || self_mnt.ino() != init_mnt.ino();
+                    println!(
+                        "{} {} {}",
+                        "mount_ns".bold().bright_blue(),
+                        if isolated {
+                            "isolated".green().bold().to_string()
                         } else {
-                            "not isolated"
-                        }
+                            "host-shared".red().bold().to_string()
+                        },
+                        format!("(self_ino={} init_ino={})", self_mnt.ino(), init_mnt.ino())
+                            .bright_black(),
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    println!(
+                        "{} {} {}",
+                        "mount_ns".bold().bright_blue(),
+                        "unknown".yellow().bold(),
+                        format!("({})", e).bright_black()
                     );
                 }
             }
+            println!();
         }
         /// We are just putting state in proc now, basically. Seems cleaner
         MainCommand::Enter { sargs, target } => {
@@ -735,15 +981,16 @@ fn main() -> anyhow::Result<()> {
                             cwd: args.cwd,
                             gids: args.gids,
                             args: args.args,
+                            ns: args.ns,
                         };
                         diag::DaemonRequest::Spawn { args: dra }
                     }
-                    CliDaemonRequest::SpawnCli { cli_json } => {
+                    CliDaemonRequest::SpawnCli { cli_json, ns } => {
                         // Parse provided JSON into `Cli` and bincode-serialize it.
                         let cli_struct: Cli = serde_json::from_str(&cli_json)
                             .map_err(|e| anyhow!("failed to parse cli JSON: {}", e))?;
                         let b = bincode::serialize(&cli_struct)?;
-                        diag::DaemonRequest::SpawnCli { cli_bincode: b }
+                        diag::DaemonRequest::SpawnCli { cli_bincode: b, ns }
                     }
                 };
 
@@ -799,16 +1046,51 @@ fn main() -> anyhow::Result<()> {
                     Clone3Result::Parent {
                         child_pid, mut tx, ..
                     } => {
+                        let parent_mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))?;
+                        let parent_net = ExactNS::from_source((PidPath::Selfproc, "net"))?;
+                        let parent_pid = ExactNS::from_source((PidPath::Selfproc, "pid"))?;
+                        let child_mnt = ExactNS::from_source((PidPath::N(child_pid), "mnt"))?;
+                        let child_net = ExactNS::from_source((PidPath::N(child_pid), "net"))?;
+                        let child_pid_ns = ExactNS::from_source((PidPath::N(child_pid), "pid"))?;
+                        info!(
+                            "ns indicator parent[mnt={},net={},pid={}] child[mnt={},net={},pid={}]",
+                            parent_mnt.unique,
+                            parent_net.unique,
+                            parent_pid.unique,
+                            child_mnt.unique,
+                            child_net.unique,
+                            child_pid_ns.unique,
+                        );
+
                         if let Some(parent) = bind_mount.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
                         let path = format!("/proc/{}/ns/net", child_pid);
                         let path = PathBuf::from(path);
                         mount_ns(&path, &bind_mount)?;
+                        let bind_net = ExactNS::from_source(bind_mount.clone())?;
+                        info!(
+                            "up ns indicator bind_mount[mnt_path={:?},net={}]",
+                            bind_mount,
+                            bind_net.unique
+                        );
+
+                        NamespacesRegistry::update_locked(|registry| {
+                            registry.profiles.insert(
+                                profile.clone(),
+                                ProfileNamespaces {
+                                    mnt: child_mnt.clone(),
+                                    net: child_net.clone(),
+                                    pid: child_pid_ns.clone(),
+                                },
+                            );
+                            Ok(())
+                        })?;
 
                         info!("Updating NS metadata at {:?}", &ns_meta);
                         let up_pid = std::process::id();
                         update_ns_alive(&ns_meta, |ns_alive| {
+                            ns_alive.profile_name = Some(profile.clone());
                             ns_alive.browser_profile = profile_conf.browser_profile.clone();
                             ns_alive.bind_mount = bind_mount.clone();
                             ns_alive.child_pid = Some(child_pid as u32);
@@ -854,6 +1136,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 warn!("no NS metadata found at {:?}", ns_meta);
             }
+
+            NamespacesRegistry::update_locked(|registry| {
+                registry.profiles.remove(&profile);
+                Ok(())
+            })?;
 
             // Unmount and remove the bind-mount file.
             if bind_mount.exists() {
@@ -1744,6 +2031,10 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
         serve_pid: 0,
     })));
 
+    // Shared per-process stdout/stderr ring buffer.
+    let raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+
     // If the UI passed a control socket path, connect to it immediately and serve it
     // as a reversed-role client.  This is event-triggered: the UI doesn't need to
     // poll our socket; we initiate the connection and it receives DaemonEvent frames
@@ -1755,11 +2046,12 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
         let ns_meta2 = ns_meta.clone();
         let log_rx2 = diag::subscribe_up_logs()
             .expect("up log broadcast must be initialised before control socket connect");
+        let raw_logs2 = raw_logs.clone();
         tokio::spawn(async move {
             match connect_and_greet_up(&ctrl_path, &profile_name).await {
                 Ok(stream) => {
                     info!("up daemon: connected to UI control socket, serving reversed connection");
-                    if let Err(e) = handle_up_client(stream, state2, ns_meta2, keeper_pid, log_rx2).await {
+                    if let Err(e) = handle_up_client(stream, state2, ns_meta2, keeper_pid, log_rx2, raw_logs2).await {
                         warn!("up daemon reversed client error: {}", e);
                     }
                 }
@@ -1783,12 +2075,51 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
         // Subscribe to the log broadcast for this new connection.
         let log_rx = diag::subscribe_up_logs()
             .expect("up log broadcast must be initialised before accept loop");
+        let raw_logs_conn = raw_logs.clone();
         current_task = Some(tokio::spawn(async move {
-            if let Err(e) = handle_up_client(stream, state, ns_meta, keeper_pid, log_rx).await {
+            if let Err(e) = handle_up_client(stream, state, ns_meta, keeper_pid, log_rx, raw_logs_conn).await {
                 warn!("up daemon client error: {}", e);
             }
         }));
     }
+}
+
+/// Spawn a blocking thread that reads lines from `fd` and appends them to the per-process
+/// raw log ring buffer.  The thread exits automatically when the write end of the pipe is
+/// closed (i.e. when the process exits).
+fn spawn_pipe_reader(
+    pid: u32,
+    kind: diag::RawLogKind,
+    fd: std::os::unix::io::RawFd,
+    raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::io::FromRawFd;
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            match line {
+                Ok(content) => {
+                    let entry = diag::RawLog {
+                        ts: diag::Timestamp::now(),
+                        kind,
+                        content,
+                    };
+                    if let Ok(mut guard) = raw_logs.lock() {
+                        let ring = guard
+                            .entry(pid)
+                            .or_insert_with(|| VecDeque::with_capacity(diag::RAW_LOG_RING_CAP));
+                        if ring.len() >= diag::RAW_LOG_RING_CAP {
+                            ring.pop_front();
+                        }
+                        ring.push_back(entry);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// Per-connection handler for the `sp up` daemon.
@@ -1798,6 +2129,7 @@ async fn handle_up_client(
     ns_meta: PathBuf,
     keeper_pid: u32,
     mut log_rx: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
+    raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let (mut read_half, mut write_half) = stream.into_split();
@@ -1837,7 +2169,7 @@ async fn handle_up_client(
                     }
                     diag::DaemonRequest::Spawn { args } => {
                         let ns_alive = read_ns_alive(&ns_meta)?;
-                        let child = spawn_daemon_process(&args, &ns_alive)?;
+                        let (child, stdout_r, stderr_r) = spawn_daemon_process(&args, &ns_alive)?;
                         let child_pid = match child {
                             Clone3Result::Parent { child_pid, .. } => child_pid as u32,
                             _ => {
@@ -1860,6 +2192,9 @@ async fn handle_up_client(
                         );
                         state.store(Arc::new(new));
 
+                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stdout, stdout_r, raw_logs.clone());
+                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
+
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
                         write_bincode_frame_async(&mut write_half, &spawned).await?;
                         let s = state.load();
@@ -1875,7 +2210,7 @@ async fn handle_up_client(
                             let _ = exit_tx2.send(child_pid);
                         });
                     }
-                    diag::DaemonRequest::SpawnCli { cli_bincode } => {
+                    diag::DaemonRequest::SpawnCli { cli_bincode, ns } => {
                         let cli = match bincode::deserialize::<Cli>(&cli_bincode) {
                             Ok(cli) => cli,
                             Err(err) => {
@@ -1888,8 +2223,10 @@ async fn handle_up_client(
                             }
                         };
                         let is_serve = matches!(&cli.cmd, MainCommand::Serve { .. });
-                        let child_pid = match spawn_cli_process(&cli)? {
-                            Some(pid) => pid,
+                        let ns_alive = read_ns_alive(&ns_meta)?;
+                        let (child_pid, stdout_r, stderr_r) =
+                            match spawn_cli_process(&cli, &ns_alive, ns)? {
+                            Some((pid, stdout_r, stderr_r)) => (pid, stdout_r, stderr_r),
                             None => {
                                 reap_dead_children_into_state(&state);
                                 continue;
@@ -1912,6 +2249,9 @@ async fn handle_up_client(
                             new.serve_pid = child_pid;
                         }
                         state.store(Arc::new(new));
+
+                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stdout, stdout_r, raw_logs.clone());
+                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
 
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
                         write_bincode_frame_async(&mut write_half, &spawned).await?;
@@ -1974,6 +2314,19 @@ async fn handle_up_client(
                     diag::DaemonRequest::QueryRecentLogs { limit } => {
                         let entries = diag::query_recent_logs(limit);
                         let evt = diag::DaemonEvent::RecentLogs(entries);
+                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                    }
+                    diag::DaemonRequest::QueryRawLogs { pid, limit } => {
+                        let logs = {
+                            let guard = raw_logs.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.get(&pid)
+                                .map(|ring| {
+                                    let skip = ring.len().saturating_sub(limit);
+                                    ring.iter().skip(skip).cloned().collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        };
+                        let evt = diag::DaemonEvent::RawLogs { pid, logs };
                         write_bincode_frame_async(&mut write_half, &evt).await?;
                     }
                 }
@@ -2094,14 +2447,36 @@ fn reap_dead_children_into_state(state: &Arc<ArcSwap<UpDaemonState>>) {
     }
 }
 
-fn spawn_cli_process(cli: &Cli) -> Result<Option<u32>> {
+fn spawn_cli_process(
+    cli: &Cli,
+    ns_alive: &nsproxy_core::NsAlive,
+    ns: diag::NamespaceSpawn,
+) -> Result<Option<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>> {
     let exe = std::env::current_exe()?;
     let fd_file = cli_to_inheritable_fd(cli)?;
     let fd = fd_file.as_raw_fd();
 
+    let (stdout_r, stdout_w) = pipe()?;
+    let (stderr_r, stderr_w) = pipe()?;
+
     match unsafe { fork()? } {
-        ForkResult::Parent { child } => Ok(Some(child.as_raw() as u32)),
+        ForkResult::Parent { child } => {
+            let _ = nix::unistd::close(stdout_w);
+            let _ = nix::unistd::close(stderr_w);
+            Ok(Some((child.as_raw() as u32, stdout_r, stderr_r)))
+        }
         ForkResult::Child => {
+            let _ = nix::unistd::close(stdout_r);
+            let _ = nix::unistd::close(stderr_r);
+            let _ = dup2(stdout_w, 1);
+            let _ = dup2(stderr_w, 2);
+            let _ = nix::unistd::close(stdout_w);
+            let _ = nix::unistd::close(stderr_w);
+
+            if matches!(ns, diag::NamespaceSpawn::Inside) {
+                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+            }
+
             let fd_str = fd.to_string();
             let exe_s = exe.to_string_lossy();
             let argv = [to_cstr(exe_s.as_ref()), to_cstr(&fd_str)];
@@ -2145,12 +2520,20 @@ async fn connect_and_greet_serve(ctrl_path: &Path, profile: &str) -> Result<toki
 fn spawn_daemon_process(
     args: &diag::SpawnArgs,
     ns_alive: &nsproxy_core::NsAlive,
-) -> Result<Clone3Result> {
+) -> Result<(Clone3Result, std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
     let exec = args
         .exec
         .clone()
         .ok_or_else(|| anyhow!("spawn args missing exec"))?;
-    let cmd = std::ffi::CString::new(exec.as_str())?;
+    let exec_resolved = if exec.contains('/') {
+        exec.clone()
+    } else {
+        match which::which(exec.as_str()) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => exec.clone(),
+        }
+    };
+    let cmd = std::ffi::CString::new(exec_resolved.as_str())?;
 
     let mut argv: Vec<std::ffi::CString> = if args.args.is_empty() {
         vec![std::ffi::CString::new(exec.as_str())?]
@@ -2165,18 +2548,24 @@ fn spawn_daemon_process(
         argv.push(std::ffi::CString::new(exec.as_str())?);
     }
 
+    let container_val = ns_alive
+        .profile_name
+        .clone()
+        .unwrap_or_else(|| "UNSPEC".to_string());
     let profile_val = ns_alive
         .browser_profile
         .clone()
         .unwrap_or_else(|| "UNSPEC".to_string());
     let ns_val = ns_alive.bind_mount.to_string_lossy().to_string();
     unsafe {
+        std::env::set_var(ENV_CONTAINER, &container_val);
         std::env::set_var(ENV_PROFILE, &profile_val);
         std::env::set_var(ENV_NS, &ns_val);
     }
 
     let mut env_pairs: Vec<(String, String)> = std::env::vars().collect();
-    env_pairs.retain(|(k, _)| k != ENV_PROFILE && k != ENV_NS);
+    env_pairs.retain(|(k, _)| k != ENV_CONTAINER && k != ENV_PROFILE && k != ENV_NS);
+    env_pairs.push((ENV_CONTAINER.to_string(), container_val));
     env_pairs.push((ENV_PROFILE.to_string(), profile_val));
     env_pairs.push((ENV_NS.to_string(), ns_val));
     let env_c: Vec<std::ffi::CString> = env_pairs
@@ -2184,9 +2573,23 @@ fn spawn_daemon_process(
         .map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    let (stdout_r, stdout_w) = pipe()?;
+    let (stderr_r, stderr_w) = pipe()?;
+
     let clone = nsproxy_core::sys::clone3::<false>(false, false)?;
     match &clone {
         Clone3Result::IsChild { .. } => {
+            let _ = nix::unistd::close(stdout_r);
+            let _ = nix::unistd::close(stderr_r);
+            let _ = dup2(stdout_w, 1);
+            let _ = dup2(stderr_w, 2);
+            let _ = nix::unistd::close(stdout_w);
+            let _ = nix::unistd::close(stderr_w);
+
+            if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+            }
+
             if !args.gids.is_empty() {
                 setgroups(
                     &args
@@ -2219,10 +2622,13 @@ fn spawn_daemon_process(
                 }
             }
         }
-        Clone3Result::Parent { .. } => {}
+        Clone3Result::Parent { .. } => {
+            let _ = nix::unistd::close(stdout_w);
+            let _ = nix::unistd::close(stderr_w);
+        }
     }
 
-    Ok(clone)
+    Ok((clone, stdout_r, stderr_r))
 }
 
 fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {

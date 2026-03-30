@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
+use std::{fs::File, io::{BufRead, BufReader}};
 
 use anyhow::{Context, Result};
 use diag::summary::DiagAccumulator;
@@ -11,6 +12,7 @@ use diag::{ControlCommand, DiagEvent, DiagEventStream, LogEntry};
 use libc;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{execve, fork, ForkResult, Pid};
+use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::state_paths;
 use nsproxy_common::stats::ProxyStats;
@@ -57,6 +59,13 @@ pub enum LogSource {
     Pid(u32),
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NamespaceIndicator {
+    pub mnt: Option<String>,
+    pub net: Option<String>,
+    pub pid: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ContainerState {
     pub process_list_snapshot: Option<diag::ProcessListSnapshot>,
@@ -86,6 +95,8 @@ pub struct ContainerState {
     #[serde(skip)]
     pub template_value: serde_json::Value,
     pub ns_alive: Option<NsAlive>,
+    pub up_ns: Option<NamespaceIndicator>,
+    pub keeper_ns: Option<NamespaceIndicator>,
     /// Logs from the `sp up` process (forwarded via up-daemon log protocol, or converted from
     /// stdout capture while that transition is in progress).
     #[serde(skip)]
@@ -105,12 +116,24 @@ pub struct ContainerState {
     /// Built in `emit_snapshot`; used directly by the log panel render.
     #[serde(skip)]
     pub merged_logs: Vec<Arc<LogEntryOf>>,
+    /// Raw stdout/stderr captured from managed processes, keyed by slot PID.
+    #[serde(skip)]
+    pub process_raw_logs: HashMap<u32, Vec<diag::RawLog>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SupervisorSnapshot {
     pub profiles: BTreeMap<ContainerName, ContainerState>,
+    pub ui_ns: NamespaceIndicator,
+    pub auto_open_logs_target: Option<AutoOpenLogsTarget>,
     pub generated_at: SystemTime,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AutoOpenLogsTarget {
+    pub profile: ContainerName,
+    pub pid: u32,
+    pub token: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +190,7 @@ pub enum SupervisorCommand {
     },
     StartDaemon {
         profile: ContainerName,
-        args: ShellArgs,
+        args: diag::SpawnArgs,
     },
     StopContainer {
         profile: ContainerName,
@@ -178,6 +201,13 @@ pub enum SupervisorCommand {
     KillManagedProcess {
         profile: ContainerName,
         pid: u32,
+    },
+    /// Request the most-recent raw stdout/stderr lines for a managed process.
+    /// The response is stored in `ContainerState::process_raw_logs[pid]`.
+    QueryRawLogs {
+        profile: ContainerName,
+        pid: u32,
+        limit: usize,
     },
     StartHotconfigDaemons {
         profile: ContainerName,
@@ -192,6 +222,7 @@ pub enum SupervisorCommand {
     ReloadProfile(ContainerName),
     LoadProfile(ContainerName),
     LoadProfiles(Vec<ContainerName>),
+    RefreshNamespaces,
 
     Init,
     OnTabOpen {
@@ -211,6 +242,8 @@ impl SupervisorHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(SupervisorSnapshot {
             profiles: BTreeMap::new(),
+            ui_ns: NamespaceIndicator::default(),
+            auto_open_logs_target: None,
             generated_at: SystemTime::now(),
         });
 
@@ -334,6 +367,12 @@ impl Default for DiagState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProfileNamespaceState {
+    up: Option<NamespaceIndicator>,
+    keeper: Option<NamespaceIndicator>,
+}
+
 fn command_name(cmd: &SupervisorCommand) -> &'static str {
     match cmd {
         SupervisorCommand::StartUp { .. } => "StartUp",
@@ -343,12 +382,14 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StopContainer { .. } => "StopContainer",
         SupervisorCommand::KillContainer { .. } => "KillContainer",
         SupervisorCommand::KillManagedProcess { .. } => "KillManagedProcess",
+        SupervisorCommand::QueryRawLogs { .. } => "QueryRawLogs",
         SupervisorCommand::StartHotconfigDaemons { .. } => "StartHotconfigDaemons",
         SupervisorCommand::Ctrl { .. } => "Ctrl",
         SupervisorCommand::ReloadHotconfig(_) => "ReloadHotconfig",
         SupervisorCommand::ReloadProfile(_) => "ReloadProfile",
         SupervisorCommand::LoadProfile(_) => "LoadProfile",
         SupervisorCommand::LoadProfiles(_) => "LoadProfiles",
+        SupervisorCommand::RefreshNamespaces => "RefreshNamespaces",
         SupervisorCommand::Init => "Init",
         SupervisorCommand::OnTabOpen { .. } => "OnTabOpen",
     }
@@ -368,8 +409,9 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::OnTabOpen { profile, .. } => Some(profile.as_str()),
         SupervisorCommand::StartDaemon { profile, .. }
         | SupervisorCommand::KillManagedProcess { profile, .. }
+        | SupervisorCommand::QueryRawLogs { profile, .. }
         | SupervisorCommand::Ctrl { profile, .. } => Some(profile.as_str()),
-        SupervisorCommand::LoadProfiles(_) | SupervisorCommand::Init => None,
+        SupervisorCommand::LoadProfiles(_) | SupervisorCommand::RefreshNamespaces | SupervisorCommand::Init => None,
     }
 }
 
@@ -383,6 +425,7 @@ fn daemon_event_name(event: &diag::DaemonEvent) -> &'static str {
         diag::DaemonEvent::Stopping => "Stopping",
         diag::DaemonEvent::Log(_) => "Log",
         diag::DaemonEvent::RecentLogs(_) => "RecentLogs",
+        diag::DaemonEvent::RawLogs { .. } => "RawLogs",
     }
 }
 
@@ -434,6 +477,19 @@ struct Supervisor {
     config_cache: HashMap<ContainerName, CachedProfileConfig>,
     /// Cached full NsAlive per profile; refreshed in refresh_profile_status_inner.
     ns_alive_cache: HashMap<ContainerName, NsAlive>,
+    /// Cached namespace indicators per profile; refreshed in refresh_profile_status_inner.
+    profile_ns_cache: HashMap<ContainerName, ProfileNamespaceState>,
+    /// Cached namespace indicators for the UI process itself.
+    ui_ns_cache: NamespaceIndicator,
+    /// Per-process raw stdout/stderr log ring (profile -> pid -> lines).
+    process_raw_logs: HashMap<ContainerName, HashMap<u32, Vec<diag::RawLog>>>,
+    /// Baseline slot PID set captured when the UI requests StartDaemon.
+    /// Used on the actor thread to detect newly spawned process slots.
+    pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
+    /// Last computed "open raw logs for this process" target sent to UI.
+    auto_open_logs_target: Option<AutoOpenLogsTarget>,
+    /// Monotonic token for auto-open targets so UI can consume each target once.
+    auto_open_logs_token: u64,
     /// Path to the UI-side control socket.  Spawned processes connect here.
     control_sock_path: PathBuf,
     /// Wall-clock time recorded immediately after successfully forking `sp up`.
@@ -474,6 +530,12 @@ impl Supervisor {
             diag_attempt: HashMap::new(),
             config_cache: HashMap::new(),
             ns_alive_cache: HashMap::new(),
+            profile_ns_cache: HashMap::new(),
+            ui_ns_cache: probe_namespace_indicator(std::process::id() as i32).unwrap_or_default(),
+            process_raw_logs: HashMap::new(),
+            pending_auto_open_logs: HashMap::new(),
+            auto_open_logs_target: None,
+            auto_open_logs_token: 0,
             control_sock_path,
             up_start_time: HashMap::new(),
         }
@@ -613,10 +675,22 @@ impl Supervisor {
                     },
                 );
                 match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
-                    Ok(_pid) => {
+                    Ok(spawned) => {
+                        spawn_bootstrap_log_reader(
+                            profile.clone(),
+                            BootstrapLogStream::Stdout,
+                            spawned.stdout_r,
+                            self.event_tx.clone(),
+                        );
+                        spawn_bootstrap_log_reader(
+                            profile.clone(),
+                            BootstrapLogStream::Stderr,
+                            spawned.stderr_r,
+                            self.event_tx.clone(),
+                        );
                         // Record the spawn wall-clock time for PID-reuse detection in up_pid_alive.
                         self.up_start_time.insert(profile.clone(), SystemTime::now());
-                        info!(profile = profile.as_str(), "spawned sp up process");
+                        info!(profile = profile.as_str(), pid = spawned.pid.as_raw(), "spawned sp up process");
                     }
                     Err(err) => {
                         self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
@@ -662,7 +736,10 @@ impl Supervisor {
                     Ok(cli_bincode) => {
                         if let Some(tx) = self.up_cmd.get(&profile) {
                             info!(profile = profile.as_str(), bytes = cli_bincode.len(), "sending SpawnCli to up daemon");
-                            let _ = tx.send(diag::DaemonRequest::SpawnCli { cli_bincode });
+                            let _ = tx.send(diag::DaemonRequest::SpawnCli {
+                                cli_bincode,
+                                ns: diag::NamespaceSpawn::Outside,
+                            });
                         }
                     }
                     Err(err) => warn!("failed to serialize serve cli for {}: {err}", profile),
@@ -681,29 +758,19 @@ impl Supervisor {
                 self.refresh_profile_status(&profile);
             }
             SupervisorCommand::StartDaemon { profile, args } => {
-                info!(profile = profile.as_str(), shell = ?args.shell, cwd = ?args.cwd, argc = args.args.len(), "starting managed daemon");
+                info!(profile = profile.as_str(), exec = ?args.exec, cwd = ?args.cwd, argc = args.args.len(), "starting managed daemon");
                 self.known_profiles.insert(profile.clone());
+                let existing_slots = self
+                    .process_list_snapshot
+                    .get(&profile)
+                    .map(|snap| snap.procs.keys().copied().collect::<HashSet<u32>>())
+                    .unwrap_or_default();
+                self.pending_auto_open_logs
+                    .insert(profile.clone(), existing_slots);
                 self.ensure_up_client(&profile);
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let exec_resolved = if let Some(name) = &args.shell {
-                        match which::which(name) {
-                            Ok(p) => Some(p.to_string_lossy().to_string()),
-                            Err(_) => Some(name.clone()),
-                        }
-                    } else {
-                        None
-                    };
-
-                    let spawn_args = diag::SpawnArgs {
-                        uid: args.uid,
-                        gid: args.gid,
-                        exec: exec_resolved,
-                        cwd: args.cwd,
-                        gids: args.gids,
-                        args: args.args,
-                    };
-                    info!(profile = profile.as_str(), exec = ?spawn_args.exec, argc = spawn_args.args.len(), "sending Spawn request to up daemon");
-                    let _ = tx.send(diag::DaemonRequest::Spawn { args: spawn_args });
+                    info!(profile = profile.as_str(), exec = ?args.exec, argc = args.args.len(), "sending Spawn request to up daemon");
+                    let _ = tx.send(diag::DaemonRequest::Spawn { args });
                 }
             }
             SupervisorCommand::StopContainer { profile } => {
@@ -848,6 +915,11 @@ impl Supervisor {
                 }
                 self.refresh_profile_status(&profile);
             }
+            SupervisorCommand::QueryRawLogs { profile, pid, limit } => {
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::QueryRawLogs { pid, limit });
+                }
+            }
             SupervisorCommand::StartHotconfigDaemons { profile } => {
                 info!(profile = profile.as_str(), "starting hotconfig daemons");
                 self.spawn_hotconfig_daemons(&profile);
@@ -880,6 +952,14 @@ impl Supervisor {
                     self.known_profiles.insert(profile.clone());
                     self.refresh_config_cache(&profile);
                     self.refresh_profile_status(&profile);
+                }
+            }
+            SupervisorCommand::RefreshNamespaces => {
+                self.ui_ns_cache = probe_namespace_indicator(std::process::id() as i32)
+                    .unwrap_or_default();
+                let profiles: Vec<_> = self.known_profiles.iter().cloned().collect();
+                for profile in profiles {
+                    self.refresh_profile_state_only(&profile);
                 }
             }
             SupervisorCommand::Init => {
@@ -950,7 +1030,7 @@ impl Supervisor {
     }
 
     fn refresh_profile_status_inner(&mut self, profile: &ContainerName, rearm_clients: bool) {
-        let had_up_client = self.up_cmd.contains_key(profile);
+        let _had_up_client = self.up_cmd.contains_key(profile);
         let up_connection_state = self
             .up_connection
             .get(profile)
@@ -1004,10 +1084,27 @@ impl Supervisor {
             },
         );
 
+        let up_ns = up_pid.and_then(probe_namespace_indicator);
+        let keeper_ns = child_pid.and_then(probe_namespace_indicator);
+        if up_ns.is_some() || keeper_ns.is_some() {
+            self.profile_ns_cache.insert(
+                profile.clone(),
+                ProfileNamespaceState {
+                    up: up_ns,
+                    keeper: keeper_ns,
+                },
+            );
+        } else {
+            self.profile_ns_cache.remove(profile);
+        }
+
         let start_in_flight = matches!(
             self.container_lifecycle(profile),
             ContainerLifecycleState::Starting
-        ) && (had_up_client || up_connection_state == ConnectionState::Connecting);
+        ) && matches!(
+            up_connection_state,
+            ConnectionState::Connecting | ConnectionState::Connected
+        );
         self.reconcile_container_lifecycle(profile, child_alive, start_in_flight);
 
         if !child_alive {
@@ -1161,6 +1258,11 @@ impl Supervisor {
                     let buf = self.up_logs.entry(profile.clone()).or_default();
                     buf.clear();
                     buf.extend(entries);
+                } else if let diag::DaemonEvent::RawLogs { pid, logs } = event {
+                    self.process_raw_logs
+                        .entry(profile.clone())
+                        .or_default()
+                        .insert(pid, logs);
                 } else if let diag::DaemonEvent::ProcessListSnapshot(snapshot) = event {
                     if let Some(status) = self.ns_alive_status.get_mut(&profile) {
                         // `snapshot.serve` is the PID of the sp-serve process (0 = none).
@@ -1201,6 +1303,30 @@ impl Supervisor {
                             );
                         }
                     }
+                    if let Some(existing_slots) = self.pending_auto_open_logs.get(&profile) {
+                        let newest_spawned = snapshot
+                            .procs
+                            .iter()
+                            .filter(|(pid, _)| !existing_slots.contains(pid))
+                            .max_by_key(|(_, entry)| {
+                                entry
+                                    .spawned_at
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_micros())
+                                    .unwrap_or(0)
+                            })
+                            .map(|(pid, _)| *pid);
+                        if let Some(pid) = newest_spawned {
+                            self.auto_open_logs_token = self.auto_open_logs_token.saturating_add(1);
+                            self.auto_open_logs_target = Some(AutoOpenLogsTarget {
+                                profile: profile.clone(),
+                                pid,
+                                token: self.auto_open_logs_token,
+                            });
+                            self.pending_auto_open_logs.remove(&profile);
+                        }
+                    }
+
                     self.process_list_snapshot.insert(profile, snapshot);
                 }
             }
@@ -1258,6 +1384,34 @@ impl Supervisor {
                         },
                     );
                     self.refresh_profile_status(&profile);
+                }
+            }
+            SupervisorEvent::BootstrapUpLog {
+                profile,
+                stream,
+                line,
+            } => {
+                // Only keep bootstrap stdio while the up socket is not connected yet.
+                // Once connected, authoritative daemon logs arrive via DaemonEvent::Log.
+                let connected = self
+                    .up_connection
+                    .get(&profile)
+                    .is_some_and(|s| s.state == ConnectionState::Connected);
+                if !connected {
+                    let level = match stream {
+                        BootstrapLogStream::Stdout => "INFO",
+                        BootstrapLogStream::Stderr => "WARN",
+                    };
+                    push_up_log(
+                        &mut self.up_logs,
+                        &profile,
+                        diag::LogEntry {
+                            ts: diag::Timestamp::now(),
+                            level: level.to_string(),
+                            target: "sp-up-bootstrap".to_string(),
+                            message: line,
+                        },
+                    );
                 }
             }
         }
@@ -1465,6 +1619,7 @@ impl Supervisor {
                         cwd: args.cwd,
                         gids: args.gids,
                         args: args.args,
+                        ns: diag::NamespaceSpawn::Inside,
                     };
                     let _ = tx.send(diag::DaemonRequest::Spawn { args: spawn_args });
                 }
@@ -1540,6 +1695,14 @@ impl Supervisor {
                     hotconfig_value,
                     template_value,
                     ns_alive,
+                    up_ns: self
+                        .profile_ns_cache
+                        .get(profile)
+                        .and_then(|v| v.up.clone()),
+                    keeper_ns: self
+                        .profile_ns_cache
+                        .get(profile)
+                        .and_then(|v| v.keeper.clone()),
                     up_logs: self
                         .up_logs
                         .get(profile)
@@ -1560,12 +1723,19 @@ impl Supervisor {
                         let sl = diag.map(|d| &d.serve_logs).unwrap_or(&empty_vd);
                         build_merged_logs(ul, sl)
                     },
+                    process_raw_logs: self
+                        .process_raw_logs
+                        .get(profile)
+                        .cloned()
+                        .unwrap_or_default(),
                 },
             );
         }
 
         let _ = self.snapshot_tx.send(SupervisorSnapshot {
             profiles,
+            ui_ns: self.ui_ns_cache.clone(),
+            auto_open_logs_target: self.auto_open_logs_target.clone(),
             generated_at: SystemTime::now(),
         });
         let elapsed = started.elapsed();
@@ -1622,6 +1792,19 @@ enum SupervisorEvent {
     UpDaemonExited {
         profile: ContainerName,
     },
+    /// Bootstrap stderr/stdout captured directly from spawned `sp up` before
+    /// the up-daemon socket stream is connected.
+    BootstrapUpLog {
+        profile: ContainerName,
+        stream: BootstrapLogStream,
+        line: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BootstrapLogStream {
+    Stdout,
+    Stderr,
 }
 
 /// Timestamp-based exponential backoff for connection retry loops.
@@ -2222,28 +2405,56 @@ fn default_nsproxy_path() -> PathBuf {
     PathBuf::from("nsproxy")
 }
 
-fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<Pid> {
+
+/// Direct spawning by UI
+struct SpawnedCli {
+    pid: Pid,
+    stdout_r: i32,
+    stderr_r: i32,
+}
+
+/// Direct spawning by UI
+fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<SpawnedCli> {
     let fd_file = cli_to_inheritable_fd(cli)?;
     let fd = fd_file.as_raw_fd();
 
+    let mut stdout_pipe = [0; 2];
+    let mut stderr_pipe = [0; 2];
+    unsafe {
+        if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if libc::pipe(stderr_pipe.as_mut_ptr()) != 0 {
+            libc::close(stdout_pipe[0]);
+            libc::close(stdout_pipe[1]);
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+
     match unsafe { fork()? } {
-        ForkResult::Parent { child } => Ok(child),
+        ForkResult::Parent { child } => {
+            unsafe {
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[1]);
+            }
+            Ok(SpawnedCli {
+                pid: child,
+                stdout_r: stdout_pipe[0],
+                stderr_r: stderr_pipe[0],
+            })
+        }
         ForkResult::Child => {
+            unsafe {
+                libc::close(stdout_pipe[0]);
+                libc::close(stderr_pipe[0]);
+            }
             let _ = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
             let _ = unsafe { libc::setsid() };
-            // Detach from the UI's stdout/stderr so child tracing output does not
-            // bleed into the terminal.  Logging reaches the UI exclusively through
-            // the up-daemon socket (DaemonEvent::Log) and the diag socket (DiagEvent::Log).
             unsafe {
-                let devnull = libc::open(
-                    b"/dev/null\0".as_ptr() as *const libc::c_char,
-                    libc::O_WRONLY,
-                );
-                if devnull >= 0 {
-                    libc::dup2(devnull, libc::STDOUT_FILENO);
-                    libc::dup2(devnull, libc::STDERR_FILENO);
-                    libc::close(devnull);
-                }
+                libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
+                libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[1]);
             }
             let fd_str = fd.to_string();
             let argv = [to_cstr(path.to_string_lossy().as_ref()), to_cstr(&fd_str)];
@@ -2259,6 +2470,44 @@ fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<Pid> {
             std::process::exit(127);
         }
     }
+}
+
+fn spawn_bootstrap_log_reader(
+    profile: ContainerName,
+    stream: BootstrapLogStream,
+    fd: i32,
+    event_tx: mpsc::UnboundedSender<SupervisorEvent>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let msg = line.trim_end_matches(['\r', '\n']).to_string();
+                    if msg.is_empty() {
+                        continue;
+                    }
+                    let _ = event_tx.send(SupervisorEvent::BootstrapUpLog {
+                        profile: profile.clone(),
+                        stream,
+                        line: msg,
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(SupervisorEvent::BootstrapUpLog {
+                        profile: profile.clone(),
+                        stream,
+                        line: format!("bootstrap log read error: {err}"),
+                    });
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn load_hotconfig_daemons(profile: &str) -> Result<Vec<ShellArgs>> {
@@ -2288,6 +2537,20 @@ fn load_hotconfig_from_disk(profile: &ContainerName) -> Option<HotConfig> {
 
 fn pid_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn probe_namespace_indicator(pid: i32) -> Option<NamespaceIndicator> {
+    let mnt = ExactNS::from_source((PidPath::N(pid), "mnt")).ok();
+    let net = ExactNS::from_source((PidPath::N(pid), "net")).ok();
+    let pid_ns = ExactNS::from_source((PidPath::N(pid), "pid")).ok();
+    if mnt.is_none() && net.is_none() && pid_ns.is_none() {
+        return None;
+    }
+    Some(NamespaceIndicator {
+        mnt: mnt.map(|v| format!("{}", v.unique)),
+        net: net.map(|v| format!("{}", v.unique)),
+        pid: pid_ns.map(|v| format!("{}", v.unique)),
+    })
 }
 
 /// Read the wall-clock start time of a process by parsing `/proc/{pid}/stat` and

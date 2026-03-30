@@ -1010,6 +1010,17 @@ pub struct SpawnArgs {
     pub cwd: Option<PathBuf>,
     pub gids: Vec<u32>,
     pub args: Vec<String>,
+    pub ns: NamespaceSpawn,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub enum NamespaceSpawn {
+    /// The namespace of parent process of a container `sp up` daemon
+    #[default]
+    Outside,
+    /// Inside the associated container. Enters all associated kernel namespaces.
+    Inside,
+    // Other namespaces are currently not supported.
 }
 
 impl SpawnArgs {
@@ -1020,6 +1031,26 @@ impl SpawnArgs {
     pub fn shell_cwd_hint(&self) -> Option<PathBuf> {
         self.cwd.clone()
     }
+}
+
+// ── Per-process stdout/stderr capture ────────────────────────────────
+
+/// Maximum number of raw log lines retained per managed process.
+pub const RAW_LOG_RING_CAP: usize = 2000;
+
+/// Which output stream a captured line originated from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawLogKind {
+    Stdout,
+    Stderr,
+}
+
+/// A single line of raw stdout/stderr output from a managed process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawLog {
+    pub ts: Timestamp,
+    pub kind: RawLogKind,
+    pub content: String,
 }
 
 // ── `sp up` daemon protocol (controller ↔ parent process) ───────────
@@ -1035,6 +1066,7 @@ pub enum DaemonRequest {
     /// The receiver should pass it via inheritable fd and invoke `sp <fd>`.
     SpawnCli {
         cli_bincode: Vec<u8>,
+        ns: NamespaceSpawn,
     },
     /// Request current process list snapshot
     GetProcessList,
@@ -1048,6 +1080,9 @@ pub enum DaemonRequest {
     /// Request the most-recent `limit` log entries from the up-daemon ring buffer.
     /// The server responds immediately with `DaemonEvent::RecentLogs`.
     QueryRecentLogs { limit: usize },
+    /// Request the most-recent `limit` raw stdout/stderr lines captured from process `pid`.
+    /// The server responds immediately with `DaemonEvent::RawLogs`.
+    QueryRawLogs { pid: u32, limit: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1076,6 +1111,9 @@ pub enum DaemonEvent {
     /// Historical log entries from the up-daemon ring buffer.
     /// Sent in response to `DaemonRequest::QueryRecentLogs`.
     RecentLogs(Vec<LogEntry>),
+    /// Raw stdout/stderr lines captured from a managed process.
+    /// Sent in response to `DaemonRequest::QueryRawLogs`.
+    RawLogs { pid: u32, logs: Vec<RawLog> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

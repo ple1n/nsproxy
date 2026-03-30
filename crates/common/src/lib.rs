@@ -14,9 +14,10 @@ use std::str::FromStr;
 use std::sync::{LazyLock, RwLock};
 use std::{borrow::Cow, os::fd::AsRawFd, path::PathBuf};
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use anyhow::Result;
 use derive_new::new;
+use fs4::fs_std::FileExt;
 use fully_pub::fully_pub as public;
 use indexmap::{Equivalent, IndexMap};
 use libc::stat;
@@ -136,10 +137,18 @@ pub mod state_paths {
     pub fn pivot_root_dir(name: &str) -> PathBuf {
         PathBuf::from(format!("/tmp/nsproxy_{}", name))
     }
+
+    /// Global namespace registry path.
+    /// Returns /nsp3/namespaces.json
+    pub fn namespaces_registry() -> PathBuf {
+        persist_root().join("namespaces.json")
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct NsAlive {
+    #[serde(default)]
+    pub profile_name: Option<String>,
     pub browser_profile: Option<String>,
     pub bind_mount: PathBuf,
     /// keeper process within netns
@@ -149,6 +158,88 @@ pub struct NsAlive {
     /// sp up daemon, socket server
     #[serde(default)]
     pub up_pid: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ProfileNamespaces {
+    pub mnt: ExactNS,
+    pub net: ExactNS,
+    pub pid: ExactNS,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
+pub struct NamespacesRegistry {
+    #[serde(default)]
+    pub profiles: HashMap<String, ProfileNamespaces>,
+}
+
+impl NamespacesRegistry {
+    pub fn load_locked() -> Result<Self> {
+        let path = state_paths::namespaces_registry();
+        let lock = Self::open_lock_file()?;
+        lock.lock_shared()
+            .context("failed to acquire shared namespaces registry lock")?;
+        let registry = Self::read_or_default(&path)?;
+        Ok(registry)
+    }
+
+    pub fn update_locked<T>(update: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let path = state_paths::namespaces_registry();
+        let lock = Self::open_lock_file()?;
+        lock.lock_exclusive()
+            .context("failed to acquire exclusive namespaces registry lock")?;
+
+        let mut registry = Self::read_or_default(&path)?;
+        let result = update(&mut registry)?;
+        Self::write_atomic(&path, &registry)?;
+        Ok(result)
+    }
+
+    fn open_lock_file() -> Result<std::fs::File> {
+        let path = state_paths::namespaces_registry();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("failed to create namespaces state dir")?;
+        }
+
+        let lock_path = path.with_extension("json.lock");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .context("failed to open namespaces registry lock file")
+    }
+
+    fn read_or_default(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read namespaces registry from {:?}", path))?;
+        serde_json::from_str(&content).context("failed to parse namespaces registry json")
+    }
+
+    fn write_atomic(path: &Path, registry: &Self) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("failed to create namespaces state dir")?;
+        }
+
+        let tmp = path.with_extension("tmp");
+        let content = serde_json::to_string_pretty(registry)
+            .context("failed to serialize namespaces registry")?;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("failed to create temp namespaces file {:?}", tmp))?;
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())
+            .context("failed to write temp namespaces file")?;
+        file.sync_all()
+            .context("failed to sync temp namespaces file")?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to replace namespaces registry {:?}", path))?;
+        Ok(())
+    }
 }
 
 /// Represents an NS anchored to a process, or a file

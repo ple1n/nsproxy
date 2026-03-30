@@ -43,9 +43,8 @@ use tracing::info;
 use tracing::warn;
 use uzers::os::unix::UserExt;
 
-use std::{mem::size_of, os::fd::RawFd};
-use std::os::unix::fs::PermissionsExt; // for setting file modes
-
+use std::os::unix::fs::PermissionsExt;
+use std::{mem::size_of, os::fd::RawFd}; // for setting file modes
 
 use anyhow::Result;
 use nix::{
@@ -238,18 +237,108 @@ unsafe fn mount_setattr(
 
 /// Automatically removes dst if exists
 pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
-    warn!("bind mounting {:?} onto {:?}", source, dst);
-    if dst.exists() {
-        let _ = rm_mount(dst);
+    info!("mount_ns: begin source={:?} dst={:?}", source, dst);
+
+    let src_stat = nix::sys::stat::stat(source)
+        .map_err(|e| anyhow::anyhow!("mount_ns: source stat failed for {:?}: {}", source, e))?;
+    info!(
+        "mount_ns: source identity dev={} ino={}",
+        src_stat.st_dev, src_stat.st_ino
+    );
+
+    if let Ok(link) = std::fs::read_link(source) {
+        info!("mount_ns: source readlink={:?}", link);
     }
-    File::create(dst)?;
-    mount(
-        Some(source),
-        dst,
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )?;
+
+    if dst.exists() {
+        info!("mount_ns: destination exists before mount: {:?}", dst);
+        if let Err(e) = rm_mount(dst) {
+            warn!(
+                "mount_ns: rm_mount failed for {:?}: {} (continuing with fallback cleanup)",
+                dst, e
+            );
+        }
+        if dst.exists() {
+            warn!(
+                "mount_ns: destination still exists after rm_mount, trying remove_file {:?}",
+                dst
+            );
+            if let Err(e) = remove_file(dst) {
+                warn!("mount_ns: remove_file fallback failed for {:?}: {}", dst, e);
+            }
+        }
+    }
+
+    if let Some(parent) = dst.parent() {
+        create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "mount_ns: failed to create parent dir {:?} for {:?}: {}",
+                parent,
+                dst,
+                e
+            )
+        })?;
+    }
+
+    if !dst.exists() {
+        File::create(dst)
+            .map_err(|e| anyhow::anyhow!("mount_ns: failed to create {:?}: {}", dst, e))?;
+    }
+
+    warn!("bind mounting {:?} onto {:?}", source, dst);
+    mount(Some(source), dst, None::<&str>, MsFlags::MS_BIND, None::<&str>).map_err(|e| {
+        anyhow::anyhow!(
+            "mount_ns: bind mount failed source={:?} dst={:?}: {}",
+            source,
+            dst,
+            e
+        )
+    })?;
+
+    let dst_stat = nix::sys::stat::stat(dst)
+        .map_err(|e| anyhow::anyhow!("mount_ns: destination stat failed for {:?}: {}", dst, e))?;
+    info!(
+        "mount_ns: destination identity after mount dev={} ino={}",
+        dst_stat.st_dev, dst_stat.st_ino
+    );
+
+    match std::fs::read_link(dst) {
+        Ok(link) => info!("mount_ns: destination readlink={:?}", link),
+        Err(e) => info!(
+            "mount_ns: destination is not a symlink-like path ({}) - this can be normal for bind-mounted netns handles",
+            e
+        ),
+    }
+
+    let src_ns = ExactNS::from_source(source.to_path_buf()).map_err(|e| {
+        anyhow::anyhow!(
+            "mount_ns: failed to resolve source namespace identity {:?}: {}",
+            source,
+            e
+        )
+    })?;
+    let dst_ns = ExactNS::from_source(dst.to_path_buf()).map_err(|e| {
+        anyhow::anyhow!(
+            "mount_ns: failed to resolve destination namespace identity {:?}: {}",
+            dst,
+            e
+        )
+    })?;
+
+    if src_ns.unique != dst_ns.unique {
+        bail!(
+            "mount_ns: post-mount namespace mismatch source={:?}({}) dst={:?}({})",
+            source,
+            src_ns,
+            dst,
+            dst_ns
+        );
+    }
+
+    info!(
+        "mount_ns: verification ok; source and destination refer to the same namespace {}",
+        src_ns
+    );
 
     Ok(())
 }

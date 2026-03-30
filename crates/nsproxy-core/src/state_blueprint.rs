@@ -114,6 +114,7 @@ pub fn global_state_tree() -> StateNode {
         "nsp3",
         state_paths::persist_root(),
         vec![
+            StateNode::leaf("namespaces_registry", state_paths::namespaces_registry()),
             StateNode::leaf(
                 "wrapped_binaries",
                 state_paths::wrapped_binaries_config(),

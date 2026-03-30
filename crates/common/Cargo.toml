@@ -10,12 +10,14 @@ anyhow = "1.0.75"
 derivative = "2.2.0"
 derive-new = "0.6.0"
 fully_pub = "0.1.4"
+fs4 = { workspace = true }
 indexmap = "2.1.0"
 libc = "0.2.150"
 nix = { version = "0.27.1", features = ["sched", "net", "mount", "env", "hostname", "fs", "user"] }
 owo-colors = "3.5.0"
 pidfd = "0.2.4"
 serde = { version = "1.0.193", features = ["derive"] }
+serde_json = "1.0.149"
 thiserror = "1.0.50"
 tracing = "0.1.41"
 socks5-impl = { path = "../socks5-impl" }
@@ -24,5 +26,4 @@ hex = "0.4"
 rangemap = { version = "1", features = ["serde1"] }
 
 [dev-dependencies]
-serde_json = "1.0.149"
 rand = "0.8"

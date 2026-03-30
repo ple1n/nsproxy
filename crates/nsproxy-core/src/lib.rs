@@ -1564,6 +1564,8 @@ pub struct CliSpawnArgs {
     pub cwd: Option<PathBuf>,
     pub gids: Vec<u32>,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub ns: diag::NamespaceSpawn,
 }
 
 impl Default for CliSpawnArgs {
@@ -1575,6 +1577,7 @@ impl Default for CliSpawnArgs {
             cwd: None,
             gids: Vec::new(),
             args: Vec::new(),
+            ns: diag::NamespaceSpawn::Outside,
         }
     }
 }
@@ -1585,7 +1588,11 @@ pub enum CliDaemonRequest {
     Spawn { args: CliSpawnArgs },
     /// Provide a JSON `Cli` payload as text; it will be bincode-serialized
     /// and sent as the raw payload (converts to `DaemonRequest::SpawnCli`).
-    SpawnCli { cli_json: String },
+    SpawnCli {
+        cli_json: String,
+        #[serde(default)]
+        ns: diag::NamespaceSpawn,
+    },
     /// Liveness ping
     Ping,
     GetProcessList,
@@ -1756,6 +1763,7 @@ pub enum MainCommand {
     StateTree,
     /// Pivot-root sandbox: enters an existing namespace, builds a tmpfs pivot
     /// root from a profile's TemplateConfig, and watches HotConfig for changes.
+    /// Deprecated/Scheduled for refactor. This command currently runs a daemon which is bad.
     #[command(alias = "sb")]
     Sandbox {
         /// Profile name (must have been created with `profile` and brought up with `up`)

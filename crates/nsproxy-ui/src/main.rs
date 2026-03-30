@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use which;
 
 mod profile_loader;
 mod supervisor;
@@ -356,11 +357,25 @@ struct LoadResult {
     error: Option<String>,
 }
 
-#[derive(Default, Clone)]
-struct DaemonForm {
-    shell: String,
-    args: String,
-    cwd: String,
+#[derive(Clone)]
+struct RunCommandDraft {
+    command_line: String,
+    pending_spawn_args: Option<diag::SpawnArgs>,
+    parse_error: Option<String>,
+    status: Option<String>,
+    spawn_inside_container: bool,
+}
+
+impl Default for RunCommandDraft {
+    fn default() -> Self {
+        Self {
+            command_line: String::new(),
+            pending_spawn_args: None,
+            parse_error: None,
+            status: None,
+            spawn_inside_container: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -391,7 +406,7 @@ struct App {
     all_groups: HashSet<GroupId>,
     supervisor: SupervisorHandle,
     snapshot: supervisor::SupervisorSnapshot,
-    daemon_form: DaemonForm,
+    run_command: RunCommandDraft,
     hide_secret: bool,
     cover_text: String,
     tokio_rt: Option<Runtime>,
@@ -415,6 +430,13 @@ struct App {
     hotconfig_editor_status: Option<String>,
     selected_traffic_conn: Option<diag::ConnId>,
     traffic_subview: TrafficSubview,
+    /// Which process's raw logs are currently being inspected (profile, slot-pid).
+    selected_process_logs: Option<(ContainerName, u32)>,
+    /// Last consumed auto-open token from supervisor snapshots.
+    last_auto_open_logs_token: u64,
+    /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
+    selected_process_spawn_args: Option<(ContainerName, u32)>,
+    raw_log_show_details: bool,
     // Viewer sub-view state (ported from nsp-diag viewer.rs)
     viewer_ping_tx: flume::Sender<ViewerPingRequest>,
     viewer_dns_config: Arc<Mutex<String>>,
@@ -548,28 +570,41 @@ fn format_shell_args(args: &ShellArgs) -> String {
     }
 }
 
-fn build_shell_args(form: &DaemonForm) -> Option<ShellArgs> {
-    let shell = form.shell.trim();
-    if shell.is_empty() {
-        return None;
+fn parse_command_line_to_spawn_args(
+    command_line: &str,
+    spawn_inside_container: bool,
+) -> Result<diag::SpawnArgs, String> {
+    let trimmed = command_line.trim();
+    if trimmed.is_empty() {
+        return Err("command line is empty".to_string());
     }
-    let args = form
-        .args
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let cwd = form.cwd.trim();
-    Some(ShellArgs {
+    let tokens = shlex::split(trimmed)
+        .ok_or_else(|| "failed to parse command line (check quoting/escaping)".to_string())?;
+    if tokens.is_empty() {
+        return Err("command line did not produce any argv entries".to_string());
+    }
+    // Resolve exec using standard PATH lookup if not an absolute path
+    let exec_str = &tokens[0];
+    let exec_resolved = if std::path::Path::new(exec_str).is_absolute() {
+        exec_str.clone()
+    } else {
+        match which::which(exec_str) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => exec_str.clone(), // Fall back to original if not found in PATH
+        }
+    };
+    Ok(diag::SpawnArgs {
         uid: None,
         gid: None,
-        shell: Some(shell.to_string()),
-        cwd: if cwd.is_empty() {
-            None
-        } else {
-            Some(cwd.into())
-        },
+        exec: Some(exec_resolved),
+        cwd: None,
         gids: Vec::new(),
-        args,
+        args: tokens,
+        ns: if spawn_inside_container {
+            diag::NamespaceSpawn::Inside
+        } else {
+            diag::NamespaceSpawn::Outside
+        },
     })
 }
 
@@ -807,9 +842,11 @@ impl App {
             supervisor,
             snapshot: supervisor::SupervisorSnapshot {
                 profiles: BTreeMap::new(),
+                ui_ns: supervisor::NamespaceIndicator::default(),
+                auto_open_logs_target: None,
                 generated_at: SystemTime::now(),
             },
-            daemon_form: DaemonForm::default(),
+            run_command: RunCommandDraft::default(),
             hide_secret: false,
             cover_text: "redacted".to_string(),
             tokio_rt: Some(tokio_rt),
@@ -832,6 +869,10 @@ impl App {
             hotconfig_editor_status: None,
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
+            selected_process_logs: None,
+            last_auto_open_logs_token: 0,
+            selected_process_spawn_args: None,
+            raw_log_show_details: false,
             viewer_ping_tx,
             viewer_dns_config,
             viewer_ping_state,
@@ -2015,6 +2056,126 @@ impl App {
         changed
     }
 
+    fn render_spawn_args_gadget(
+        ui: &mut egui::Ui,
+        args: &mut diag::SpawnArgs,
+        id_prefix: &str,
+        read_only: bool,
+    ) -> bool {
+        let mut changed = false;
+        ui.group(|ui| {
+            ui.strong("SpawnArgs");
+
+            if read_only {
+                ui.label(format!("uid: {:?}", args.uid));
+                ui.label(format!("gid: {:?}", args.gid));
+                ui.label(format!("exec: {:?}", args.exec));
+                ui.label(format!("cwd: {:?}", args.cwd));
+                ui.label(format!("gids: {:?}", args.gids));
+                ui.label("argv:");
+                for (i, arg) in args.args.iter().enumerate() {
+                    ui.monospace(format!("  [{i}] {arg}"));
+                }
+                return;
+            }
+
+            if Self::render_optional_u32(ui, "uid", &mut args.uid) {
+                changed = true;
+            }
+            if Self::render_optional_u32(ui, "gid", &mut args.gid) {
+                changed = true;
+            }
+            if Self::render_optional_text(ui, "exec", &mut args.exec) {
+                changed = true;
+            }
+
+            let mut cwd_text = args
+                .cwd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                let mut enabled = args.cwd.is_some();
+                if ui.checkbox(&mut enabled, "cwd").changed() {
+                    changed = true;
+                    if enabled && args.cwd.is_none() {
+                        args.cwd = Some(std::path::PathBuf::from("/"));
+                        cwd_text = "/".to_string();
+                    }
+                    if !enabled {
+                        args.cwd = None;
+                    }
+                }
+                if enabled && ui.text_edit_singleline(&mut cwd_text).changed() {
+                    args.cwd = Some(std::path::PathBuf::from(cwd_text.clone()));
+                    changed = true;
+                }
+            });
+
+            let mut gids_csv = args
+                .gids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            ui.horizontal(|ui| {
+                ui.label("gids csv");
+                if ui.text_edit_singleline(&mut gids_csv).changed() {
+                    args.gids = gids_csv
+                        .split(',')
+                        .filter_map(|s| {
+                            let t = s.trim();
+                            if t.is_empty() {
+                                None
+                            } else {
+                                t.parse::<u32>().ok()
+                            }
+                        })
+                        .collect();
+                    changed = true;
+                }
+            });
+
+            ui.label("argv (args)");
+            let mut remove_ix: Option<usize> = None;
+            for i in 0..args.args.len() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("[{i}]"));
+                    if ui.text_edit_singleline(&mut args.args[i]).changed() {
+                        changed = true;
+                    }
+                    if ui.small_button("x").clicked() {
+                        remove_ix = Some(i);
+                    }
+                });
+            }
+            if let Some(ix) = remove_ix {
+                args.args.remove(ix);
+                changed = true;
+            }
+            if ui.button("+ Add arg").clicked() {
+                args.args.push(String::new());
+                changed = true;
+            }
+
+            if args.args.is_empty() {
+                ui.colored_label(
+                    Color32::from_rgb(220, 170, 90),
+                    "argv is empty; argv[0] is typically the executable name",
+                );
+            }
+
+            ui.push_id((id_prefix, "spawnargs-json"), |ui| {
+                if let Ok(json) = serde_json::to_string_pretty(args) {
+                    ui.collapsing("Raw JSON", |ui| {
+                        ui.monospace(json);
+                    });
+                }
+            });
+        });
+        changed
+    }
+
     fn render_template_form(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
 
@@ -2411,6 +2572,17 @@ impl eframe::App for App {
             self.snapshot = snapshot;
         }
         if drained_snapshots > 0 {
+            if let Some(target) = self.snapshot.auto_open_logs_target.as_ref() {
+                if target.token > self.last_auto_open_logs_token {
+                    self.selected_process_logs = Some((target.profile.clone(), target.pid));
+                    self.supervisor.send(SupervisorCommand::QueryRawLogs {
+                        profile: target.profile.clone(),
+                        pid: target.pid,
+                        limit: diag::RAW_LOG_RING_CAP,
+                    });
+                    self.last_auto_open_logs_token = target.token;
+                }
+            }
             info!(
                 frame = self.ui_frame_seq,
                 drained_snapshots,
@@ -2495,12 +2667,71 @@ impl eframe::App for App {
                     }
                 }
 
+                ui.add_space(2.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("namespaces")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    if ui
+                        .small_button("⟳")
+                        .on_hover_text("Refresh namespace view")
+                        .clicked()
+                    {
+                        self.supervisor
+                            .send(SupervisorCommand::RefreshNamespaces);
+                        ctx.request_repaint();
+                    }
+                });
+
+                let self_pid = std::process::id() as i32;
+                let self_text = format_namespace_indicator(&self.snapshot.ui_ns);
+                ui.small(format!("ui[{self_pid}] {self_text}"));
+
+                if let Some(profile_name) = &self.selected_profile {
+                    if let Some(profile_snapshot) = self.snapshot.profiles.get(profile_name) {
+                        let up_pid = profile_snapshot
+                            .ns_alive
+                            .as_ref()
+                            .and_then(|ns| ns.up_pid)
+                            .map(|p| p as i32);
+                        let child_pid = profile_snapshot
+                            .ns_alive
+                            .as_ref()
+                            .and_then(|ns| ns.child_pid)
+                            .map(|p| p as i32);
+
+                        if let Some(pid) = up_pid {
+                            let text = profile_snapshot
+                                .up_ns
+                                .as_ref()
+                                .map(format_namespace_indicator)
+                                .unwrap_or_else(|| "unavailable".to_string());
+                            ui.small(format!("up[{pid}] {text}"));
+                        }
+                        if let Some(pid) = child_pid {
+                            let text = profile_snapshot
+                                .keeper_ns
+                                .as_ref()
+                                .map(format_namespace_indicator)
+                                .unwrap_or_else(|| "unavailable".to_string());
+                            ui.small(format!("keeper[{pid}] {text}"));
+                        }
+                        if up_pid.is_none() && child_pid.is_none() {
+                            ui.small("selected profile has no live pid yet");
+                        }
+                    }
+                }
+
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let btn_label = if self.hide_secret {
-                        "🔓 Show secrets"
+                        "Show secrets"
                     } else {
-                        "🔒 Hide secrets"
+                        "Hide secrets"
                     };
                     if ui
                         .button(btn_label)
@@ -2631,14 +2862,18 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(6.0);
 
-            match self.right_tab {
-                RightTab::Proxies => self.render_proxies_tab(ui),
-                RightTab::Processes => self.render_processes_tab(ui),
-                RightTab::Traffic => self.render_traffic_tab(ui),
-                RightTab::Dns => self.render_dns_tab(ui),
-                RightTab::Hotconfig => self.render_hotconfig_tab(ui),
-                RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
-            }
+            let scroll_id = format!("right_tab_panel_scroll_{}", self.right_tab_label());
+            egui::ScrollArea::vertical()
+                .id_salt(scroll_id)
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.right_tab {
+                    RightTab::Proxies => self.render_proxies_tab(ui),
+                    RightTab::Processes => self.render_processes_tab(ui),
+                    RightTab::Traffic => self.render_traffic_tab(ui),
+                    RightTab::Dns => self.render_dns_tab(ui),
+                    RightTab::Hotconfig => self.render_hotconfig_tab(ui),
+                    RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
+                });
         });
 
         self.render_proxy_detail_window(ctx);
@@ -3175,16 +3410,19 @@ impl App {
         }
 
         ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
 
         self.render_units_table(ui, &profile_name);
 
+        if self.selected_process_spawn_args.is_some() {
+            self.render_process_spawn_args_panel(ui);
+        }
         if let Some(profile) = &profile_name {
             ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
             self.render_run_command_section(ui, profile);
+        }
+
+        if self.selected_process_logs.is_some() {
+            self.render_process_raw_logs_panel(ui);
         }
     }
 
@@ -3356,8 +3594,15 @@ impl App {
                 }
             }
 
-            let serve_subtitle =
-                if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
+            let serve_enabled = up_running
+                && matches!(
+                    container_lifecycle,
+                    supervisor::ContainerLifecycleState::Running
+                );
+
+            let serve_subtitle = if !serve_enabled {
+                "requires container up"
+            } else if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
                     "connecting"
                 } else if serve_running && serve_diag_connected {
                     "connected"
@@ -3371,8 +3616,9 @@ impl App {
             } else {
                 "Start TUN"
             };
-            let serve_color =
-                if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
+            let serve_color = if !serve_enabled {
+                egui::Color32::from_rgb(160, 80, 80)
+            } else if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
                     egui::Color32::from_rgb(200, 165, 90)
                 } else if serve_running && serve_diag_connected {
                     egui::Color32::from_rgb(120, 200, 140)
@@ -3392,8 +3638,10 @@ impl App {
             );
             if let Some(ref err) = diag_error {
                 serve_resp = serve_resp.on_hover_text(format!("diag: {err}"));
+            } else if !serve_enabled {
+                serve_resp = serve_resp.on_hover_text("Start Container first");
             }
-            if serve_resp.clicked() {
+            if serve_enabled && serve_resp.clicked() {
                 if serve_running {
                     info!(profile = profile_name.as_str(), "ui clicked Stop TUN");
                     self.supervisor.send(SupervisorCommand::StopServe {
@@ -3416,7 +3664,6 @@ impl App {
             .map(|p| p.merged_logs.as_slice())
             .unwrap_or(&[]);
 
-        let total_rows = entries.len();
         let cached_log = &mut self.cached_log;
 
         egui::Frame::none()
@@ -3425,22 +3672,20 @@ impl App {
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
-                let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_salt(format!("log_panel_{}", profile_name))
                     .max_height(500.0)
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
-                    .show_rows(ui, row_h, total_rows, |ui, row_range| {
-                        if total_rows == 0 {
+                    .show(ui, |ui| {
+                        if entries.is_empty() {
                             ui.colored_label(
                                 Color32::from_gray(110),
                                 "no logs yet — start the container to see output",
                             );
                             return;
                         }
-                        for i in row_range {
-                            let entry = &entries[i];
+                        for entry in entries {
                             let is_serve = matches!(entry.src, LogSource::Serve);
                             // Retrieve cached ANSI-parsed parts; compute and cache on miss.
                             let ansi_parts = if let Some(p) = cached_log.get(&entry.log.message) {
@@ -3477,6 +3722,65 @@ impl App {
                             });
                         }
                     });
+            });
+    }
+
+    fn render_process_spawn_args_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((profile, slot_pid)) = self.selected_process_spawn_args.clone() else {
+            return;
+        };
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.heading(format!("SpawnArgs — PID {slot_pid}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    self.selected_process_spawn_args = None;
+                }
+            });
+        });
+
+        let maybe_entry = self
+            .snapshot
+            .profiles
+            .get(&profile)
+            .and_then(|p| p.process_list_snapshot.as_ref())
+            .and_then(|snap| snap.procs.get(&slot_pid))
+            .cloned();
+
+        egui::Frame::none()
+            .fill(Color32::from_gray(16))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| match maybe_entry {
+                Some(entry) => match entry.meta {
+                    diag::SpawnedEntry::Args(mut args) => {
+                        Self::render_spawn_args_gadget(
+                            ui,
+                            &mut args,
+                            "process-inspect-spawnargs",
+                            true,
+                        );
+                    }
+                    diag::SpawnedEntry::Cli(cli_meta) => {
+                        ui.colored_label(
+                            Color32::from_rgb(220, 170, 90),
+                            "This unit was launched via SpawnCli payload.",
+                        );
+                        ui.label(format!(
+                            "cli_bincode bytes: {}  mode: {}",
+                            cli_meta.cli_bincode.len(),
+                            if cli_meta.is_serve {
+                                "serve"
+                            } else {
+                                "spawncli"
+                            }
+                        ));
+                    }
+                },
+                None => {
+                    ui.colored_label(Color32::from_gray(120), "process entry not found");
+                }
             });
     }
 
@@ -3519,6 +3823,8 @@ impl App {
 
         let now = std::time::SystemTime::now();
         let mut kill_request: Option<(ContainerName, u32)> = None;
+        let mut inspect_request: Option<(ContainerName, u32)> = None;
+        let mut logs_request: Option<(ContainerName, u32)> = None;
 
         TableBuilder::new(ui)
             .striped(true)
@@ -3530,6 +3836,9 @@ impl App {
             .column(Column::exact(42.0)) // UID
             .column(Column::auto()) // Spawned
             .column(Column::exact(46.0)) // Kill
+            .column(Column::exact(64.0)) // Inspect
+            .column(Column::exact(60.0)) // Logs
+            .column(Column::remainder()) // Fill remaining width
             .header(22.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("Profile");
@@ -3550,6 +3859,9 @@ impl App {
                     ui.strong("Spawned");
                 });
                 header.col(|ui| { /* Kill */ });
+                header.col(|ui| { /* Inspect */ });
+                header.col(|ui| { /* Logs */ });
+                header.col(|ui| { /* Fill */ });
             })
             .body(|mut body| {
                 for (row_profile, slot_pid, entry) in &rows {
@@ -3573,7 +3885,7 @@ impl App {
                                     ("stopping", Color32::from_rgb(220, 165, 60))
                                 }
                                 diag::ProcessStatus::Killed(_) => {
-                                    ("killed", Color32::from_rgb(200, 80, 80))
+                                    ("dead", Color32::from_rgb(200, 80, 80))
                                 }
                                 diag::ProcessStatus::Vacant => ("vacant", Color32::from_gray(130)),
                             };
@@ -3631,6 +3943,42 @@ impl App {
                                 }
                             }
                         });
+
+                        // Inspect button (SpawnArgs gadget)
+                        row.col(|ui| {
+                            let is_selected = self
+                                .selected_process_spawn_args
+                                .as_ref()
+                                .map(|(p, pid)| p == row_profile && *pid == *slot_pid)
+                                .unwrap_or(false);
+                            let btn_text = if is_selected { "Close" } else { "Inspect" };
+                            if ui.small_button(btn_text).clicked() {
+                                if is_selected {
+                                    self.selected_process_spawn_args = None;
+                                } else {
+                                    inspect_request = Some((row_profile.clone(), *slot_pid));
+                                }
+                            }
+                        });
+
+                        // Logs button
+                        row.col(|ui| {
+                            let is_selected = self
+                                .selected_process_logs
+                                .as_ref()
+                                .map(|(p, pid)| p == row_profile && *pid == *slot_pid)
+                                .unwrap_or(false);
+                            let btn_text = if is_selected { "Close" } else { "Logs" };
+                            if ui.small_button(btn_text).clicked() {
+                                if is_selected {
+                                    self.selected_process_logs = None;
+                                } else {
+                                    logs_request = Some((row_profile.clone(), *slot_pid));
+                                }
+                            }
+                        });
+
+                        row.col(|_ui| {});
                     });
                 }
             });
@@ -3639,6 +3987,105 @@ impl App {
             self.supervisor
                 .send(SupervisorCommand::KillManagedProcess { profile, pid });
         }
+        if let Some((profile, pid)) = inspect_request {
+            self.selected_process_spawn_args = Some((profile, pid));
+        }
+        if let Some((profile, pid)) = logs_request {
+            self.selected_process_logs = Some((profile.clone(), pid));
+            self.supervisor.send(SupervisorCommand::QueryRawLogs {
+                profile,
+                pid,
+                limit: diag::RAW_LOG_RING_CAP,
+            });
+        }
+    }
+
+    fn render_process_raw_logs_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((profile, slot_pid)) = self.selected_process_logs.clone() else {
+            return;
+        };
+
+        ui.add_space(8.0);
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.heading(format!("Output — PID {slot_pid}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    self.selected_process_logs = None;
+                    return;
+                }
+                if ui.small_button("Refresh").clicked() {
+                    self.supervisor.send(SupervisorCommand::QueryRawLogs {
+                        profile: profile.clone(),
+                        pid: slot_pid,
+                        limit: diag::RAW_LOG_RING_CAP,
+                    });
+                }
+                let details_label = if self.raw_log_show_details {
+                    "Hide details"
+                } else {
+                    "Details"
+                };
+                if ui.small_button(details_label).clicked() {
+                    self.raw_log_show_details = !self.raw_log_show_details;
+                }
+            });
+        });
+
+        let show_details = self.raw_log_show_details;
+        let logs: &[diag::RawLog] = self
+            .snapshot
+            .profiles
+            .get(&profile)
+            .and_then(|p| p.process_raw_logs.get(&slot_pid).map(Vec::as_slice))
+            .unwrap_or(&[]);
+
+        egui::Frame::none()
+            .fill(Color32::from_gray(15))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(55)))
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::Vec2::new(ui.available_width(), 200.0));
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let total = logs.len();
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("raw_logs_{}_{}", profile, slot_pid))
+                    .max_height(400.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show_rows(ui, row_h, total, |ui, row_range| {
+                        if total == 0 {
+                            ui.colored_label(
+                                Color32::from_gray(100),
+                                "no output captured yet — click Refresh",
+                            );
+                            return;
+                        }
+                        for i in row_range {
+                            let entry = &logs[i];
+                            ui.horizontal(|ui| {
+                                if show_details {
+                                    ui.colored_label(
+                                        Color32::from_gray(90),
+                                        format_timestamp_age(entry.ts),
+                                    );
+                                    // Stream badge
+                                    let (badge, badge_color) = match entry.kind {
+                                        diag::RawLogKind::Stdout => {
+                                            ("out", Color32::from_rgb(140, 200, 140))
+                                        }
+                                        diag::RawLogKind::Stderr => {
+                                            ("err", Color32::from_rgb(220, 130, 80))
+                                        }
+                                    };
+                                    ui.colored_label(badge_color, badge);
+                                };
+                                render_ansi_line(ui, &entry.content);
+                            });
+                        }
+                    });
+            });
     }
 
     fn render_run_command_section(&mut self, ui: &mut egui::Ui, profile: &ContainerName) {
@@ -3646,26 +4093,66 @@ impl App {
         ui.separator();
         ui.add_space(8.0);
 
-        ui.heading("Run Command");
         ui.horizontal(|ui| {
-            ui.label("Program");
-            ui.text_edit_singleline(&mut self.daemon_form.shell);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Args");
-            ui.text_edit_singleline(&mut self.daemon_form.args);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Cwd");
-            ui.text_edit_singleline(&mut self.daemon_form.cwd);
-        });
-        if ui.button("Start Command").clicked() {
-            if let Some(args) = build_shell_args(&self.daemon_form) {
-                self.supervisor.send(SupervisorCommand::StartDaemon {
-                    profile: profile.clone(),
-                    args,
-                });
+            ui.heading("Run Command (POSIX compatible command line)");
+            ui.add_space(10.0);
+            if ui.button("Run").clicked() {
+                if let Some(args) = self.run_command.pending_spawn_args.clone() {
+                    self.supervisor.send(SupervisorCommand::StartDaemon {
+                        profile: profile.clone(),
+                        args,
+                    });
+                    self.run_command.status = Some("Spawn request sent".to_string());
+                    self.run_command.pending_spawn_args = None;
+                    self.run_command.parse_error = None;
+                } else {
+                    match parse_command_line_to_spawn_args(
+                        &self.run_command.command_line,
+                        self.run_command.spawn_inside_container,
+                    ) {
+                        Ok(args) => {
+                            self.run_command.pending_spawn_args = Some(args);
+                            self.run_command.parse_error = None;
+                            self.run_command.status = Some(
+                                "Review parsed SpawnArgs, then click Run to confirm".to_string(),
+                            );
+                        }
+                        Err(err) => {
+                            self.run_command.parse_error = Some(err);
+                            self.run_command.status = None;
+                        }
+                    }
+                }
             }
+        });
+
+        let edited = ui
+            .text_edit_singleline(&mut self.run_command.command_line)
+            .changed();
+
+        let ns_toggled = ui
+            .checkbox(
+                &mut self.run_command.spawn_inside_container,
+                "Spawn inside container namespace",
+            )
+            .changed();
+
+        if edited || ns_toggled {
+            self.run_command.pending_spawn_args = None;
+            self.run_command.parse_error = None;
+            self.run_command.status = None;
+        }
+
+        if let Some(err) = self.run_command.parse_error.as_ref() {
+            ui.colored_label(Color32::LIGHT_RED, err);
+        }
+        if let Some(status) = self.run_command.status.as_ref() {
+            ui.colored_label(Color32::from_rgb(140, 190, 240), status);
+        }
+
+        if let Some(args) = self.run_command.pending_spawn_args.as_mut() {
+            ui.add_space(8.0);
+            Self::render_spawn_args_gadget(ui, args, "run-command-confirm-spawnargs", false);
         }
     }
 
@@ -4616,10 +5103,7 @@ impl App {
     }
 }
 
-/// Format a plot x-value as a human-readable age label.
-/// `x` is negative seconds relative to now: 0 = now, -3600 = 1 hour ago.
-fn format_age_label(x: f64, _window_secs: f64) -> String {
-    let age = (-x).max(0.0);
+fn format_relative_age_label(age: f64) -> String {
     if age < 15.0 {
         "now".to_string()
     } else if age < 90.0 {
@@ -4635,6 +5119,17 @@ fn format_age_label(x: f64, _window_secs: f64) -> String {
             format!("{:.1}h ago", h)
         }
     }
+}
+
+/// Format a plot x-value as a human-readable age label.
+/// `x` is negative seconds relative to now: 0 = now, -3600 = 1 hour ago.
+fn format_age_label(x: f64, _window_secs: f64) -> String {
+    format_relative_age_label((-x).max(0.0))
+}
+
+fn format_timestamp_age(ts: Timestamp) -> String {
+    let age = Timestamp::now().elapsed_since(ts).as_secs_f64();
+    format_relative_age_label(age)
 }
 
 /// Grid spacer for a 1-hour window: minor marks every 5 min, medium every 15 min, major every 30 min.
@@ -5434,6 +5929,13 @@ fn determine_byte_unit(max_bytes: f64) -> (f64, &'static str) {
     } else {
         (1024.0 * 1024.0 * 1024.0, "GB")
     }
+}
+
+fn format_namespace_indicator(ns: &supervisor::NamespaceIndicator) -> String {
+    let mnt = ns.mnt.as_deref().unwrap_or("?");
+    let net = ns.net.as_deref().unwrap_or("?");
+    let pid_ns = ns.pid.as_deref().unwrap_or("?");
+    format!("mnt={mnt} net={net} pid={pid_ns}")
 }
 
 /// Helper to draw a large rectangular selectable box used in the left sidebar.
