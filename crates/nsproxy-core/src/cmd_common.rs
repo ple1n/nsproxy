@@ -81,6 +81,7 @@ pub fn enter_ns(ns_alive: &NsAlive, fallback_netns: &Path) -> Result<()> {
 }
 
 pub fn apply_ns_env(shell: &mut ShellPrefs, ns_alive: &NsAlive) {
+    shell.set_container_env(ns_alive.profile_name.as_deref());
     shell.set_nsproxy_env(ns_alive.browser_profile.clone());
     shell.set_ns_env(Some(&ns_alive.bind_mount.to_string_lossy()));
 }

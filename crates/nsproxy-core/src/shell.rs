@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
 use crate::{
-    env::{CommandEnv, ENV_NS, ENV_PROFILE},
+    env::{CommandEnv, ENV_CONTAINER, ENV_NS, ENV_PROFILE},
     prelude::*,
     sys::{Clone3Result, NSEnter, clone3},
 };
@@ -148,6 +148,16 @@ impl ShellPrefs {
         }
         self.env
             .push_front(CString::from_str(&format!("{}={}", ENV_PROFILE, val)).unwrap());
+    }
+    pub fn set_container_env(&mut self, profile_name: Option<&str>) {
+        warn!("setting env variable for container profile {:?}", &profile_name);
+        let val = profile_name.unwrap_or("UNSPEC");
+        unsafe {
+            std::env::set_var(ENV_CONTAINER, val);
+        }
+        self.env.push_front(
+            CString::from_str(&format!("{}={}", ENV_CONTAINER, val)).unwrap(),
+        );
     }
     pub fn set_ns_env(&mut self, ns: Option<&str>) {
         warn!("setting env variable for netns {:?}", &ns);

@@ -127,6 +127,7 @@ impl<'a> ExactSizeIterator for CommandEnvs<'a> {
 }
 
 pub static ENV_PROFILE: &'static str = "NSPROXY_PROFILE_BROWSER";
+pub static ENV_CONTAINER: &'static str = "NSPROXY_PROFILE";
 pub static ENV_NSWRAP: &'static str = "NSWRAP";
 
 // For mounted paths
