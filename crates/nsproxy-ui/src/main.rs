@@ -3672,55 +3672,65 @@ impl App {
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
+                let row_h = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
+                let total = entries.len();
+
                 egui::ScrollArea::both()
                     .id_salt(format!("log_panel_{}", profile_name))
                     .max_height(500.0)
                     .auto_shrink([false, false])
-                    .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        if entries.is_empty() {
-                            ui.colored_label(
-                                Color32::from_gray(110),
-                                "no logs yet — start the container to see output",
-                            );
-                            return;
-                        }
-                        for entry in entries {
-                            let is_serve = matches!(entry.src, LogSource::Serve);
-                            // Retrieve cached ANSI-parsed parts; compute and cache on miss.
-                            let ansi_parts = if let Some(p) = cached_log.get(&entry.log.message) {
-                                p.clone()
-                            } else {
-                                let p = egui_sgr::ansi_to_rich_text(&entry.log.message);
-                                cached_log.insert(entry.log.message.clone(), p.clone());
-                                p
-                            };
-                            ui.horizontal(|ui| {
-                                let (badge_text, badge_color) = if is_serve {
-                                    ("serve", Color32::from_rgb(100, 180, 130))
-                                } else {
-                                    ("up", Color32::from_rgb(100, 150, 210))
-                                };
-                                ui.colored_label(badge_color, badge_text);
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("log_panel_rows_{}", profile_name))
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show_rows(ui, row_h, total, |ui, row_range| {
+                                if total == 0 {
+                                    ui.colored_label(
+                                        Color32::from_gray(110),
+                                        "no logs yet — start the container to see output",
+                                    );
+                                    return;
+                                }
+                                for i in row_range {
+                                    let entry = &entries[i];
+                                    let is_serve = matches!(entry.src, LogSource::Serve);
+                                    // Retrieve cached ANSI-parsed parts; compute and cache on miss.
+                                    cached_log
+                                        .entry(entry.log.message.clone())
+                                        .or_insert_with(|| {
+                                            egui_sgr::ansi_to_rich_text(&entry.log.message)
+                                        });
+                                    ui.horizontal(|ui| {
+                                        let (badge_text, badge_color) = if is_serve {
+                                            ("serve", Color32::from_rgb(100, 180, 130))
+                                        } else {
+                                            ("up", Color32::from_rgb(100, 150, 210))
+                                        };
+                                        ui.colored_label(badge_color, badge_text);
 
-                                let level_color = match entry.log.level.as_str() {
-                                    "ERROR" => Color32::from_rgb(220, 80, 80),
-                                    "WARN" => Color32::from_rgb(210, 160, 60),
-                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                    _ => Color32::from_gray(200),
-                                };
-                                ui.colored_label(level_color, &entry.log.level);
+                                        let level_color = match entry.log.level.as_str() {
+                                            "ERROR" => Color32::from_rgb(220, 80, 80),
+                                            "WARN" => Color32::from_rgb(210, 160, 60),
+                                            "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                            _ => Color32::from_gray(200),
+                                        };
+                                        ui.colored_label(level_color, &entry.log.level);
 
-                                ui.colored_label(
-                                    Color32::from_gray(100),
-                                    format!("[{}]", entry.log.target),
-                                );
+                                        ui.colored_label(
+                                            Color32::from_gray(100),
+                                            format!("[{}]", entry.log.target),
+                                        );
 
-                                for part in ansi_parts {
-                                    ui.label(part);
+                                        if let Some(ansi_parts) = cached_log.get(&entry.log.message)
+                                        {
+                                            for part in ansi_parts {
+                                                ui.label(part.clone());
+                                            }
+                                        }
+                                    });
                                 }
                             });
-                        }
                     });
             });
     }
@@ -4001,9 +4011,12 @@ impl App {
     }
 
     fn render_process_raw_logs_panel(&mut self, ui: &mut egui::Ui) {
-        let Some((profile, slot_pid)) = self.selected_process_logs.clone() else {
+        let Some((selected_profile, selected_slot_pid)) = self.selected_process_logs.as_ref()
+        else {
             return;
         };
+        let profile = selected_profile.clone();
+        let slot_pid = *selected_slot_pid;
 
         ui.add_space(8.0);
         ui.add_space(4.0);
@@ -4040,6 +4053,7 @@ impl App {
             .get(&profile)
             .and_then(|p| p.process_raw_logs.get(&slot_pid).map(Vec::as_slice))
             .unwrap_or(&[]);
+        let cached_log = &mut self.cached_log;
 
         egui::Frame::none()
             .fill(Color32::from_gray(15))
@@ -4081,7 +4095,14 @@ impl App {
                                     };
                                     ui.colored_label(badge_color, badge);
                                 };
-                                render_ansi_line(ui, &entry.content);
+                                cached_log
+                                    .entry(entry.content.clone())
+                                    .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.content));
+                                if let Some(ansi_parts) = cached_log.get(&entry.content) {
+                                    for part in ansi_parts {
+                                        ui.label(part.clone());
+                                    }
+                                }
                             });
                         }
                     });
