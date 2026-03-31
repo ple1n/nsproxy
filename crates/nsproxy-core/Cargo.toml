@@ -2,6 +2,13 @@
 name = "nsproxy-core"
 version = "3.4.0"
 edition = "2024"
+build = "build.rs"
+
+[build-dependencies]
+blake3 = "1.8"
+cargo_metadata = "0.18"
+cargo-lock = "10"
+walkdir = "2.5"
 
 [dependencies]
 anyhow = "1.0.99"
@@ -26,6 +33,7 @@ nix = { version = "0.27.1", features = [
     "user",
     "ioctl",
     "signal",
+    "term",
 ] }
 tracing = "0.1.41"
 libc = "0.2.175"
@@ -40,6 +48,7 @@ smol = "2.0.2"
 futures-lite = "2.6.1"
 futures_codec = "0.4.1"
 procfs = "=0.18.0"
+chrono = "0.4"
 clone3.path = "../clone3"
 passfd.workspace = true
 tracing-subscriber = "0.3.20"

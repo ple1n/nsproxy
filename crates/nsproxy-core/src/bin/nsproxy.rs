@@ -30,9 +30,11 @@ use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
 use nix::{
     mount::{MsFlags, mount as nix_mount},
+    pty::openpty,
     sched::{CloneFlags, unshare},
     unistd::{
         ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, getresuid, pipe,
+        setsid,
         setgroups, setresgid, setresuid,
     },
 };
@@ -110,6 +112,9 @@ use tun2socks5::{
     tun_rs::AsyncDevice,
 };
 
+const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
+const PTY_BROADCAST_CAP: usize = 128;
+
 fn main() -> anyhow::Result<()> {
     // Ignore SIGPIPE so logging to a closed pipe does not kill the daemon.
     unsafe {
@@ -135,6 +140,7 @@ fn main() -> anyhow::Result<()> {
         state_paths::set_persist_root(root.clone());
         info!("Using state root: {:?}", root);
     }
+    diag::set_protocol_version(nsproxy_core::build_identity());
     // DEBUG is annoying because its filled with TCP retransmission logs
     let (layer, reload_handle) = tracing_subscriber::reload::Layer::new(
         fmt::Layer::new()
@@ -954,7 +960,26 @@ fn main() -> anyhow::Result<()> {
                 info!("Hot config: {:?}", new_profile.hot);
             }
         }
-        MainCommand::Up { profile, cmd } => {
+        MainCommand::Up {
+            profile,
+            cmd,
+            simulate_protocol_no_upgrade,
+            simulate_conn_close,
+            simulate_slow_shutdown,
+        } => {
+            // Show build identity and human-readable build time early for diagnostics.
+            let build_hash = nsproxy_core::build_tree_hash();
+            let build_epoch = nsproxy_core::build_epoch_secs();
+            let human_time = chrono::NaiveDateTime::from_timestamp_opt(build_epoch as i64, 0)
+                .map(|dt: chrono::NaiveDateTime| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            warn!(
+                profile = profile.as_str(),
+                "sp up starting: build_hash={} build_time={} (epoch={})",
+                build_hash,
+                human_time,
+                build_epoch
+            );
             let profile_path = state_paths::profile_config(&profile);
             if !profile_path.exists() {
                 bail!(
@@ -996,11 +1021,17 @@ fn main() -> anyhow::Result<()> {
 
                 // Send over the profile's up.sock and print a single response if any.
                 let sock_path = diag::up_sock_path(&profile);
-                let mut stream = UnixStream::connect(&sock_path)?;
-                write_bincode_frame(&mut stream, &req)?;
-                if let Some(evt) = read_bincode_frame::<diag::DaemonEvent>(&mut stream)? {
-                    println!("{:?}", evt);
-                }
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let mut stream = diag::connect_up_daemon(&sock_path).await?;
+                    stream.send_unstable_request(&req).await?;
+                    if let Some(evt) = stream.next_event().await? {
+                        println!("{:?}", evt);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })?;
                 return Ok(());
             }
 
@@ -1010,34 +1041,84 @@ fn main() -> anyhow::Result<()> {
             }
 
             let ns_meta = state_paths::profile_ns_meta(&profile);
+            let mut upkeeper_pid: Option<u32> = None;
+            let mut existing_up_daemon_pid: Option<u32> = None;
             if ns_meta.exists() {
                 info!("Reading NS metadata from {:?}", &ns_meta);
-                if let Ok(content) = std::fs::read_to_string(&ns_meta) {
-                    if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
-                        if let Some(pid) = ns_alive.child_pid {
-                            let proc_path = PathBuf::from("/proc").join(pid.to_string());
-                            if proc_path.exists() {
-                                bail!("profile already up; pid {} is alive", pid);
-                            }
-                        }
+                warn!(
+                    profile = profile.as_str(),
+                    ns_meta = %ns_meta.display(),
+                    "up preflight: ns metadata present; evaluating existing daemon state"
+                );
+                if let Some(ns_alive) = read_ns_alive_opt(&ns_meta) {
+                    warn!(
+                        profile = profile.as_str(),
+                        up_pid = ?ns_alive.up_pid,
+                        child_pid = ?ns_alive.child_pid,
+                        "up preflight: loaded NsAlive metadata"
+                    );
+                    let alive_child = ns_alive.child_pid.filter(|pid| pid_is_alive(*pid));
+
+                    warn!(
+                        profile = profile.as_str(),
+                        alive_child = ?alive_child,
+                        "up preflight: probed live child pid"
+                    );
+
+                    if let Some(target_pid) = alive_child {
+                        upkeeper_pid = Some(target_pid);
+                        existing_up_daemon_pid = ns_alive.up_pid.filter(|pid| pid_is_alive(*pid));
+                        warn!(
+                            profile = profile.as_str(),
+                            target_pid,
+                            "up preflight: existing namespace detected; will use clone3 no-newns replacement path"
+                        );
                     }
                 }
             }
 
-            // Always enter as many namespaces as possible here, since other processes can enter less.
-            let clone = nsproxy_core::sys::clone3::<true>(true, true);
+            let clone = if upkeeper_pid.is_some() {
+                warn!(
+                    profile = profile.as_str(),
+                    target_pid = ?upkeeper_pid,
+                    "up startup: using clone3 without new namespaces; child will enter existing namespaces"
+                );
+                nsproxy_core::sys::clone3::<false>(false, false)
+            } else {
+                // Fresh profile start: create new mount/net namespaces.
+                nsproxy_core::sys::clone3::<true>(true, true)
+            };
             match clone {
                 Ok(clone) => match clone {
                     Clone3Result::IsChild { mut tx } => {
+                        if let Some(target_pid) = upkeeper_pid {
+                            warn!(
+                                profile = profile.as_str(),
+                                target_pid,
+                                "up child: entering existing namespaces"
+                            );
+                            enter_all_profile_namespaces_of_pid(target_pid)?;
+                        }
+
+                        // Signal to parent that child namespace context is ready to inspect.
+                        tx.write(&[1])?;
+
                         let mut buf = [0; 1];
                         enable_ping_all()?;
                         tx.read(&mut buf)?; // wait for bind mount
 
-                        // always done when there is new mount namespace
-                        mount_bind_root()?;
-                        // mounting DNS related things is also basic to either overlay or pivot sandbox
-                        mount_resolv_conf("100.68.0.2")?;
-                        mount_nsswitch_conf()?;
+                        if upkeeper_pid.is_none() {
+                            // always done when there is new mount namespace
+                            mount_bind_root()?;
+                            // mounting DNS related things is also basic to either overlay or pivot sandbox
+                            mount_resolv_conf("100.68.0.2")?;
+                            mount_nsswitch_conf()?;
+                        } else {
+                            warn!(
+                                profile = profile.as_str(),
+                                "up child: reusing existing namespace mounts; skip fresh namespace bootstrap mounts"
+                            );
+                        }
 
                         loop {
                             std::thread::park();
@@ -1046,6 +1127,9 @@ fn main() -> anyhow::Result<()> {
                     Clone3Result::Parent {
                         child_pid, mut tx, ..
                     } => {
+                        let mut ready = [0; 1];
+                        tx.read(&mut ready)?;
+
                         let parent_mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))?;
                         let parent_net = ExactNS::from_source((PidPath::Selfproc, "net"))?;
                         let parent_pid = ExactNS::from_source((PidPath::Selfproc, "pid"))?;
@@ -1098,12 +1182,59 @@ fn main() -> anyhow::Result<()> {
                         })?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
+                        if let Some(old_up_pid) = existing_up_daemon_pid.filter(|pid| pid_is_alive(*pid)) {
+                            warn!(
+                                profile = profile.as_str(),
+                                old_up_pid,
+                                "up replacement: new child keeper is ready; requesting graceful shutdown of old up daemon"
+                            );
+                            let sock_path = diag::up_sock_path(&profile);
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()?;
+                            rt.block_on(async {
+                                let mut stream = diag::connect_up_daemon_stable(&sock_path).await?;
+                                stream.send_stable_request(&diag::StableRequest::GracefulShutdown).await?;
+                                match tokio::time::timeout(Duration::from_secs(5), stream.next_event()).await {
+                                    Ok(Ok(Some(diag::UpWireEvent::Stable(diag::StableEvent::ShuttingDown))))
+                                    | Ok(Ok(Some(diag::UpWireEvent::Unstable(diag::DaemonEvent::Stopping))))
+                                    | Ok(Ok(None)) => Ok::<(), anyhow::Error>(()),
+                                    Ok(Ok(Some(diag::UpWireEvent::Stable(diag::StableEvent::Error { msg })))) => {
+                                        bail!("old up daemon returned error on graceful shutdown: {}", msg)
+                                    }
+                                    Ok(Ok(Some(diag::UpWireEvent::Unstable(diag::DaemonEvent::Error { msg })))) => {
+                                        bail!("old up daemon returned error on graceful shutdown: {}", msg)
+                                    }
+                                    Ok(Ok(Some(other))) => {
+                                        bail!("unexpected response from old up daemon: {:?}", other)
+                                    }
+                                    Ok(Err(e)) => Err(e.into()),
+                                    Err(_) => bail!(
+                                        "timed out waiting for graceful-shutdown acknowledgement from old up daemon"
+                                    ),
+                                }
+                            })?;
+                            warn!(
+                                profile = profile.as_str(),
+                                old_up_pid,
+                                "up replacement: old up daemon shutdown acknowledged"
+                            );
+                        }
+
                         tx.write(&[0])?;
 
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()?;
-                        rt.block_on(run_up_daemon(&profile, ns_meta, child_pid as u32, cli.control_socket.clone()))?;
+                        rt.block_on(run_up_daemon(
+                            &profile,
+                            ns_meta,
+                            child_pid as u32,
+                            cli.control_socket.clone(),
+                            simulate_protocol_no_upgrade,
+                            simulate_conn_close,
+                            simulate_slow_shutdown,
+                        ))?;
                         std::process::exit(0);
                     }
                 },
@@ -1338,7 +1469,11 @@ fn main() -> anyhow::Result<()> {
         MainCommand::StateTree => {
             let tree = nsproxy_core::state_blueprint::global_state_tree();
             println!("{}", tree.render_tree());
-        }
+        },
+        MainCommand::Version => {
+            println!("hash={}", nsproxy_core::build_tree_hash());
+            println!("epoch={}", nsproxy_core::build_epoch_secs());
+        },
         MainCommand::Uplink { kind } => cmd_uplink(kind)?,
         MainCommand::Sandbox { profile, sargs } => {
             // Pivot-root sandbox: enter an existing namespace, apply
@@ -2009,7 +2144,15 @@ where
 /// previous connection handler so the daemon is never stuck on a stale client.
 /// The shared `UpDaemonState` is passed as `Arc<ArcSwap<…>>` so each handler
 /// can do lock-free load/store updates without a mutex.
-async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control_socket: Option<PathBuf>) -> Result<()> {
+async fn run_up_daemon(
+    profile: &str,
+    ns_meta: PathBuf,
+    keeper_pid: u32,
+    control_socket: Option<PathBuf>,
+    simulate_protocol_no_upgrade: bool,
+    simulate_conn_close: bool,
+    simulate_slow_shutdown: bool,
+) -> Result<()> {
     let sock_path = diag::up_sock_path(profile);
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2034,12 +2177,30 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
     // Shared per-process stdout/stderr ring buffer.
     let raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
+    // Shared PTY byte scrollback ring per process.
+    let pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    // PTY master fd per process for input/resize control.
+    let pty_masters: Arc<Mutex<BTreeMap<u32, OwnedFd>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    // PTY output broadcast channels keyed by process pid.
+    let pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    // Daemon-level broadcast for process exit notifications.  Hoisted out of
+    // handle_up_client so that watcher tasks spawned on an older connection
+    // survive a reconnect and can still update state and notify the new client.
+    let (exit_broadcast_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
+    let exit_broadcast_tx: Arc<tokio::sync::broadcast::Sender<u32>> = Arc::new(exit_broadcast_tx);
 
     // If the UI passed a control socket path, connect to it immediately and serve it
     // as a reversed-role client.  This is event-triggered: the UI doesn't need to
     // poll our socket; we initiate the connection and it receives DaemonEvent frames
     // just as if it had connected to us.
-    if let Some(ref ctrl_path) = control_socket {
+    if simulate_conn_close {
+        warn!(
+            profile,
+            "up daemon mock mode active: simulate_conn_close=true, skipping reversed control-socket connection"
+        );
+    } else if let Some(ref ctrl_path) = control_socket {
         let ctrl_path = ctrl_path.clone();
         let profile_name = profile.to_string();
         let state2 = state.clone();
@@ -2047,11 +2208,28 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
         let log_rx2 = diag::subscribe_up_logs()
             .expect("up log broadcast must be initialised before control socket connect");
         let raw_logs2 = raw_logs.clone();
+        let pty_scrollback2 = pty_scrollback.clone();
+        let pty_masters2 = pty_masters.clone();
+        let pty_streams2 = pty_streams.clone();
+        let exit_broadcast2 = Arc::clone(&exit_broadcast_tx);
         tokio::spawn(async move {
             match connect_and_greet_up(&ctrl_path, &profile_name).await {
                 Ok(stream) => {
                     info!("up daemon: connected to UI control socket, serving reversed connection");
-                    if let Err(e) = handle_up_client(stream, state2, ns_meta2, keeper_pid, log_rx2, raw_logs2).await {
+                    if let Err(e) = handle_up_client(
+                        stream,
+                        state2,
+                        ns_meta2,
+                        keeper_pid,
+                        simulate_protocol_no_upgrade,
+                        simulate_slow_shutdown,
+                        log_rx2,
+                        raw_logs2,
+                        pty_scrollback2,
+                        pty_masters2,
+                        pty_streams2,
+                        exit_broadcast2,
+                    ).await {
                         warn!("up daemon reversed client error: {}", e);
                     }
                 }
@@ -2063,7 +2241,17 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
     let mut current_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (mut stream, _addr) = listener.accept().await?;
+
+        if simulate_conn_close {
+            warn!(profile, "up daemon mock mode: simulate_conn_close=true, dropping accepted connection");
+            continue;
+        }
+
+        if let Err(e) = diag::handshake_server(&mut stream, diag::ProtocolChannel::Up).await {
+            warn!("up daemon handshake failed: {}", e);
+            continue;
+        }
 
         // New connection: kick out the old client if any.
         if let Some(task) = current_task.take() {
@@ -2076,8 +2264,25 @@ async fn run_up_daemon(profile: &str, ns_meta: PathBuf, keeper_pid: u32, control
         let log_rx = diag::subscribe_up_logs()
             .expect("up log broadcast must be initialised before accept loop");
         let raw_logs_conn = raw_logs.clone();
+        let pty_scrollback_conn = pty_scrollback.clone();
+        let pty_masters_conn = pty_masters.clone();
+        let pty_streams_conn = pty_streams.clone();
+        let exit_broadcast_conn = Arc::clone(&exit_broadcast_tx);
         current_task = Some(tokio::spawn(async move {
-            if let Err(e) = handle_up_client(stream, state, ns_meta, keeper_pid, log_rx, raw_logs_conn).await {
+            if let Err(e) = handle_up_client(
+                stream,
+                state,
+                ns_meta,
+                keeper_pid,
+                simulate_protocol_no_upgrade,
+                simulate_slow_shutdown,
+                log_rx,
+                raw_logs_conn,
+                pty_scrollback_conn,
+                pty_masters_conn,
+                pty_streams_conn,
+                exit_broadcast_conn,
+            ).await {
                 warn!("up daemon client error: {}", e);
             }
         }));
@@ -2122,23 +2327,206 @@ fn spawn_pipe_reader(
     });
 }
 
+fn append_pty_scrollback(ring: &mut VecDeque<u8>, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let overflow = ring
+        .len()
+        .saturating_add(data.len())
+        .saturating_sub(PTY_SCROLLBACK_CAP);
+    for _ in 0..overflow {
+        ring.pop_front();
+    }
+    ring.extend(data.iter().copied());
+}
+
+/// Scan `chunk` for DA1 (`ESC [ c` / `ESC [ 0 c`) and DA2 (`ESC [ > c` / `ESC [ > 0 c`)
+/// terminal-capability query sequences sent by the child process. For each found, write
+/// the appropriate response directly back to `file` (the PTY master fd is bidirectional).
+/// Returns the chunk with those sequences removed, or `None` if no changes were needed.
+/// Responding here avoids the UI round-trip latency that causes the delayed response to
+/// arrive after fish has already moved on and prints the escape bytes as literal text.
+fn intercept_terminal_queries(file: &mut std::fs::File, chunk: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i] == 0x1b && chunk.get(i + 1) == Some(&b'[') {
+            // DA1: ESC [ c
+            if chunk.get(i + 2) == Some(&b'c') {
+                let _ = file.write_all(b"\x1b[?6c");
+                out.get_or_insert_with(|| chunk[..i].to_vec());
+                i += 3;
+                continue;
+            }
+            // DA1: ESC [ 0 c
+            if chunk.get(i + 2) == Some(&b'0') && chunk.get(i + 3) == Some(&b'c') {
+                let _ = file.write_all(b"\x1b[?6c");
+                out.get_or_insert_with(|| chunk[..i].to_vec());
+                i += 4;
+                continue;
+            }
+            // DA2: ESC [ > c
+            if chunk.get(i + 2) == Some(&b'>') && chunk.get(i + 3) == Some(&b'c') {
+                let _ = file.write_all(b"\x1b[>0;10;1c");
+                out.get_or_insert_with(|| chunk[..i].to_vec());
+                i += 4;
+                continue;
+            }
+            // DA2: ESC [ > 0 c
+            if chunk.get(i + 2) == Some(&b'>')
+                && chunk.get(i + 3) == Some(&b'0')
+                && chunk.get(i + 4) == Some(&b'c')
+            {
+                let _ = file.write_all(b"\x1b[>0;10;1c");
+                out.get_or_insert_with(|| chunk[..i].to_vec());
+                i += 5;
+                continue;
+            }
+        }
+        if let Some(ref mut v) = out {
+            v.push(chunk[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn spawn_pty_relay(
+    pid: u32,
+    relay_fd: OwnedFd,
+    pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>>,
+    pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>>,
+) {
+    std::thread::spawn(move || {
+        let mut file = std::fs::File::from(relay_fd);
+        let mut buf = [0_u8; 4096];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let chunk = &buf[..n];
+
+            // Respond to DA1/DA2 terminal queries immediately and strip them
+            // from the broadcast so the UI doesn't generate a second, delayed response.
+            let filtered = intercept_terminal_queries(&mut file, chunk);
+            let broadcast_chunk: &[u8] = filtered.as_deref().unwrap_or(chunk);
+            if broadcast_chunk.is_empty() {
+                continue;
+            }
+
+            {
+                let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                let ring = guard
+                    .entry(pid)
+                    .or_insert_with(|| VecDeque::with_capacity(PTY_SCROLLBACK_CAP));
+                append_pty_scrollback(ring, broadcast_chunk);
+            }
+
+            let tx_opt = {
+                let guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get(&pid).cloned()
+            };
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(broadcast_chunk.to_vec());
+            }
+        }
+    });
+}
+
 /// Per-connection handler for the `sp up` daemon.
 async fn handle_up_client(
     stream: tokio::net::UnixStream,
     state: Arc<ArcSwap<UpDaemonState>>,
     ns_meta: PathBuf,
     keeper_pid: u32,
+    simulate_protocol_no_upgrade: bool,
+    simulate_slow_shutdown: bool,
     mut log_rx: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
     raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>>,
+    pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>>,
+    pty_masters: Arc<Mutex<BTreeMap<u32, OwnedFd>>>,
+    pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>>,
+    exit_broadcast_tx: Arc<tokio::sync::broadcast::Sender<u32>>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let (mut read_half, mut write_half) = stream.into_split();
-    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let mut exit_rx = exit_broadcast_tx.subscribe();
+    let (pty_evt_tx, mut pty_evt_rx) = tokio::sync::mpsc::unbounded_channel::<diag::DaemonEvent>();
+    let mut attached_pty_tasks: HashMap<u32, tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
         tokio::select! {
-            req_result = read_bincode_frame_async::<diag::DaemonRequest, _>(&mut read_half) => {
+            req_result = read_bincode_frame_async::<diag::UpWireRequest, _>(&mut read_half) => {
                 let Some(req) = req_result? else {
                     break;
+                };
+
+                // Reap before dispatching so that GetProcessList returns
+                // the freshest state (catches children that exited since
+                // the last event loop iteration).
+                reap_dead_children_into_state(&state);
+
+                let req = match req {
+                    diag::UpWireRequest::Stable(stable_req) => {
+                        warn!(req = ?stable_req, "up daemon: received stable request");
+                        match stable_req {
+                            diag::StableRequest::Ping => {
+                                warn!("up daemon stable step: responding to ping");
+                                let stable_evt = diag::StableEvent::Pong;
+                                let _ = write_up_stable_frame(&mut write_half, &stable_evt).await;
+                            }
+                            diag::StableRequest::GracefulShutdown => {
+                                warn!("up daemon stable step: graceful shutdown requested");
+                                if simulate_slow_shutdown {
+                                    warn!("up daemon mock mode: simulate_slow_shutdown=true, delaying graceful shutdown acknowledgement by 6s");
+                                    sleep(Duration::from_secs(6)).await;
+                                }
+                                let stable_evt = diag::StableEvent::ShuttingDown;
+                                let _ = write_up_stable_frame(&mut write_half, &stable_evt).await;
+                                warn!("up daemon stable step: shutdown acknowledgement sent; stopping daemon");
+
+                                if perform_up_daemon_stop(&state, keeper_pid).await {
+                                    std::process::exit(0);
+                                }
+                            }
+                            diag::StableRequest::Upgrade { build_tree_hash } => {
+                                warn!(
+                                    remote_hash = %build_tree_hash,
+                                    local_hash = %nsproxy_core::build_tree_hash(),
+                                    "up daemon stable step: protocol upgrade requested"
+                                );
+                                if simulate_protocol_no_upgrade {
+                                    warn!("up daemon mock mode: simulate_protocol_no_upgrade=true, forcing upgrade rejection");
+                                    let stable_evt = diag::StableEvent::UpgradeRejected {
+                                        msg: "simulated no-upgrade mode".to_string(),
+                                    };
+                                    write_up_stable_frame(&mut write_half, &stable_evt).await?;
+                                    continue;
+                                }
+                                let local_hash = nsproxy_core::build_tree_hash();
+                                if build_tree_hash == local_hash {
+                                    warn!("up daemon stable step: upgrade accepted");
+                                    let stable_evt = diag::StableEvent::UpgradeAccepted {
+                                        build_tree_hash: local_hash.to_string(),
+                                    };
+                                    write_up_stable_frame(&mut write_half, &stable_evt).await?;
+                                } else {
+                                    warn!("up daemon stable step: upgrade rejected (hash mismatch)");
+                                    let stable_evt = diag::StableEvent::UpgradeRejected {
+                                        msg: format!(
+                                            "build hash mismatch: local={}, remote={}",
+                                            local_hash, build_tree_hash
+                                        ),
+                                    };
+                                    write_up_stable_frame(&mut write_half, &stable_evt).await?;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    diag::UpWireRequest::Unstable(req) => req,
                 };
 
                 match req {
@@ -2148,7 +2536,7 @@ async fn handle_up_client(
                             procs: s.process_list.processes.clone(),
                             serve: s.serve_pid,
                         });
-                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                     diag::DaemonRequest::Kill { pid } => {
                         let _ = nix::sys::signal::kill(
@@ -2165,7 +2553,7 @@ async fn handle_up_client(
                             procs: s.process_list.processes.clone(),
                             serve: s.serve_pid,
                         });
-                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                     diag::DaemonRequest::Spawn { args } => {
                         let ns_alive = read_ns_alive(&ns_meta)?;
@@ -2176,7 +2564,7 @@ async fn handle_up_client(
                                 let evt = diag::DaemonEvent::Error {
                                     msg: "spawn daemon in child context".to_string(),
                                 };
-                                write_bincode_frame_async(&mut write_half, &evt).await?;
+                                write_up_unstable_frame(&mut write_half, &evt).await?;
                                 reap_dead_children_into_state(&state);
                                 continue;
                             }
@@ -2196,17 +2584,27 @@ async fn handle_up_client(
                         spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
 
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
-                        write_bincode_frame_async(&mut write_half, &spawned).await?;
+                        write_up_unstable_frame(&mut write_half, &spawned).await?;
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
                             procs: s.process_list.processes.clone(),
                             serve: s.serve_pid,
                         });
-                        write_bincode_frame_async(&mut write_half, &snapshot).await?;
+                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
 
-                        let exit_tx2 = exit_tx.clone();
+                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
+                        let state_w = state.clone();
                         tokio::spawn(async move {
                             wait_for_child_exit_async(child_pid).await;
+                            let mut new = (*state_w.load_full()).clone();
+                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
+                                entry.status = diag::ProcessStatus::Killed(child_pid);
+                            }
+                            if new.serve_pid == child_pid {
+                                new.serve_pid = 0;
+                            }
+                            state_w.store(Arc::new(new));
+                            info!("child pid {} exited", child_pid);
                             let _ = exit_tx2.send(child_pid);
                         });
                     }
@@ -2217,7 +2615,7 @@ async fn handle_up_client(
                                 let evt = diag::DaemonEvent::Error {
                                     msg: format!("invalid cli payload: {err}"),
                                 };
-                                write_bincode_frame_async(&mut write_half, &evt).await?;
+                                write_up_unstable_frame(&mut write_half, &evt).await?;
                                 reap_dead_children_into_state(&state);
                                 continue;
                             }
@@ -2254,67 +2652,204 @@ async fn handle_up_client(
                         spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
 
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
-                        write_bincode_frame_async(&mut write_half, &spawned).await?;
+                        write_up_unstable_frame(&mut write_half, &spawned).await?;
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
                             procs: s.process_list.processes.clone(),
                             serve: s.serve_pid,
                         });
-                        write_bincode_frame_async(&mut write_half, &snapshot).await?;
+                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
 
-                        let exit_tx2 = exit_tx.clone();
+                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
+                        let state_w = state.clone();
                         tokio::spawn(async move {
                             wait_for_child_exit_async(child_pid).await;
+                            let mut new = (*state_w.load_full()).clone();
+                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
+                                entry.status = diag::ProcessStatus::Killed(child_pid);
+                            }
+                            if new.serve_pid == child_pid {
+                                new.serve_pid = 0;
+                            }
+                            state_w.store(Arc::new(new));
+                            info!("child pid {} exited", child_pid);
                             let _ = exit_tx2.send(child_pid);
                         });
                     }
-                    diag::DaemonRequest::Stop => {
-                        let evt = diag::DaemonEvent::Stopping;
-                        let _ = write_bincode_frame_async(&mut write_half, &evt).await;
-
-                        {
-                            let s = state.load();
-                            // serve is tracked in process_list.processes under its PID,
-                            // so .keys() already covers it — no extra chain needed.
-                            for pid in s.process_list.processes.keys().copied() {
-                                let _ = nix::sys::signal::kill(
-                                    Pid::from_raw(pid as i32),
-                                    nix::sys::signal::Signal::SIGTERM,
-                                );
-                            }
-                        }
-
-                        let keeper_dead = kill_and_wait_for_exit_async(keeper_pid, Duration::from_secs(5)).await;
-
-                        if !keeper_dead {
-                            warn!("keeper pid {} did not exit within 5 seconds", keeper_pid);
+                    diag::DaemonRequest::SpawnPty { args } => {
+                        let ns_alive = read_ns_alive(&ns_meta)?;
+                        let (child_pid, master_fd) = spawn_pty_process(&args, &ns_alive)?;
+                        let relay_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };
+                        if relay_raw < 0 {
+                            let evt = diag::DaemonEvent::Error {
+                                msg: format!("dup PTY master failed: {}", std::io::Error::last_os_error()),
+                            };
+                            write_up_unstable_frame(&mut write_half, &evt).await?;
                             reap_dead_children_into_state(&state);
                             continue;
                         }
+                        let relay_fd = unsafe { OwnedFd::from_raw_fd(relay_raw) };
 
-                        reap_dead_children_into_state(&state);
-                        wait_all_children_async(&state, Duration::from_secs(5)).await;
-                        if any_child_alive(&state) {
-                            info!(
-                                "keeper is dead but child processes are still alive; keep socket loop running"
-                            );
-                            continue;
+                        {
+                            let mut guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.insert(child_pid, master_fd);
+                        }
+                        {
+                            let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .entry(child_pid)
+                                .or_insert_with(|| VecDeque::with_capacity(PTY_SCROLLBACK_CAP));
+                        }
+                        {
+                            let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .entry(child_pid)
+                                .or_insert_with(|| tokio::sync::broadcast::channel(PTY_BROADCAST_CAP).0);
                         }
 
-                        info!(
-                            "keeper pid {} dead and no child processes alive; exiting",
-                            keeper_pid
+                        spawn_pty_relay(child_pid, relay_fd, pty_scrollback.clone(), pty_streams.clone());
+
+                        let mut new = (*state.load_full()).clone();
+                        new.process_list.processes.insert(
+                            child_pid,
+                            diag::ProcessEntry {
+                                meta: diag::SpawnedEntry::Pty(args),
+                                spawned_at: SystemTime::now(),
+                                status: diag::ProcessStatus::Alive(child_pid),
+                            },
                         );
-                        std::process::exit(0);
+                        state.store(Arc::new(new));
+
+                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        write_up_unstable_frame(&mut write_half, &spawned).await?;
+                        let s = state.load();
+                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
+
+                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
+                        let state_w = state.clone();
+                        tokio::spawn(async move {
+                            wait_for_child_exit_async(child_pid).await;
+                            let mut new = (*state_w.load_full()).clone();
+                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
+                                entry.status = diag::ProcessStatus::Killed(child_pid);
+                            }
+                            if new.serve_pid == child_pid {
+                                new.serve_pid = 0;
+                            }
+                            state_w.store(Arc::new(new));
+                            info!("child pid {} exited", child_pid);
+                            let _ = exit_tx2.send(child_pid);
+                        });
+                    }
+                    diag::DaemonRequest::AttachPty { pid } => {
+                        let scrollback = {
+                            let guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .get(&pid)
+                                .map(|ring| ring.iter().copied().collect::<Vec<u8>>())
+                                .unwrap_or_default()
+                        };
+                        let evt = diag::DaemonEvent::PtyScrollback {
+                            pid,
+                            data: scrollback,
+                        };
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
+
+                        let tx_opt = {
+                            let guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.get(&pid).cloned()
+                        };
+                        if let Some(tx) = tx_opt {
+                            if let Some(old) = attached_pty_tasks.remove(&pid) {
+                                old.abort();
+                            }
+                            let mut rx = tx.subscribe();
+                            let pty_evt_tx2 = pty_evt_tx.clone();
+                            let task = tokio::spawn(async move {
+                                loop {
+                                    match rx.recv().await {
+                                        Ok(data) => {
+                                            let _ = pty_evt_tx2.send(diag::DaemonEvent::PtyOutput { pid, data });
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                            });
+                            attached_pty_tasks.insert(pid, task);
+                        }
+                    }
+                    diag::DaemonRequest::DetachPty { pid } => {
+                        if let Some(task) = attached_pty_tasks.remove(&pid) {
+                            task.abort();
+                        }
+                    }
+                    diag::DaemonRequest::PtyInput { pid, data } => {
+                        let write_result = {
+                            let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .get(&pid)
+                                .ok_or_else(|| anyhow!("pty pid {} not found", pid))
+                                .and_then(|fd| nix::unistd::write(fd.as_raw_fd(), &data).map(|_| ()).map_err(|e| anyhow!(e)))
+                        };
+                        if let Err(e) = write_result {
+                            let evt = diag::DaemonEvent::Error {
+                                msg: format!("pty input failed for pid {}: {}", pid, e),
+                            };
+                            write_up_unstable_frame(&mut write_half, &evt).await?;
+                        }
+                    }
+                    diag::DaemonRequest::PtyResize { pid, cols, rows } => {
+                        let resize_result = {
+                            let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(fd) = guard.get(&pid) {
+                                let ws = libc::winsize {
+                                    ws_row: rows.max(1),
+                                    ws_col: cols.max(1),
+                                    ws_xpixel: 0,
+                                    ws_ypixel: 0,
+                                };
+                                let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+                                if rc == 0 {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow!(std::io::Error::last_os_error()))
+                                }
+                            } else {
+                                Err(anyhow!("pty pid {} not found", pid))
+                            }
+                        };
+                        if let Err(e) = resize_result {
+                            let evt = diag::DaemonEvent::Error {
+                                msg: format!("pty resize failed for pid {}: {}", pid, e),
+                            };
+                            write_up_unstable_frame(&mut write_half, &evt).await?;
+                        }
+                    }
+                    diag::DaemonRequest::Stop => {
+                        if simulate_slow_shutdown {
+                            warn!("up daemon mock mode: simulate_slow_shutdown=true, delaying stop response by 6s");
+                            sleep(Duration::from_secs(6)).await;
+                        }
+                        let evt = diag::DaemonEvent::Stopping;
+                        let _ = write_up_unstable_frame(&mut write_half, &evt).await;
+
+                        if perform_up_daemon_stop(&state, keeper_pid).await {
+                            std::process::exit(0);
+                        }
                     }
                     diag::DaemonRequest::Ping => {
                         let evt = diag::DaemonEvent::Pong;
-                        let _ = write_bincode_frame_async(&mut write_half, &evt).await;
+                        let _ = write_up_unstable_frame(&mut write_half, &evt).await;
                     }
                     diag::DaemonRequest::QueryRecentLogs { limit } => {
                         let entries = diag::query_recent_logs(limit);
                         let evt = diag::DaemonEvent::RecentLogs(entries);
-                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                     diag::DaemonRequest::QueryRawLogs { pid, limit } => {
                         let logs = {
@@ -2327,7 +2862,7 @@ async fn handle_up_client(
                                 .unwrap_or_default()
                         };
                         let evt = diag::DaemonEvent::RawLogs { pid, logs };
-                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                 }
 
@@ -2335,24 +2870,50 @@ async fn handle_up_client(
             }
 
             exited_pid = exit_rx.recv() => {
-                if let Some(pid) = exited_pid {
-                    let mut new = (*state.load_full()).clone();
-                    if let Some(entry) = new.process_list.processes.get_mut(&pid) {
-                        entry.status = diag::ProcessStatus::Killed(pid);
+                match exited_pid {
+                    Ok(pid) => {
+                        // State was already updated by the watcher task; just clean up
+                        // per-connection PTY resources and push events to the client.
+                        if let Some(task) = attached_pty_tasks.remove(&pid) {
+                            task.abort();
+                        }
+                        {
+                            let mut guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.remove(&pid);
+                        }
+                        {
+                            let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.remove(&pid);
+                        }
+                        {
+                            let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.remove(&pid);
+                        }
+                        let exit_evt = diag::DaemonEvent::ProcessExit { pid };
+                        write_up_unstable_frame(&mut write_half, &exit_evt).await?;
+                        let s = state.load();
+                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
                     }
-                    if new.serve_pid == pid {
-                        new.serve_pid = 0;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("exit broadcast lagged by {}, sending full snapshot", n);
+                        let s = state.load();
+                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+                            procs: s.process_list.processes.clone(),
+                            serve: s.serve_pid,
+                        });
+                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
                     }
-                    state.store(Arc::new(new));
-                    info!("child pid {} exited", pid);
-                    let exit_evt = diag::DaemonEvent::ProcessExit { pid };
-                    write_bincode_frame_async(&mut write_half, &exit_evt).await?;
-                    let s = state.load();
-                    let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
-                        procs: s.process_list.processes.clone(),
-                        serve: s.serve_pid,
-                    });
-                    write_bincode_frame_async(&mut write_half, &snapshot).await?;
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+
+            pty_evt = pty_evt_rx.recv() => {
+                if let Some(evt) = pty_evt {
+                    write_up_unstable_frame(&mut write_half, &evt).await?;
                 }
             }
 
@@ -2370,6 +2931,56 @@ async fn handle_up_client(
         }
     }
     Ok(())
+}
+
+async fn write_up_stable_frame<W: tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    evt: &diag::StableEvent,
+) -> Result<()> {
+    write_bincode_frame_async(stream, &diag::UpWireEvent::Stable(evt.clone())).await
+}
+
+async fn write_up_unstable_frame<W: tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    evt: &diag::DaemonEvent,
+) -> Result<()> {
+    write_bincode_frame_async(stream, &diag::UpWireEvent::Unstable(evt.clone())).await
+}
+
+async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid: u32) -> bool {
+    warn!(keeper_pid, "up daemon stop: begin stop sequence");
+    {
+        let s = state.load();
+        // serve is tracked in process_list.processes under its PID,
+        // so .keys() already covers it — no extra chain needed.
+        for pid in s.process_list.processes.keys().copied() {
+            warn!(pid, "up daemon stop: sending SIGTERM to child");
+            let _ = nix::sys::signal::kill(
+                Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+
+    warn!(keeper_pid, "up daemon stop: waiting for keeper process exit");
+    let keeper_dead = kill_and_wait_for_exit_async(keeper_pid, Duration::from_secs(5)).await;
+
+    if !keeper_dead {
+        warn!("keeper pid {} did not exit within 5 seconds", keeper_pid);
+        reap_dead_children_into_state(state);
+        return false;
+    }
+
+    warn!("up daemon stop: keeper exited; waiting for managed child processes");
+    reap_dead_children_into_state(state);
+    wait_all_children_async(state, Duration::from_secs(5)).await;
+    if any_child_alive(state) {
+        warn!("up daemon stop: keeper is dead but children still alive; keeping socket loop running");
+        return false;
+    }
+
+    warn!("up daemon stop: keeper dead and no child processes alive; exiting daemon");
+    true
 }
 
 /// Returns `true` if any process recorded in `state` is still alive according to the OS.
@@ -2498,10 +3109,11 @@ fn spawn_cli_process(
 /// Connect to the UI control socket, send a `ControlSocketGreeting::UpDaemon` frame,
 /// and return the stream ready for `handle_up_client`.
 async fn connect_and_greet_up(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
-    use tokio::io::AsyncWriteExt as _;
     let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
+    diag::control_handshake_client(&mut stream).await?;
     let greeting = diag::ControlSocketGreeting::UpDaemon { name: profile.to_string() };
     let frame = diag::encode_control_greeting(&greeting)?;
+    use tokio::io::AsyncWriteExt as _;
     stream.write_all(&frame).await?;
     Ok(stream)
 }
@@ -2509,10 +3121,11 @@ async fn connect_and_greet_up(ctrl_path: &Path, profile: &str) -> Result<tokio::
 /// Connect to the UI control socket, send a `ControlSocketGreeting::ServeDaemon` frame,
 /// and return the stream ready to be handed to `DiagServer::add_reversed_client`.
 async fn connect_and_greet_serve(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
-    use tokio::io::AsyncWriteExt as _;
     let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
+    diag::control_handshake_client(&mut stream).await?;
     let greeting = diag::ControlSocketGreeting::ServeDaemon { name: profile.to_string() };
     let frame = diag::encode_control_greeting(&greeting)?;
+    use tokio::io::AsyncWriteExt as _;
     stream.write_all(&frame).await?;
     Ok(stream)
 }
@@ -2631,6 +3244,111 @@ fn spawn_daemon_process(
     Ok((clone, stdout_r, stderr_r))
 }
 
+fn spawn_pty_process(
+    args: &diag::SpawnArgs,
+    ns_alive: &nsproxy_core::NsAlive,
+) -> Result<(u32, OwnedFd)> {
+    let exec = args
+        .exec
+        .clone()
+        .ok_or_else(|| anyhow!("spawn args missing exec"))?;
+    let exec_resolved = if exec.contains('/') {
+        exec.clone()
+    } else {
+        match which::which(exec.as_str()) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => exec.clone(),
+        }
+    };
+    let cmd = std::ffi::CString::new(exec_resolved.as_str())?;
+
+    let mut argv: Vec<std::ffi::CString> = if args.args.is_empty() {
+        vec![std::ffi::CString::new(exec.as_str())?]
+    } else {
+        args.args
+            .iter()
+            .map(|a| std::ffi::CString::new(a.as_str()))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if argv.is_empty() {
+        argv.push(std::ffi::CString::new(exec.as_str())?);
+    }
+
+    let container_val = ns_alive
+        .profile_name
+        .clone()
+        .unwrap_or_else(|| "UNSPEC".to_string());
+    let profile_val = ns_alive
+        .browser_profile
+        .clone()
+        .unwrap_or_else(|| "UNSPEC".to_string());
+    let ns_val = ns_alive.bind_mount.to_string_lossy().to_string();
+    unsafe {
+        std::env::set_var(ENV_CONTAINER, &container_val);
+        std::env::set_var(ENV_PROFILE, &profile_val);
+        std::env::set_var(ENV_NS, &ns_val);
+    }
+
+    let mut env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    env_pairs.retain(|(k, _)| k != ENV_CONTAINER && k != ENV_PROFILE && k != ENV_NS);
+    env_pairs.push((ENV_CONTAINER.to_string(), container_val));
+    env_pairs.push((ENV_PROFILE.to_string(), profile_val));
+    env_pairs.push((ENV_NS.to_string(), ns_val));
+    let env_c: Vec<std::ffi::CString> = env_pairs
+        .into_iter()
+        .map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let pty = openpty(None, None)?;
+    match unsafe { fork()? } {
+        ForkResult::Parent { child } => Ok((child.as_raw() as u32, pty.master)),
+        ForkResult::Child => {
+            let slave_fd = pty.slave.as_raw_fd();
+            let _ = setsid();
+            let _ = unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) };
+            let _ = dup2(slave_fd, 0);
+            let _ = dup2(slave_fd, 1);
+            let _ = dup2(slave_fd, 2);
+
+            if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+            }
+
+            if !args.gids.is_empty() {
+                setgroups(
+                    &args
+                        .gids
+                        .iter()
+                        .map(|g| Gid::from_raw(*g))
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+
+            if let Some(gid) = args.gid {
+                let g = Gid::from_raw(gid);
+                setresgid(g, g, g)?;
+            }
+
+            if let Some(uid) = args.uid {
+                let u = Uid::from_raw(uid);
+                setresuid(u, u, u)?;
+            }
+
+            if let Some(cwd) = &args.cwd {
+                chdir(cwd)?;
+            }
+
+            match execve(cmd.as_c_str(), &argv, &env_c) {
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    error!("pty spawn execve failed: {}", e);
+                    std::process::exit(127);
+                }
+            }
+        }
+    }
+}
+
 fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
     if pid == 0 {
         return false;
@@ -2682,6 +3400,25 @@ fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
     }
 
     false
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    PathBuf::from("/proc").join(pid.to_string()).exists()
+}
+
+fn enter_all_profile_namespaces_of_pid(pid: u32) -> Result<()> {
+    warn!(pid, "up preflight: entering mount namespace");
+    let source = NSSource::Pid(pid as i32);
+    source.enter(CloneFlags::CLONE_NEWNS)?;
+    warn!(pid, "up preflight: entering network namespace");
+    source.enter(CloneFlags::CLONE_NEWNET)?;
+    warn!(pid, "up preflight: entering pid namespace");
+    source.enter(CloneFlags::CLONE_NEWPID)?;
+    warn!(pid, "up preflight: entered all target namespaces");
+    Ok(())
 }
 
 async fn kill_and_wait_for_exit_async(pid: u32, timeout: Duration) -> bool {
