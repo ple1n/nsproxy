@@ -22,7 +22,7 @@ use nsproxy_core::{
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,9 +33,81 @@ use which;
 
 mod profile_loader;
 mod supervisor;
+mod term_view;
 
 use profile_loader::ProfileInfo;
 use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
+use term_view::{TermSession, TermView};
+
+/// Self-contained state for an external PTY viewport (separate OS window).
+///
+/// Holds everything the deferred viewport callback needs so it is fully
+/// independent of the main `App`.  All communication with the rest of the
+/// system goes through the cloned `SupervisorHandle`.
+struct ExternalPtyViewport {
+    profile: ContainerName,
+    pid: u32,
+    session: Mutex<TermSession>,
+    supervisor: SupervisorHandle,
+    closed: AtomicBool,
+    viewport_id: egui::ViewportId,
+}
+
+impl ExternalPtyViewport {
+    /// Called from the deferred viewport's `Fn(&Context, ViewportClass)` callback.
+    fn viewport_ui(this: &Arc<Self>, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            this.closed.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        // Drain buffered PTY output from supervisor and feed into terminal.
+        let incoming = this.supervisor.drain_pty(&this.profile, this.pid);
+        {
+            let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
+            if !incoming.is_empty() {
+                session.feed(&incoming);
+                for resp in session.drain_responses() {
+                    if !resp.is_empty() {
+                        this.supervisor.send(SupervisorCommand::PtyInput {
+                            profile: this.profile.clone(),
+                            pid: this.pid,
+                            data: resp,
+                        });
+                    }
+                }
+            }
+
+            let mut input_frames: Vec<Vec<u8>> = Vec::new();
+            let mut resize_evt: Option<(u16, u16)> = None;
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(
+                    TermView::new(&mut session, &mut input_frames, &mut resize_evt)
+                        .set_size(ui.available_size()),
+                );
+            });
+
+            for data in input_frames {
+                if !data.is_empty() {
+                    this.supervisor.send(SupervisorCommand::PtyInput {
+                        profile: this.profile.clone(),
+                        pid: this.pid,
+                        data,
+                    });
+                }
+            }
+            if let Some((cols, rows)) = resize_evt {
+                this.supervisor.send(SupervisorCommand::PtyResize {
+                    profile: this.profile.clone(),
+                    pid: this.pid,
+                    cols,
+                    rows,
+                });
+            }
+        }
+    }
+}
 
 const HOTCONFIG_EXAMPLE: &str = r#"{}"#;
 
@@ -364,6 +436,7 @@ struct RunCommandDraft {
     parse_error: Option<String>,
     status: Option<String>,
     spawn_inside_container: bool,
+    spawn_as_pty: bool,
 }
 
 impl Default for RunCommandDraft {
@@ -374,6 +447,7 @@ impl Default for RunCommandDraft {
             parse_error: None,
             status: None,
             spawn_inside_container: true,
+            spawn_as_pty: false,
         }
     }
 }
@@ -389,6 +463,75 @@ struct U32MapEditorState {
     pairs: Vec<(u32, u32)>,
     snapshot: Vec<(u32, u32)>,
     text_buffers: std::collections::HashMap<usize, (String, String)>,
+}
+
+struct IntInput {
+    texts: HashMap<(egui::Id, usize), String>,
+}
+
+impl Default for IntInput {
+    fn default() -> Self {
+        Self {
+            texts: HashMap::new(),
+        }
+    }
+}
+
+impl IntInput {
+    fn show<F>(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        value: &mut Option<u32>,
+        validate: F,
+    ) -> bool
+    where
+        F: Fn(u32) -> bool,
+    {
+        let value_addr = value as *mut Option<u32> as usize;
+        let text_edit_id = id.with(("text", value_addr));
+        let cache_key = (id, value_addr);
+        let mut changed = false;
+
+        let is_first_render = !self.texts.contains_key(&cache_key);
+        let input = self.texts.entry(cache_key).or_insert_with(|| {
+            value.map(|parsed| parsed.to_string()).unwrap_or_default()
+        });
+
+        let parsed = input.parse::<u32>().ok();
+        let is_valid = parsed.is_some_and(&validate);
+        let bg_color = if input.is_empty() && value.is_none() {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else if input.is_empty() {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        } else if is_valid {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        };
+
+        let visuals = ui.visuals_mut();
+        let old_bg = visuals.extreme_bg_color;
+        visuals.extreme_bg_color = bg_color;
+        let resp = ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(input).id_source(text_edit_id));
+            resp
+        }).inner;
+        ui.visuals_mut().extreme_bg_color = old_bg;
+
+        let next_value = if input.is_empty() {
+            None
+        } else {
+            parsed.filter(|parsed_value| validate(*parsed_value))
+        };
+
+        if *value != next_value {
+            *value = next_value;
+            changed = true;
+        }
+
+        changed
+    }
 }
 
 struct App {
@@ -407,6 +550,7 @@ struct App {
     supervisor: SupervisorHandle,
     snapshot: supervisor::SupervisorSnapshot,
     run_command: RunCommandDraft,
+    int_input: IntInput,
     hide_secret: bool,
     cover_text: String,
     tokio_rt: Option<Runtime>,
@@ -432,11 +576,14 @@ struct App {
     traffic_subview: TrafficSubview,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
+    /// State for the external PTY viewport (separate OS window), if any.
+    external_pty_viewport: Option<Arc<ExternalPtyViewport>>,
     /// Last consumed auto-open token from supervisor snapshots.
     last_auto_open_logs_token: u64,
     /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
     selected_process_spawn_args: Option<(ContainerName, u32)>,
     raw_log_show_details: bool,
+    pty_sessions: HashMap<(ContainerName, u32), TermSession>,
     // Viewer sub-view state (ported from nsp-diag viewer.rs)
     viewer_ping_tx: flume::Sender<ViewerPingRequest>,
     viewer_dns_config: Arc<Mutex<String>>,
@@ -847,6 +994,7 @@ impl App {
                 generated_at: SystemTime::now(),
             },
             run_command: RunCommandDraft::default(),
+            int_input: IntInput::default(),
             hide_secret: false,
             cover_text: "redacted".to_string(),
             tokio_rt: Some(tokio_rt),
@@ -870,9 +1018,11 @@ impl App {
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
             selected_process_logs: None,
+            external_pty_viewport: None,
             last_auto_open_logs_token: 0,
             selected_process_spawn_args: None,
             raw_log_show_details: false,
+            pty_sessions: HashMap::new(),
             viewer_ping_tx,
             viewer_dns_config,
             viewer_ping_state,
@@ -1245,10 +1395,19 @@ impl App {
         self.profile_editor_status = Some(format!("Created profile '{}'", name));
     }
 
-    fn render_optional_u32(ui: &mut egui::Ui, label: &str, value: &mut Option<u32>) -> bool {
+    fn render_optional_u32(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        label: &str,
+        value: &mut Option<u32>,
+    ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
-            let mut enabled = value.is_some();
+            let state_id = ui.make_persistent_id(("optional-u32-enabled", label));
+            let mut enabled = ui
+                .data_mut(|d| d.get_temp::<bool>(state_id))
+                .unwrap_or(value.is_some());
+
             if ui.checkbox(&mut enabled, label).changed() {
                 changed = true;
                 if enabled && value.is_none() {
@@ -1257,71 +1416,24 @@ impl App {
                 if !enabled {
                     *value = None;
                 }
+                ui.data_mut(|d| d.insert_temp(state_id, enabled));
             }
+
+            // If an external change set the value to Some(...), ensure the
+            // persisted enabled state follows so the input doesn't get hidden.
+            if value.is_some() && !enabled {
+                enabled = true;
+                ui.data_mut(|d| d.insert_temp(state_id, enabled));
+            }
+
             if enabled {
-                if let Some(v) = value.as_mut() {
-                    let mut text = v.to_string();
-                    if label == "mode" {
-                        let is_valid = Self::is_valid_mode(*v) && !text.is_empty();
-                        let bg_color = if text.is_empty() {
-                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                        } else if is_valid {
-                            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
-                        } else {
-                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                        };
-                        let visuals = ui.visuals_mut();
-                        let old_bg = visuals.extreme_bg_color;
-                        visuals.extreme_bg_color = bg_color;
-                        let resp = ui.text_edit_singleline(&mut text);
-                        ui.visuals_mut().extreme_bg_color = old_bg;
-                        if resp.lost_focus() {
-                            if text.is_empty() {
-                                *value = None;
-                                changed = true;
-                            } else if let Ok(parsed) = text.parse::<u32>() {
-                                *v = parsed;
-                                changed = true;
-                            }
-                        }
-                    } else {
-                        let is_valid = text.parse::<u32>().is_ok() && !text.is_empty();
-                        let bg_color = if text.is_empty() {
-                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                        } else if is_valid {
-                            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
-                        } else {
-                            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                        };
-                        let visuals = ui.visuals_mut();
-                        let old_bg = visuals.extreme_bg_color;
-                        visuals.extreme_bg_color = bg_color;
-                        let resp = ui.text_edit_singleline(&mut text);
-                        ui.visuals_mut().extreme_bg_color = old_bg;
-                        if resp.lost_focus() {
-                            if text.is_empty() {
-                                *value = None;
-                                changed = true;
-                            } else if let Ok(parsed) = text.parse::<u32>() {
-                                *v = parsed;
-                                changed = true;
-                            }
-                        }
+                let id = ui.make_persistent_id(("optional-u32", label));
+                if label == "mode" {
+                    if int_input.show(ui, id, value, Self::is_valid_mode) {
+                        changed = true;
                     }
-                } else {
-                    let mut text = String::new();
-                    let bg_color = egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25);
-                    let visuals = ui.visuals_mut();
-                    let old_bg = visuals.extreme_bg_color;
-                    visuals.extreme_bg_color = bg_color;
-                    let resp = ui.text_edit_singleline(&mut text);
-                    ui.visuals_mut().extreme_bg_color = old_bg;
-                    if resp.lost_focus() && !text.is_empty() {
-                        if let Ok(parsed) = text.parse::<u32>() {
-                            *value = Some(parsed);
-                            changed = true;
-                        }
-                    }
+                } else if int_input.show(ui, id, value, |_| true) {
+                    changed = true;
                 }
             }
         });
@@ -1420,7 +1532,11 @@ impl App {
         changed
     }
 
-    fn render_chmod_list(ui: &mut egui::Ui, chmod: &mut Vec<ProfileChmod>) -> bool {
+    fn render_chmod_list(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        chmod: &mut Vec<ProfileChmod>,
+    ) -> bool {
         let mut changed = false;
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -1446,13 +1562,13 @@ impl App {
                     if Self::render_path_field(ui, "path", &mut op.path, i) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, "mode", &mut op.mode) {
+                    if Self::render_optional_u32(ui, int_input, "mode", &mut op.mode) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, "uid", &mut op.uid) {
+                    if Self::render_optional_u32(ui, int_input, "uid", &mut op.uid) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, "gid", &mut op.gid) {
+                    if Self::render_optional_u32(ui, int_input, "gid", &mut op.gid) {
                         changed = true;
                     }
                     if op.path.to_string_lossy().is_empty() {
@@ -1853,6 +1969,7 @@ impl App {
 
     fn render_shell_args_list(
         ui: &mut egui::Ui,
+        int_input: &mut IntInput,
         list: &mut Vec<ShellArgs>,
         id_prefix: &str,
     ) -> bool {
@@ -1876,7 +1993,7 @@ impl App {
                             remove_ix = Some(i);
                         }
                     });
-                    if Self::render_shell_args(ui, args, "shell args") {
+                    if Self::render_shell_args(ui, int_input, args, "shell args") {
                         changed = true;
                     }
                 });
@@ -1889,7 +2006,12 @@ impl App {
         changed
     }
 
-    fn render_hotconfig_form(ui: &mut egui::Ui, id_prefix: &str, hot: &mut HotConfig) -> bool {
+    fn render_hotconfig_form(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        id_prefix: &str,
+        hot: &mut HotConfig,
+    ) -> bool {
         let mut changed = false;
 
         if Self::render_string_map(ui, "dns", &mut hot.dns, id_prefix) {
@@ -1907,7 +2029,7 @@ impl App {
         if Self::render_mount_list(ui, &mut hot.mounts, "mounts") {
             changed = true;
         }
-        if Self::render_shell_args_list(ui, &mut hot.daemons, id_prefix) {
+        if Self::render_shell_args_list(ui, int_input, &mut hot.daemons, id_prefix) {
             changed = true;
         }
 
@@ -1928,6 +2050,7 @@ impl App {
 
     fn render_hotconfig_editor_split(
         ui: &mut egui::Ui,
+        int_input: &mut IntInput,
         id_prefix: &str,
         hot: &mut HotConfig,
         json_text: &mut String,
@@ -1939,7 +2062,7 @@ impl App {
             egui::ScrollArea::vertical()
                 .id_salt(format!("{}-form-scroll", id_prefix))
                 .show(&mut columns[0], |ui| {
-                    if Self::render_hotconfig_form(ui, id_prefix, hot) {
+                    if Self::render_hotconfig_form(ui, int_input, id_prefix, hot) {
                         *json_text =
                             serde_json::to_string_pretty(hot).unwrap_or_else(|_| "{}".to_string());
                         *json_error = None;
@@ -1979,14 +2102,19 @@ impl App {
         changed
     }
 
-    fn render_shell_args(ui: &mut egui::Ui, sargs: &mut ShellArgs, title: &str) -> bool {
+    fn render_shell_args(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        sargs: &mut ShellArgs,
+        title: &str,
+    ) -> bool {
         let mut changed = false;
         ui.group(|ui| {
             ui.strong(title);
-            if Self::render_optional_u32(ui, "uid", &mut sargs.uid) {
+            if Self::render_optional_u32(ui, int_input, "uid", &mut sargs.uid) {
                 changed = true;
             }
-            if Self::render_optional_u32(ui, "gid", &mut sargs.gid) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut sargs.gid) {
                 changed = true;
             }
             if Self::render_optional_text(ui, "shell", &mut sargs.shell) {
@@ -2058,6 +2186,7 @@ impl App {
 
     fn render_spawn_args_gadget(
         ui: &mut egui::Ui,
+        int_input: &mut IntInput,
         args: &mut diag::SpawnArgs,
         id_prefix: &str,
         read_only: bool,
@@ -2079,10 +2208,10 @@ impl App {
                 return;
             }
 
-            if Self::render_optional_u32(ui, "uid", &mut args.uid) {
+            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid) {
                 changed = true;
             }
-            if Self::render_optional_u32(ui, "gid", &mut args.gid) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid) {
                 changed = true;
             }
             if Self::render_optional_text(ui, "exec", &mut args.exec) {
@@ -2219,7 +2348,7 @@ impl App {
         if Self::render_mount_list(ui, &mut self.profile_editor_template.mounts, "mounts") {
             changed = true;
         }
-        if Self::render_chmod_list(ui, &mut self.profile_editor_template.chmod) {
+        if Self::render_chmod_list(ui, &mut self.int_input, &mut self.profile_editor_template.chmod) {
             changed = true;
         }
         if Self::render_env_map(ui, &mut self.profile_editor_template.env) {
@@ -2259,7 +2388,12 @@ impl App {
                     .hot_init
                     .clone()
                     .unwrap_or_default();
-                if Self::render_hotconfig_form(ui, "profile-hot-init", &mut hot_init) {
+                if Self::render_hotconfig_form(
+                    ui,
+                    &mut self.int_input,
+                    "profile-hot-init",
+                    &mut hot_init,
+                ) {
                     self.profile_editor_template.hot_init = Some(hot_init);
                     self.profile_editor_hot_init_json = self
                         .profile_editor_template
@@ -2279,7 +2413,7 @@ impl App {
             self.refresh_hot_init_json_from_template();
         }
 
-        if Self::render_shell_args(ui, &mut self.profile_editor_template.sargs, "sargs") {
+        if Self::render_shell_args(ui, &mut self.int_input, &mut self.profile_editor_template.sargs, "sargs") {
             changed = true;
         }
         if Self::render_optional_text(
@@ -2437,6 +2571,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.close_external_pty_window();
         info!("app drop started; shutting down tokio runtime in background");
         if let Some(rt) = self.tokio_rt.take() {
             rt.shutdown_background();
@@ -2683,7 +2818,6 @@ impl eframe::App for App {
                     {
                         self.supervisor
                             .send(SupervisorCommand::RefreshNamespaces);
-                        ctx.request_repaint();
                     }
                 });
 
@@ -2876,6 +3010,7 @@ impl eframe::App for App {
                 });
         });
 
+        self.render_external_pty_window(ctx);
         self.render_proxy_detail_window(ctx);
 
         let frame_elapsed = frame_started.elapsed();
@@ -3422,7 +3557,11 @@ impl App {
         }
 
         if self.selected_process_logs.is_some() {
-            self.render_process_raw_logs_panel(ui);
+            if self.selected_process_is_pty() {
+                self.render_process_pty_panel(ui);
+            } else {
+                self.render_process_raw_logs_panel(ui);
+            }
         }
     }
 
@@ -3512,7 +3651,7 @@ impl App {
             let up_title = match container_lifecycle {
                 supervisor::ContainerLifecycleState::Stopped => "Start Container",
                 supervisor::ContainerLifecycleState::Starting
-                | supervisor::ContainerLifecycleState::Running => "Stop Container",
+                | supervisor::ContainerLifecycleState::Running => "Restart Container",
                 supervisor::ContainerLifecycleState::Stopping { .. }
                 | supervisor::ContainerLifecycleState::Killing { .. } => "Kill Container",
             };
@@ -3575,9 +3714,9 @@ impl App {
                     | supervisor::ContainerLifecycleState::Running => {
                         info!(
                             profile = profile_name.as_str(),
-                            child_pid, "ui clicked Stop Container"
+                            child_pid, "ui clicked Restart Container"
                         );
-                        self.supervisor.send(SupervisorCommand::StopContainer {
+                        self.supervisor.send(SupervisorCommand::StartUp {
                             profile: profile_name.clone(),
                         });
                     }
@@ -3767,8 +3906,22 @@ impl App {
                     diag::SpawnedEntry::Args(mut args) => {
                         Self::render_spawn_args_gadget(
                             ui,
+                            &mut self.int_input,
                             &mut args,
                             "process-inspect-spawnargs",
+                            true,
+                        );
+                    }
+                    diag::SpawnedEntry::Pty(mut args) => {
+                        ui.colored_label(
+                            Color32::from_rgb(100, 180, 240),
+                            "PTY process (interactive terminal)",
+                        );
+                        Self::render_spawn_args_gadget(
+                            ui,
+                            &mut self.int_input,
+                            &mut args,
+                            "process-inspect-spawnargs-pty",
                             true,
                         );
                     }
@@ -3835,6 +3988,7 @@ impl App {
         let mut kill_request: Option<(ContainerName, u32)> = None;
         let mut inspect_request: Option<(ContainerName, u32)> = None;
         let mut logs_request: Option<(ContainerName, u32)> = None;
+        let mut external_pty_request: Option<(ContainerName, u32)> = None;
 
         TableBuilder::new(ui)
             .striped(true)
@@ -3848,6 +4002,7 @@ impl App {
             .column(Column::exact(46.0)) // Kill
             .column(Column::exact(64.0)) // Inspect
             .column(Column::exact(60.0)) // Logs
+            .column(Column::exact(44.0)) // Ext
             .column(Column::remainder()) // Fill remaining width
             .header(22.0, |mut header| {
                 header.col(|ui| {
@@ -3871,6 +4026,7 @@ impl App {
                 header.col(|ui| { /* Kill */ });
                 header.col(|ui| { /* Inspect */ });
                 header.col(|ui| { /* Logs */ });
+                header.col(|ui| { /* Ext */ });
                 header.col(|ui| { /* Fill */ });
             })
             .body(|mut body| {
@@ -3910,7 +4066,15 @@ impl App {
                                     .uid
                                     .map(|u| u.to_string())
                                     .unwrap_or_else(|| "-".to_string());
-                                (prog, uid)
+                                (format!("[output] {}", prog), uid)
+                            }
+                            diag::SpawnedEntry::Pty(a) => {
+                                let prog = a.exec_program_hint().unwrap_or_else(|| "-".to_string());
+                                let uid = a
+                                    .uid
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                (format!("[PTY] {}", prog), uid)
                             }
                             diag::SpawnedEntry::Cli(cli_meta) => {
                                 let prog = if cli_meta.is_serve {
@@ -3918,7 +4082,7 @@ impl App {
                                 } else {
                                     "sp spawncli".to_string()
                                 };
-                                (prog, "-".to_string())
+                                (format!("[output] {}", prog), "-".to_string())
                             }
                         };
 
@@ -3988,6 +4152,19 @@ impl App {
                             }
                         });
 
+                        // External PTY window button
+                        row.col(|ui| {
+                            if matches!(&entry.meta, diag::SpawnedEntry::Pty(_)) {
+                                if ui
+                                    .small_button("ext")
+                                    .on_hover_text("Open PTY in native window")
+                                    .clicked()
+                                {
+                                    external_pty_request = Some((row_profile.clone(), *slot_pid));
+                                }
+                            }
+                        });
+
                         row.col(|_ui| {});
                     });
                 }
@@ -4002,12 +4179,202 @@ impl App {
         }
         if let Some((profile, pid)) = logs_request {
             self.selected_process_logs = Some((profile.clone(), pid));
-            self.supervisor.send(SupervisorCommand::QueryRawLogs {
-                profile,
-                pid,
-                limit: diag::RAW_LOG_RING_CAP,
+            if self.is_pty_process(&profile, pid) {
+                self.supervisor
+                    .send(SupervisorCommand::AttachPty { profile, pid });
+            } else {
+                self.supervisor.send(SupervisorCommand::QueryRawLogs {
+                    profile,
+                    pid,
+                    limit: diag::RAW_LOG_RING_CAP,
+                });
+            }
+        }
+        if let Some((profile, pid)) = external_pty_request {
+            let is_same = self.is_same_external_pty(&profile, pid);
+            if is_same {
+                self.close_external_pty_window();
+            } else {
+                if let Some(prev) = self.external_pty_viewport.as_ref() {
+                    let inline_same = self
+                        .selected_process_logs
+                        .as_ref()
+                        .is_some_and(|(p, q)| p == &prev.profile && *q == prev.pid)
+                        && self.selected_process_is_pty();
+                    if !inline_same {
+                        self.supervisor.send(SupervisorCommand::DetachPty {
+                            profile: prev.profile.clone(),
+                            pid: prev.pid,
+                        });
+                        self.pty_sessions.remove(&(prev.profile.clone(), prev.pid));
+                    }
+                }
+                self.supervisor
+                    .send(SupervisorCommand::AttachPty { profile: profile.clone(), pid });
+                let viewport_id = egui::ViewportId::from_hash_of("pty-external");
+                self.supervisor.set_pty_viewport(viewport_id);
+                self.external_pty_viewport = Some(Arc::new(ExternalPtyViewport {
+                    profile,
+                    pid,
+                    session: Mutex::new(TermSession::new(pid)),
+                    supervisor: self.supervisor.clone(),
+                    closed: AtomicBool::new(false),
+                    viewport_id,
+                }));
+            }
+        }
+    }
+
+    fn is_pty_process(&self, profile: &ContainerName, slot_pid: u32) -> bool {
+        self.snapshot
+            .profiles
+            .get(profile)
+            .and_then(|p| p.process_list_snapshot.as_ref())
+            .and_then(|snap| snap.procs.get(&slot_pid))
+            .map(|entry| matches!(entry.meta, diag::SpawnedEntry::Pty(_)))
+            .unwrap_or(false)
+    }
+
+    fn selected_process_is_pty(&self) -> bool {
+        self.selected_process_logs
+            .as_ref()
+            .is_some_and(|(profile, pid)| self.is_pty_process(profile, *pid))
+    }
+
+    fn is_same_external_pty(&self, profile: &ContainerName, pid: u32) -> bool {
+        self.external_pty_viewport
+            .as_ref()
+            .is_some_and(|v| v.profile == *profile && v.pid == pid)
+    }
+
+    fn close_external_pty_window(&mut self) {
+        if let Some(vp) = self.external_pty_viewport.take() {
+            vp.closed.store(true, Ordering::Relaxed);
+            self.supervisor.clear_pty_viewport();
+            let profile = &vp.profile;
+            let pid = vp.pid;
+            let inline_same = self
+                .selected_process_logs
+                .as_ref()
+                .is_some_and(|(p, q)| p == profile && *q == pid)
+                && self.selected_process_is_pty();
+            if !inline_same {
+                self.supervisor.send(SupervisorCommand::DetachPty {
+                    profile: profile.clone(),
+                    pid,
+                });
+                self.pty_sessions.remove(&(profile.clone(), pid));
+            }
+        }
+    }
+
+    fn render_process_pty_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((selected_profile, selected_slot_pid)) = self.selected_process_logs.as_ref() else {
+            return;
+        };
+        let profile = selected_profile.clone();
+        let slot_pid = *selected_slot_pid;
+        let key = (profile.clone(), slot_pid);
+
+        // Request continuous repaint while a PTY panel is open so incoming
+        // data shows up immediately.
+        ui.ctx().request_repaint();
+
+        ui.add_space(8.0);
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.heading(format!("Terminal — PID {slot_pid}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    if !self.is_same_external_pty(&profile, slot_pid) {
+                        self.supervisor.send(SupervisorCommand::DetachPty {
+                            profile: profile.clone(),
+                            pid: slot_pid,
+                        });
+                        self.pty_sessions.remove(&key);
+                    }
+                    self.selected_process_logs = None;
+                }
+            });
+        });
+
+        self.render_process_pty_terminal(ui, &profile, slot_pid);
+    }
+
+    fn render_process_pty_terminal(&mut self, ui: &mut egui::Ui, profile: &ContainerName, slot_pid: u32) {
+        let key = (profile.clone(), slot_pid);
+
+        let incoming = self.supervisor.drain_pty(&profile, slot_pid);
+
+        let session = self
+            .pty_sessions
+            .entry(key)
+            .or_insert_with(|| TermSession::new(slot_pid));
+        if !incoming.is_empty() {
+            session.feed(&incoming);
+            for resp in session.drain_responses() {
+                if !resp.is_empty() {
+                    self.supervisor.send(SupervisorCommand::PtyInput {
+                        profile: profile.clone(),
+                        pid: slot_pid,
+                        data: resp,
+                    });
+                }
+            }
+        }
+
+        let mut input_frames: Vec<Vec<u8>> = Vec::new();
+        let mut resize_evt: Option<(u16, u16)> = None;
+        ui.add(
+            TermView::new(session, &mut input_frames, &mut resize_evt)
+                .set_size(ui.available_size()),
+        );
+
+        for data in input_frames {
+            if !data.is_empty() {
+                self.supervisor.send(SupervisorCommand::PtyInput {
+                    profile: profile.clone(),
+                    pid: slot_pid,
+                    data,
+                });
+            }
+        }
+        if let Some((cols, rows)) = resize_evt {
+            self.supervisor.send(SupervisorCommand::PtyResize {
+                profile: profile.clone(),
+                pid: slot_pid,
+                cols,
+                rows,
             });
         }
+    }
+
+    fn render_external_pty_window(&mut self, ctx: &egui::Context) {
+        // Check if the deferred viewport signalled close.
+        if let Some(ref vp) = self.external_pty_viewport {
+            if vp.closed.load(Ordering::Relaxed) {
+                self.close_external_pty_window();
+                return;
+            }
+        }
+
+        let Some(vp) = self.external_pty_viewport.clone() else {
+            return;
+        };
+
+        let viewport_id = vp.viewport_id;
+        let title = format!("Terminal — {} / PID {}", vp.profile, vp.pid);
+
+        ctx.show_viewport_deferred(
+            viewport_id,
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size([1200.0, 760.0]),
+            move |ctx, _class| {
+                ExternalPtyViewport::viewport_ui(&vp, ctx);
+            },
+        );
     }
 
     fn render_process_raw_logs_panel(&mut self, ui: &mut egui::Ui) {
@@ -4103,7 +4470,7 @@ impl App {
                                         ui.label(part.clone());
                                     }
                                 }
-                            });
+            });
                         }
                     });
             });
@@ -4119,11 +4486,19 @@ impl App {
             ui.add_space(10.0);
             if ui.button("Run").clicked() {
                 if let Some(args) = self.run_command.pending_spawn_args.clone() {
-                    self.supervisor.send(SupervisorCommand::StartDaemon {
-                        profile: profile.clone(),
-                        args,
-                    });
-                    self.run_command.status = Some("Spawn request sent".to_string());
+                    if self.run_command.spawn_as_pty {
+                        self.supervisor.send(SupervisorCommand::SpawnPty {
+                            profile: profile.clone(),
+                            args,
+                        });
+                        self.run_command.status = Some("PTY spawn request sent".to_string());
+                    } else {
+                        self.supervisor.send(SupervisorCommand::StartDaemon {
+                            profile: profile.clone(),
+                            args,
+                        });
+                        self.run_command.status = Some("Output-mode spawn request sent".to_string());
+                    }
                     self.run_command.pending_spawn_args = None;
                     self.run_command.parse_error = None;
                 } else {
@@ -4147,9 +4522,47 @@ impl App {
             }
         });
 
-        let edited = ui
-            .text_edit_singleline(&mut self.run_command.command_line)
-            .changed();
+        let response = ui.text_edit_singleline(&mut self.run_command.command_line);
+        let edited = response.changed();
+
+        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        if enter_pressed {
+            if let Some(args) = self.run_command.pending_spawn_args.clone() {
+                if self.run_command.spawn_as_pty {
+                    self.supervisor.send(SupervisorCommand::SpawnPty {
+                        profile: profile.clone(),
+                        args,
+                    });
+                    self.run_command.status = Some("PTY spawn request sent".to_string());
+                } else {
+                    self.supervisor.send(SupervisorCommand::StartDaemon {
+                        profile: profile.clone(),
+                        args,
+                    });
+                    self.run_command.status = Some("Output-mode spawn request sent".to_string());
+                }
+                self.run_command.pending_spawn_args = None;
+                self.run_command.parse_error = None;
+            } else if response.lost_focus() {
+                match parse_command_line_to_spawn_args(
+                    &self.run_command.command_line,
+                    self.run_command.spawn_inside_container,
+                ) {
+                    Ok(args) => {
+                        self.run_command.pending_spawn_args = Some(args);
+                        self.run_command.parse_error = None;
+                        self.run_command.status = Some(
+                            "Review parsed SpawnArgs, then click Run to confirm".to_string(),
+                        );
+                    }
+                    Err(err) => {
+                        self.run_command.parse_error = Some(err);
+                        self.run_command.status = None;
+                    }
+                }
+            }
+        }
 
         let ns_toggled = ui
             .checkbox(
@@ -4158,7 +4571,14 @@ impl App {
             )
             .changed();
 
-        if edited || ns_toggled {
+        let mode_toggled = ui
+            .checkbox(
+                &mut self.run_command.spawn_as_pty,
+                "Spawn as PTY (interactive terminal)",
+            )
+            .changed();
+
+        if edited || ns_toggled || mode_toggled {
             self.run_command.pending_spawn_args = None;
             self.run_command.parse_error = None;
             self.run_command.status = None;
@@ -4173,7 +4593,13 @@ impl App {
 
         if let Some(args) = self.run_command.pending_spawn_args.as_mut() {
             ui.add_space(8.0);
-            Self::render_spawn_args_gadget(ui, args, "run-command-confirm-spawnargs", false);
+            Self::render_spawn_args_gadget(
+                ui,
+                &mut self.int_input,
+                args,
+                "run-command-confirm-spawnargs",
+                false,
+            );
         }
     }
 
@@ -4911,6 +5337,7 @@ impl App {
 
         let changed = Self::render_hotconfig_editor_split(
             ui,
+            &mut self.int_input,
             "hotconfig-tab",
             &mut self.hotconfig_editor_value,
             &mut self.hotconfig_editor_json,
@@ -6166,6 +6593,8 @@ fn main() {
         .with_line_number(true)
         .try_init();
 
+    diag::set_protocol_version(nsproxy_core::build_identity());
+
     info!("starting nsproxy-ui");
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -6174,6 +6603,8 @@ fn main() {
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             setup_cjk_font(&cc.egui_ctx);
+            // Allow deferred viewports to open as independent OS windows.
+            cc.egui_ctx.set_embed_viewports(false);
             // Set every text style to 16px for consistent sizing.
             cc.egui_ctx.style_mut(|style| {
                 for ts in &[

@@ -65,6 +65,20 @@ pub mod state_blueprint;
 pub mod sys;
 pub mod utils;
 
+pub fn build_tree_hash() -> &'static str {
+    option_env!("NSP_BUILD_TREE_HASH").unwrap_or("unknown")
+}
+
+pub fn build_epoch_secs() -> u64 {
+    option_env!("NSP_BUILD_EPOCH_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+pub fn build_identity() -> String {
+    build_tree_hash().to_owned()
+}
+
 pub struct TunMaker {
     pub name: String,
     pub ipv4: Ipv4Network,
@@ -1585,7 +1599,9 @@ impl Default for CliSpawnArgs {
 /// Lightweight CLI form of `DaemonRequest` used for `--cmd` parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CliDaemonRequest {
-    Spawn { args: CliSpawnArgs },
+    Spawn {
+        args: CliSpawnArgs,
+    },
     /// Provide a JSON `Cli` payload as text; it will be bincode-serialized
     /// and sent as the raw payload (converts to `DaemonRequest::SpawnCli`).
     SpawnCli {
@@ -1596,7 +1612,9 @@ pub enum CliDaemonRequest {
     /// Liveness ping
     Ping,
     GetProcessList,
-    Kill { pid: u32 },
+    Kill {
+        pid: u32,
+    },
     Stop,
 }
 
@@ -1607,7 +1625,9 @@ impl std::str::FromStr for CliDaemonRequest {
         match t.to_ascii_lowercase().as_str() {
             "stop" => Ok(CliDaemonRequest::Stop),
             "ping" => Ok(CliDaemonRequest::Ping),
-            "get" | "getprocesslist" | "get_process_list" | "processlist" => Ok(CliDaemonRequest::GetProcessList),
+            "get" | "getprocesslist" | "get_process_list" | "processlist" => {
+                Ok(CliDaemonRequest::GetProcessList)
+            }
             other => {
                 // Try JSON fallback for more complex forms
                 if other.starts_with('{') || other.starts_with('[') {
@@ -1706,6 +1726,15 @@ pub enum MainCommand {
         /// Optional daemon request to send to the `up` daemon. Provide JSON matching `CliDaemonRequest`.
         #[arg(long)]
         cmd: Option<CliDaemonRequest>,
+        /// Mock mode: reject protocol upgrades as if daemon runs an older version.
+        #[arg(long)]
+        simulate_protocol_no_upgrade: bool,
+        /// Mock mode: accept and immediately close incoming up-daemon connections.
+        #[arg(long)]
+        simulate_conn_close: bool,
+        /// Mock mode: delay daemon shutdown acknowledgement/exit to simulate slow replacement.
+        #[arg(long)]
+        simulate_slow_shutdown: bool,
     },
     /// Tear down a profile: kill the keeper process and remove the namespace bind mount.
     Down {
@@ -1761,6 +1790,9 @@ pub enum MainCommand {
     },
     /// Print a typed blueprint tree for global state paths
     StateTree,
+    /// Print build identity (BLAKE3 source tree hash + build epoch timestamp)
+    #[command(alias = "v")]
+    Version,
     /// Pivot-root sandbox: enters an existing namespace, builds a tmpfs pivot
     /// root from a profile's TemplateConfig, and watches HotConfig for changes.
     /// Deprecated/Scheduled for refactor. This command currently runs a daemon which is bad.
@@ -1908,9 +1940,7 @@ mod level_filter_serde {
         v.as_ref().map(|lf| lf.to_string()).serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Option<LevelFilter>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<LevelFilter>, D::Error> {
         let opt: Option<String> = Option::deserialize(d)?;
         match opt {
             None => Ok(None),
@@ -2034,6 +2064,10 @@ mod cli_fd_tests {
             no_wrap_check: true,
             cmd: MainCommand::Up {
                 profile: "myprofile".into(),
+                cmd: None,
+                simulate_protocol_no_upgrade: false,
+                simulate_conn_close: false,
+                simulate_slow_shutdown: false,
             },
         });
     }

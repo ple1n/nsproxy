@@ -15,11 +15,11 @@ use std::{
     collections::{BTreeMap, VecDeque},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use nsproxy_common::routing::{ProxyID, RoutingResovled};
 use socks5_impl::protocol::WireAddress;
 pub use nsproxy_common::stats::Timestamp;
@@ -203,6 +203,75 @@ pub struct RoutingState {
     pub selected_proxy: Option<ProxyID>,
 }
 
+/// Logical protocol channel carried over the framed Unix stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProtocolChannel {
+    Diag,
+    Up,
+    Control,
+}
+
+/// Mandatory pre-frame exchanged before any protocol messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolHandshake {
+    pub channel: ProtocolChannel,
+    pub version: String,
+}
+
+static PROTOCOL_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Set this process' protocol build identity. Must be called before opening any protocol sockets.
+pub fn set_protocol_version(version: impl Into<String>) {
+    let _ = PROTOCOL_VERSION.set(version.into());
+}
+
+/// Current process protocol build identity used during handshakes.
+pub fn protocol_version() -> &'static str {
+    PROTOCOL_VERSION
+        .get()
+        .map(String::as_str)
+        .unwrap_or("unknown:0")
+}
+
+fn local_handshake(channel: ProtocolChannel) -> ProtocolHandshake {
+    ProtocolHandshake {
+        channel,
+        version: protocol_version().to_string(),
+    }
+}
+
+async fn write_handshake(stream: &mut UnixStream, channel: ProtocolChannel) -> Result<()> {
+    let frame = encode_frame(&local_handshake(channel))?;
+    stream.write_all(&frame).await?;
+    Ok(())
+}
+
+async fn read_handshake(stream: &mut UnixStream, expected_channel: ProtocolChannel) -> Result<()> {
+    let Some(remote) = read_frame::<ProtocolHandshake, _>(stream).await? else {
+        bail!("peer closed before protocol handshake");
+    };
+    if remote.channel != expected_channel {
+        bail!(
+            "protocol channel mismatch: expected {:?}, got {:?}",
+            expected_channel,
+            remote.channel
+        );
+    }
+    Ok(())
+}
+
+/// Client-side handshake: send local identity first, then validate server identity.
+pub async fn handshake_client(stream: &mut UnixStream, channel: ProtocolChannel) -> Result<()> {
+    write_handshake(stream, channel.clone()).await?;
+    read_handshake(stream, channel).await
+}
+
+/// Server-side handshake: validate client identity first, then send local identity.
+pub async fn handshake_server(stream: &mut UnixStream, channel: ProtocolChannel) -> Result<()> {
+    read_handshake(stream, channel.clone()).await?;
+    write_handshake(stream, channel).await
+}
+
 // ── Control socket (reversed-role connections) ────────────────────────
 //
 // When the UI passes `--control-socket` to a spawned process, the process
@@ -229,6 +298,16 @@ pub fn encode_control_greeting(greeting: &ControlSocketGreeting) -> Result<Vec<u
 /// Read a [`ControlSocketGreeting`] from the *unsplit* stream.  Returns `None` on clean EOF.
 pub async fn read_control_greeting(stream: &mut UnixStream) -> Result<Option<ControlSocketGreeting>> {
     read_frame(stream).await
+}
+
+/// Perform control-socket client-side handshake.
+pub async fn control_handshake_client(stream: &mut UnixStream) -> Result<()> {
+    handshake_client(stream, ProtocolChannel::Control).await
+}
+
+/// Perform control-socket server-side handshake.
+pub async fn control_handshake_server(stream: &mut UnixStream) -> Result<()> {
+    handshake_server(stream, ProtocolChannel::Control).await
 }
 
 // ── Connection-tracking types ────────────────────────────────────────
@@ -510,7 +589,11 @@ impl DiagServer {
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                    Ok((mut stream, _addr)) => {
+                        if let Err(e) = handshake_server(&mut stream, ProtocolChannel::Diag).await {
+                            warn!("diag: handshake failed: {}", e);
+                            continue;
+                        }
                         info!("diag: client connected");
                         let rx = tx2.subscribe();
                         tokio::spawn(serve_client(
@@ -755,7 +838,8 @@ where
 
 /// Connect to a running tun2socks5 diag socket.
 pub async fn connect(sock_path: &Path) -> Result<DiagEventStream> {
-    let stream = UnixStream::connect(sock_path).await?;
+    let mut stream = UnixStream::connect(sock_path).await?;
+    handshake_client(&mut stream, ProtocolChannel::Diag).await?;
     Ok(DiagEventStream::from_stream(stream))
 }
 
@@ -967,7 +1051,7 @@ where
                     let _ = tx.send(Arc::new(frame));
                 }
             } else if let Some(tx) = UP_LOG_TX.get() {
-                if let Ok(frame) = encode_frame(&DaemonEvent::Log(entry)) {
+                if let Ok(frame) = encode_frame(&UpWireEvent::Unstable(DaemonEvent::Log(entry))) {
                     let _ = tx.send(Arc::new(frame));
                 }
             }
@@ -1068,6 +1152,29 @@ pub enum DaemonRequest {
         cli_bincode: Vec<u8>,
         ns: NamespaceSpawn,
     },
+    /// Spawn a new child process connected to a PTY.
+    SpawnPty {
+        args: SpawnArgs,
+    },
+    /// Attach this client connection to PTY output stream for `pid`.
+    AttachPty {
+        pid: u32,
+    },
+    /// Detach this client connection from PTY output stream for `pid`.
+    DetachPty {
+        pid: u32,
+    },
+    /// Write raw bytes to a PTY child's stdin.
+    PtyInput {
+        pid: u32,
+        data: Vec<u8>,
+    },
+    /// Notify PTY resize in character cells.
+    PtyResize {
+        pid: u32,
+        cols: u16,
+        rows: u16,
+    },
     /// Request current process list snapshot
     GetProcessList,
     /// Kill a child process by PID
@@ -1083,6 +1190,27 @@ pub enum DaemonRequest {
     /// Request the most-recent `limit` raw stdout/stderr lines captured from process `pid`.
     /// The server responds immediately with `DaemonEvent::RawLogs`.
     QueryRawLogs { pid: u32, limit: usize },
+}
+
+/// Stable control requests available across protocol versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StableRequest {
+    /// Liveness probe independent of version-specific protocol.
+    Ping,
+    /// Ask the target up daemon to stop gracefully.
+    GracefulShutdown,
+    /// Request upgrade to version-specific protocol when build identity matches.
+    Upgrade { build_tree_hash: String },
+}
+
+/// Up-daemon wire request envelope.
+///
+/// `Stable` is the long-lived control plane. `Unstable` carries version-specific
+/// request payloads that are only valid after an accepted upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpWireRequest {
+    Stable(StableRequest),
+    Unstable(DaemonRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1114,6 +1242,30 @@ pub enum DaemonEvent {
     /// Raw stdout/stderr lines captured from a managed process.
     /// Sent in response to `DaemonRequest::QueryRawLogs`.
     RawLogs { pid: u32, logs: Vec<RawLog> },
+    /// Raw PTY bytes for a managed PTY child.
+    PtyOutput { pid: u32, data: Vec<u8> },
+    /// Initial PTY scrollback bytes sent on successful attach.
+    PtyScrollback { pid: u32, data: Vec<u8> },
+}
+
+/// Stable control responses available across protocol versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StableEvent {
+    Pong,
+    ShuttingDown,
+    UpgradeAccepted { build_tree_hash: String },
+    UpgradeRejected { msg: String },
+    Error { msg: String },
+}
+
+/// Up-daemon wire event envelope.
+///
+/// `Stable` is always available after handshake. `Unstable` carries version-specific
+/// event payloads emitted after upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpWireEvent {
+    Stable(StableEvent),
+    Unstable(DaemonEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1148,6 +1300,7 @@ pub struct ProcessEntry {
 pub enum SpawnedEntry {
     Args(SpawnArgs),
     Cli(SpawnCliType),
+    Pty(SpawnArgs),
 }
 
 /// Snapshot of the process list sent in `DaemonEvent::ProcessListSnapshot`.
@@ -1180,7 +1333,7 @@ pub struct UpDaemonReader {
 }
 
 impl UpDaemonReader {
-    pub async fn next_event(&mut self) -> Result<Option<DaemonEvent>> {
+    pub async fn next_event(&mut self) -> Result<Option<UpWireEvent>> {
         read_frame(&mut self.read_half).await
     }
 }
@@ -1190,15 +1343,50 @@ pub struct UpDaemonWriter {
 }
 
 impl UpDaemonWriter {
-    pub async fn send_request(&mut self, req: &DaemonRequest) -> Result<()> {
+    pub async fn send_request(&mut self, req: &UpWireRequest) -> Result<()> {
         let frame = encode_frame(req)?;
         self.write_half.write_all(&frame).await?;
         Ok(())
     }
+
+    /// Ergonomic helper for version-specific requests.
+    pub async fn send_unstable_request(&mut self, req: &DaemonRequest) -> Result<()> {
+        self.send_request(&UpWireRequest::Unstable(req.clone())).await
+    }
+
+    /// Ergonomic helper for stable control requests.
+    pub async fn send_stable_request(&mut self, req: &StableRequest) -> Result<()> {
+        self.send_request(&UpWireRequest::Stable(req.clone())).await
+    }
 }
 
 pub async fn connect_up_daemon(sock_path: &Path) -> Result<UpDaemonStream> {
-    let stream = UnixStream::connect(sock_path).await?;
+    let mut stream = connect_up_daemon_stable(sock_path).await?;
+    stream
+        .send_request(&UpWireRequest::Stable(StableRequest::Upgrade {
+            build_tree_hash: protocol_version().to_string(),
+        }))
+        .await?;
+    match stream.next_event().await? {
+        Some(UpWireEvent::Stable(StableEvent::UpgradeAccepted { .. })) => Ok(stream),
+        Some(UpWireEvent::Stable(StableEvent::UpgradeRejected { msg })) => {
+            bail!("up daemon protocol upgrade rejected: {}", msg)
+        }
+        Some(UpWireEvent::Stable(StableEvent::Error { msg })) => {
+            bail!("up daemon stable protocol error: {}", msg)
+        }
+        Some(UpWireEvent::Unstable(DaemonEvent::Error { msg })) => {
+            bail!("up daemon protocol error: {}", msg)
+        }
+        Some(other) => bail!("unexpected upgrade response from up daemon: {:?}", other),
+        None => bail!("up daemon closed during protocol upgrade"),
+    }
+}
+
+/// Connect to an up daemon using only handshake + stable protocol.
+pub async fn connect_up_daemon_stable(sock_path: &Path) -> Result<UpDaemonStream> {
+    let mut stream = UnixStream::connect(sock_path).await?;
+    handshake_client(&mut stream, ProtocolChannel::Up).await?;
     Ok(UpDaemonStream::from_stream(stream))
 }
 
@@ -1212,14 +1400,24 @@ impl UpDaemonStream {
 }
 
 impl UpDaemonStream {
-    pub async fn next_event(&mut self) -> Result<Option<DaemonEvent>> {
+    pub async fn next_event(&mut self) -> Result<Option<UpWireEvent>> {
         read_frame(&mut self.read_half).await
     }
 
-    pub async fn send_request(&mut self, req: &DaemonRequest) -> Result<()> {
+    pub async fn send_request(&mut self, req: &UpWireRequest) -> Result<()> {
         let frame = encode_frame(req)?;
         self.write_half.write_all(&frame).await?;
         Ok(())
+    }
+
+    /// Ergonomic helper for version-specific requests.
+    pub async fn send_unstable_request(&mut self, req: &DaemonRequest) -> Result<()> {
+        self.send_request(&UpWireRequest::Unstable(req.clone())).await
+    }
+
+    /// Ergonomic helper for stable control requests.
+    pub async fn send_stable_request(&mut self, req: &StableRequest) -> Result<()> {
+        self.send_request(&UpWireRequest::Stable(req.clone())).await
     }
 
     pub fn split(self) -> (UpDaemonReader, UpDaemonWriter) {

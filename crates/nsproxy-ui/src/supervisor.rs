@@ -4,7 +4,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
-use std::{fs::File, io::{BufRead, BufReader}};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+};
 
 use anyhow::{Context, Result};
 use diag::summary::DiagAccumulator;
@@ -12,11 +15,11 @@ use diag::{ControlCommand, DiagEvent, DiagEventStream, LogEntry};
 use libc;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{execve, fork, ForkResult, Pid};
-use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::state_paths;
 use nsproxy_common::stats::ProxyStats;
 use nsproxy_common::NsAlive;
+use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_core::cmd_common::read_ns_alive;
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{cli_to_inheritable_fd, to_cstr, Cli, HotConfig, MainCommand, TemplateConfig};
@@ -119,6 +122,9 @@ pub struct ContainerState {
     /// Raw stdout/stderr captured from managed processes, keyed by slot PID.
     #[serde(skip)]
     pub process_raw_logs: HashMap<u32, Vec<diag::RawLog>>,
+    /// Raw PTY bytes received since the previous snapshot, keyed by slot PID.
+    #[serde(skip)]
+    pub pty_streams: HashMap<u32, Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -150,8 +156,12 @@ pub enum ContainerLifecycleState {
     Stopped,
     Starting,
     Running,
-    Stopping { attempt: u8 },
-    Killing { attempt: u8 },
+    Stopping {
+        attempt: u8,
+    },
+    Killing {
+        attempt: u8,
+    },
 }
 
 impl ContainerLifecycleState {
@@ -192,6 +202,10 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         args: diag::SpawnArgs,
     },
+    SpawnPty {
+        profile: ContainerName,
+        args: diag::SpawnArgs,
+    },
     StopContainer {
         profile: ContainerName,
     },
@@ -208,6 +222,25 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         pid: u32,
         limit: usize,
+    },
+    AttachPty {
+        profile: ContainerName,
+        pid: u32,
+    },
+    DetachPty {
+        profile: ContainerName,
+        pid: u32,
+    },
+    PtyInput {
+        profile: ContainerName,
+        pid: u32,
+        data: Vec<u8>,
+    },
+    PtyResize {
+        profile: ContainerName,
+        pid: u32,
+        cols: u16,
+        rows: u16,
     },
     StartHotconfigDaemons {
         profile: ContainerName,
@@ -231,10 +264,19 @@ pub enum SupervisorCommand {
     },
 }
 
+/// Shared PTY byte buffer.  The supervisor task appends; the UI thread drains.
+type SharedPtyBuf = Arc<Mutex<HashMap<ContainerName, HashMap<u32, Vec<u8>>>>>;
+
+/// When an external PTY viewport is active, holds its ViewportId so the
+/// supervisor can repaint only that viewport (not the main window).
+type SharedPtyViewportId = Arc<Mutex<Option<egui::ViewportId>>>;
+
 #[derive(Clone)]
 pub struct SupervisorHandle {
     cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
     snapshot_rx: std::sync::Arc<std::sync::Mutex<tokio::sync::watch::Receiver<SupervisorSnapshot>>>,
+    pty_buf: SharedPtyBuf,
+    pty_viewport_id: SharedPtyViewportId,
 }
 
 impl SupervisorHandle {
@@ -247,17 +289,23 @@ impl SupervisorHandle {
             generated_at: SystemTime::now(),
         });
 
+        let pty_buf: SharedPtyBuf = Arc::new(Mutex::new(HashMap::new()));
+        let pty_viewport_id: SharedPtyViewportId = Arc::new(Mutex::new(None));
         let cmd_tx_for_self = cmd_tx.clone();
         (
             Self {
                 cmd_tx: cmd_tx_for_self,
                 snapshot_rx: std::sync::Arc::new(std::sync::Mutex::new(snapshot_rx)),
+                pty_buf: pty_buf.clone(),
+                pty_viewport_id: pty_viewport_id.clone(),
             },
             SupervisorTask {
                 cmd_tx,
                 cmd_rx,
                 snapshot_tx,
                 ectx,
+                pty_buf,
+                pty_viewport_id,
             },
         )
     }
@@ -281,6 +329,34 @@ impl SupervisorHandle {
             None
         }
     }
+
+    /// Drain accumulated PTY bytes for a specific process.
+    /// Returns the buffered bytes (may be empty) and removes them from the shared buffer.
+    pub fn drain_pty(&self, profile: &ContainerName, pid: u32) -> Vec<u8> {
+        let mut guard = match self.pty_buf.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard
+            .get_mut(profile)
+            .and_then(|m| m.remove(&pid))
+            .unwrap_or_default()
+    }
+
+    /// Register an external PTY viewport so the supervisor repaints only it
+    /// (instead of the main window) when PTY data arrives.
+    pub fn set_pty_viewport(&self, id: egui::ViewportId) {
+        if let Ok(mut guard) = self.pty_viewport_id.lock() {
+            *guard = Some(id);
+        }
+    }
+
+    /// Clear the external PTY viewport registration.
+    pub fn clear_pty_viewport(&self) {
+        if let Ok(mut guard) = self.pty_viewport_id.lock() {
+            *guard = None;
+        }
+    }
 }
 
 pub struct SupervisorTask {
@@ -288,6 +364,8 @@ pub struct SupervisorTask {
     cmd_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
     snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
     ectx: egui::Context,
+    pty_buf: SharedPtyBuf,
+    pty_viewport_id: SharedPtyViewportId,
 }
 
 impl SupervisorTask {
@@ -298,6 +376,8 @@ impl SupervisorTask {
             self.cmd_rx,
             self.snapshot_tx,
             self.ectx,
+            self.pty_buf,
+            self.pty_viewport_id,
         );
         if let Err(err) = supervisor.run().await {
             error!("supervisor stopped: {err:?}");
@@ -379,10 +459,15 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StartServe { .. } => "StartServe",
         SupervisorCommand::StopServe { .. } => "StopServe",
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
+        SupervisorCommand::SpawnPty { .. } => "SpawnPty",
         SupervisorCommand::StopContainer { .. } => "StopContainer",
         SupervisorCommand::KillContainer { .. } => "KillContainer",
         SupervisorCommand::KillManagedProcess { .. } => "KillManagedProcess",
         SupervisorCommand::QueryRawLogs { .. } => "QueryRawLogs",
+        SupervisorCommand::AttachPty { .. } => "AttachPty",
+        SupervisorCommand::DetachPty { .. } => "DetachPty",
+        SupervisorCommand::PtyInput { .. } => "PtyInput",
+        SupervisorCommand::PtyResize { .. } => "PtyResize",
         SupervisorCommand::StartHotconfigDaemons { .. } => "StartHotconfigDaemons",
         SupervisorCommand::Ctrl { .. } => "Ctrl",
         SupervisorCommand::ReloadHotconfig(_) => "ReloadHotconfig",
@@ -408,10 +493,17 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::StartHotconfigDaemons { profile }
         | SupervisorCommand::OnTabOpen { profile, .. } => Some(profile.as_str()),
         SupervisorCommand::StartDaemon { profile, .. }
+        | SupervisorCommand::SpawnPty { profile, .. }
         | SupervisorCommand::KillManagedProcess { profile, .. }
         | SupervisorCommand::QueryRawLogs { profile, .. }
+        | SupervisorCommand::AttachPty { profile, .. }
+        | SupervisorCommand::DetachPty { profile, .. }
+        | SupervisorCommand::PtyInput { profile, .. }
+        | SupervisorCommand::PtyResize { profile, .. }
         | SupervisorCommand::Ctrl { profile, .. } => Some(profile.as_str()),
-        SupervisorCommand::LoadProfiles(_) | SupervisorCommand::RefreshNamespaces | SupervisorCommand::Init => None,
+        SupervisorCommand::LoadProfiles(_)
+        | SupervisorCommand::RefreshNamespaces
+        | SupervisorCommand::Init => None,
     }
 }
 
@@ -426,6 +518,8 @@ fn daemon_event_name(event: &diag::DaemonEvent) -> &'static str {
         diag::DaemonEvent::Log(_) => "Log",
         diag::DaemonEvent::RecentLogs(_) => "RecentLogs",
         diag::DaemonEvent::RawLogs { .. } => "RawLogs",
+        diag::DaemonEvent::PtyOutput { .. } => "PtyOutput",
+        diag::DaemonEvent::PtyScrollback { .. } => "PtyScrollback",
     }
 }
 
@@ -483,6 +577,10 @@ struct Supervisor {
     ui_ns_cache: NamespaceIndicator,
     /// Per-process raw stdout/stderr log ring (profile -> pid -> lines).
     process_raw_logs: HashMap<ContainerName, HashMap<u32, Vec<diag::RawLog>>>,
+    /// Shared PTY byte buffer — written here, drained by UI thread.
+    pty_buf: SharedPtyBuf,
+    /// Viewport ID of the external PTY window, if any.
+    pty_viewport_id: SharedPtyViewportId,
     /// Baseline slot PID set captured when the UI requests StartDaemon.
     /// Used on the actor thread to detect newly spawned process slots.
     pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
@@ -504,9 +602,12 @@ impl Supervisor {
         cmd_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
         snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
         ectx: egui::Context,
+        pty_buf: SharedPtyBuf,
+        pty_viewport_id: SharedPtyViewportId,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let control_sock_path = PathBuf::from(format!("/tmp/nsproxy-ui-{}.sock", std::process::id()));
+        let control_sock_path =
+            PathBuf::from(format!("/tmp/nsproxy-ui-{}.sock", std::process::id()));
         Self {
             cmd_rx,
             event_tx,
@@ -533,6 +634,8 @@ impl Supervisor {
             profile_ns_cache: HashMap::new(),
             ui_ns_cache: probe_namespace_indicator(std::process::id() as i32).unwrap_or_default(),
             process_raw_logs: HashMap::new(),
+            pty_buf,
+            pty_viewport_id,
             pending_auto_open_logs: HashMap::new(),
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
@@ -547,6 +650,18 @@ impl Supervisor {
         lifecycle: ContainerLifecycleState,
     ) {
         self.container_lifecycle.insert(profile.clone(), lifecycle);
+    }
+
+    /// Repaint the appropriate viewport when PTY data arrives.
+    /// If an external PTY viewport is registered, repaint only that viewport.
+    /// Otherwise repaint the main window (for the inline PTY panel case).
+    fn repaint_pty_target(&self) {
+        let vp = self.pty_viewport_id.lock().ok().and_then(|g| *g);
+        if let Some(viewport_id) = vp {
+            self.ectx.request_repaint_of(viewport_id);
+        } else {
+            self.ectx.request_repaint();
+        }
     }
 
     fn container_lifecycle(&self, profile: &ContainerName) -> ContainerLifecycleState {
@@ -657,7 +772,10 @@ impl Supervisor {
                     control_socket: Some(self.control_sock_path.clone()),
                     cmd: MainCommand::Up {
                         profile: profile.clone(),
-                        cmd: None
+                        cmd: None,
+                        simulate_protocol_no_upgrade: false,
+                        simulate_conn_close: false,
+                        simulate_slow_shutdown: false,
                     },
                 };
                 {
@@ -689,8 +807,13 @@ impl Supervisor {
                             self.event_tx.clone(),
                         );
                         // Record the spawn wall-clock time for PID-reuse detection in up_pid_alive.
-                        self.up_start_time.insert(profile.clone(), SystemTime::now());
-                        info!(profile = profile.as_str(), pid = spawned.pid.as_raw(), "spawned sp up process");
+                        self.up_start_time
+                            .insert(profile.clone(), SystemTime::now());
+                        info!(
+                            profile = profile.as_str(),
+                            pid = spawned.pid.as_raw(),
+                            "spawned sp up process"
+                        );
                     }
                     Err(err) => {
                         self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
@@ -702,7 +825,10 @@ impl Supervisor {
                 self.refresh_profile_status(&profile);
             }
             SupervisorCommand::StartServe { profile } => {
-                info!(profile = profile.as_str(), "starting sp serve via up daemon");
+                info!(
+                    profile = profile.as_str(),
+                    "starting sp serve via up daemon"
+                );
                 self.known_profiles.insert(profile.clone());
                 // Fresh backoff — intentional start, connect immediately.
                 self.reset_backoff(&profile);
@@ -735,7 +861,11 @@ impl Supervisor {
                 match bincode::serialize(&cli) {
                     Ok(cli_bincode) => {
                         if let Some(tx) = self.up_cmd.get(&profile) {
-                            info!(profile = profile.as_str(), bytes = cli_bincode.len(), "sending SpawnCli to up daemon");
+                            info!(
+                                profile = profile.as_str(),
+                                bytes = cli_bincode.len(),
+                                "sending SpawnCli to up daemon"
+                            );
                             let _ = tx.send(diag::DaemonRequest::SpawnCli {
                                 cli_bincode,
                                 ns: diag::NamespaceSpawn::Outside,
@@ -751,7 +881,10 @@ impl Supervisor {
                 let ns_meta = state_paths::profile_ns_meta(profile.as_str());
                 if let Ok(ns_alive) = read_ns_alive(&ns_meta) {
                     if let Some(pid) = ns_alive.serve_pid {
-                        info!(profile = profile.as_str(), pid, "sending SIGTERM to serve pid");
+                        info!(
+                            profile = profile.as_str(),
+                            pid, "sending SIGTERM to serve pid"
+                        );
                         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                     }
                 }
@@ -773,8 +906,19 @@ impl Supervisor {
                     let _ = tx.send(diag::DaemonRequest::Spawn { args });
                 }
             }
+            SupervisorCommand::SpawnPty { profile, args } => {
+                info!(profile = profile.as_str(), exec = ?args.exec, cwd = ?args.cwd, argc = args.args.len(), "starting PTY-managed process");
+                self.known_profiles.insert(profile.clone());
+                self.ensure_up_client(&profile);
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::SpawnPty { args });
+                }
+            }
             SupervisorCommand::StopContainer { profile } => {
-                info!(profile = profile.as_str(), "requesting graceful container stop via up daemon");
+                info!(
+                    profile = profile.as_str(),
+                    "requesting graceful container stop via up daemon"
+                );
                 self.reset_backoff(&profile);
                 push_up_log(
                     &mut self.up_logs,
@@ -793,7 +937,10 @@ impl Supervisor {
                     .is_some_and(|status| status.child_alive);
 
                 if !still_running {
-                    info!(profile = profile.as_str(), "stop requested while profile already stopped");
+                    info!(
+                        profile = profile.as_str(),
+                        "stop requested while profile already stopped"
+                    );
                     self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
                     push_up_log(
                         &mut self.up_logs,
@@ -820,7 +967,10 @@ impl Supervisor {
                 // starting the quick-succession poll at that moment is the right trigger.
 
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    info!(profile = profile.as_str(), "sending Stop request to up daemon");
+                    info!(
+                        profile = profile.as_str(),
+                        "sending Stop request to up daemon"
+                    );
                     if tx.send(diag::DaemonRequest::Stop).is_ok() {
                         push_up_log(
                             &mut self.up_logs,
@@ -841,7 +991,9 @@ impl Supervisor {
                                 ts: diag::Timestamp::now(),
                                 level: "WARN".to_string(),
                                 target: "supervisor".to_string(),
-                                message: "Failed to send graceful stop; retry to force kill container".to_string(),
+                                message:
+                                    "Failed to send graceful stop; retry to force kill container"
+                                        .to_string(),
                             },
                         );
                     }
@@ -854,14 +1006,18 @@ impl Supervisor {
                             ts: diag::Timestamp::now(),
                             level: "WARN".to_string(),
                             target: "supervisor".to_string(),
-                            message: "sp up daemon unavailable; retry to force kill container".to_string(),
+                            message: "sp up daemon unavailable; retry to force kill container"
+                                .to_string(),
                         },
                     );
                 }
                 self.refresh_profile_status(&profile);
             }
             SupervisorCommand::KillContainer { profile } => {
-                info!(profile = profile.as_str(), "forcing container kill via metadata fallback");
+                info!(
+                    profile = profile.as_str(),
+                    "forcing container kill via metadata fallback"
+                );
                 self.reset_backoff(&profile);
                 push_up_log(
                     &mut self.up_logs,
@@ -915,9 +1071,38 @@ impl Supervisor {
                 }
                 self.refresh_profile_status(&profile);
             }
-            SupervisorCommand::QueryRawLogs { profile, pid, limit } => {
+            SupervisorCommand::QueryRawLogs {
+                profile,
+                pid,
+                limit,
+            } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
                     let _ = tx.send(diag::DaemonRequest::QueryRawLogs { pid, limit });
+                }
+            }
+            SupervisorCommand::AttachPty { profile, pid } => {
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::AttachPty { pid });
+                }
+            }
+            SupervisorCommand::DetachPty { profile, pid } => {
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::DetachPty { pid });
+                }
+            }
+            SupervisorCommand::PtyInput { profile, pid, data } => {
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::PtyInput { pid, data });
+                }
+            }
+            SupervisorCommand::PtyResize {
+                profile,
+                pid,
+                cols,
+                rows,
+            } => {
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::PtyResize { pid, cols, rows });
                 }
             }
             SupervisorCommand::StartHotconfigDaemons { profile } => {
@@ -932,7 +1117,11 @@ impl Supervisor {
                 info!(profile = profile.as_str(), "reloading hotconfig");
                 self.refresh_config_cache(&profile);
                 if let Ok(list) = load_hotconfig_daemons(profile.as_str()) {
-                    info!(profile = profile.as_str(), daemon_count = list.len(), "loaded hotconfig daemons from disk");
+                    info!(
+                        profile = profile.as_str(),
+                        daemon_count = list.len(),
+                        "loaded hotconfig daemons from disk"
+                    );
                     self.daemon_catalog.insert(profile.clone(), list);
                 }
                 let _ = self.send_diag_cmd(&profile, ControlCommand::QueryHotConfig);
@@ -947,7 +1136,10 @@ impl Supervisor {
                 self.refresh_profile_status(&profile);
             }
             SupervisorCommand::LoadProfiles(profiles) => {
-                info!(profile_count = profiles.len(), "loading status for multiple profiles");
+                info!(
+                    profile_count = profiles.len(),
+                    "loading status for multiple profiles"
+                );
                 for profile in profiles {
                     self.known_profiles.insert(profile.clone());
                     self.refresh_config_cache(&profile);
@@ -955,8 +1147,8 @@ impl Supervisor {
                 }
             }
             SupervisorCommand::RefreshNamespaces => {
-                self.ui_ns_cache = probe_namespace_indicator(std::process::id() as i32)
-                    .unwrap_or_default();
+                self.ui_ns_cache =
+                    probe_namespace_indicator(std::process::id() as i32).unwrap_or_default();
                 let profiles: Vec<_> = self.known_profiles.iter().cloned().collect();
                 for profile in profiles {
                     self.refresh_profile_state_only(&profile);
@@ -965,7 +1157,10 @@ impl Supervisor {
             SupervisorCommand::Init => {
                 info!("initializing supervisor profiles from disk");
                 if let Ok(profile_infos) = crate::profile_loader::list_profiles() {
-                    info!(profile_count = profile_infos.len(), "discovered profiles on disk");
+                    info!(
+                        profile_count = profile_infos.len(),
+                        "discovered profiles on disk"
+                    );
                     for info in profile_infos {
                         let profile = info.name;
                         self.known_profiles.insert(profile.clone());
@@ -996,11 +1191,18 @@ impl Supervisor {
                         let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
                         // let _ = self.send_diag_cmd(&profile, ControlCommand::SetTrackConns { enabled: true });
                         // Pre-fetch diag event log if empty.
-                        let is_empty = self.diag_state.get(&profile)
+                        let is_empty = self
+                            .diag_state
+                            .get(&profile)
                             .map(|d| d.diag_event_log.is_empty())
                             .unwrap_or(true);
                         if is_empty {
-                            let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRecentDiagEvents { limit: diag::DIAG_EVENT_RING_CAP });
+                            let _ = self.send_diag_cmd(
+                                &profile,
+                                ControlCommand::QueryRecentDiagEvents {
+                                    limit: diag::DIAG_EVENT_RING_CAP,
+                                },
+                            );
                         }
                         // Pre-fetch connection state snapshot.
                         let _ = self.send_diag_cmd(&profile, ControlCommand::QueryConnsState);
@@ -1043,7 +1245,8 @@ impl Supervisor {
             .map(|status| status.state)
             .unwrap_or_default();
         let ns_meta = state_paths::profile_ns_meta(profile.as_str());
-        let (child_alive, child_pid, serve_alive, serve_pid, up_alive, up_pid) = if ns_meta.exists() {
+        let (child_alive, child_pid, serve_alive, serve_pid, up_alive, up_pid) = if ns_meta.exists()
+        {
             match read_ns_alive(&ns_meta) {
                 Ok(ns_alive) => {
                     let child_pid = ns_alive.child_pid.filter(|&p| pid_exists(p));
@@ -1153,7 +1356,11 @@ impl Supervisor {
         match ev {
             SupervisorEvent::DiagEvent { profile, event } => {
                 let event_name = diag_event_name(&event);
-                debug!(profile = profile.as_str(), event = event_name, "received diag event");
+                debug!(
+                    profile = profile.as_str(),
+                    event = event_name,
+                    "received diag event"
+                );
                 let state = self.diag_state.entry(profile).or_default();
                 state.accumulator.ingest(&event);
                 // Update client-side connection-tracking state.
@@ -1213,7 +1420,11 @@ impl Supervisor {
                 // the 50 ms check fires right as the process disappears.
                 if target == ConnectionTarget::Up && state == ConnectionState::Disconnected {
                     let lc = self.container_lifecycle(&profile);
-                    if matches!(lc, ContainerLifecycleState::Stopping { .. } | ContainerLifecycleState::Killing { .. }) {
+                    if matches!(
+                        lc,
+                        ContainerLifecycleState::Stopping { .. }
+                            | ContainerLifecycleState::Killing { .. }
+                    ) {
                         // Use ns_alive_cache for the raw pid — it is stored without pid_exists
                         // filtering, so it works correctly even across privilege boundaries.
                         let raw_up_pid = self
@@ -1235,7 +1446,9 @@ impl Supervisor {
                             // No pid on record; treat stream closure as process exit.
                             tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                let _ = event_tx.send(SupervisorEvent::UpDaemonExited { profile: profile_name });
+                                let _ = event_tx.send(SupervisorEvent::UpDaemonExited {
+                                    profile: profile_name,
+                                });
                             });
                         }
                     }
@@ -1245,7 +1458,11 @@ impl Supervisor {
             }
             SupervisorEvent::UpEvent { profile, event } => {
                 let event_name = daemon_event_name(&event);
-                info!(profile = profile.as_str(), event = event_name, "received up daemon event");
+                info!(
+                    profile = profile.as_str(),
+                    event = event_name,
+                    "received up daemon event"
+                );
                 if let diag::DaemonEvent::Error { msg } = &event {
                     self.record_connection_error(&profile, ConnectionTarget::Up, msg.clone());
                 }
@@ -1263,6 +1480,23 @@ impl Supervisor {
                         .entry(profile.clone())
                         .or_default()
                         .insert(pid, logs);
+                } else if let diag::DaemonEvent::PtyScrollback { pid, data } = event {
+                    {
+                        let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.entry(profile.clone()).or_default().insert(pid, data);
+                    }
+                    self.repaint_pty_target();
+                } else if let diag::DaemonEvent::PtyOutput { pid, data } = event {
+                    {
+                        let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
+                        guard
+                            .entry(profile.clone())
+                            .or_default()
+                            .entry(pid)
+                            .or_default()
+                            .extend(data);
+                    }
+                    self.repaint_pty_target();
                 } else if let diag::DaemonEvent::ProcessListSnapshot(snapshot) = event {
                     if let Some(status) = self.ns_alive_status.get_mut(&profile) {
                         // `snapshot.serve` is the PID of the sp-serve process (0 = none).
@@ -1331,7 +1565,10 @@ impl Supervisor {
                 }
             }
             SupervisorEvent::InjectUpStream { profile, stream } => {
-                info!(profile = profile.as_str(), "control socket: up daemon connected, starting direct stream handler");
+                info!(
+                    profile = profile.as_str(),
+                    "control socket: up daemon connected, starting direct stream handler"
+                );
                 self.known_profiles.insert(profile.clone());
                 // Replace cmd channel — dropping old sender exits any retry loop cleanly.
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<diag::DaemonRequest>();
@@ -1343,7 +1580,10 @@ impl Supervisor {
                 });
             }
             SupervisorEvent::InjectDiagStream { profile, stream } => {
-                info!(profile = profile.as_str(), "control socket: serve daemon connected, starting direct stream handler");
+                info!(
+                    profile = profile.as_str(),
+                    "control socket: serve daemon connected, starting direct stream handler"
+                );
                 self.known_profiles.insert(profile.clone());
                 // Replace cmd channel — dropping old sender exits any retry loop cleanly.
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ControlCommand>();
@@ -1358,12 +1598,12 @@ impl Supervisor {
                 let lc = self.container_lifecycle(&profile);
                 if !matches!(
                     lc,
-                    ContainerLifecycleState::Stopping { .. } | ContainerLifecycleState::Killing { .. }
+                    ContainerLifecycleState::Stopping { .. }
+                        | ContainerLifecycleState::Killing { .. }
                 ) {
                     info!(
                         profile = profile.as_str(),
-                        "UpDaemonExited received but lifecycle is {:?}; ignoring",
-                        lc
+                        "UpDaemonExited received but lifecycle is {:?}; ignoring", lc
                     );
                 } else {
                     info!(
@@ -1666,7 +1906,11 @@ impl Supervisor {
 
             let diag = self.diag_state.get(profile);
             let up_connection = self.up_connection.get(profile).cloned().unwrap_or_default();
-            let diag_connection = self.diag_connection.get(profile).cloned().unwrap_or_default();
+            let diag_connection = self
+                .diag_connection
+                .get(profile)
+                .cloned()
+                .unwrap_or_default();
             let diag_connected = diag_connection.state == ConnectionState::Connected;
 
             profiles.insert(
@@ -1714,9 +1958,7 @@ impl Supervisor {
                     diag_event_log: diag
                         .map(|d| d.diag_event_log.iter().cloned().collect())
                         .unwrap_or_default(),
-                    conns_state: diag
-                        .map(|d| d.conns_state.clone())
-                        .unwrap_or_default(),
+                    conns_state: diag.map(|d| d.conns_state.clone()).unwrap_or_default(),
                     merged_logs: {
                         let empty_vd = VecDeque::new();
                         let ul = self.up_logs.get(profile).unwrap_or(&empty_vd);
@@ -1728,6 +1970,7 @@ impl Supervisor {
                         .get(profile)
                         .cloned()
                         .unwrap_or_default(),
+                    pty_streams: HashMap::new(),
                 },
             );
         }
@@ -1789,9 +2032,7 @@ enum SupervisorEvent {
     },
     /// `sp up` process has been confirmed dead by `kill(0)`; lifecycle transitions to Stopped.
     /// Sub-processes (sp serve, sandbox child) are owned by sp up and need no separate tracking.
-    UpDaemonExited {
-        profile: ContainerName,
-    },
+    UpDaemonExited { profile: ContainerName },
     /// Bootstrap stderr/stdout captured directly from spawned `sp up` before
     /// the up-daemon socket stream is connected.
     BootstrapUpLog {
@@ -1900,27 +2141,33 @@ async fn up_stream_loop(
     let (mut reader, mut writer) = stream.split();
 
     writer
-        .send_request(&diag::DaemonRequest::GetProcessList)
+        .send_unstable_request(&diag::DaemonRequest::GetProcessList)
         .await
         .context("request initial process list")?;
     writer
-        .send_request(&diag::DaemonRequest::QueryRecentLogs {
+        .send_unstable_request(&diag::DaemonRequest::QueryRecentLogs {
             limit: diag::LOG_RING_CAP,
         })
         .await
         .context("request recent up daemon logs")?;
-    info!(profile = profile.as_str(), "requested initial up daemon process list");
+    info!(
+        profile = profile.as_str(),
+        "requested initial up daemon process list"
+    );
 
     loop {
         tokio::select! {
             res = reader.next_event() => {
                 match res.context("read up daemon event")? {
-                    Some(event) => {
+                    Some(diag::UpWireEvent::Unstable(event)) => {
                         debug!(profile = profile.as_str(), event = daemon_event_name(&event), "forwarding up daemon event");
                         let _ = event_tx.send(SupervisorEvent::UpEvent {
                             profile: profile.clone(),
                             event,
                         });
+                    }
+                    Some(diag::UpWireEvent::Stable(event)) => {
+                        debug!(profile = profile.as_str(), event = ?event, "ignoring stable up-wire event in ui loop");
                     }
                     None => anyhow::bail!("up daemon closed connection"),
                 }
@@ -1930,7 +2177,7 @@ async fn up_stream_loop(
                     Some(cmd) => {
                         debug!(profile = profile.as_str(), cmd = ?cmd, "sending request to up daemon");
                         writer
-                            .send_request(&cmd)
+                            .send_unstable_request(&cmd)
                             .await
                             .with_context(|| format!("send up daemon request: {cmd:?}"))?
                     }
@@ -1986,6 +2233,10 @@ async fn control_socket_accept_loop(
             Ok((mut stream, _addr)) => {
                 let event_tx = event_tx.clone();
                 tokio::spawn(async move {
+                    if let Err(err) = diag::control_handshake_server(&mut stream).await {
+                        warn!(error = %err, "control socket: handshake mismatch, disconnecting");
+                        return;
+                    }
                     match diag::read_control_greeting(&mut stream).await {
                         Ok(Some(diag::ControlSocketGreeting::UpDaemon { name })) => {
                             info!(profile = %name, "control socket: received UpDaemon greeting");
@@ -2027,7 +2278,13 @@ async fn run_injected_up_stream(
     mut cmd_rx: mpsc::UnboundedReceiver<diag::DaemonRequest>,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
-    report_connection_update(&event_tx, &profile, ConnectionTarget::Up, ConnectionState::Connected, None);
+    report_connection_update(
+        &event_tx,
+        &profile,
+        ConnectionTarget::Up,
+        ConnectionState::Connected,
+        None,
+    );
     match up_stream_loop(&profile, stream, &mut cmd_rx, &event_tx).await {
         Ok(()) => {
             info!(profile = profile.as_str(), "inject up stream: clean exit");
@@ -2035,8 +2292,10 @@ async fn run_injected_up_stream(
         Err(err) => {
             info!(profile = profile.as_str(), error = %err, "inject up stream: disconnected");
             report_connection_update(
-                &event_tx, &profile,
-                ConnectionTarget::Up, ConnectionState::Disconnected,
+                &event_tx,
+                &profile,
+                ConnectionTarget::Up,
+                ConnectionState::Disconnected,
                 Some(err.to_string()),
             );
         }
@@ -2051,18 +2310,28 @@ async fn run_injected_diag_stream(
     mut cmd_rx: mpsc::UnboundedReceiver<ControlCommand>,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
-    report_connection_update(&event_tx, &profile, ConnectionTarget::Diag, ConnectionState::Connected, None);
+    report_connection_update(
+        &event_tx,
+        &profile,
+        ConnectionTarget::Diag,
+        ConnectionState::Connected,
+        None,
+    );
     for cmd in [
         ControlCommand::QueryDnsState,
         ControlCommand::QueryRoutingState,
         ControlCommand::QueryHotConfig,
         ControlCommand::QueryUplinkStats,
-        ControlCommand::QueryRecentLogs { limit: diag::LOG_RING_CAP },
+        ControlCommand::QueryRecentLogs {
+            limit: diag::LOG_RING_CAP,
+        },
     ] {
         if let Err(err) = stream.send_cmd(&cmd).await {
             report_connection_update(
-                &event_tx, &profile,
-                ConnectionTarget::Diag, ConnectionState::Disconnected,
+                &event_tx,
+                &profile,
+                ConnectionTarget::Diag,
+                ConnectionState::Disconnected,
                 Some(format!("initial query {cmd:?}: {err}")),
             );
             return;
@@ -2075,8 +2344,10 @@ async fn run_injected_diag_stream(
         Err(err) => {
             info!(profile = profile.as_str(), error = %err, "inject diag stream: disconnected");
             report_connection_update(
-                &event_tx, &profile,
-                ConnectionTarget::Diag, ConnectionState::Disconnected,
+                &event_tx,
+                &profile,
+                ConnectionTarget::Diag,
+                ConnectionState::Disconnected,
                 Some(err.to_string()),
             );
         }
@@ -2101,7 +2372,10 @@ async fn up_client_loop(
                 "up client backing off before next connect"
             );
             if sleep_or_cancelled(delay, &mut cmd_rx).await {
-                warn!(profile = profile.as_str(), "up client loop cancelled during backoff: supervisor dropped up_cmd tx");
+                warn!(
+                    profile = profile.as_str(),
+                    "up client loop cancelled during backoff: supervisor dropped up_cmd tx"
+                );
                 return;
             }
         }
@@ -2113,7 +2387,10 @@ async fn up_client_loop(
             if let Ok(ns_alive) = read_ns_alive(&ns_meta) {
                 if let Some(up_pid) = ns_alive.up_pid {
                     if !pid_exists(up_pid) {
-                        info!(profile = profile.as_str(), up_pid, "up process is gone; exiting up client loop");
+                        info!(
+                            profile = profile.as_str(),
+                            up_pid, "up process is gone; exiting up client loop"
+                        );
                         report_connection_update(
                             &event_tx,
                             &profile,
@@ -2146,7 +2423,10 @@ async fn up_client_loop(
                 );
                 match up_stream_loop(&profile, stream, &mut cmd_rx, &event_tx).await {
                     Ok(()) => {
-                        info!(profile = profile.as_str(), "up client loop exiting cleanly (cmd_rx closed)");
+                        info!(
+                            profile = profile.as_str(),
+                            "up client loop exiting cleanly (cmd_rx closed)"
+                        );
                         return;
                     }
                     Err(err) => {
@@ -2200,7 +2480,10 @@ async fn diag_client_loop(
                 "diag client backing off before next connect"
             );
             if sleep_or_cancelled(delay, &mut cmd_rx).await {
-                info!(profile = profile.as_str(), "diag client loop cancelled during backoff");
+                info!(
+                    profile = profile.as_str(),
+                    "diag client loop cancelled during backoff"
+                );
                 return;
             }
         }
@@ -2212,7 +2495,10 @@ async fn diag_client_loop(
             if let Ok(ns_alive) = read_ns_alive(&ns_meta) {
                 if let Some(serve_pid) = ns_alive.serve_pid {
                     if !pid_exists(serve_pid) {
-                        info!(profile = profile.as_str(), serve_pid, "serve process is gone; exiting diag client loop");
+                        info!(
+                            profile = profile.as_str(),
+                            serve_pid, "serve process is gone; exiting diag client loop"
+                        );
                         report_connection_update(
                             &event_tx,
                             &profile,
@@ -2244,7 +2530,10 @@ async fn diag_client_loop(
                     None,
                 );
                 if diag_stream_drive(&profile, stream, &mut cmd_rx, &event_tx, &backoff).await {
-                    info!(profile = profile.as_str(), "diag client loop exiting cleanly (cmd_rx closed)");
+                    info!(
+                        profile = profile.as_str(),
+                        "diag client loop exiting cleanly (cmd_rx closed)"
+                    );
                     return;
                 }
             }
@@ -2277,13 +2566,18 @@ async fn diag_stream_drive(
         ControlCommand::QueryRoutingState,
         ControlCommand::QueryHotConfig,
         ControlCommand::QueryUplinkStats,
-        ControlCommand::QueryRecentLogs { limit: diag::LOG_RING_CAP },
+        ControlCommand::QueryRecentLogs {
+            limit: diag::LOG_RING_CAP,
+        },
     ] {
         info!(profile = profile.as_str(), cmd = ?cmd, "sending initial diag command");
         if let Err(err) = stream.send_cmd(&cmd).await {
             info!(profile = profile.as_str(), cmd = ?cmd, error = %err, "failed to send initial diag command, will retry");
             report_connection_update(
-                event_tx, profile, ConnectionTarget::Diag, ConnectionState::Disconnected,
+                event_tx,
+                profile,
+                ConnectionTarget::Diag,
+                ConnectionState::Disconnected,
                 Some(format!("send initial diag command {cmd:?}: {err}")),
             );
             backoff.lock().unwrap().record_disconnect();
@@ -2296,7 +2590,10 @@ async fn diag_stream_drive(
             backoff.lock().unwrap().record_disconnect();
             info!(profile = profile.as_str(), error = %err, "diag connection dropped, will retry");
             report_connection_update(
-                event_tx, profile, ConnectionTarget::Diag, ConnectionState::Disconnected,
+                event_tx,
+                profile,
+                ConnectionTarget::Diag,
+                ConnectionState::Disconnected,
                 Some(err.to_string()),
             );
             false
@@ -2384,10 +2681,16 @@ fn build_merged_logs(
 ) -> Vec<Arc<LogEntryOf>> {
     let mut v: Vec<Arc<LogEntryOf>> = Vec::with_capacity(up_logs.len() + serve_logs.len());
     for e in up_logs {
-        v.push(Arc::new(LogEntryOf { log: e.clone(), src: LogSource::Up }));
+        v.push(Arc::new(LogEntryOf {
+            log: e.clone(),
+            src: LogSource::Up,
+        }));
     }
     for e in serve_logs {
-        v.push(Arc::new(LogEntryOf { log: e.clone(), src: LogSource::Serve }));
+        v.push(Arc::new(LogEntryOf {
+            log: e.clone(),
+            src: LogSource::Serve,
+        }));
     }
     v.sort_by_key(|e| e.log.ts);
     v
@@ -2404,7 +2707,6 @@ fn default_nsproxy_path() -> PathBuf {
     }
     PathBuf::from("nsproxy")
 }
-
 
 /// Direct spawning by UI
 struct SpawnedCli {
@@ -2587,8 +2889,7 @@ fn read_proc_start_time(pid: u32) -> Option<SystemTime> {
         return None;
     }
     let start_secs = btime_secs + starttime_ticks / ticks_per_sec;
-    let start_subsec_ns =
-        (starttime_ticks % ticks_per_sec) * 1_000_000_000 / ticks_per_sec;
+    let start_subsec_ns = (starttime_ticks % ticks_per_sec) * 1_000_000_000 / ticks_per_sec;
     Some(SystemTime::UNIX_EPOCH + std::time::Duration::new(start_secs, start_subsec_ns as u32))
 }
 
@@ -2617,8 +2918,8 @@ fn up_pid_alive(pid: u32, started_at: Option<SystemTime>) -> bool {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         match errno {
             e if e == libc::ESRCH => return false, // gone
-            e if e == libc::EPERM => true,          // different uid/ns but exists
-            _ => return false,                      // unexpected → treat as dead
+            e if e == libc::EPERM => true,         // different uid/ns but exists
+            _ => return false,                     // unexpected → treat as dead
         }
     };
 
@@ -2698,11 +2999,17 @@ async fn watch_up_pid_exit(
     for delay_ms in [50u64, 200, 1000, 200, 200, 200, 2000] {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         if !up_pid_alive(up_pid, started_at) {
-            info!(profile = profile.as_str(), up_pid, "sp up exited (kill(0) → ESRCH)");
+            info!(
+                profile = profile.as_str(),
+                up_pid, "sp up exited (kill(0) → ESRCH)"
+            );
             let _ = event_tx.send(SupervisorEvent::UpDaemonExited { profile });
             return;
         } else {
-            info!(profile = profile.as_str(), up_pid, "sp up still alive after {} ms", delay_ms);
+            info!(
+                profile = profile.as_str(),
+                up_pid, "sp up still alive after {} ms", delay_ms
+            );
         }
     }
     // Quick succession exhausted; fall back to 2-second periodic polling.
@@ -2710,15 +3017,17 @@ async fn watch_up_pid_exit(
         if tokio::time::Instant::now() >= deadline {
             warn!(
                 profile = profile.as_str(),
-                up_pid,
-                "sp up did not exit within 30s of stop request; forcing Stopped transition"
+                up_pid, "sp up did not exit within 30s of stop request; forcing Stopped transition"
             );
             let _ = event_tx.send(SupervisorEvent::UpDaemonExited { profile });
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if !up_pid_alive(up_pid, started_at) {
-            info!(profile = profile.as_str(), up_pid, "sp up exited (kill(0) → ESRCH)");
+            info!(
+                profile = profile.as_str(),
+                up_pid, "sp up exited (kill(0) → ESRCH)"
+            );
             let _ = event_tx.send(SupervisorEvent::UpDaemonExited { profile });
             return;
         }
@@ -2729,7 +3038,10 @@ fn fallback_stop_profile_from_metadata(
     profile: &ContainerName,
     up_logs: &mut HashMap<ContainerName, VecDeque<LogEntry>>,
 ) {
-    info!(profile = profile.as_str(), "executing metadata-based container kill fallback");
+    info!(
+        profile = profile.as_str(),
+        "executing metadata-based container kill fallback"
+    );
     let ns_meta = state_paths::profile_ns_meta(profile.as_str());
     let Ok(ns_alive) = read_ns_alive(&ns_meta) else {
         push_up_log(
@@ -2748,7 +3060,10 @@ fn fallback_stop_profile_from_metadata(
     let mut killed_any = false;
     for (label, pid) in [("up", ns_alive.up_pid), ("keeper", ns_alive.child_pid)] {
         if let Some(pid) = pid.filter(|&p| pid_exists(p)) {
-            info!(profile = profile.as_str(), label, pid, "sending SIGKILL in container kill fallback");
+            info!(
+                profile = profile.as_str(),
+                label, pid, "sending SIGKILL in container kill fallback"
+            );
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
             push_up_log(
                 up_logs,
@@ -2757,7 +3072,10 @@ fn fallback_stop_profile_from_metadata(
                     ts: diag::Timestamp::now(),
                     level: "INFO".to_string(),
                     target: "supervisor".to_string(),
-                    message: format!("Container kill fallback sent SIGKILL to {} pid {}", label, pid),
+                    message: format!(
+                        "Container kill fallback sent SIGKILL to {} pid {}",
+                        label, pid
+                    ),
                 },
             );
             killed_any = true;
