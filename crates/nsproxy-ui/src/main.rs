@@ -493,7 +493,6 @@ impl IntInput {
         let cache_key = (id, value_addr);
         let mut changed = false;
 
-        let is_first_render = !self.texts.contains_key(&cache_key);
         let input = self.texts.entry(cache_key).or_insert_with(|| {
             value.map(|parsed| parsed.to_string()).unwrap_or_default()
         });
@@ -531,6 +530,16 @@ impl IntInput {
         }
 
         changed
+    }
+
+    /// Update the internal text cache for an `Option<u32>` so the UI reflects
+    /// an external programmatic change to the `value` (value -> UI sync).
+    fn sync_from_value(&mut self, ui: &mut egui::Ui, label: &str, value: &Option<u32>) {
+        let id = ui.make_persistent_id(("optional-u32", label));
+        let value_addr = value as *const Option<u32> as usize;
+        let cache_key = (id, value_addr);
+        let text = value.map(|v| v.to_string()).unwrap_or_default();
+        self.texts.insert(cache_key, text);
     }
 }
 
@@ -1400,6 +1409,7 @@ impl App {
         int_input: &mut IntInput,
         label: &str,
         value: &mut Option<u32>,
+        value_changed: bool,
     ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -1428,6 +1438,9 @@ impl App {
 
             if enabled {
                 let id = ui.make_persistent_id(("optional-u32", label));
+                if value_changed {
+                    int_input.sync_from_value(ui, label, &*value);
+                }
                 if label == "mode" {
                     if int_input.show(ui, id, value, Self::is_valid_mode) {
                         changed = true;
@@ -1562,13 +1575,13 @@ impl App {
                     if Self::render_path_field(ui, "path", &mut op.path, i) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, int_input, "mode", &mut op.mode) {
+                    if Self::render_optional_u32(ui, int_input, "mode", &mut op.mode, false) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, int_input, "uid", &mut op.uid) {
+                    if Self::render_optional_u32(ui, int_input, "uid", &mut op.uid, false) {
                         changed = true;
                     }
-                    if Self::render_optional_u32(ui, int_input, "gid", &mut op.gid) {
+                    if Self::render_optional_u32(ui, int_input, "gid", &mut op.gid, false) {
                         changed = true;
                     }
                     if op.path.to_string_lossy().is_empty() {
@@ -2111,10 +2124,10 @@ impl App {
         let mut changed = false;
         ui.group(|ui| {
             ui.strong(title);
-            if Self::render_optional_u32(ui, int_input, "uid", &mut sargs.uid) {
+            if Self::render_optional_u32(ui, int_input, "uid", &mut sargs.uid, false) {
                 changed = true;
             }
-            if Self::render_optional_u32(ui, int_input, "gid", &mut sargs.gid) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut sargs.gid, false) {
                 changed = true;
             }
             if Self::render_optional_text(ui, "shell", &mut sargs.shell) {
@@ -2208,10 +2221,36 @@ impl App {
                 return;
             }
 
-            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid) {
+            // track if we programmatically changed uid/gid so input buffers sync
+            let mut uid_gid_value_changed = false;
+            ui.horizontal(|ui| {
+                if ui.button("default user").clicked() {
+                    let uid = nix::unistd::getuid().as_raw();
+                    let gid = nix::unistd::getgid().as_raw();
+                    let gids = nix::unistd::getgroups()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g: nix::unistd::Gid| g.as_raw())
+                        .collect();
+                    args.uid = Some(uid);
+                    args.gid = Some(gid);
+                    args.gids = gids;
+                    changed = true;
+                    uid_gid_value_changed = true;
+                }
+                if ui.button("root").clicked() {
+                    args.uid = Some(0);
+                    args.gid = Some(0);
+                    args.gids = vec![];
+                    changed = true;
+                    uid_gid_value_changed = true;
+                }
+            });
+
+            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid, uid_gid_value_changed) {
                 changed = true;
             }
-            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid, uid_gid_value_changed) {
                 changed = true;
             }
             if Self::render_optional_text(ui, "exec", &mut args.exec) {
