@@ -769,12 +769,36 @@ impl Supervisor {
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
+                    // PtyInput/PtyResize don't change any snapshot-visible state;
+                    // skip emit_snapshot() to avoid a redundant request_repaint()
+                    // on every keystroke (the PTY repaint is handled by the
+                    // coalescing pty_repaint_notify task via repaint_pty_target()).
+                    let needs_snapshot = !matches!(
+                        cmd,
+                        SupervisorCommand::PtyInput { .. } | SupervisorCommand::PtyResize { .. }
+                    );
                     self.handle_command(cmd).await;
-                    self.emit_snapshot();
+                    if needs_snapshot {
+                        self.emit_snapshot();
+                    }
                 }
                 Some(ev) = self.event_rx.recv() => {
+                    // PtyOutput/PtyScrollback only write to pty_buf (not in the snapshot)
+                    // and already schedule a repaint via repaint_pty_target().
+                    let is_pty_data = matches!(
+                        &ev,
+                        SupervisorEvent::UpEvent {
+                            event: diag::DaemonEvent::PtyOutput { .. },
+                            ..
+                        } | SupervisorEvent::UpEvent {
+                            event: diag::DaemonEvent::PtyScrollback { .. },
+                            ..
+                        }
+                    );
                     self.handle_event(ev);
-                    self.emit_snapshot();
+                    if !is_pty_data {
+                        self.emit_snapshot();
+                    }
                 }
                 else => break,
             }

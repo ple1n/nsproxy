@@ -4,6 +4,36 @@ members = [
 ]
 resolver = "3"
 
+[profile.dev.package.term-view]
+opt-level = 3
+
+[profile.dev.package.egui]
+opt-level = 3
+
+[profile.dev.package.eframe]
+opt-level = 3
+
+[profile.dev.package.epaint]
+opt-level = 3
+
+[profile.dev.package.egui_extras]
+opt-level = 3
+
+[profile.dev.package.egui_plot]
+opt-level = 3
+
+[profile.dev.package.egui_code_editor]
+opt-level = 3
+
+[profile.dev.package.egui-phosphor]
+opt-level = 3
+
+[profile.dev.package.egui_json_tree]
+opt-level = 3
+
+[profile.dev.package.egui_sgr]
+opt-level = 3
+
 [workspace.package]
 version = "0.3.0"
 edition = "2021"

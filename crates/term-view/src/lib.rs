@@ -5,25 +5,104 @@ use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::term::{self, test::TermSize, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use egui::epaint::{Galley, RectShape};
-use egui::{Align2, Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Shape, Vec2, Widget};
-use smallstr::SmallString;
-use std::collections::HashMap;
-use std::sync::Arc;
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Shape, Vec2, Widget};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Compact string type: runs up to 32 bytes fit inline (no heap alloc).
-/// Most terminal text runs on a single row are well under 120 single-byte chars
-/// but we limit the inline size to 32 — longer runs promote to heap.
-type S = SmallString<[u8; 32]>;
+const BG_DEFAULT: Color32 = Color32::from_rgb(10, 12, 16);
+const FG_DEFAULT: Color32 = Color32::from_rgb(200, 200, 200);
+
+/// IPC interface that `ExternalPtyViewport` uses to communicate with the rest
+/// of the system.  Implemented by the `nsproxy-ui` side; kept in this crate so
+/// the entire hot PTY data path runs at `opt-level = 3`.
+pub trait PtyIpc: Send + Sync + 'static {
+    /// Drain any PTY bytes the daemon has sent since the last call.
+    fn drain_incoming(&self) -> Vec<u8>;
+    /// Forward bytes typed in the terminal back to the PTY slave.
+    fn send_input(&self, data: Vec<u8>);
+    /// Notify the PTY slave of a terminal resize.
+    fn send_resize(&self, cols: u16, rows: u16);
+}
+
+/// Self-contained state for an external PTY OS window (deferred viewport).
+///
+/// Generic over `I: PtyIpc` so the hot path (data draining, input forwarding,
+/// TermSession feed, TermView render) all live here in `term-view` and are
+/// therefore compiled at `opt-level = 3` even in debug builds.
+pub struct ExternalPtyViewport<I: PtyIpc> {
+    pub ipc: I,
+    pub pid: u32,
+    session: Mutex<TermSession>,
+    pub closed: AtomicBool,
+    pub viewport_id: egui::ViewportId,
+    pub title: String,
+}
+
+impl<I: PtyIpc> ExternalPtyViewport<I> {
+    pub fn new(ipc: I, pid: u32, title: String) -> Self {
+        Self {
+            ipc,
+            pid,
+            session: Mutex::new(TermSession::new(pid)),
+            closed: AtomicBool::new(false),
+            viewport_id: egui::ViewportId::from_hash_of("pty-external"),
+            title,
+        }
+    }
+
+    /// Called from the deferred viewport's `Fn(&Context, ViewportClass)` callback.
+    /// The entire hot path — drain, feed, render, input dispatch — runs here.
+    pub fn viewport_ui(this: &Arc<Self>, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            this.closed.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        let incoming = this.ipc.drain_incoming();
+        let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !incoming.is_empty() {
+            session.feed(&incoming);
+            for resp in session.drain_responses() {
+                if !resp.is_empty() {
+                    this.ipc.send_input(resp);
+                }
+            }
+        }
+
+        let mut input_frames: Vec<Vec<u8>> = Vec::new();
+        let mut resize_evt: Option<(u16, u16)> = None;
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(
+                TermView::new(&mut session, &mut input_frames, &mut resize_evt)
+                    .set_size(ui.available_size()),
+            );
+        });
+
+        for data in input_frames {
+            if !data.is_empty() {
+                this.ipc.send_input(data);
+            }
+        }
+        if let Some((cols, rows)) = resize_evt {
+            this.ipc.send_resize(cols, rows);
+        }
+    }
+}
 
 /// Per-viewport-row cached render data.
 /// Positions are stored in grid-space (col index) so they remain valid
 /// across window moves; pixel coords are computed cheaply at emit time.
 #[derive(Clone)]
 struct CachedRow {
-    /// Background fill rects: (col, width_in_cells, color)
+    /// Background fill rects: (start_col, width_in_cells, color).
+    /// Adjacent same-color cells are coalesced into single spans.
     bg_rects: Vec<(usize, f32, Color32)>,
-    /// Text runs: (col, pre-shaped galley)
-    text_runs: Vec<(usize, Arc<Galley>)>,
+    /// Single pre-shaped galley for the entire row, built from a LayoutJob
+    /// with one TextFormat section per color run. None when the row is blank.
+    row_galley: Option<Arc<Galley>>,
 }
 
 /// Event listener that captures PtyWrite responses (device attribute replies,
@@ -51,13 +130,6 @@ pub struct TermSession {
     pub pid: u32,
     pub last_size: (u16, u16),
 
-    /// Galley cache: (text_run_content, color) → Arc<Galley>.
-    ///
-    /// Key uses SmallString<[u8;32]> to avoid heap allocation for short runs.
-    /// Built once via `fonts_mut` on first encounter; reused via `Shape::galley`
-    /// on subsequent frames with zero font-lock overhead.
-    galley_cache: HashMap<(S, Color32), Arc<Galley>>,
-
     /// Per-viewport-row render cache, indexed 0..num_rows.
     /// `None` means the row is dirty and must be rebuilt before use.
     row_cache: Vec<Option<CachedRow>>,
@@ -71,10 +143,25 @@ pub struct TermSession {
     /// we measure it once on first frame and reuse forever.
     cached_cell_dims: Option<(f32, f32)>,
 
+    /// Cached FontId — avoids `String` allocation in `FontId::monospace()` per frame.
+    cached_font_id: FontId,
+
     /// Pre-allocated per-row scratch buffer: indexed [0..num_rows].
     /// Each inner Vec accumulates (col, char, fg, bg, wide) for dirty rows.
     /// Cleared in-place each frame — no per-frame heap allocation.
     dirty_row_cells: Vec<Vec<(usize, char, Color32, Color32, bool)>>,
+
+    /// Reusable scratch: dense (char, fg) cell buffer for one row during rebuild.
+    cell_buf: Vec<(char, Color32)>,
+
+    /// Reusable scratch: background rects for one row during rebuild.
+    bg_rect_buf: Vec<(usize, f32, Color32)>,
+
+    /// Reusable scratch: LayoutJob segment text builder.
+    seg_text_buf: String,
+
+    /// Reusable shapes vec, cleared each frame but retains its capacity.
+    shapes_buf: Vec<Shape>,
 }
 
 impl TermSession {
@@ -84,17 +171,22 @@ impl TermSession {
         let event_collector = PtyWriteCollector { tx };
         let term = Term::new(term::Config::default(), &size, event_collector);
         let num_rows = 50usize;
+        let num_cols = 120usize;
         Self {
             term,
             processor: Processor::new(),
             write_rx,
             pid,
             last_size: (120, 50),
-            galley_cache: HashMap::new(),
             row_cache: vec![None; num_rows],
             force_full_rebuild: true,
             cached_cell_dims: None,
+            cached_font_id: FontId::monospace(14.0),
             dirty_row_cells: (0..num_rows).map(|_| Vec::new()).collect(),
+            cell_buf: vec![(' ', FG_DEFAULT); num_cols],
+            bg_rect_buf: Vec::with_capacity(32),
+            seg_text_buf: String::with_capacity(num_cols),
+            shapes_buf: Vec::with_capacity(num_rows * 2 + 2),
         }
     }
 
@@ -116,12 +208,13 @@ impl TermSession {
         self.term.resize(TermSize::new(cols as usize, rows as usize));
         // Resize invalidates all cached row positions and content.
         let r = rows as usize;
+        let c = cols as usize;
         self.row_cache.resize_with(r, || None);
         for slot in &mut self.row_cache {
             *slot = None;
         }
         self.dirty_row_cells.resize_with(r, Vec::new);
-        // (dirty_row_cells inner vecs are cleared at the start of show(), no need here)
+        self.cell_buf.resize(c, (' ', FG_DEFAULT));
         self.force_full_rebuild = true;
     }
 
@@ -290,9 +383,8 @@ impl<'a> TermView<'a> {
         if let Some(dims) = session.cached_cell_dims {
             return dims;
         }
-        let font_id = FontId::monospace(14.0);
         let dims = ctx.fonts_mut(|f| {
-            (f.glyph_width(&font_id, 'm'), f.row_height(&font_id))
+            (f.glyph_width(&session.cached_font_id, 'm'), f.row_height(&session.cached_font_id))
         });
         session.cached_cell_dims = Some(dims);
         dims
@@ -309,8 +401,6 @@ impl<'a> TermView<'a> {
     }
 
     fn show(&mut self, layout: &Response, painter: &Painter, cell_dims: (f32, f32)) {
-        let bg_default = Color32::from_rgb(10, 12, 16);
-        let font_id = FontId::monospace(14.0);
         let (cell_w, cell_h) = cell_dims;
         let rect = layout.rect;
 
@@ -345,12 +435,11 @@ impl<'a> TermView<'a> {
 
         // ── Step 2: collect grid data ─────────────────────────────────────────
         let grid = self.session.term.grid();
-        let cursor = grid.cursor.clone();
+        let cursor_point = grid.cursor.point;
         let display_offset = grid.display_offset() as i32;
         let num_rows = self.session.last_size.1 as usize;
 
         // Clear pre-allocated scratch buffers in-place (no allocation).
-        // Only rows whose cache slot is None (dirty) will be populated.
         for row in &mut self.session.dirty_row_cells {
             row.clear();
         }
@@ -367,7 +456,7 @@ impl<'a> TermView<'a> {
             // Only process if the slot needs rebuilding.
             if self.session.row_cache.get(vrow).map_or(true, |s| s.is_none()) {
                 let mut fg = color_to_egui(indexed.fg, Color32::LIGHT_GRAY);
-                let mut bg_cell = color_to_egui(indexed.bg, bg_default);
+                let mut bg_cell = color_to_egui(indexed.bg, BG_DEFAULT);
                 if indexed.cell.flags.contains(cell::Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg_cell);
                 }
@@ -378,101 +467,95 @@ impl<'a> TermView<'a> {
             }
         }
 
-        // ── Step 3: rebuild dirty rows, using/populating the galley cache ─────
+        // ── Step 3: rebuild dirty rows using LayoutJob ────────────────────────
         //
-        // galley_cache maps (text_content, color) → Arc<Galley>.
-        // On a miss we call fonts_mut once (per unique text+color pair) to shape
-        // the text. On subsequent frames the galley is reused with Shape::galley()
-        // which needs NO font lock at all — just an Arc::clone().
-        //
-        // For a terminal with 256 colors × ~96 printable ASCII chars the cache
-        // saturates after the first few seconds; steady-state fonts_mut calls ≈ 0.
-        let galley_cache = &mut self.session.galley_cache;
+        // For each dirty row, build a single LayoutJob whose sections correspond
+        // to consecutive same-fg-color cell runs (including spaces so positions
+        // stay aligned). One fonts_mut call shapes the job into a single
+        // Arc<Galley> per row, emitted as one Shape::galley in step 4.
+        let num_cols = self.session.last_size.0 as usize;
+        let font_id = &self.session.cached_font_id;
         let row_cache = &mut self.session.row_cache;
         let dirty_row_cells = &self.session.dirty_row_cells;
+        let cell_buf = &mut self.session.cell_buf;
+        let bg_rect_buf = &mut self.session.bg_rect_buf;
+        let seg_text = &mut self.session.seg_text_buf;
 
         for (vrow, cells) in dirty_row_cells.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
-            let mut bg_rects: Vec<(usize, f32, Color32)> = Vec::new();
+            bg_rect_buf.clear();
 
-            // Build galley text runs: merge same-color consecutive chars.
-            // SmallString avoids heap for runs ≤ 32 bytes (most terminal runs).
-            struct Run {
-                start_col: usize,
-                text: S,
-                color: Color32,
-                next_col: usize,
+            // Reset cell_buf slice to defaults (re-use allocation).
+            for slot in cell_buf.iter_mut().take(num_cols) {
+                *slot = (' ', FG_DEFAULT);
             }
-            let mut runs: Vec<Run> = Vec::new();
-            let mut cur_run: Option<Run> = None;
 
             for &(col, c, fg, bg_cell, wide) in cells {
-                let cell_w_ratio = if wide { 2.0f32 } else { 1.0 };
-
-                if bg_cell != Color32::TRANSPARENT && bg_cell != bg_default {
-                    bg_rects.push((col, cell_w_ratio, bg_cell));
-                }
-
-                if c == ' ' || c == '\t' || wide {
-                    if let Some(run) = cur_run.take() {
-                        runs.push(run);
-                    }
-                    if c != ' ' && c != '\t' {
-                        // Wide char: solo run
-                        let mut t = S::new();
-                        t.push(c);
-                        runs.push(Run { start_col: col, text: t, color: fg, next_col: col + 1 });
-                    }
-                } else {
-                    let can_extend = cur_run
-                        .as_ref()
-                        .map_or(false, |r| r.color == fg && r.next_col == col);
-                    if can_extend {
-                        let r = cur_run.as_mut().unwrap();
-                        r.text.push(c);
-                        r.next_col = col + 1;
-                    } else {
-                        if let Some(run) = cur_run.take() {
-                            runs.push(run);
+                let width_ratio = if wide { 2.0f32 } else { 1.0 };
+                if bg_cell != Color32::TRANSPARENT && bg_cell != BG_DEFAULT {
+                    // Coalesce adjacent same-color bg rects.
+                    if let Some(last) = bg_rect_buf.last_mut() {
+                        let (last_col, last_w, last_color) = last;
+                        if *last_color == bg_cell && *last_col + (*last_w as usize) == col {
+                            *last_w += width_ratio;
+                        } else {
+                            bg_rect_buf.push((col, width_ratio, bg_cell));
                         }
-                        let mut t = S::new();
-                        t.push(c);
-                        cur_run = Some(Run { start_col: col, text: t, color: fg, next_col: col + 1 });
+                    } else {
+                        bg_rect_buf.push((col, width_ratio, bg_cell));
                     }
                 }
-            }
-            if let Some(run) = cur_run.take() {
-                runs.push(run);
-            }
-
-            // Resolve galleys: cache hit → Arc clone (no font lock);
-            //                  cache miss → fonts_mut (adds to atlas once).
-            let mut text_runs: Vec<(usize, Arc<Galley>)> = Vec::with_capacity(runs.len());
-            let mut needs_font: Vec<(usize, S, Color32)> = Vec::new();
-
-            for run in &runs {
-                let key = (run.text.clone(), run.color);
-                if let Some(galley) = galley_cache.get(&key) {
-                    text_runs.push((run.start_col, Arc::clone(galley)));
-                } else {
-                    needs_font.push((run.start_col, run.text.clone(), run.color));
+                if col < num_cols {
+                    cell_buf[col] = (c, fg);
                 }
             }
 
-            if !needs_font.is_empty() {
-                // Single fonts_mut call per dirty row to shape all cache-miss runs.
-                painter.ctx().fonts_mut(|fonts| {
-                    for (col, text, color) in needs_font {
-                        let galley = fonts.layout_no_wrap(text.to_string(), font_id.clone(), color);
-                        galley_cache.insert((text, color), Arc::clone(&galley));
-                        text_runs.push((col, galley));
+            // Trim trailing spaces so the galley stays as narrow as needed.
+            let trim_end = cell_buf[..num_cols]
+                .iter()
+                .rposition(|(c, _)| *c != ' ')
+                .map_or(0, |i| i + 1);
+
+            let row_galley = if trim_end == 0 {
+                None
+            } else {
+                // Build one LayoutJob, merging consecutive same-color cells.
+                let mut job = LayoutJob::default();
+                let mut seg_color = cell_buf[0].1;
+                seg_text.clear();
+
+                for col in 0..trim_end {
+                    let (c, fg) = cell_buf[col];
+                    if fg != seg_color {
+                        if !seg_text.is_empty() {
+                            job.append(seg_text, 0.0, TextFormat {
+                                font_id: font_id.clone(),
+                                color: seg_color,
+                                ..Default::default()
+                            });
+                            seg_text.clear();
+                        }
+                        seg_color = fg;
                     }
-                });
-                // Re-sort by column (needs_font was appended after cache hits).
-                text_runs.sort_unstable_by_key(|(col, _)| *col);
-            }
+                    seg_text.push(c);
+                }
+                if !seg_text.is_empty() {
+                    job.append(seg_text, 0.0, TextFormat {
+                        font_id: font_id.clone(),
+                        color: seg_color,
+                        ..Default::default()
+                    });
+                    seg_text.clear();
+                }
+
+                // Single fonts_mut call per dirty row to shape the entire row.
+                Some(painter.ctx().fonts_mut(|fonts| fonts.layout_job(job)))
+            };
 
             if let Some(slot) = row_cache.get_mut(vrow) {
-                *slot = Some(CachedRow { bg_rects, text_runs });
+                *slot = Some(CachedRow {
+                    bg_rects: bg_rect_buf.clone(),
+                    row_galley,
+                });
             }
         }
 
@@ -480,11 +563,14 @@ impl<'a> TermView<'a> {
         //
         // Pixel positions are computed here from current rect / display_offset.
         // This is pure arithmetic — no font or grid access.
-        let mut shapes = vec![Shape::Rect(RectShape::filled(
+        // Reuse shapes_buf to avoid per-frame Vec allocation.
+        let shapes = &mut self.session.shapes_buf;
+        shapes.clear();
+        shapes.push(Shape::Rect(RectShape::filled(
             Rect::from_min_max(rect.min, rect.max),
             CornerRadius::ZERO,
-            bg_default,
-        ))];
+            BG_DEFAULT,
+        )));
 
         for (vrow, slot) in self.session.row_cache.iter().enumerate() {
             let Some(row) = slot else { continue };
@@ -502,18 +588,20 @@ impl<'a> TermView<'a> {
                 )));
             }
 
-            for (col, galley) in &row.text_runs {
-                let x = rect.min.x + cell_w * (*col) as f32;
-                // Shape::galley uses the pre-shaped Arc<Galley> directly —
-                // zero font lock, just an Arc::clone internally.
-                shapes.push(Shape::galley(Pos2::new(x, y), Arc::clone(galley), Color32::WHITE));
+            // Single galley covers the entire row from column 0.
+            if let Some(galley) = &row.row_galley {
+                shapes.push(Shape::galley(
+                    Pos2::new(rect.min.x, y),
+                    Arc::clone(galley),
+                    Color32::WHITE,
+                ));
             }
         }
 
         // Cursor is drawn above the cached layer so it never invalidates row cache.
-        let cvrow = (cursor.point.line.0 - display_offset) as usize;
+        let cvrow = (cursor_point.line.0 - display_offset) as usize;
         if cvrow < num_rows {
-            let cx = rect.min.x + cell_w * cursor.point.column.0 as f32;
+            let cx = rect.min.x + cell_w * cursor_point.column.0 as f32;
             let cy = rect.min.y + cell_h * cvrow as f32;
             shapes.push(Shape::Rect(RectShape::filled(
                 Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(cell_w, cell_h)),
@@ -522,7 +610,7 @@ impl<'a> TermView<'a> {
             )));
         }
 
-        painter.extend(shapes);
+        painter.extend(std::mem::take(shapes));
     }
 }
 
@@ -562,6 +650,7 @@ impl Widget for TermView<'_> {
     }
 }
 
+#[inline]
 fn color_to_egui(color: Color, default: Color32) -> Color32 {
     match color {
         Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
@@ -570,10 +659,11 @@ fn color_to_egui(color: Color, default: Color32) -> Color32 {
     }
 }
 
+#[inline]
 fn named_to_color(color: NamedColor) -> Option<Color32> {
     let c = match color {
         NamedColor::Foreground => Color32::from_rgb(220, 220, 220),
-        NamedColor::Background => Color32::from_rgb(10, 12, 16),
+        NamedColor::Background => BG_DEFAULT,
         NamedColor::Black => Color32::from_rgb(20, 20, 20),
         NamedColor::Red => Color32::from_rgb(220, 90, 90),
         NamedColor::Green => Color32::from_rgb(110, 200, 120),
