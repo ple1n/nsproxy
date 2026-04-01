@@ -604,6 +604,9 @@ struct App {
     ui_frame_seq: u64,
     last_frame_progress_log: Instant,
     last_frame_elapsed_ms: u128,
+    fps_window_start: Instant,
+    fps_window_count: u32,
+    last_fps: f32,
     /// ANSI-render cache keyed by raw log message string.
     cached_log: HashMap<String, Vec<egui::RichText>>,
 }
@@ -1042,6 +1045,9 @@ impl App {
             ui_frame_seq: 0,
             last_frame_progress_log: Instant::now(),
             last_frame_elapsed_ms: 0,
+            fps_window_start: Instant::now(),
+            fps_window_count: 0,
+            last_fps: 0.0,
             cached_log: HashMap::new(),
         }
     }
@@ -2917,7 +2923,7 @@ impl eframe::App for App {
 
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("frame: {}ms", self.last_frame_elapsed_ms))
+                    egui::RichText::new(format!("frame: {}ms  {:.1}fps", self.last_frame_elapsed_ms, self.last_fps))
                         .color(egui::Color32::GRAY)
                         .small(),
                 );
@@ -3054,6 +3060,13 @@ impl eframe::App for App {
 
         let frame_elapsed = frame_started.elapsed();
         self.last_frame_elapsed_ms = frame_elapsed.as_millis();
+        self.fps_window_count += 1;
+        let fps_elapsed = self.fps_window_start.elapsed();
+        if fps_elapsed >= Duration::from_secs(1) {
+            self.last_fps = self.fps_window_count as f32 / fps_elapsed.as_secs_f32();
+            self.fps_window_count = 0;
+            self.fps_window_start = Instant::now();
+        }
         if frame_elapsed >= Duration::from_millis(100) {
             info!(
                 frame = self.ui_frame_seq,
@@ -4314,10 +4327,6 @@ impl App {
         let profile = selected_profile.clone();
         let slot_pid = *selected_slot_pid;
         let key = (profile.clone(), slot_pid);
-
-        // Request continuous repaint while a PTY panel is open so incoming
-        // data shows up immediately.
-        ui.ctx().request_repaint();
 
         ui.add_space(8.0);
         ui.add_space(4.0);

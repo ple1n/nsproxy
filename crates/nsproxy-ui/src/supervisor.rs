@@ -581,6 +581,10 @@ struct Supervisor {
     pty_buf: SharedPtyBuf,
     /// Viewport ID of the external PTY window, if any.
     pty_viewport_id: SharedPtyViewportId,
+    /// Notified whenever PTY data arrives.  A dedicated tokio task awaits this
+    /// and calls request_repaint() once per batch, regardless of how many
+    /// notify_one() calls fire in rapid succession.
+    pty_repaint_notify: Arc<tokio::sync::Notify>,
     /// Baseline slot PID set captured when the UI requests StartDaemon.
     /// Used on the actor thread to detect newly spawned process slots.
     pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
@@ -636,6 +640,7 @@ impl Supervisor {
             process_raw_logs: HashMap::new(),
             pty_buf,
             pty_viewport_id,
+            pty_repaint_notify: Arc::new(tokio::sync::Notify::new()),
             pending_auto_open_logs: HashMap::new(),
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
@@ -655,13 +660,17 @@ impl Supervisor {
     /// Repaint the appropriate viewport when PTY data arrives.
     /// If an external PTY viewport is registered, repaint only that viewport.
     /// Otherwise repaint the main window (for the inline PTY panel case).
+    ///
+    /// We cap to ~120 fps with a delay so that rapid PTY output (e.g. typing
+    /// echo or htop redrawing) doesn't call request_repaint() hundreds of
+    /// times per second and pin the render loop at uncapped frame rate.
+    /// The supervisor actor may receive one PtyOutput chunk per echo byte,
+    /// so without this every keystroke could trigger dozens of immediate
+    /// repaints back-to-back. 8 ms gives ~120 fps max repaint rate, which
+    /// is plenty for interactive terminal use.
     fn repaint_pty_target(&self) {
-        let vp = self.pty_viewport_id.lock().ok().and_then(|g| *g);
-        if let Some(viewport_id) = vp {
-            self.ectx.request_repaint_of(viewport_id);
-        } else {
-            self.ectx.request_repaint();
-        }
+        // Wake the dedicated repaint task; multiple concurrent calls coalesce.
+        self.pty_repaint_notify.notify_one();
     }
 
     fn container_lifecycle(&self, profile: &ContainerName) -> ContainerLifecycleState {
@@ -737,6 +746,26 @@ impl Supervisor {
         tokio::spawn(async move {
             control_socket_accept_loop(ctrl_path, event_tx_ctrl).await;
         });
+        // Deduplicated PTY repaint task.  Many notify_one() calls while the
+        // task is already running coalesce into a single pending wake-up, so
+        // we fire request_repaint() at most once per "batch" of PTY data with
+        // no arbitrary timer boundary.
+        {
+            let notify = self.pty_repaint_notify.clone();
+            let ectx = self.ectx.clone();
+            let pty_viewport_id = self.pty_viewport_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    notify.notified().await;
+                    let vp = pty_viewport_id.lock().ok().and_then(|g| *g);
+                    if let Some(viewport_id) = vp {
+                        ectx.request_repaint_of(viewport_id);
+                    } else {
+                        ectx.request_repaint();
+                    }
+                }
+            });
+        }
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
