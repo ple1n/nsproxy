@@ -4723,6 +4723,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "smallstr",
+ "term-view",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6936,6 +6937,15 @@ dependencies = [
  "once_cell",
  "rustix 0.38.34",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "term-view"
+version = "0.3.0"
+dependencies = [
+ "alacritty_terminal",
+ "egui 0.33.3",
+ "flume",
 ]
 
 [[package]]

@@ -1,0 +1,9 @@
+[package]
+name = "term-view"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+egui = "0.33.3"
+flume = "0.11.1"
+alacritty_terminal = "0.25.1"

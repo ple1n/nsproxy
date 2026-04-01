@@ -33,79 +33,38 @@ use which;
 
 mod profile_loader;
 mod supervisor;
-mod term_view;
 
 use profile_loader::ProfileInfo;
 use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
-use term_view::{TermSession, TermView};
+use term_view::{ExternalPtyViewport, PtyIpc, TermSession, TermView};  // from crates/term-view
 
-/// Self-contained state for an external PTY viewport (separate OS window).
-///
-/// Holds everything the deferred viewport callback needs so it is fully
-/// independent of the main `App`.  All communication with the rest of the
-/// system goes through the cloned `SupervisorHandle`.
-struct ExternalPtyViewport {
+/// `PtyIpc` implementation that routes through the supervisor for a specific
+/// (profile, pid) combination.  Lives in `nsproxy-ui` (debug build) but is
+/// only the thin dispatch layer; all data processing is in `term-view`.
+struct SupervisorPtyIpc {
+    supervisor: SupervisorHandle,
     profile: ContainerName,
     pid: u32,
-    session: Mutex<TermSession>,
-    supervisor: SupervisorHandle,
-    closed: AtomicBool,
-    viewport_id: egui::ViewportId,
 }
 
-impl ExternalPtyViewport {
-    /// Called from the deferred viewport's `Fn(&Context, ViewportClass)` callback.
-    fn viewport_ui(this: &Arc<Self>, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) {
-            this.closed.store(true, Ordering::Relaxed);
-            return;
-        }
-
-        // Drain buffered PTY output from supervisor and feed into terminal.
-        let incoming = this.supervisor.drain_pty(&this.profile, this.pid);
-        {
-            let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
-            if !incoming.is_empty() {
-                session.feed(&incoming);
-                for resp in session.drain_responses() {
-                    if !resp.is_empty() {
-                        this.supervisor.send(SupervisorCommand::PtyInput {
-                            profile: this.profile.clone(),
-                            pid: this.pid,
-                            data: resp,
-                        });
-                    }
-                }
-            }
-
-            let mut input_frames: Vec<Vec<u8>> = Vec::new();
-            let mut resize_evt: Option<(u16, u16)> = None;
-
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.add(
-                    TermView::new(&mut session, &mut input_frames, &mut resize_evt)
-                        .set_size(ui.available_size()),
-                );
-            });
-
-            for data in input_frames {
-                if !data.is_empty() {
-                    this.supervisor.send(SupervisorCommand::PtyInput {
-                        profile: this.profile.clone(),
-                        pid: this.pid,
-                        data,
-                    });
-                }
-            }
-            if let Some((cols, rows)) = resize_evt {
-                this.supervisor.send(SupervisorCommand::PtyResize {
-                    profile: this.profile.clone(),
-                    pid: this.pid,
-                    cols,
-                    rows,
-                });
-            }
-        }
+impl PtyIpc for SupervisorPtyIpc {
+    fn drain_incoming(&self) -> Vec<u8> {
+        self.supervisor.drain_pty(&self.profile, self.pid)
+    }
+    fn send_input(&self, data: Vec<u8>) {
+        self.supervisor.send(SupervisorCommand::PtyInput {
+            profile: self.profile.clone(),
+            pid: self.pid,
+            data,
+        });
+    }
+    fn send_resize(&self, cols: u16, rows: u16) {
+        self.supervisor.send(SupervisorCommand::PtyResize {
+            profile: self.profile.clone(),
+            pid: self.pid,
+            cols,
+            rows,
+        });
     }
 }
 
@@ -586,7 +545,7 @@ struct App {
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
     /// State for the external PTY viewport (separate OS window), if any.
-    external_pty_viewport: Option<Arc<ExternalPtyViewport>>,
+    external_pty_viewport: Option<Arc<ExternalPtyViewport<SupervisorPtyIpc>>>,
     /// Last consumed auto-open token from supervisor snapshots.
     last_auto_open_logs_token: u64,
     /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
@@ -4251,28 +4210,30 @@ impl App {
                     let inline_same = self
                         .selected_process_logs
                         .as_ref()
-                        .is_some_and(|(p, q)| p == &prev.profile && *q == prev.pid)
+                        .is_some_and(|(p, q)| p == &prev.ipc.profile && *q == prev.pid)
                         && self.selected_process_is_pty();
                     if !inline_same {
                         self.supervisor.send(SupervisorCommand::DetachPty {
-                            profile: prev.profile.clone(),
+                            profile: prev.ipc.profile.clone(),
                             pid: prev.pid,
                         });
-                        self.pty_sessions.remove(&(prev.profile.clone(), prev.pid));
+                        self.pty_sessions.remove(&(prev.ipc.profile.clone(), prev.pid));
                     }
                 }
                 self.supervisor
                     .send(SupervisorCommand::AttachPty { profile: profile.clone(), pid });
                 let viewport_id = egui::ViewportId::from_hash_of("pty-external");
                 self.supervisor.set_pty_viewport(viewport_id);
-                self.external_pty_viewport = Some(Arc::new(ExternalPtyViewport {
-                    profile,
+                let title = format!("Terminal \u{2014} {} / PID {}", profile, pid);
+                self.external_pty_viewport = Some(Arc::new(ExternalPtyViewport::new(
+                    SupervisorPtyIpc {
+                        supervisor: self.supervisor.clone(),
+                        profile: profile.clone(),
+                        pid,
+                    },
                     pid,
-                    session: Mutex::new(TermSession::new(pid)),
-                    supervisor: self.supervisor.clone(),
-                    closed: AtomicBool::new(false),
-                    viewport_id,
-                }));
+                    title,
+                )));
             }
         }
     }
@@ -4296,14 +4257,14 @@ impl App {
     fn is_same_external_pty(&self, profile: &ContainerName, pid: u32) -> bool {
         self.external_pty_viewport
             .as_ref()
-            .is_some_and(|v| v.profile == *profile && v.pid == pid)
+            .is_some_and(|v| v.ipc.profile == *profile && v.pid == pid)
     }
 
     fn close_external_pty_window(&mut self) {
         if let Some(vp) = self.external_pty_viewport.take() {
             vp.closed.store(true, Ordering::Relaxed);
             self.supervisor.clear_pty_viewport();
-            let profile = &vp.profile;
+            let profile = &vp.ipc.profile;
             let pid = vp.pid;
             let inline_same = self
                 .selected_process_logs
@@ -4412,7 +4373,7 @@ impl App {
         };
 
         let viewport_id = vp.viewport_id;
-        let title = format!("Terminal — {} / PID {}", vp.profile, vp.pid);
+        let title = vp.title.clone();
 
         ctx.show_viewport_deferred(
             viewport_id,
