@@ -61,6 +61,13 @@ impl PtyIpc for SupervisorPtyIpc {
     fn drain_incoming(&self) -> Vec<u8> {
         self.supervisor.drain_pty(&self.profile, self.pid)
     }
+    fn wait_for_incoming(&self, observed_generation: u64) -> u64 {
+        self.supervisor
+            .wait_for_pty(&self.profile, self.pid, observed_generation)
+    }
+    fn wake_waiters(&self) {
+        self.supervisor.wake_pty_waiters();
+    }
     fn send_input(&self, data: Vec<u8>) {
         self.supervisor.send(SupervisorCommand::PtyInput {
             profile: self.profile.clone(),

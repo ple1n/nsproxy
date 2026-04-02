@@ -90,6 +90,11 @@ const FG_DEFAULT: Color32 = Color32::from_rgb(200, 200, 200);
 pub trait PtyIpc: Send + Sync + 'static {
     /// Drain any PTY bytes the daemon has sent since the last call.
     fn drain_incoming(&self) -> Vec<u8>;
+    /// Block until new PTY bytes are available after `observed_generation`.
+    /// Returns the latest generation number.
+    fn wait_for_incoming(&self, observed_generation: u64) -> u64;
+    /// Wake any blocked waiters so they can observe shutdown/close promptly.
+    fn wake_waiters(&self);
     /// Forward bytes typed in the terminal back to the PTY slave.
     fn send_input(&self, data: Vec<u8>);
     /// Notify the PTY slave of a terminal resize.
