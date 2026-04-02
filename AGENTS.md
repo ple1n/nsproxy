@@ -261,3 +261,17 @@ Result:
 - Form widgets:
   - Search: `render_optional_u32`, `render_optional_text`, `render_path_field`, `render_mount_list`, `render_chmod_list`, `render_env_map`, `render_string_map`, `render_u32_map`, `render_path_map`, `render_shell_args_list`, `render_shell_args`
   - File: `crates/nsproxy-ui/src/main.rs`
+
+## term-view keyboard mapping (Ctrl+Backspace)
+
+- External Alacritty runtime entrypoint (window boot + WindowContext wiring):
+  - Search: `ExternalViewportRequest::create_window_context`, `WindowContext::external`
+  - File: `crates/term-view/src/alacritty_runtime.rs`
+
+- Alacritty default keybindings (external windows):
+  - Search: `default_key_bindings`, `Backspace, ModifiersState::CONTROL`, `Action::Esc("\x17".into())`
+  - File: `crates/term-view/src/alacritty_port/config/bindings.rs`
+
+- Inline egui terminal input path (already maps Ctrl+Backspace => ^W):
+  - Search: `egui::Event::Key`, `Key::Backspace if modifiers.ctrl => &[0x17]`
+  - File: `crates/term-view/src/lib.rs`

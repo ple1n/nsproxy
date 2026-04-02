@@ -10,6 +10,77 @@ use egui::{Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Sh
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod render_pipeline;
+
+pub use render_pipeline::{RenderPipeline, SizeInfo};
+
+#[cfg(feature = "alacritty-opengl")]
+const DEFAULT_PIPELINE: RenderPipeline = RenderPipeline::AlacrittyOpenGl;
+#[cfg(not(feature = "alacritty-opengl"))]
+const DEFAULT_PIPELINE: RenderPipeline = RenderPipeline::Egui;
+
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/cli.rs"]
+pub mod cli;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/clipboard.rs"]
+pub mod clipboard;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/config/mod.rs"]
+pub mod config;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/daemon.rs"]
+pub mod daemon;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/display/mod.rs"]
+pub mod display;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/event.rs"]
+pub mod event;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/input/mod.rs"]
+pub mod input;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/logging.rs"]
+pub mod logging;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/message_bar.rs"]
+pub mod message_bar;
+#[cfg(all(feature = "alacritty-opengl", windows))]
+#[path = "alacritty_port/panic.rs"]
+pub mod panic;
+#[cfg(all(feature = "alacritty-opengl", unix))]
+#[path = "alacritty_port/ipc.rs"]
+pub mod ipc;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/renderer/mod.rs"]
+pub mod renderer;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/scheduler.rs"]
+pub mod scheduler;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/string.rs"]
+pub mod string;
+#[cfg(feature = "alacritty-opengl")]
+#[path = "alacritty_port/window_context.rs"]
+pub mod window_context;
+#[cfg(feature = "alacritty-opengl")]
+mod alacritty_runtime;
+#[cfg(feature = "alacritty-opengl")]
+pub use alacritty_runtime::{
+    about_to_wait_external_windows, handle_external_window_event, has_external_window,
+    install_external_window_waker, process_external_window_events, shutdown_external_windows,
+};
+
+#[cfg(feature = "alacritty-opengl")]
+mod gl {
+    #![allow(clippy::all, unsafe_op_in_unsafe_fn)]
+    include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
+
+#[cfg(feature = "alacritty-opengl")]
+pub use config::monitor::ConfigMonitor;
+
 const BG_DEFAULT: Color32 = Color32::from_rgb(10, 12, 16);
 const FG_DEFAULT: Color32 = Color32::from_rgb(200, 200, 200);
 
@@ -25,6 +96,36 @@ pub trait PtyIpc: Send + Sync + 'static {
     fn send_resize(&self, cols: u16, rows: u16);
 }
 
+/// Drive one PTY IO cycle: pull bytes from backend, feed terminal parser,
+/// and flush alacritty-generated device responses back to backend.
+pub fn pump_pty_io<I: PtyIpc>(ipc: &I, session: &mut TermSession) {
+    let incoming = ipc.drain_incoming();
+    if !incoming.is_empty() {
+        session.feed(&incoming);
+        for resp in session.drain_responses() {
+            if !resp.is_empty() {
+                ipc.send_input(resp);
+            }
+        }
+    }
+}
+
+/// Flush terminal-widget outbound actions captured during a frame.
+pub fn flush_term_outputs<I: PtyIpc>(
+    ipc: &I,
+    input_frames: Vec<Vec<u8>>,
+    resize_evt: Option<(u16, u16)>,
+) {
+    for data in input_frames {
+        if !data.is_empty() {
+            ipc.send_input(data);
+        }
+    }
+    if let Some((cols, rows)) = resize_evt {
+        ipc.send_resize(cols, rows);
+    }
+}
+
 /// Self-contained state for an external PTY OS window (deferred viewport).
 ///
 /// Generic over `I: PtyIpc` so the hot path (data draining, input forwarding,
@@ -37,10 +138,21 @@ pub struct ExternalPtyViewport<I: PtyIpc> {
     pub closed: AtomicBool,
     pub viewport_id: egui::ViewportId,
     pub title: String,
+    pub pipeline: RenderPipeline,
+    window_started: AtomicBool,
 }
 
 impl<I: PtyIpc> ExternalPtyViewport<I> {
     pub fn new(ipc: I, pid: u32, title: String) -> Self {
+        Self::new_with_pipeline(ipc, pid, title, DEFAULT_PIPELINE)
+    }
+
+    pub fn new_with_pipeline(
+        ipc: I,
+        pid: u32,
+        title: String,
+        pipeline: RenderPipeline,
+    ) -> Self {
         Self {
             ipc,
             pid,
@@ -48,6 +160,28 @@ impl<I: PtyIpc> ExternalPtyViewport<I> {
             closed: AtomicBool::new(false),
             viewport_id: egui::ViewportId::from_hash_of("pty-external"),
             title,
+            pipeline,
+            window_started: AtomicBool::new(false),
+        }
+    }
+
+    pub fn uses_native_window(&self) -> bool {
+        matches!(self.pipeline, RenderPipeline::AlacrittyOpenGl)
+    }
+
+    #[cfg(feature = "alacritty-opengl")]
+    pub fn ensure_native_window(this: &Arc<Self>)
+    where
+        I: Send + Sync + 'static,
+    {
+        if this.window_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        if let Err(err) = alacritty_runtime::open_external_window(Arc::clone(this)) {
+            eprintln!("term-view alacritty window error: {err}");
+            this.window_started.store(false, Ordering::Relaxed);
+            this.closed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -58,37 +192,46 @@ impl<I: PtyIpc> ExternalPtyViewport<I> {
             this.closed.store(true, Ordering::Relaxed);
             return;
         }
-
-        let incoming = this.ipc.drain_incoming();
         let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
 
-        if !incoming.is_empty() {
-            session.feed(&incoming);
-            for resp in session.drain_responses() {
-                if !resp.is_empty() {
-                    this.ipc.send_input(resp);
-                }
-            }
-        }
+        pump_pty_io(&this.ipc, &mut session);
 
         let mut input_frames: Vec<Vec<u8>> = Vec::new();
         let mut resize_evt: Option<(u16, u16)> = None;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add(
-                TermView::new(&mut session, &mut input_frames, &mut resize_evt)
-                    .set_size(ui.available_size()),
-            );
-        });
+        this.render_with_pipeline(ctx, &mut session, &mut input_frames, &mut resize_evt);
 
-        for data in input_frames {
-            if !data.is_empty() {
-                this.ipc.send_input(data);
+        flush_term_outputs(&this.ipc, input_frames, resize_evt);
+    }
+
+    fn render_with_pipeline(
+        &self,
+        ctx: &egui::Context,
+        session: &mut TermSession,
+        input_frames: &mut Vec<Vec<u8>>,
+        resize_evt: &mut Option<(u16, u16)>,
+    ) {
+        match self.pipeline {
+            RenderPipeline::Egui => {
+                Self::render_via_egui(ctx, session, input_frames, resize_evt);
+            }
+            RenderPipeline::AlacrittyOpenGl => {
+                Self::render_via_egui(ctx, session, input_frames, resize_evt);
             }
         }
-        if let Some((cols, rows)) = resize_evt {
-            this.ipc.send_resize(cols, rows);
-        }
+    }
+
+    fn render_via_egui(
+        ctx: &egui::Context,
+        session: &mut TermSession,
+        input_frames: &mut Vec<Vec<u8>>,
+        resize_evt: &mut Option<(u16, u16)>,
+    ) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(
+                TermView::new(session, input_frames, resize_evt).set_size(ui.available_size()),
+            );
+        });
     }
 }
 

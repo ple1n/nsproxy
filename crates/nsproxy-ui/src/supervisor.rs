@@ -148,6 +148,8 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// Terminal error state: do not attempt further reconnects unless user intervenes.
+    NoRetry,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1774,6 +1776,16 @@ impl Supervisor {
                         message: format!("{} disconnected", target.label()),
                     },
                 ),
+                ConnectionState::NoRetry => push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    diag::LogEntry {
+                        ts: diag::Timestamp::now(),
+                        level: "WARN".to_string(),
+                        target: "supervisor".to_string(),
+                        message: format!("{} upgrade rejected — no further retries", target.label()),
+                    },
+                ),
                 ConnectionState::Connecting => {}
             }
         }
@@ -2503,6 +2515,22 @@ async fn up_client_loop(
                     error = %err,
                     "failed to connect to up daemon socket"
                 );
+                // If the remote rejected our upgrade due to a build hash mismatch,
+                // record a terminal NoRetry state so we stop frantic reconnect attempts.
+                let err_str = err.to_string();
+                if err_str.contains("build hash mismatch") {
+                    info!(profile = profile.as_str(), "up daemon upgrade rejected: build hash mismatch; stopping retries");
+                    report_connection_update(
+                        &event_tx,
+                        &profile,
+                        ConnectionTarget::Up,
+                        ConnectionState::NoRetry,
+                        Some(format!("failed to connect to {}: {err}", sock.display())),
+                    );
+                    // Do not continue retrying for this profile.
+                    return;
+                }
+
                 report_connection_update(
                     &event_tx,
                     &profile,

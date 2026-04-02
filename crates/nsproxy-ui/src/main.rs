@@ -26,6 +26,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use winit::application::ApplicationHandler;
+use winit::event::{DeviceEvent, StartCause, WindowEvent};
+use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::ControlFlow;
+use winit::window::WindowId;
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,7 +41,12 @@ mod supervisor;
 
 use profile_loader::ProfileInfo;
 use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
-use term_view::{ExternalPtyViewport, PtyIpc, TermSession, TermView};  // from crates/term-view
+use term_view::{
+    ExternalPtyViewport, PtyIpc, TermSession, TermView, about_to_wait_external_windows,
+    flush_term_outputs, handle_external_window_event, has_external_window,
+    install_external_window_waker, process_external_window_events, pump_pty_io,
+    shutdown_external_windows,
+};
 
 /// `PtyIpc` implementation that routes through the supervisor for a specific
 /// (profile, pid) combination.  Lives in `nsproxy-ui` (debug build) but is
@@ -4202,38 +4212,8 @@ impl App {
             }
         }
         if let Some((profile, pid)) = external_pty_request {
-            let is_same = self.is_same_external_pty(&profile, pid);
-            if is_same {
-                self.close_external_pty_window();
-            } else {
-                if let Some(prev) = self.external_pty_viewport.as_ref() {
-                    let inline_same = self
-                        .selected_process_logs
-                        .as_ref()
-                        .is_some_and(|(p, q)| p == &prev.ipc.profile && *q == prev.pid)
-                        && self.selected_process_is_pty();
-                    if !inline_same {
-                        self.supervisor.send(SupervisorCommand::DetachPty {
-                            profile: prev.ipc.profile.clone(),
-                            pid: prev.pid,
-                        });
-                        self.pty_sessions.remove(&(prev.ipc.profile.clone(), prev.pid));
-                    }
-                }
-                self.supervisor
-                    .send(SupervisorCommand::AttachPty { profile: profile.clone(), pid });
-                let viewport_id = egui::ViewportId::from_hash_of("pty-external");
-                self.supervisor.set_pty_viewport(viewport_id);
-                let title = format!("Terminal \u{2014} {} / PID {}", profile, pid);
-                self.external_pty_viewport = Some(Arc::new(ExternalPtyViewport::new(
-                    SupervisorPtyIpc {
-                        supervisor: self.supervisor.clone(),
-                        profile: profile.clone(),
-                        pid,
-                    },
-                    pid,
-                    title,
-                )));
+            if !self.is_same_external_pty(&profile, pid) {
+                self.replace_external_pty_window(profile, pid);
             }
         }
     }
@@ -4258,6 +4238,51 @@ impl App {
         self.external_pty_viewport
             .as_ref()
             .is_some_and(|v| v.ipc.profile == *profile && v.pid == pid)
+    }
+
+    fn replace_external_pty_window(&mut self, profile: ContainerName, pid: u32) {
+        if let Some(prev) = self.external_pty_viewport.take() {
+            prev.closed.store(true, Ordering::Relaxed);
+
+            let inline_same = self
+                .selected_process_logs
+                .as_ref()
+                .is_some_and(|(p, q)| p == &prev.ipc.profile && *q == prev.pid)
+                && self.selected_process_is_pty();
+
+            if !inline_same {
+                self.supervisor.send(SupervisorCommand::DetachPty {
+                    profile: prev.ipc.profile.clone(),
+                    pid: prev.pid,
+                });
+                self.pty_sessions.remove(&(prev.ipc.profile.clone(), prev.pid));
+            }
+        }
+
+        self.supervisor
+            .send(SupervisorCommand::AttachPty { profile: profile.clone(), pid });
+
+        let viewport_id = egui::ViewportId::from_hash_of("pty-external");
+        self.supervisor.set_pty_viewport(viewport_id);
+
+        let title = format!("Terminal \u{2014} {} / PID {}", profile, pid);
+        let viewport = Arc::new(ExternalPtyViewport::new(
+            SupervisorPtyIpc {
+                supervisor: self.supervisor.clone(),
+                profile,
+                pid,
+            },
+            pid,
+            title,
+        ));
+
+        if viewport.uses_native_window() {
+            self.supervisor.clear_pty_viewport();
+        } else {
+            self.supervisor.set_pty_viewport(viewport.viewport_id);
+        }
+
+        self.external_pty_viewport = Some(viewport);
     }
 
     fn close_external_pty_window(&mut self) {
@@ -4314,24 +4339,17 @@ impl App {
     fn render_process_pty_terminal(&mut self, ui: &mut egui::Ui, profile: &ContainerName, slot_pid: u32) {
         let key = (profile.clone(), slot_pid);
 
-        let incoming = self.supervisor.drain_pty(&profile, slot_pid);
+        let ipc = SupervisorPtyIpc {
+            supervisor: self.supervisor.clone(),
+            profile: profile.clone(),
+            pid: slot_pid,
+        };
 
         let session = self
             .pty_sessions
             .entry(key)
             .or_insert_with(|| TermSession::new(slot_pid));
-        if !incoming.is_empty() {
-            session.feed(&incoming);
-            for resp in session.drain_responses() {
-                if !resp.is_empty() {
-                    self.supervisor.send(SupervisorCommand::PtyInput {
-                        profile: profile.clone(),
-                        pid: slot_pid,
-                        data: resp,
-                    });
-                }
-            }
-        }
+        pump_pty_io(&ipc, session);
 
         let mut input_frames: Vec<Vec<u8>> = Vec::new();
         let mut resize_evt: Option<(u16, u16)> = None;
@@ -4340,23 +4358,7 @@ impl App {
                 .set_size(ui.available_size()),
         );
 
-        for data in input_frames {
-            if !data.is_empty() {
-                self.supervisor.send(SupervisorCommand::PtyInput {
-                    profile: profile.clone(),
-                    pid: slot_pid,
-                    data,
-                });
-            }
-        }
-        if let Some((cols, rows)) = resize_evt {
-            self.supervisor.send(SupervisorCommand::PtyResize {
-                profile: profile.clone(),
-                pid: slot_pid,
-                cols,
-                rows,
-            });
-        }
+        flush_term_outputs(&ipc, input_frames, resize_evt);
     }
 
     fn render_external_pty_window(&mut self, ctx: &egui::Context) {
@@ -4371,6 +4373,11 @@ impl App {
         let Some(vp) = self.external_pty_viewport.clone() else {
             return;
         };
+
+        if vp.uses_native_window() {
+            ExternalPtyViewport::ensure_native_window(&vp);
+            return;
+        }
 
         let viewport_id = vp.viewport_id;
         let title = vp.title.clone();
@@ -6590,6 +6597,139 @@ fn setup_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
+    setup_cjk_font(&cc.egui_ctx);
+    // Allow deferred viewports to open as independent OS windows.
+    cc.egui_ctx.set_embed_viewports(false);
+    // Set every text style to 16px for consistent sizing.
+    cc.egui_ctx.style_mut(|style| {
+        for ts in &[
+            egui::TextStyle::Heading,
+            egui::TextStyle::Body,
+            egui::TextStyle::Monospace,
+            egui::TextStyle::Button,
+            egui::TextStyle::Small,
+        ] {
+            style
+                .text_styles
+                .insert(ts.clone(), egui::FontId::proportional(16.0));
+        }
+    });
+}
+
+struct UiApplication<'a> {
+    eframe_app: eframe::EframeWinitApplication<'a>,
+}
+
+impl UiApplication<'_> {
+    fn merge_control_flow(current: ControlFlow, term_deadline: Option<Instant>) -> ControlFlow {
+        match (current, term_deadline) {
+            (ControlFlow::Poll, _) => ControlFlow::Poll,
+            (ControlFlow::Wait, Some(deadline)) => ControlFlow::WaitUntil(deadline),
+            (ControlFlow::Wait, None) => ControlFlow::Wait,
+            (ControlFlow::WaitUntil(deadline), Some(term_deadline)) => {
+                ControlFlow::WaitUntil(deadline.min(term_deadline))
+            }
+            (ControlFlow::WaitUntil(deadline), None) => ControlFlow::WaitUntil(deadline),
+        }
+    }
+}
+
+impl ApplicationHandler<eframe::UserEvent> for UiApplication<'_> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.eframe_app.resumed(event_loop);
+        process_external_window_events(event_loop);
+    }
+
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        self.eframe_app.suspended(event_loop);
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        self.eframe_app.new_events(event_loop, cause);
+        process_external_window_events(event_loop);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: eframe::UserEvent) {
+        self.eframe_app.user_event(event_loop, event);
+        process_external_window_events(event_loop);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if has_external_window(window_id)
+            && handle_external_window_event(event_loop, window_id, event.clone())
+        {
+            return;
+        }
+
+        self.eframe_app.window_event(event_loop, window_id, event);
+        process_external_window_events(event_loop);
+    }
+
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        self.eframe_app.device_event(event_loop, device_id, event);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.eframe_app.about_to_wait(event_loop);
+
+        let term_deadline = about_to_wait_external_windows(event_loop);
+        let merged = Self::merge_control_flow(event_loop.control_flow(), term_deadline);
+        event_loop.set_control_flow(merged);
+    }
+
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
+        self.eframe_app.memory_warning(event_loop);
+    }
+
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        shutdown_external_windows();
+        self.eframe_app.exiting(event_loop);
+    }
+}
+
+fn run_manual_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let native_options = eframe::NativeOptions::default();
+    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event()
+        .build()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let wake_proxy = event_loop.create_proxy();
+    install_external_window_waker(move || {
+        let _ = wake_proxy.send_event(eframe::UserEvent::RequestRepaint {
+            viewport_id: egui::ViewportId::ROOT,
+            when: Instant::now(),
+            cumulative_pass_nr: 0,
+        });
+    })?;
+
+    let eframe_app = eframe::create_native(
+        "nsproxy - dashboard",
+        native_options,
+        Box::new(|cc| {
+            let ctx = cc.egui_ctx.clone();
+            configure_ui_context(cc);
+            Ok(Box::new(App::new(ctx)))
+        }),
+        &event_loop,
+    );
+
+    let mut app = UiApplication { eframe_app };
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
+}
+
 fn main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -6605,30 +6745,9 @@ fn main() {
     diag::set_protocol_version(nsproxy_core::build_identity());
 
     info!("starting nsproxy-ui");
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "nsproxy - dashboard",
-        native_options,
-        Box::new(|cc| {
-            let ctx = cc.egui_ctx.clone();
-            setup_cjk_font(&cc.egui_ctx);
-            // Allow deferred viewports to open as independent OS windows.
-            cc.egui_ctx.set_embed_viewports(false);
-            // Set every text style to 16px for consistent sizing.
-            cc.egui_ctx.style_mut(|style| {
-                for ts in &[
-                    egui::TextStyle::Heading,
-                    egui::TextStyle::Body,
-                    egui::TextStyle::Monospace,
-                    egui::TextStyle::Button,
-                    egui::TextStyle::Small,
-                ] {
-                    style
-                        .text_styles
-                        .insert(ts.clone(), egui::FontId::proportional(16.0));
-                }
-            });
-            Ok(Box::new(App::new(ctx)))
-        }),
-    );
+    info!("launching manual ui event loop");
+    if let Err(err) = run_manual_loop() {
+        tracing::error!(%err, "ui event loop failed");
+        std::process::exit(1);
+    }
 }
