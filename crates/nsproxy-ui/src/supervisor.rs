@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime};
 use std::{
     fs::File,
@@ -269,6 +269,64 @@ pub enum SupervisorCommand {
 /// Shared PTY byte buffer.  The supervisor task appends; the UI thread drains.
 type SharedPtyBuf = Arc<Mutex<HashMap<ContainerName, HashMap<u32, Vec<u8>>>>>;
 
+type SharedPtyWakeState = Arc<PtyWakeState>;
+
+struct PtyWakeState {
+    generations: Mutex<HashMap<ContainerName, HashMap<u32, u64>>>,
+    condvar: Condvar,
+}
+
+impl PtyWakeState {
+    fn new() -> Self {
+        Self {
+            generations: Mutex::new(HashMap::new()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn wait_for_change(&self, profile: &ContainerName, pid: u32, observed_generation: u64) -> u64 {
+        let mut guard = self
+            .generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            let current_generation = guard
+                .get(profile)
+                .and_then(|per_profile| per_profile.get(&pid))
+                .copied()
+                .unwrap_or_default();
+
+            if current_generation > observed_generation {
+                return current_generation;
+            }
+
+            guard = self
+                .condvar
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn notify_pty_data(&self, profile: &ContainerName, pid: u32) {
+        let mut guard = self
+            .generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = guard
+            .entry(profile.clone())
+            .or_default()
+            .entry(pid)
+            .or_default();
+        *generation = generation.saturating_add(1);
+        self.condvar.notify_all();
+    }
+
+    fn wake_all(&self) {
+        self.condvar.notify_all();
+    }
+}
+
 /// When an external PTY viewport is active, holds its ViewportId so the
 /// supervisor can repaint only that viewport (not the main window).
 type SharedPtyViewportId = Arc<Mutex<Option<egui::ViewportId>>>;
@@ -278,6 +336,7 @@ pub struct SupervisorHandle {
     cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
     snapshot_rx: std::sync::Arc<std::sync::Mutex<tokio::sync::watch::Receiver<SupervisorSnapshot>>>,
     pty_buf: SharedPtyBuf,
+    pty_wake_state: SharedPtyWakeState,
     pty_viewport_id: SharedPtyViewportId,
 }
 
@@ -292,6 +351,7 @@ impl SupervisorHandle {
         });
 
         let pty_buf: SharedPtyBuf = Arc::new(Mutex::new(HashMap::new()));
+        let pty_wake_state: SharedPtyWakeState = Arc::new(PtyWakeState::new());
         let pty_viewport_id: SharedPtyViewportId = Arc::new(Mutex::new(None));
         let cmd_tx_for_self = cmd_tx.clone();
         (
@@ -299,6 +359,7 @@ impl SupervisorHandle {
                 cmd_tx: cmd_tx_for_self,
                 snapshot_rx: std::sync::Arc::new(std::sync::Mutex::new(snapshot_rx)),
                 pty_buf: pty_buf.clone(),
+                pty_wake_state: pty_wake_state.clone(),
                 pty_viewport_id: pty_viewport_id.clone(),
             },
             SupervisorTask {
@@ -307,6 +368,7 @@ impl SupervisorHandle {
                 snapshot_tx,
                 ectx,
                 pty_buf,
+                pty_wake_state,
                 pty_viewport_id,
             },
         )
@@ -345,6 +407,15 @@ impl SupervisorHandle {
             .unwrap_or_default()
     }
 
+    pub fn wait_for_pty(&self, profile: &ContainerName, pid: u32, observed_generation: u64) -> u64 {
+        self.pty_wake_state
+            .wait_for_change(profile, pid, observed_generation)
+    }
+
+    pub fn wake_pty_waiters(&self) {
+        self.pty_wake_state.wake_all();
+    }
+
     /// Register an external PTY viewport so the supervisor repaints only it
     /// (instead of the main window) when PTY data arrives.
     pub fn set_pty_viewport(&self, id: egui::ViewportId) {
@@ -367,6 +438,7 @@ pub struct SupervisorTask {
     snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
     ectx: egui::Context,
     pty_buf: SharedPtyBuf,
+    pty_wake_state: SharedPtyWakeState,
     pty_viewport_id: SharedPtyViewportId,
 }
 
@@ -379,6 +451,7 @@ impl SupervisorTask {
             self.snapshot_tx,
             self.ectx,
             self.pty_buf,
+            self.pty_wake_state,
             self.pty_viewport_id,
         );
         if let Err(err) = supervisor.run().await {
@@ -581,6 +654,8 @@ struct Supervisor {
     process_raw_logs: HashMap<ContainerName, HashMap<u32, Vec<diag::RawLog>>>,
     /// Shared PTY byte buffer — written here, drained by UI thread.
     pty_buf: SharedPtyBuf,
+    /// Event-driven wake state for PTY readers waiting on new bytes.
+    pty_wake_state: SharedPtyWakeState,
     /// Viewport ID of the external PTY window, if any.
     pty_viewport_id: SharedPtyViewportId,
     /// Notified whenever PTY data arrives.  A dedicated tokio task awaits this
@@ -609,6 +684,7 @@ impl Supervisor {
         snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
         ectx: egui::Context,
         pty_buf: SharedPtyBuf,
+        pty_wake_state: SharedPtyWakeState,
         pty_viewport_id: SharedPtyViewportId,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -641,6 +717,7 @@ impl Supervisor {
             ui_ns_cache: probe_namespace_indicator(std::process::id() as i32).unwrap_or_default(),
             process_raw_logs: HashMap::new(),
             pty_buf,
+            pty_wake_state,
             pty_viewport_id,
             pty_repaint_notify: Arc::new(tokio::sync::Notify::new()),
             pending_auto_open_logs: HashMap::new(),
@@ -1540,6 +1617,7 @@ impl Supervisor {
                         let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
                         guard.entry(profile.clone()).or_default().insert(pid, data);
                     }
+                    self.pty_wake_state.notify_pty_data(&profile, pid);
                     self.repaint_pty_target();
                 } else if let diag::DaemonEvent::PtyOutput { pid, data } = event {
                     {
@@ -1551,6 +1629,7 @@ impl Supervisor {
                             .or_default()
                             .extend(data);
                     }
+                            self.pty_wake_state.notify_pty_data(&profile, pid);
                     self.repaint_pty_target();
                 } else if let diag::DaemonEvent::ProcessListSnapshot(snapshot) = event {
                     if let Some(status) = self.ns_alive_status.get_mut(&profile) {

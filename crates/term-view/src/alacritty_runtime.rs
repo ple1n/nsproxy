@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use polling::{Event as PollingEvent, PollMode, Poller};
 use winit::event::{Event as WinitEvent, WindowEvent};
@@ -441,17 +441,22 @@ impl<I: PtyIpc + Send + Sync + 'static> SocketEventedPty<I> {
         let feed_thread = thread::Builder::new()
             .name(format!("term-view-pty-feed-{}", viewport.pid))
             .spawn(move || {
+                let mut observed_generation = 0;
                 while !shutdown_bg.load(Ordering::Relaxed)
                     && !viewport_bg.closed.load(Ordering::Relaxed)
                 {
                     let bytes = viewport_bg.ipc.drain_incoming();
-                    if bytes.is_empty() {
-                        thread::sleep(Duration::from_millis(8));
-                        continue;
-                    }
-                    if feeder_writer_bg.write_all(&bytes).is_err() {
+                    if !bytes.is_empty() && feeder_writer_bg.write_all(&bytes).is_err() {
                         break;
                     }
+
+                    if shutdown_bg.load(Ordering::Relaxed)
+                        || viewport_bg.closed.load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+
+                    observed_generation = viewport_bg.ipc.wait_for_incoming(observed_generation);
                 }
             })
             .map_err(io::Error::other)?;
@@ -470,6 +475,7 @@ impl<I: PtyIpc + Send + Sync + 'static> SocketEventedPty<I> {
 impl<I: PtyIpc + Send + Sync + 'static> Drop for SocketEventedPty<I> {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.writer.viewport.ipc.wake_waiters();
     }
 }
 
