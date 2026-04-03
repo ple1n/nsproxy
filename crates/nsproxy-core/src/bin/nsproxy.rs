@@ -2140,10 +2140,9 @@ where
 
 /// Accept loop for the `sp up` daemon socket.
 ///
-/// Always accepts new connections. When a new client connects it aborts the
-/// previous connection handler so the daemon is never stuck on a stale client.
-/// The shared `UpDaemonState` is passed as `Arc<ArcSwap<…>>` so each handler
-/// can do lock-free load/store updates without a mutex.
+/// Always accepts new connections and serves each in its own handler task.
+/// The shared `UpDaemonState` is passed as `Arc<ArcSwap<…>>` so handlers can
+/// do lock-free load/store updates without a mutex.
 async fn run_up_daemon(
     profile: &str,
     ns_meta: PathBuf,
@@ -2238,8 +2237,6 @@ async fn run_up_daemon(
         });
     }
 
-    let mut current_task: Option<tokio::task::JoinHandle<()>> = None;
-
     loop {
         let (mut stream, _addr) = listener.accept().await?;
 
@@ -2253,11 +2250,6 @@ async fn run_up_daemon(
             continue;
         }
 
-        // New connection: kick out the old client if any.
-        if let Some(task) = current_task.take() {
-            task.abort();
-        }
-
         let state = state.clone();
         let ns_meta = ns_meta.clone();
         // Subscribe to the log broadcast for this new connection.
@@ -2268,7 +2260,7 @@ async fn run_up_daemon(
         let pty_masters_conn = pty_masters.clone();
         let pty_streams_conn = pty_streams.clone();
         let exit_broadcast_conn = Arc::clone(&exit_broadcast_tx);
-        current_task = Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = handle_up_client(
                 stream,
                 state,
@@ -2285,7 +2277,7 @@ async fn run_up_daemon(
             ).await {
                 warn!("up daemon client error: {}", e);
             }
-        }));
+        });
     }
 }
 
