@@ -38,14 +38,15 @@ use which;
 
 mod profile_loader;
 mod supervisor;
+mod alacritty_window;
 
+use alacritty_window::ExternalTermWindowClient;
 use profile_loader::ProfileInfo;
 use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
 use term_view::{
-    ExternalPtyViewport, PtyIpc, TermSession, TermView, about_to_wait_external_windows,
-    flush_term_outputs, handle_external_window_event, has_external_window,
-    install_external_window_waker, process_external_window_events, pump_pty_io,
-    shutdown_external_windows,
+    PtyIpc, TermSession, TermView, about_to_wait_external_windows, flush_term_outputs,
+    handle_external_window_event, has_external_window, install_external_window_waker,
+    process_external_window_events, pump_pty_io, shutdown_external_windows,
 };
 
 /// `PtyIpc` implementation that routes through the supervisor for a specific
@@ -561,8 +562,8 @@ struct App {
     traffic_subview: TrafficSubview,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
-    /// State for the external PTY viewport (separate OS window), if any.
-    external_pty_viewport: Option<Arc<ExternalPtyViewport<SupervisorPtyIpc>>>,
+    /// State for the external terminal child process, if any.
+    external_term_window: ExternalTermWindowClient,
     /// Last consumed auto-open token from supervisor snapshots.
     last_auto_open_logs_token: u64,
     /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
@@ -1006,7 +1007,7 @@ impl App {
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
             selected_process_logs: None,
-            external_pty_viewport: None,
+            external_term_window: ExternalTermWindowClient::default(),
             last_auto_open_logs_token: 0,
             selected_process_spawn_args: None,
             raw_log_show_details: false,
@@ -4185,7 +4186,7 @@ impl App {
                             if matches!(&entry.meta, diag::SpawnedEntry::Pty(_)) {
                                 if ui
                                     .small_button("ext")
-                                    .on_hover_text("Open PTY in native window")
+                                    .on_hover_text("Open PTY in separate terminal window")
                                     .clicked()
                                 {
                                     external_pty_request = Some((row_profile.clone(), *slot_pid));
@@ -4221,6 +4222,8 @@ impl App {
         if let Some((profile, pid)) = external_pty_request {
             if !self.is_same_external_pty(&profile, pid) {
                 self.replace_external_pty_window(profile, pid);
+            } else if let Err(err) = self.external_term_window.focus() {
+                tracing::warn!(%err, "failed to focus terminal child window");
             }
         }
     }
@@ -4242,75 +4245,19 @@ impl App {
     }
 
     fn is_same_external_pty(&self, profile: &ContainerName, pid: u32) -> bool {
-        self.external_pty_viewport
-            .as_ref()
-            .is_some_and(|v| v.ipc.profile == *profile && v.pid == pid)
+        self.external_term_window
+            .current_target()
+            .is_some_and(|target| target.profile == *profile && target.pid == pid)
     }
 
     fn replace_external_pty_window(&mut self, profile: ContainerName, pid: u32) {
-        if let Some(prev) = self.external_pty_viewport.take() {
-            prev.closed.store(true, Ordering::Relaxed);
-
-            let inline_same = self
-                .selected_process_logs
-                .as_ref()
-                .is_some_and(|(p, q)| p == &prev.ipc.profile && *q == prev.pid)
-                && self.selected_process_is_pty();
-
-            if !inline_same {
-                self.supervisor.send(SupervisorCommand::DetachPty {
-                    profile: prev.ipc.profile.clone(),
-                    pid: prev.pid,
-                });
-                self.pty_sessions.remove(&(prev.ipc.profile.clone(), prev.pid));
-            }
+        if let Err(err) = self.external_term_window.attach(profile, pid) {
+            tracing::warn!(%err, "failed to attach terminal child window");
         }
-
-        self.supervisor
-            .send(SupervisorCommand::AttachPty { profile: profile.clone(), pid });
-
-        let viewport_id = egui::ViewportId::from_hash_of("pty-external");
-        self.supervisor.set_pty_viewport(viewport_id);
-
-        let title = format!("Terminal \u{2014} {} / PID {}", profile, pid);
-        let viewport = Arc::new(ExternalPtyViewport::new(
-            SupervisorPtyIpc {
-                supervisor: self.supervisor.clone(),
-                profile,
-                pid,
-            },
-            pid,
-            title,
-        ));
-
-        if viewport.uses_native_window() {
-            self.supervisor.clear_pty_viewport();
-        } else {
-            self.supervisor.set_pty_viewport(viewport.viewport_id);
-        }
-
-        self.external_pty_viewport = Some(viewport);
     }
 
     fn close_external_pty_window(&mut self) {
-        if let Some(vp) = self.external_pty_viewport.take() {
-            vp.closed.store(true, Ordering::Relaxed);
-            self.supervisor.clear_pty_viewport();
-            let profile = &vp.ipc.profile;
-            let pid = vp.pid;
-            let inline_same = self
-                .selected_process_logs
-                .as_ref()
-                .is_some_and(|(p, q)| p == profile && *q == pid)
-                && self.selected_process_is_pty();
-            if !inline_same {
-                self.supervisor.send(SupervisorCommand::DetachPty {
-                    profile: profile.clone(),
-                    pid,
-                });
-                self.pty_sessions.remove(&(profile.clone(), pid));
-            }
-        }
+        self.external_term_window.shutdown();
     }
 
     fn render_process_pty_panel(&mut self, ui: &mut egui::Ui) {
@@ -4369,35 +4316,8 @@ impl App {
     }
 
     fn render_external_pty_window(&mut self, ctx: &egui::Context) {
-        // Check if the deferred viewport signalled close.
-        if let Some(ref vp) = self.external_pty_viewport {
-            if vp.closed.load(Ordering::Relaxed) {
-                self.close_external_pty_window();
-                return;
-            }
-        }
-
-        let Some(vp) = self.external_pty_viewport.clone() else {
-            return;
-        };
-
-        if vp.uses_native_window() {
-            ExternalPtyViewport::ensure_native_window(&vp);
-            return;
-        }
-
-        let viewport_id = vp.viewport_id;
-        let title = vp.title.clone();
-
-        ctx.show_viewport_deferred(
-            viewport_id,
-            egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_inner_size([1200.0, 760.0]),
-            move |ctx, _class| {
-                ExternalPtyViewport::viewport_ui(&vp, ctx);
-            },
-        );
+        let _ = ctx;
+        self.external_term_window.poll();
     }
 
     fn render_process_raw_logs_panel(&mut self, ui: &mut egui::Ui) {
