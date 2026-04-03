@@ -1,172 +1,131 @@
 #![cfg(feature = "alacritty-opengl")]
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::env;
+use std::error::Error;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
 
 use polling::{Event as PollingEvent, PollMode, Poller};
-use winit::event::{Event as WinitEvent, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::application::ApplicationHandler;
+use winit::event::{Event as WinitEvent, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
 use alacritty_terminal::event::{Event as TerminalEvent, OnResize, WindowSize};
-use alacritty_terminal::tty::{ChildEvent, EventedPty, EventedReadWrite};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 
-use crate::ExternalPtyViewport;
 use crate::PtyIpc;
-use crate::cli::WindowOptions;
+use crate::cli::Options;
 use crate::clipboard::Clipboard;
-use crate::config::UiConfig;
+use crate::config::{self, UiConfig};
 use crate::event::{Event, EventSender, EventType};
 use crate::scheduler::Scheduler;
 use crate::window_context::WindowContext;
 
 const PTY_READ_WRITE_TOKEN: usize = 0;
-const PTY_CHILD_EVENT_TOKEN: usize = 1;
 
-type PendingViewports = Arc<Mutex<VecDeque<Arc<dyn ExternalViewportHandle>>>>;
-
-struct RuntimeQueueHandle {
-    pending_viewports: PendingViewports,
-    pending_events: Arc<Mutex<VecDeque<Event>>>,
-    wake: Arc<dyn Fn() + Send + Sync>,
+struct PendingWindow<I: PtyIpc + Send + Sync + 'static> {
+    ipc: Arc<I>,
+    pid: u32,
+    closed: Arc<AtomicBool>,
 }
 
-impl RuntimeQueueHandle {
-    fn sender(self: &Arc<Self>) -> EventSender {
-        let handle = Arc::clone(self);
-        EventSender::new(move |event| {
-            let mut events = handle
-                .pending_events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            events.push_back(event);
-            (handle.wake)();
-        })
-    }
-
-    fn wake(&self) {
-        (self.wake)();
-    }
-}
-
-struct ExternalWindowRuntime {
-    queue: Arc<RuntimeQueueHandle>,
+struct StandaloneRuntime<I: PtyIpc + Send + Sync + 'static> {
     sender: EventSender,
     clipboard: Clipboard,
     scheduler: Scheduler,
-    windows: HashMap<WindowId, ExternalWindowState>,
+    config: Rc<UiConfig>,
+    pending: Option<PendingWindow<I>>,
+    window: Option<WindowContext>,
+    initial_error: Option<Box<dyn Error>>,
 }
 
-impl ExternalWindowRuntime {
-    fn new(queue: Arc<RuntimeQueueHandle>) -> Self {
-        let sender = queue.sender();
+impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
+    fn new(sender: EventSender, config: Rc<UiConfig>, pending: PendingWindow<I>) -> Self {
         Self {
             clipboard: Clipboard::new_nop(),
             scheduler: Scheduler::new(sender.clone()),
             sender,
-            queue,
-            windows: HashMap::new(),
+            config,
+            pending: Some(pending),
+            window: None,
+            initial_error: None,
         }
     }
 
-    fn drain_pending_windows(&mut self, event_loop: &ActiveEventLoop) {
-        loop {
-            let viewport = {
-                let mut pending = self
-                    .queue
-                    .pending_viewports
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                pending.pop_front()
-            };
-
-            let Some(viewport) = viewport else {
-                break;
-            };
-
-            match viewport.create_window_context(event_loop, self.sender.clone(), &mut self.clipboard)
-            {
-                Ok(window_context) => {
-                    self.windows.insert(
-                        window_context.id(),
-                        ExternalWindowState {
-                            viewport,
-                            window_context,
-                        },
-                    );
-                }
-                Err(err) => {
-                    eprintln!("term-view alacritty window error: {err}");
-                    viewport.mark_start_failed();
-                }
-            }
-        }
-    }
-
-    fn drain_pending_events(&mut self, event_loop: &ActiveEventLoop) {
-        let events = {
-            let mut pending = self
-                .queue
-                .pending_events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.drain(..).collect::<Vec<_>>()
+    fn create_initial_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
         };
 
-        for event in events {
-            self.handle_event(event_loop, event);
+        let title_prefix_provider = {
+            let ipc = Arc::clone(&pending.ipc);
+            Arc::new(move || ipc.window_title_prefix())
+        };
+
+        unsafe {
+            self.clipboard = Clipboard::new(event_loop.display_handle().unwrap().as_raw());
+        }
+
+        let ready_ipc = Arc::clone(&pending.ipc);
+
+        let window_context = WindowContext::external(
+            event_loop,
+            self.sender.clone(),
+            self.config.clone(),
+            Default::default(),
+            SocketEventedPty::new(pending.ipc, pending.pid, pending.closed)?,
+            Some(title_prefix_provider),
+        )?;
+
+        self.window = Some(window_context);
+        ready_ipc.window_ready();
+        Ok(())
+    }
+
+    fn close_window(&mut self) {
+        if let Some(mut window) = self.window.take() {
+            self.scheduler.unschedule_window(window.id());
+            window.shutdown();
         }
     }
 
-    fn process_pending(&mut self, event_loop: &ActiveEventLoop) {
-        self.drain_pending_windows(event_loop);
-        self.drain_pending_events(event_loop);
-    }
-
-    fn close_window(&mut self, window_id: WindowId) {
-        if let Some(mut state) = self.windows.remove(&window_id) {
-            self.scheduler.unschedule_window(window_id);
-            state.window_context.shutdown();
-            state.viewport.mark_closed();
-        }
-    }
-
-    fn handle_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+    fn handle_user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match (event.payload(), event.window_id()) {
-            (EventType::CreateExternalWindow, _) => {
-                self.drain_pending_windows(event_loop);
-            }
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
-                if let Some(state) = self.windows.get_mut(&window_id) {
-                    state.window_context.dirty = true;
-                    if state.window_context.display.window.has_frame {
-                        state.window_context.display.window.request_redraw();
+                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                    window.dirty = true;
+                    if window.display.window.has_frame {
+                        window.display.window.request_redraw();
                     }
                 }
             }
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                self.close_window(window_id);
+                if self
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.id() == window_id)
+                {
+                    self.close_window();
+                    event_loop.exit();
+                }
             }
             (EventType::Frame, Some(window_id)) => {
-                if let Some(state) = self.windows.get_mut(&window_id) {
-                    state.window_context.display.window.has_frame = true;
-                    if state.window_context.dirty {
-                        state.window_context.display.window.request_redraw();
+                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                    window.display.window.has_frame = true;
+                    if window.dirty {
+                        window.display.window.request_redraw();
                     }
                 }
             }
             (payload, Some(window_id)) => {
-                if let Some(state) = self.windows.get_mut(&window_id) {
-                    state.window_context.handle_event(
+                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                    window.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
                         &self.sender,
@@ -177,67 +136,53 @@ impl ExternalWindowRuntime {
                 }
             }
             (payload, None) => {
-                let event = WinitEvent::UserEvent(Event::new(payload.clone(), None));
-                for state in self.windows.values_mut() {
-                    state.window_context.handle_event(
+                if let Some(window) = self.window.as_mut() {
+                    window.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
                         &self.sender,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        event.clone(),
+                        WinitEvent::UserEvent(Event::new(payload.clone(), None)),
                     );
                 }
             }
         }
     }
+}
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) -> Option<Instant> {
-        self.process_pending(event_loop);
+impl<I: PtyIpc + Send + Sync + 'static> ApplicationHandler<Event> for StandaloneRuntime<I> {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
-        let mut closed_windows = Vec::new();
-        for (window_id, state) in self.windows.iter_mut() {
-            if state.viewport.is_closed() {
-                closed_windows.push(*window_id);
-                continue;
-            }
-
-            state.window_context.handle_event(
-                #[cfg(target_os = "macos")]
-                event_loop,
-                &self.sender,
-                &mut self.clipboard,
-                &mut self.scheduler,
-                WinitEvent::AboutToWait,
-            );
-
-            if state.viewport.is_closed() {
-                closed_windows.push(*window_id);
-            }
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if cause != StartCause::Init {
+            return;
         }
 
-        for window_id in closed_windows {
-            self.close_window(window_id);
+        if let Err(err) = self.create_initial_window(event_loop) {
+            self.initial_error = Some(err);
+            event_loop.exit();
         }
-
-        self.drain_pending_events(event_loop);
-        self.scheduler.update()
     }
 
-    fn handle_window_event(
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        self.handle_user_event(event_loop, event);
+    }
+
+    fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
-    ) -> bool {
-        self.process_pending(event_loop);
+    ) {
+        let close_requested = matches!(event, WindowEvent::CloseRequested);
+        let is_redraw = matches!(event, WindowEvent::RedrawRequested);
 
-        let Some(state) = self.windows.get_mut(&window_id) else {
-            return false;
+        let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) else {
+            return;
         };
 
-        let is_redraw = matches!(event, WindowEvent::RedrawRequested);
-        state.window_context.handle_event(
+        window.handle_event(
             #[cfg(target_os = "macos")]
             event_loop,
             &self.sender,
@@ -247,227 +192,183 @@ impl ExternalWindowRuntime {
         );
 
         if is_redraw {
-            state.window_context.draw(&mut self.scheduler);
+            window.draw(&mut self.scheduler);
         }
 
-        if state.viewport.is_closed() {
-            self.close_window(window_id);
+        if close_requested {
+            self.close_window();
+            event_loop.exit();
         }
-
-        true
     }
 
-    fn has_window(&self, window_id: WindowId) -> bool {
-        self.windows.contains_key(&window_id)
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(window) = self.window.as_mut() {
+            window.handle_event(
+                #[cfg(target_os = "macos")]
+                event_loop,
+                &self.sender,
+                &mut self.clipboard,
+                &mut self.scheduler,
+                WinitEvent::AboutToWait,
+            );
+        } else {
+            event_loop.exit();
+            return;
+        }
+
+        event_loop.set_control_flow(
+            self.scheduler
+                .update()
+                .map(ControlFlow::WaitUntil)
+                .unwrap_or(ControlFlow::Wait),
+        );
     }
 
-    fn shutdown(&mut self) {
-        let window_ids: Vec<_> = self.windows.keys().copied().collect();
-        for window_id in window_ids {
-            self.close_window(window_id);
-        }
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.close_window();
         self.clipboard = Clipboard::new_nop();
     }
 }
 
-thread_local! {
-    static RUNTIME_STATE: RefCell<Option<ExternalWindowRuntime>> = const { RefCell::new(None) };
-}
+pub fn run_standalone_window<I: PtyIpc + Send + Sync + 'static>(
+    ipc: Arc<I>,
+    pid: u32,
+    closed: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    let mut options = Options::default();
+    let config = config::load(&mut options);
 
-static RUNTIME_QUEUE: OnceLock<Arc<RuntimeQueueHandle>> = OnceLock::new();
-
-pub fn install_external_window_waker(
-    wake: impl Fn() + Send + Sync + 'static,
-) -> Result<(), String> {
-    if RUNTIME_QUEUE.get().is_some() {
-        return Ok(());
+    tty::setup_env();
+    for (key, value) in config.env.iter() {
+        unsafe { env::set_var(key, value); }
     }
 
-    let handle = Arc::new(RuntimeQueueHandle {
-        pending_viewports: Arc::new(Mutex::new(VecDeque::new())),
-        pending_events: Arc::new(Mutex::new(VecDeque::new())),
-        wake: Arc::new(wake),
-    });
+    let event_loop = EventLoop::<Event>::with_user_event().build()?;
+    event_loop.listen_device_events(DeviceEvents::Never);
 
-    RUNTIME_QUEUE
-        .set(handle)
-        .map_err(|_| "term-view external runtime already initialized".to_owned())
+    let sender = EventSender::from_winit_proxy(event_loop.create_proxy());
+    let mut runtime = StandaloneRuntime::new(
+        sender,
+        Rc::new(config),
+        PendingWindow { ipc, pid, closed },
+    );
+
+    let result = event_loop.run_app(&mut runtime);
+    if let Some(err) = runtime.initial_error.take() {
+        return Err(err);
+    }
+
+    result.map_err(Into::into)
 }
 
-fn runtime_queue() -> Result<Arc<RuntimeQueueHandle>, String> {
-    RUNTIME_QUEUE
-        .get()
-        .cloned()
-        .ok_or_else(|| "term-view external runtime is not installed".to_owned())
+pub struct SocketPtyReader<I: PtyIpc + Send + Sync + 'static> {
+    ipc: Arc<I>,
+    wake_reader: UnixStream,
+    pending: Vec<u8>,
+    pending_offset: usize,
 }
 
-fn with_runtime_mut<R>(f: impl FnOnce(&mut ExternalWindowRuntime) -> R) -> Option<R> {
-    let queue = runtime_queue().ok()?;
-    RUNTIME_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let runtime = state.get_or_insert_with(|| ExternalWindowRuntime::new(queue));
-        Some(f(runtime))
-    })
-}
-
-pub fn open_external_window<I: PtyIpc + Send + Sync + 'static>(
-    viewport: Arc<ExternalPtyViewport<I>>,
-) -> Result<(), String> {
-    let queue = runtime_queue()?;
-    let mut pending = queue
-        .pending_viewports
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    pending.push_back(Arc::new(ExternalViewportRequest { viewport }));
-    drop(pending);
-    queue.wake();
-    Ok(())
-}
-
-pub fn process_external_window_events(event_loop: &ActiveEventLoop) {
-    let _ = with_runtime_mut(|runtime| runtime.process_pending(event_loop));
-}
-
-pub fn about_to_wait_external_windows(event_loop: &ActiveEventLoop) -> Option<Instant> {
-    with_runtime_mut(|runtime| runtime.about_to_wait(event_loop)).flatten()
-}
-
-pub fn handle_external_window_event(
-    event_loop: &ActiveEventLoop,
-    window_id: WindowId,
-    event: WindowEvent,
-) -> bool {
-    with_runtime_mut(|runtime| runtime.handle_window_event(event_loop, window_id, event))
-        .unwrap_or(false)
-}
-
-pub fn has_external_window(window_id: WindowId) -> bool {
-    with_runtime_mut(|runtime| runtime.has_window(window_id)).unwrap_or(false)
-}
-
-pub fn shutdown_external_windows() {
-    RUNTIME_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        if let Some(runtime) = state.as_mut() {
-            runtime.shutdown();
+impl<I: PtyIpc + Send + Sync + 'static> SocketPtyReader<I> {
+    fn new(ipc: Arc<I>, wake_reader: UnixStream) -> Self {
+        Self {
+            ipc,
+            wake_reader,
+            pending: Vec::new(),
+            pending_offset: 0,
         }
-        *state = None;
-    });
-}
+    }
 
-trait ExternalViewportHandle: Send + Sync {
-    fn create_window_context(
-        &self,
-        event_loop: &ActiveEventLoop,
-        sender: EventSender,
-        clipboard: &mut Clipboard,
-    ) -> Result<WindowContext, String>;
-
-    fn is_closed(&self) -> bool;
-
-    fn mark_closed(&self);
-
-    fn mark_start_failed(&self);
-}
-
-struct ExternalViewportRequest<I: PtyIpc + Send + Sync + 'static> {
-    viewport: Arc<ExternalPtyViewport<I>>,
-}
-
-impl<I: PtyIpc + Send + Sync + 'static> ExternalViewportHandle for ExternalViewportRequest<I> {
-    fn create_window_context(
-        &self,
-        event_loop: &ActiveEventLoop,
-        sender: EventSender,
-        clipboard: &mut Clipboard,
-    ) -> Result<WindowContext, String> {
-        let pty = SocketEventedPty::new(Arc::clone(&self.viewport)).map_err(|err| err.to_string())?;
-        let mut config = UiConfig::default();
-        config.window.identity.title = self.viewport.title.clone();
-
-        let mut window_options = WindowOptions::default();
-        window_options.window_identity.title = Some(self.viewport.title.clone());
-
-        unsafe {
-            *clipboard = Clipboard::new(event_loop.display_handle().unwrap().as_raw());
+    fn refill_pending(&mut self) {
+        if self.pending_offset < self.pending.len() {
+            return;
         }
 
-        // Keyboard mapping for external windows is resolved by WindowContext input/bindings.
-        // Search anchors: default_key_bindings, Backspace, ModifiersState::CONTROL.
-        WindowContext::external(event_loop, sender, Rc::new(config), window_options, pty)
-            .map_err(|err| err.to_string())
+        self.pending = self.ipc.drain_incoming();
+        self.pending_offset = 0;
     }
 
-    fn is_closed(&self) -> bool {
-        self.viewport.closed.load(Ordering::Relaxed)
-    }
-
-    fn mark_closed(&self) {
-        self.viewport.closed.store(true, Ordering::Relaxed);
-    }
-
-    fn mark_start_failed(&self) {
-        self.viewport.window_started.store(false, Ordering::Relaxed);
-        self.viewport.closed.store(true, Ordering::Relaxed);
+    fn drain_wake_bytes(&mut self) -> io::Result<()> {
+        let mut buf = [0_u8; 256];
+        loop {
+            match self.wake_reader.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) if n < buf.len() => return Ok(()),
+                Ok(_) => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 
-struct ExternalWindowState {
-    viewport: Arc<dyn ExternalViewportHandle>,
-    window_context: WindowContext,
+impl<I: PtyIpc + Send + Sync + 'static> io::Read for SocketPtyReader<I> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.drain_wake_bytes()?;
+        self.refill_pending();
+
+        if self.pending_offset >= self.pending.len() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+
+        let remaining = &self.pending[self.pending_offset..];
+        let count = remaining.len().min(buf.len());
+        buf[..count].copy_from_slice(&remaining[..count]);
+        self.pending_offset += count;
+
+        if self.pending_offset >= self.pending.len() {
+            self.pending.clear();
+            self.pending_offset = 0;
+        }
+
+        Ok(count)
+    }
 }
 
 pub struct SocketEventedPty<I: PtyIpc + Send + Sync + 'static> {
-    reader: UnixStream,
+    reader: SocketPtyReader<I>,
     writer: SocketPtyWriter<I>,
-    signal_reader: UnixStream,
-    _signal_writer: UnixStream,
+    wake_reader: UnixStream,
     shutdown: Arc<AtomicBool>,
-    _feed_thread: Option<thread::JoinHandle<()>>,
+    closed: Arc<AtomicBool>,
+    child_exit_pending: bool,
+    _wake_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl<I: PtyIpc + Send + Sync + 'static> SocketEventedPty<I> {
-    pub fn new(viewport: Arc<ExternalPtyViewport<I>>) -> io::Result<Self> {
-        let (reader, feeder_writer) = UnixStream::pair()?;
-        let (signal_reader, signal_writer) = UnixStream::pair()?;
-        reader.set_nonblocking(true)?;
-        signal_reader.set_nonblocking(true)?;
+    pub fn new(ipc: Arc<I>, pid: u32, closed: Arc<AtomicBool>) -> io::Result<Self> {
+        let (wake_reader, wake_writer) = UnixStream::pair()?;
+        wake_reader.set_nonblocking(true)?;
+        wake_writer.set_nonblocking(true)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_bg = Arc::clone(&shutdown);
-        let viewport_bg = Arc::clone(&viewport);
-        let mut feeder_writer_bg = feeder_writer.try_clone()?;
+        let closed_bg = Arc::clone(&closed);
+        let ipc_bg = Arc::clone(&ipc);
+        let mut wake_writer_bg = wake_writer.try_clone()?;
 
-        let feed_thread = thread::Builder::new()
-            .name(format!("term-view-pty-feed-{}", viewport.pid))
+        let wake_thread = thread::Builder::new()
+            .name(format!("term-view-pty-wake-{pid}"))
             .spawn(move || {
                 let mut observed_generation = 0;
-                while !shutdown_bg.load(Ordering::Relaxed)
-                    && !viewport_bg.closed.load(Ordering::Relaxed)
-                {
-                    let bytes = viewport_bg.ipc.drain_incoming();
-                    if !bytes.is_empty() && feeder_writer_bg.write_all(&bytes).is_err() {
+                while !shutdown_bg.load(Ordering::Relaxed) && !closed_bg.load(Ordering::Relaxed) {
+                    observed_generation = ipc_bg.wait_for_incoming(observed_generation);
+                    let _ = wake_writer_bg.write(&[1]);
+                    if shutdown_bg.load(Ordering::Relaxed) || closed_bg.load(Ordering::Relaxed) {
                         break;
                     }
-
-                    if shutdown_bg.load(Ordering::Relaxed)
-                        || viewport_bg.closed.load(Ordering::Relaxed)
-                    {
-                        break;
-                    }
-
-                    observed_generation = viewport_bg.ipc.wait_for_incoming(observed_generation);
                 }
             })
             .map_err(io::Error::other)?;
 
         Ok(Self {
-            reader,
-            writer: SocketPtyWriter { viewport },
-            signal_reader,
-            _signal_writer: signal_writer,
+            reader: SocketPtyReader::new(Arc::clone(&ipc), wake_reader.try_clone()?),
+            writer: SocketPtyWriter { ipc },
+            wake_reader,
             shutdown,
-            _feed_thread: Some(feed_thread),
+            closed,
+            child_exit_pending: true,
+            _wake_thread: Some(wake_thread),
         })
     }
 }
@@ -475,12 +376,12 @@ impl<I: PtyIpc + Send + Sync + 'static> SocketEventedPty<I> {
 impl<I: PtyIpc + Send + Sync + 'static> Drop for SocketEventedPty<I> {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        self.writer.viewport.ipc.wake_waiters();
+        self.writer.ipc.wake_waiters();
     }
 }
 
 impl<I: PtyIpc + Send + Sync + 'static> EventedReadWrite for SocketEventedPty<I> {
-    type Reader = UnixStream;
+    type Reader = SocketPtyReader<I>;
     type Writer = SocketPtyWriter<I>;
 
     unsafe fn register(
@@ -490,14 +391,7 @@ impl<I: PtyIpc + Send + Sync + 'static> EventedReadWrite for SocketEventedPty<I>
         poll_opts: PollMode,
     ) -> io::Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
-        unsafe { poll.add_with_mode(&self.reader, interest, poll_opts)? };
-        unsafe {
-            poll.add_with_mode(
-                &self.signal_reader,
-                PollingEvent::readable(PTY_CHILD_EVENT_TOKEN),
-                PollMode::Level,
-            )
-        }
+        unsafe { poll.add_with_mode(&self.wake_reader, interest, poll_opts) }
     }
 
     fn reregister(
@@ -507,17 +401,11 @@ impl<I: PtyIpc + Send + Sync + 'static> EventedReadWrite for SocketEventedPty<I>
         poll_opts: PollMode,
     ) -> io::Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
-        poll.modify_with_mode(&self.reader, interest, poll_opts)?;
-        poll.modify_with_mode(
-            &self.signal_reader,
-            PollingEvent::readable(PTY_CHILD_EVENT_TOKEN),
-            PollMode::Level,
-        )
+        poll.modify_with_mode(&self.wake_reader, interest, poll_opts)
     }
 
     fn deregister(&mut self, poll: &std::sync::Arc<Poller>) -> io::Result<()> {
-        poll.delete(&self.reader)?;
-        poll.delete(&self.signal_reader)
+        poll.delete(&self.wake_reader)
     }
 
     fn reader(&mut self) -> &mut Self::Reader {
@@ -531,6 +419,10 @@ impl<I: PtyIpc + Send + Sync + 'static> EventedReadWrite for SocketEventedPty<I>
 
 impl<I: PtyIpc + Send + Sync + 'static> EventedPty for SocketEventedPty<I> {
     fn next_child_event(&mut self) -> Option<ChildEvent> {
+        if self.closed.load(Ordering::Relaxed) && self.child_exit_pending {
+            self.child_exit_pending = false;
+            return Some(ChildEvent::Exited(None));
+        }
         None
     }
 }
@@ -538,20 +430,19 @@ impl<I: PtyIpc + Send + Sync + 'static> EventedPty for SocketEventedPty<I> {
 impl<I: PtyIpc + Send + Sync + 'static> OnResize for SocketEventedPty<I> {
     fn on_resize(&mut self, window_size: WindowSize) {
         self.writer
-            .viewport
             .ipc
             .send_resize(window_size.num_cols, window_size.num_lines);
     }
 }
 
 pub struct SocketPtyWriter<I: PtyIpc + Send + Sync + 'static> {
-    viewport: Arc<ExternalPtyViewport<I>>,
+    ipc: Arc<I>,
 }
 
 impl<I: PtyIpc + Send + Sync + 'static> Write for SocketPtyWriter<I> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if !buf.is_empty() {
-            self.viewport.ipc.send_input(buf.to_vec());
+            self.ipc.send_input(buf.to_vec());
         }
         Ok(buf.len())
     }

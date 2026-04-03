@@ -22,15 +22,11 @@ use nsproxy_core::{
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, StartCause, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
-use winit::event_loop::ControlFlow;
-use winit::window::WindowId;
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -40,14 +36,10 @@ mod profile_loader;
 mod supervisor;
 mod alacritty_window;
 
-use alacritty_window::ExternalTermWindowClient;
+use alacritty_window::{ExternalTermWindowClient, parse_term_window_fd_arg, run_term_window_process};
 use profile_loader::ProfileInfo;
 use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
-use term_view::{
-    PtyIpc, TermSession, TermView, about_to_wait_external_windows, flush_term_outputs,
-    handle_external_window_event, has_external_window, install_external_window_waker,
-    process_external_window_events, pump_pty_io, shutdown_external_windows,
-};
+use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
 
 /// `PtyIpc` implementation that routes through the supervisor for a specific
 /// (profile, pid) combination.  Lives in `nsproxy-ui` (debug build) but is
@@ -562,8 +554,10 @@ struct App {
     traffic_subview: TrafficSubview,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
-    /// State for the external terminal child process, if any.
-    external_term_window: ExternalTermWindowClient,
+    /// State for the special swap terminal child process, if any.
+    swap_term_window: ExternalTermWindowClient,
+    /// Dedicated PTY windows keyed by their owning (profile, slot-pid).
+    dedicated_term_windows: HashMap<(ContainerName, u32), ExternalTermWindowClient>,
     /// Last consumed auto-open token from supervisor snapshots.
     last_auto_open_logs_token: u64,
     /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
@@ -1007,7 +1001,8 @@ impl App {
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
             selected_process_logs: None,
-            external_term_window: ExternalTermWindowClient::default(),
+            swap_term_window: ExternalTermWindowClient::default(),
+            dedicated_term_windows: HashMap::new(),
             last_auto_open_logs_token: 0,
             selected_process_spawn_args: None,
             raw_log_show_details: false,
@@ -2593,7 +2588,8 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.close_external_pty_window();
+        self.close_swap_pty_window();
+        self.close_dedicated_pty_windows();
         info!("app drop started; shutting down tokio runtime in background");
         if let Some(rt) = self.tokio_rt.take() {
             rt.shutdown_background();
@@ -3977,6 +3973,8 @@ impl App {
     }
 
     fn render_units_table(&mut self, ui: &mut egui::Ui, profile_name: &Option<ContainerName>) {
+        self.poll_term_windows();
+
         // Collect owned rows so we don't borrow self.snapshot across the mutable send below.
         let rows: Vec<(ContainerName, u32, diag::ProcessEntry)> = {
             let mut v = Vec::new();
@@ -4017,7 +4015,9 @@ impl App {
         let mut kill_request: Option<(ContainerName, u32)> = None;
         let mut inspect_request: Option<(ContainerName, u32)> = None;
         let mut logs_request: Option<(ContainerName, u32)> = None;
-        let mut external_pty_request: Option<(ContainerName, u32)> = None;
+        let mut swap_external_pty_request: Option<(ContainerName, u32, String)> = None;
+        let mut open_dedicated_pty_request: Option<(ContainerName, u32, String)> = None;
+        let mut close_dedicated_pty_request: Option<(ContainerName, u32)> = None;
 
         TableBuilder::new(ui)
             .striped(true)
@@ -4031,7 +4031,8 @@ impl App {
             .column(Column::exact(46.0)) // Kill
             .column(Column::exact(64.0)) // Inspect
             .column(Column::exact(60.0)) // Logs
-            .column(Column::exact(44.0)) // Ext
+            .column(Column::exact(50.0)) // Swap
+            .column(Column::exact(54.0)) // Open/Close
             .column(Column::remainder()) // Fill remaining width
             .header(22.0, |mut header| {
                 header.col(|ui| {
@@ -4055,7 +4056,12 @@ impl App {
                 header.col(|ui| { /* Kill */ });
                 header.col(|ui| { /* Inspect */ });
                 header.col(|ui| { /* Logs */ });
-                header.col(|ui| { /* Ext */ });
+                header.col(|ui| {
+                    ui.strong("Swap");
+                });
+                header.col(|ui| {
+                    ui.strong("Open");
+                });
                 header.col(|ui| { /* Fill */ });
             })
             .body(|mut body| {
@@ -4122,6 +4128,11 @@ impl App {
                             ui.label(&uid_str);
                         });
 
+                        let external_title = Self::format_external_terminal_title(row_profile, entry);
+                        let swap_title = Self::format_swap_terminal_title(row_profile, entry);
+                        let is_swap_target = self.is_same_swap_pty(row_profile, *slot_pid);
+                        let is_dedicated_open = self.is_dedicated_pty_open(row_profile, *slot_pid);
+
                         // Spawned — relative age
                         row.col(|ui| {
                             let age = now.duration_since(entry.spawned_at).unwrap_or_default();
@@ -4181,15 +4192,53 @@ impl App {
                             }
                         });
 
-                        // External PTY window button
+                        // Swap PTY into the special second terminal window.
                         row.col(|ui| {
                             if matches!(&entry.meta, diag::SpawnedEntry::Pty(_)) {
                                 if ui
-                                    .small_button("ext")
-                                    .on_hover_text("Open PTY in separate terminal window")
+                                    .add_enabled(
+                                        !is_dedicated_open && !is_swap_target,
+                                        egui::Button::new("swap").small(),
+                                    )
+                                    .on_hover_text("Swap this PTY into the special second terminal window")
                                     .clicked()
                                 {
-                                    external_pty_request = Some((row_profile.clone(), *slot_pid));
+                                    swap_external_pty_request = Some((
+                                        row_profile.clone(),
+                                        *slot_pid,
+                                        swap_title.clone(),
+                                    ));
+                                }
+                            }
+                        });
+
+                        // Open/Close dedicated PTY window.
+                        row.col(|ui| {
+                            if matches!(&entry.meta, diag::SpawnedEntry::Pty(_)) {
+                                if is_dedicated_open {
+                                    if ui
+                                        .small_button("close")
+                                        .on_hover_text("Close the dedicated PTY window")
+                                        .clicked()
+                                    {
+                                        close_dedicated_pty_request =
+                                            Some((row_profile.clone(), *slot_pid));
+                                    }
+                                } else {
+                                    if ui
+                                        .add_enabled(
+                                            !is_swap_target,
+                                            egui::Button::new("open").small(),
+                                        )
+                                        .on_hover_text("Open a dedicated terminal window for this PTY")
+                                        .clicked()
+                                    {
+                                        open_dedicated_pty_request = Some((
+                                            row_profile.clone(),
+                                            *slot_pid,
+                                            external_title,
+                                        ));
+                                    }
                                 }
                             }
                         });
@@ -4219,13 +4268,77 @@ impl App {
                 });
             }
         }
-        if let Some((profile, pid)) = external_pty_request {
-            if !self.is_same_external_pty(&profile, pid) {
-                self.replace_external_pty_window(profile, pid);
-            } else if let Err(err) = self.external_term_window.focus() {
+        if let Some((profile, pid, title)) = open_dedicated_pty_request {
+            self.open_dedicated_pty_window(profile, pid, title);
+        }
+        if let Some((profile, pid)) = close_dedicated_pty_request {
+            self.close_dedicated_pty_window(&profile, pid);
+        }
+        if let Some((profile, pid, title)) = swap_external_pty_request {
+            if !self.is_same_swap_pty(&profile, pid) {
+                self.attach_swap_pty_window(profile, pid, title);
+            } else if let Err(err) = self.swap_term_window.focus() {
                 tracing::warn!(%err, "failed to focus terminal child window");
             }
         }
+    }
+
+    fn format_external_terminal_title(
+        profile: &ContainerName,
+        entry: &diag::ProcessEntry,
+    ) -> String {
+        let profile = profile.to_string();
+        let (program, uid) = match &entry.meta {
+            diag::SpawnedEntry::Pty(args) | diag::SpawnedEntry::Args(args) => {
+                let raw_program = args
+                    .exec_program_hint()
+                    .or_else(|| args.args.first().cloned())
+                    .unwrap_or_else(|| "-".to_string());
+                let program = Path::new(raw_program.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(raw_program.as_str())
+                    .to_string();
+                let uid = args
+                    .uid
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                (program, uid)
+            }
+            diag::SpawnedEntry::Cli(cli_meta) => {
+                let program = if cli_meta.is_serve {
+                    "sp-serve".to_string()
+                } else {
+                    "sp-spawncli".to_string()
+                };
+                (program, "-".to_string())
+            }
+        };
+
+        Self::join_title_parts([Some(profile.as_str()), Some(program.as_str()), Some(uid.as_str())])
+    }
+
+    fn format_swap_terminal_title(profile: &ContainerName, entry: &diag::ProcessEntry) -> String {
+        let title = Self::format_external_terminal_title(profile, entry);
+        Self::join_title_parts([Some("swap"), Some(title.as_str()), None])
+    }
+
+    fn join_title_parts(parts: [Option<&str>; 3]) -> String {
+        let mut title = String::new();
+
+        for part in parts
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|part| !part.is_empty() && *part != "-")
+        {
+            if !title.is_empty() {
+                title.push_str(" - ");
+            }
+            title.push_str(part);
+        }
+
+        title
     }
 
     fn is_pty_process(&self, profile: &ContainerName, slot_pid: u32) -> bool {
@@ -4244,20 +4357,69 @@ impl App {
             .is_some_and(|(profile, pid)| self.is_pty_process(profile, *pid))
     }
 
-    fn is_same_external_pty(&self, profile: &ContainerName, pid: u32) -> bool {
-        self.external_term_window
+    fn is_same_swap_pty(&self, profile: &ContainerName, pid: u32) -> bool {
+        self.swap_term_window
             .current_target()
             .is_some_and(|target| target.profile == *profile && target.pid == pid)
+            || self
+                .swap_term_window
+                .pending_target()
+                .is_some_and(|target| target.profile == *profile && target.pid == pid)
     }
 
-    fn replace_external_pty_window(&mut self, profile: ContainerName, pid: u32) {
-        if let Err(err) = self.external_term_window.attach(profile, pid) {
-            tracing::warn!(%err, "failed to attach terminal child window");
+    fn is_dedicated_pty_open(&self, profile: &ContainerName, pid: u32) -> bool {
+        self.dedicated_term_windows
+            .get(&(profile.clone(), pid))
+            .is_some_and(|window| window.is_open() || window.pending_target().is_some())
+    }
+
+    fn attach_swap_pty_window(&mut self, profile: ContainerName, pid: u32, title: String) {
+        let Some(rt) = self.tokio_rt.as_ref() else {
+            tracing::warn!("tokio runtime unavailable for swap terminal spawn");
+            return;
+        };
+        if let Err(err) = self.swap_term_window.attach(rt, profile, pid, title) {
+            tracing::warn!(%err, "failed to attach swap terminal child window");
         }
     }
 
-    fn close_external_pty_window(&mut self) {
-        self.external_term_window.shutdown();
+    fn close_swap_pty_window(&mut self) {
+        self.swap_term_window.shutdown();
+    }
+
+    fn open_dedicated_pty_window(&mut self, profile: ContainerName, pid: u32, title: String) {
+        let Some(rt) = self.tokio_rt.as_ref() else {
+            tracing::warn!("tokio runtime unavailable for dedicated terminal spawn");
+            return;
+        };
+        let key = (profile.clone(), pid);
+        let window = self
+            .dedicated_term_windows
+            .entry(key)
+            .or_default();
+        if let Err(err) = window.attach(rt, profile, pid, title) {
+            tracing::warn!(%err, "failed to attach dedicated terminal child window");
+        }
+    }
+
+    fn close_dedicated_pty_window(&mut self, profile: &ContainerName, pid: u32) {
+        if let Some(mut window) = self.dedicated_term_windows.remove(&(profile.clone(), pid)) {
+            window.shutdown();
+        }
+    }
+
+    fn close_dedicated_pty_windows(&mut self) {
+        for (_, mut window) in self.dedicated_term_windows.drain() {
+            window.shutdown();
+        }
+    }
+
+    fn poll_term_windows(&mut self) {
+        self.swap_term_window.poll();
+        self.dedicated_term_windows.retain(|_, window| {
+            window.poll();
+            window.is_open() || window.pending_target().is_some()
+        });
     }
 
     fn render_process_pty_panel(&mut self, ui: &mut egui::Ui) {
@@ -4275,7 +4437,7 @@ impl App {
             ui.heading(format!("Terminal — PID {slot_pid}"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Close").clicked() {
-                    if !self.is_same_external_pty(&profile, slot_pid) {
+                    if !self.is_same_swap_pty(&profile, slot_pid) {
                         self.supervisor.send(SupervisorCommand::DetachPty {
                             profile: profile.clone(),
                             pid: slot_pid,
@@ -4317,7 +4479,7 @@ impl App {
 
     fn render_external_pty_window(&mut self, ctx: &egui::Context) {
         let _ = ctx;
-        self.external_term_window.poll();
+        self.poll_term_windows();
     }
 
     fn render_process_raw_logs_panel(&mut self, ui: &mut egui::Ui) {
@@ -6526,8 +6688,6 @@ fn setup_cjk_font(ctx: &egui::Context) {
 
 fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
     setup_cjk_font(&cc.egui_ctx);
-    // Allow deferred viewports to open as independent OS windows.
-    cc.egui_ctx.set_embed_viewports(false);
     // Set every text style to 16px for consistent sizing.
     cc.egui_ctx.style_mut(|style| {
         for ts in &[
@@ -6544,103 +6704,9 @@ fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
     });
 }
 
-struct UiApplication<'a> {
-    eframe_app: eframe::EframeWinitApplication<'a>,
-}
-
-impl UiApplication<'_> {
-    fn merge_control_flow(current: ControlFlow, term_deadline: Option<Instant>) -> ControlFlow {
-        match (current, term_deadline) {
-            (ControlFlow::Poll, _) => ControlFlow::Poll,
-            (ControlFlow::Wait, Some(deadline)) => ControlFlow::WaitUntil(deadline),
-            (ControlFlow::Wait, None) => ControlFlow::Wait,
-            (ControlFlow::WaitUntil(deadline), Some(term_deadline)) => {
-                ControlFlow::WaitUntil(deadline.min(term_deadline))
-            }
-            (ControlFlow::WaitUntil(deadline), None) => ControlFlow::WaitUntil(deadline),
-        }
-    }
-}
-
-impl ApplicationHandler<eframe::UserEvent> for UiApplication<'_> {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        self.eframe_app.resumed(event_loop);
-        process_external_window_events(event_loop);
-    }
-
-    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
-        self.eframe_app.suspended(event_loop);
-    }
-
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        self.eframe_app.new_events(event_loop, cause);
-        process_external_window_events(event_loop);
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: eframe::UserEvent) {
-        self.eframe_app.user_event(event_loop, event);
-        process_external_window_events(event_loop);
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        if has_external_window(window_id)
-            && handle_external_window_event(event_loop, window_id, event.clone())
-        {
-            return;
-        }
-
-        self.eframe_app.window_event(event_loop, window_id, event);
-        process_external_window_events(event_loop);
-    }
-
-    fn device_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        device_id: winit::event::DeviceId,
-        event: DeviceEvent,
-    ) {
-        self.eframe_app.device_event(event_loop, device_id, event);
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.eframe_app.about_to_wait(event_loop);
-
-        let term_deadline = about_to_wait_external_windows(event_loop);
-        let merged = Self::merge_control_flow(event_loop.control_flow(), term_deadline);
-        event_loop.set_control_flow(merged);
-    }
-
-    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
-        self.eframe_app.memory_warning(event_loop);
-    }
-
-    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
-        shutdown_external_windows();
-        self.eframe_app.exiting(event_loop);
-    }
-}
-
 fn run_manual_loop() -> Result<(), Box<dyn std::error::Error>> {
     let native_options = eframe::NativeOptions::default();
-    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event()
-        .build()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    let wake_proxy = event_loop.create_proxy();
-    install_external_window_waker(move || {
-        let _ = wake_proxy.send_event(eframe::UserEvent::RequestRepaint {
-            viewport_id: egui::ViewportId::ROOT,
-            when: Instant::now(),
-            cumulative_pass_nr: 0,
-        });
-    })?;
-
-    let eframe_app = eframe::create_native(
+    eframe::run_native(
         "nsproxy - dashboard",
         native_options,
         Box::new(|cc| {
@@ -6648,13 +6714,8 @@ fn run_manual_loop() -> Result<(), Box<dyn std::error::Error>> {
             configure_ui_context(cc);
             Ok(Box::new(App::new(ctx)))
         }),
-        &event_loop,
-    );
-
-    let mut app = UiApplication { eframe_app };
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
+    )
+    .map_err(|err| err.into())
 }
 
 fn main() {
@@ -6671,8 +6732,17 @@ fn main() {
 
     diag::set_protocol_version(nsproxy_core::build_identity());
 
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(control_fd) = parse_term_window_fd_arg(&args) {
+        if let Err(err) = run_term_window_process(control_fd) {
+            tracing::error!(%err, "terminal child process failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     info!("starting nsproxy-ui");
-    info!("launching manual ui event loop");
+    info!("launching ui event loop");
     if let Err(err) = run_manual_loop() {
         tracing::error!(%err, "ui event loop failed");
         std::process::exit(1);

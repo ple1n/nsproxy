@@ -236,6 +236,24 @@ Result:
   - Search: `SupervisorHandle::new`, `send(SupervisorCommand::Init`, `try_recv_snapshot`
   - File: `crates/nsproxy-ui/src/main.rs`
 
+## terminal naming
+
+- The special swap terminal window title is composed on the UI `swap` path as `container - program - uid`.
+  - Search: `format_external_terminal_title`, `attach_swap_pty_window`
+  - File: `crates/nsproxy-ui/src/main.rs`
+
+- The same computed title is also reused for dedicated per-PTY windows opened via `open`.
+  - Search: `open_dedicated_pty_window`, `format_external_terminal_title`
+  - File: `crates/nsproxy-ui/src/main.rs`
+
+- The computed title is forwarded to the child process in the control message and applied immediately during PTY swap/attach.
+  - Search: `TermWindowRequest::Attach`, `shared.reset_terminal(&title)`
+  - File: `crates/nsproxy-ui/src/alacritty_window.rs`
+
+- Shell-originated title updates do not replace the assigned container title; the runtime composes them as `container - program - uid - shell-title` when a shell title is present.
+  - Search: `compose_window_title`, `TerminalEvent::Title`, `TerminalEvent::ResetTitle`
+  - Files: `crates/term-view/src/alacritty_port/window_context.rs`, `crates/term-view/src/alacritty_port/event.rs`
+
 ## nsproxy-ui visual components (search map)
 
 - Left sidebar and helper cards:

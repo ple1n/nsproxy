@@ -8,14 +8,10 @@ use winit::window::ActivationToken;
 #[cfg(all(not(feature = "x11"), not(any(target_os = "macos", windows))))]
 use winit::platform::wayland::WindowAttributesExtWayland;
 
-#[rustfmt::skip]
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use {
-    std::io::Cursor,
     winit::platform::x11::{WindowAttributesExtX11, ActiveEventLoopExtX11},
     glutin::platform::x11::X11VisualInfo,
-    winit::window::Icon,
-    png::Decoder,
 };
 
 use std::fmt::{self, Display, Formatter};
@@ -44,14 +40,6 @@ use crate::cli::WindowOptions;
 use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
 use crate::display::SizeInfo;
-
-/// Window icon for `_NET_WM_ICON` property.
-#[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
-const WINDOW_ICON: &[u8] = include_bytes!("../../extra/logo/compat/alacritty-term.png");
-
-/// This should match the definition of IDI_ICON from `alacritty.rc`.
-#[cfg(windows)]
-const IDI_ICON: u16 = 0x101;
 
 /// Window errors.
 #[derive(Debug)]
@@ -285,23 +273,9 @@ impl Window {
             X11VisualInfo,
         >,
     ) -> WindowAttributes {
-        #[cfg(feature = "x11")]
-        let icon = {
-            let mut decoder = Decoder::new(Cursor::new(WINDOW_ICON));
-            decoder.set_transformations(png::Transformations::normalize_to_color8());
-            let mut reader = decoder.read_info().expect("invalid embedded icon");
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let _ = reader.next_frame(&mut buf);
-            Icon::from_rgba(buf, reader.info().width, reader.info().height)
-                .expect("invalid embedded icon format")
-        };
-
         let builder = WinitWindow::default_attributes()
             .with_name(&identity.class.general, &identity.class.instance)
             .with_decorations(window_config.decorations != Decorations::None);
-
-        #[cfg(feature = "x11")]
-        let builder = builder.with_window_icon(Some(icon));
 
         #[cfg(feature = "x11")]
         let builder = match x11_visual {
@@ -314,12 +288,7 @@ impl Window {
 
     #[cfg(windows)]
     pub fn get_platform_window(_: &Identity, window_config: &WindowConfig) -> WindowAttributes {
-        let icon = winit::window::Icon::from_resource(IDI_ICON, None);
-
-        WinitWindow::default_attributes()
-            .with_decorations(window_config.decorations != Decorations::None)
-            .with_window_icon(icon.as_ref().ok().cloned())
-            .with_taskbar_icon(icon.ok())
+        WinitWindow::default_attributes().with_decorations(window_config.decorations != Decorations::None)
     }
 
     #[cfg(target_os = "macos")]

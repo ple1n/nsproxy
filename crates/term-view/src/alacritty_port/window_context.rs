@@ -45,6 +45,8 @@ use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
 use crate::{input, renderer};
 
+type TitlePrefixProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Event context for one individual Alacritty window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
@@ -62,6 +64,7 @@ pub struct WindowContext {
     touch: TouchPurpose,
     occluded: bool,
     preserve_title: bool,
+    title_prefix_provider: Option<TitlePrefixProvider>,
     #[cfg(not(windows))]
     master_fd: RawFd,
     #[cfg(not(windows))]
@@ -126,6 +129,7 @@ impl WindowContext {
         config: Rc<UiConfig>,
         mut options: WindowOptions,
         pty: T,
+        title_prefix_provider: Option<TitlePrefixProvider>,
     ) -> Result<Self, Box<dyn Error>>
     where
         T: tty::EventedPty + OnResize + Send + 'static,
@@ -171,6 +175,7 @@ impl WindowContext {
             options,
             proxy,
             pty,
+            title_prefix_provider,
             #[cfg(not(windows))]
             -1,
             #[cfg(not(windows))]
@@ -271,6 +276,7 @@ impl WindowContext {
             options,
             proxy,
             pty,
+            None,
             #[cfg(not(windows))]
             master_fd,
             #[cfg(not(windows))]
@@ -284,6 +290,7 @@ impl WindowContext {
         options: WindowOptions,
         proxy: EventSender,
         mut pty: T,
+        title_prefix_provider: Option<TitlePrefixProvider>,
         #[cfg(not(windows))] master_fd: RawFd,
         #[cfg(not(windows))] shell_pid: u32,
     ) -> Result<Self, Box<dyn Error>>
@@ -331,6 +338,7 @@ impl WindowContext {
 
         Ok(WindowContext {
             preserve_title,
+            title_prefix_provider,
             terminal,
             display,
             #[cfg(not(windows))]
@@ -352,6 +360,20 @@ impl WindowContext {
             touch: Default::default(),
             dirty: Default::default(),
         })
+    }
+
+    pub fn compose_window_title(&self, shell_title: Option<&str>) -> String {
+        let prefix = self
+            .title_prefix_provider
+            .as_ref()
+            .and_then(|provider| provider());
+
+        let title = join_title_parts([prefix.as_deref(), shell_title.map(str::trim)]);
+        if title.is_empty() {
+            self.config.window.identity.title.clone()
+        } else {
+            title
+        }
     }
 
     /// Update the terminal window to the latest config.
@@ -403,7 +425,7 @@ impl WindowContext {
             && (!self.config.window.dynamic_title
                 || self.display.window.title() == old_config.window.identity.title)
         {
-            self.display.window.set_title(self.config.window.identity.title.clone());
+            self.display.window.set_title(self.compose_window_title(None));
         }
 
         let opaque = self.config.window_opacity() >= 1.;
@@ -542,6 +564,7 @@ impl WindowContext {
             #[cfg(not(windows))]
             shell_pid: self.shell_pid,
             preserve_title: self.preserve_title,
+            title_prefix_provider: self.title_prefix_provider.clone(),
             config: &self.config,
             event_proxy,
             #[cfg(target_os = "macos")]
@@ -659,6 +682,24 @@ impl WindowContext {
             }
         }
     }
+}
+
+fn join_title_parts(parts: [Option<&str>; 2]) -> String {
+    let mut title = String::new();
+
+    for part in parts
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "-")
+    {
+        if !title.is_empty() {
+            title.push_str(" - ");
+        }
+        title.push_str(part);
+    }
+
+    title
 }
 
 impl Drop for WindowContext {
