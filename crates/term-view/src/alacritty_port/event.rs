@@ -705,10 +705,45 @@ pub struct ActionContext<'a, N, T> {
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
+    pub title_prefix_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     #[cfg(not(windows))]
     pub master_fd: RawFd,
     #[cfg(not(windows))]
     pub shell_pid: u32,
+}
+
+impl<'a, N, T> ActionContext<'a, N, T> {
+    fn compose_window_title(&self, shell_title: Option<&str>) -> String {
+        let prefix = self
+            .title_prefix_provider
+            .as_ref()
+            .and_then(|provider| provider());
+
+        let title = join_title_parts([prefix.as_deref(), shell_title.map(str::trim)]);
+        if title.is_empty() {
+            self.config.window.identity.title.clone()
+        } else {
+            title
+        }
+    }
+}
+
+fn join_title_parts(parts: [Option<&str>; 2]) -> String {
+    let mut title = String::new();
+
+    for part in parts
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "-")
+    {
+        if !title.is_empty() {
+            title.push_str(" - ");
+        }
+        title.push_str(part);
+    }
+
+    title
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -1892,13 +1927,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Terminal(event) => match event {
                     TerminalEvent::Title(title) => {
                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            self.ctx.window().set_title(title);
+                            let composed_title = self.ctx.compose_window_title(Some(title.as_str()));
+                            self.ctx.window().set_title(composed_title);
                         }
                     },
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
-                            self.ctx.display.window.set_title(window_config.identity.title.clone());
+                            let composed_title = self.ctx.compose_window_title(None);
+                            self.ctx.display.window.set_title(composed_title);
                         }
                     },
                     TerminalEvent::Bell => {

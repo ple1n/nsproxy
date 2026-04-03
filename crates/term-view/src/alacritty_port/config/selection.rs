@@ -1,3 +1,5 @@
+//! Synced with local/alacritty/alacritty/src/config/selection.rs.
+
 use serde::Serialize;
 
 use alacritty_config_derive::ConfigDeserialize;

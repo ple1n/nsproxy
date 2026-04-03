@@ -7,17 +7,11 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use egui::epaint::{Galley, RectShape};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Shape, Vec2, Widget};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod render_pipeline;
 
 pub use render_pipeline::{RenderPipeline, SizeInfo};
-
-#[cfg(feature = "alacritty-opengl")]
-const DEFAULT_PIPELINE: RenderPipeline = RenderPipeline::AlacrittyOpenGl;
-#[cfg(not(feature = "alacritty-opengl"))]
-const DEFAULT_PIPELINE: RenderPipeline = RenderPipeline::Egui;
 
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/cli.rs"]
@@ -67,10 +61,7 @@ pub mod window_context;
 #[cfg(feature = "alacritty-opengl")]
 mod alacritty_runtime;
 #[cfg(feature = "alacritty-opengl")]
-pub use alacritty_runtime::{
-    about_to_wait_external_windows, handle_external_window_event, has_external_window,
-    install_external_window_waker, process_external_window_events, shutdown_external_windows,
-};
+pub use alacritty_runtime::run_standalone_window;
 
 #[cfg(feature = "alacritty-opengl")]
 mod gl {
@@ -84,9 +75,8 @@ pub use config::monitor::ConfigMonitor;
 const BG_DEFAULT: Color32 = Color32::from_rgb(10, 12, 16);
 const FG_DEFAULT: Color32 = Color32::from_rgb(200, 200, 200);
 
-/// IPC interface that `ExternalPtyViewport` uses to communicate with the rest
-/// of the system.  Implemented by the `nsproxy-ui` side; kept in this crate so
-/// the entire hot PTY data path runs at `opt-level = 3`.
+/// IPC interface shared by the inline egui terminal and the standalone
+/// Alacritty/OpenGL child window.
 pub trait PtyIpc: Send + Sync + 'static {
     /// Drain any PTY bytes the daemon has sent since the last call.
     fn drain_incoming(&self) -> Vec<u8>;
@@ -99,6 +89,14 @@ pub trait PtyIpc: Send + Sync + 'static {
     fn send_input(&self, data: Vec<u8>);
     /// Notify the PTY slave of a terminal resize.
     fn send_resize(&self, cols: u16, rows: u16);
+    /// Optional fixed title prefix assigned by the caller for standalone windows.
+    fn window_title_prefix(&self) -> Option<String> {
+        None
+    }
+
+    /// Notify the parent that the child window has been created and is ready
+    /// to receive control messages.
+    fn window_ready(&self) {}
 }
 
 /// Drive one PTY IO cycle: pull bytes from backend, feed terminal parser,
@@ -128,115 +126,6 @@ pub fn flush_term_outputs<I: PtyIpc>(
     }
     if let Some((cols, rows)) = resize_evt {
         ipc.send_resize(cols, rows);
-    }
-}
-
-/// Self-contained state for an external PTY OS window (deferred viewport).
-///
-/// Generic over `I: PtyIpc` so the hot path (data draining, input forwarding,
-/// TermSession feed, TermView render) all live here in `term-view` and are
-/// therefore compiled at `opt-level = 3` even in debug builds.
-pub struct ExternalPtyViewport<I: PtyIpc> {
-    pub ipc: I,
-    pub pid: u32,
-    session: Mutex<TermSession>,
-    pub closed: AtomicBool,
-    pub viewport_id: egui::ViewportId,
-    pub title: String,
-    pub pipeline: RenderPipeline,
-    window_started: AtomicBool,
-}
-
-impl<I: PtyIpc> ExternalPtyViewport<I> {
-    pub fn new(ipc: I, pid: u32, title: String) -> Self {
-        Self::new_with_pipeline(ipc, pid, title, DEFAULT_PIPELINE)
-    }
-
-    pub fn new_with_pipeline(
-        ipc: I,
-        pid: u32,
-        title: String,
-        pipeline: RenderPipeline,
-    ) -> Self {
-        Self {
-            ipc,
-            pid,
-            session: Mutex::new(TermSession::new(pid)),
-            closed: AtomicBool::new(false),
-            viewport_id: egui::ViewportId::from_hash_of("pty-external"),
-            title,
-            pipeline,
-            window_started: AtomicBool::new(false),
-        }
-    }
-
-    pub fn uses_native_window(&self) -> bool {
-        matches!(self.pipeline, RenderPipeline::AlacrittyOpenGl)
-    }
-
-    #[cfg(feature = "alacritty-opengl")]
-    pub fn ensure_native_window(this: &Arc<Self>)
-    where
-        I: Send + Sync + 'static,
-    {
-        if this.window_started.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        if let Err(err) = alacritty_runtime::open_external_window(Arc::clone(this)) {
-            eprintln!("term-view alacritty window error: {err}");
-            this.window_started.store(false, Ordering::Relaxed);
-            this.closed.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Called from the deferred viewport's `Fn(&Context, ViewportClass)` callback.
-    /// The entire hot path — drain, feed, render, input dispatch — runs here.
-    pub fn viewport_ui(this: &Arc<Self>, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) {
-            this.closed.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
-
-        pump_pty_io(&this.ipc, &mut session);
-
-        let mut input_frames: Vec<Vec<u8>> = Vec::new();
-        let mut resize_evt: Option<(u16, u16)> = None;
-
-        this.render_with_pipeline(ctx, &mut session, &mut input_frames, &mut resize_evt);
-
-        flush_term_outputs(&this.ipc, input_frames, resize_evt);
-    }
-
-    fn render_with_pipeline(
-        &self,
-        ctx: &egui::Context,
-        session: &mut TermSession,
-        input_frames: &mut Vec<Vec<u8>>,
-        resize_evt: &mut Option<(u16, u16)>,
-    ) {
-        match self.pipeline {
-            RenderPipeline::Egui => {
-                Self::render_via_egui(ctx, session, input_frames, resize_evt);
-            }
-            RenderPipeline::AlacrittyOpenGl => {
-                Self::render_via_egui(ctx, session, input_frames, resize_evt);
-            }
-        }
-    }
-
-    fn render_via_egui(
-        ctx: &egui::Context,
-        session: &mut TermSession,
-        input_frames: &mut Vec<Vec<u8>>,
-        resize_evt: &mut Option<(u16, u16)>,
-    ) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add(
-                TermView::new(session, input_frames, resize_evt).set_size(ui.available_size()),
-            );
-        });
     }
 }
 

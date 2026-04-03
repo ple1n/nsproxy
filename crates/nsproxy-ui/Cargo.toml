@@ -7,7 +7,7 @@ repository.workspace = true
 [dependencies]
 egui = "0.33.3"
 eframe = "0.33.3"
-tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "sync", "signal", "time", "process", "io-util"] }
+tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "sync", "signal", "time", "process", "io-util", "net"] }
 tracing = "0.1.44"
 nsproxy-common = { version = "0.1.0", path = "../common" }
 flume = "0.11.1"
@@ -32,5 +32,15 @@ futures = "0.3"
 shlex = "1.3"
 alacritty_terminal = "0.25.1"
 smallstr = "0.3.1"
-term-view = { path = "../term-view" }
+term-view = { path = "../term-view", default-features = false }
 winit = "0.30.12"
+
+[features]
+default = [
+	"term-view/egui-renderer",
+	"term-view/alacritty-opengl",
+	"x11",
+	"wayland",
+]
+x11 = ["term-view/x11"]
+wayland = ["term-view/wayland"]
