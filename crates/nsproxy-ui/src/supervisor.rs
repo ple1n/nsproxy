@@ -2003,6 +2003,7 @@ impl Supervisor {
                         cwd: args.cwd,
                         gids: args.gids,
                         args: args.args,
+                        ringbuf_size: None,
                         ns: diag::NamespaceSpawn::Inside,
                     };
                     let _ = tx.send(diag::DaemonRequest::Spawn { args: spawn_args });

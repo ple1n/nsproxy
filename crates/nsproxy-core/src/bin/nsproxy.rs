@@ -115,6 +115,34 @@ use tun2socks5::{
 const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
 const PTY_BROADCAST_CAP: usize = 128;
 
+struct PtyScrollbackState {
+    cap: usize,
+    ring: VecDeque<u8>,
+}
+
+impl PtyScrollbackState {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            ring: VecDeque::with_capacity(cap),
+        }
+    }
+}
+
+struct RawLogRingState {
+    cap: usize,
+    ring: VecDeque<diag::RawLog>,
+}
+
+impl RawLogRingState {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            ring: VecDeque::with_capacity(cap),
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Ignore SIGPIPE so logging to a closed pipe does not kill the daemon.
     unsafe {
@@ -1006,6 +1034,7 @@ fn main() -> anyhow::Result<()> {
                             cwd: args.cwd,
                             gids: args.gids,
                             args: args.args,
+                            ringbuf_size: None,
                             ns: args.ns,
                         };
                         diag::DaemonRequest::Spawn { args: dra }
@@ -2174,10 +2203,10 @@ async fn run_up_daemon(
     })));
 
     // Shared per-process stdout/stderr ring buffer.
-    let raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>> =
+    let raw_logs: Arc<Mutex<BTreeMap<u32, RawLogRingState>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
     // Shared PTY byte scrollback ring per process.
-    let pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>> =
+    let pty_scrollback: Arc<Mutex<BTreeMap<u32, PtyScrollbackState>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
     // PTY master fd per process for input/resize control.
     let pty_masters: Arc<Mutex<BTreeMap<u32, OwnedFd>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -2288,7 +2317,8 @@ fn spawn_pipe_reader(
     pid: u32,
     kind: diag::RawLogKind,
     fd: std::os::unix::io::RawFd,
-    raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>>,
+    raw_logs: Arc<Mutex<BTreeMap<u32, RawLogRingState>>>,
+    raw_log_cap: usize,
 ) {
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
@@ -2304,13 +2334,17 @@ fn spawn_pipe_reader(
                         content,
                     };
                     if let Ok(mut guard) = raw_logs.lock() {
-                        let ring = guard
+                        let state = guard
                             .entry(pid)
-                            .or_insert_with(|| VecDeque::with_capacity(diag::RAW_LOG_RING_CAP));
-                        if ring.len() >= diag::RAW_LOG_RING_CAP {
-                            ring.pop_front();
+                            .or_insert_with(|| RawLogRingState::new(raw_log_cap));
+                        if state.cap == 0 {
+                            state.ring.clear();
+                            continue;
                         }
-                        ring.push_back(entry);
+                        if state.ring.len() >= state.cap {
+                            state.ring.pop_front();
+                        }
+                        state.ring.push_back(entry);
                     }
                 }
                 Err(_) => break,
@@ -2319,18 +2353,58 @@ fn spawn_pipe_reader(
     });
 }
 
-fn append_pty_scrollback(ring: &mut VecDeque<u8>, data: &[u8]) {
+fn ringbuf_cap_from_args(args: &diag::SpawnArgs, default_cap: usize) -> usize {
+    args.ringbuf_size
+        .map(|size| size as usize)
+        .unwrap_or(default_cap)
+}
+
+fn append_pty_scrollback(state: &mut PtyScrollbackState, data: &[u8]) {
     if data.is_empty() {
         return;
     }
-    let overflow = ring
+    if state.cap == 0 {
+        state.ring.clear();
+        return;
+    }
+    if data.len() >= state.cap {
+        state.ring.clear();
+        state.ring
+            .extend(data[data.len().saturating_sub(state.cap)..].iter().copied());
+        return;
+    }
+    let overflow = state
+        .ring
         .len()
         .saturating_add(data.len())
-        .saturating_sub(PTY_SCROLLBACK_CAP);
+        .saturating_sub(state.cap);
     for _ in 0..overflow {
-        ring.pop_front();
+        state.ring.pop_front();
     }
-    ring.extend(data.iter().copied());
+    state.ring.extend(data.iter().copied());
+}
+
+fn signal_pty_foreground_process_group(fd: std::os::fd::RawFd) -> anyhow::Result<()> {
+    let mut pgid: libc::pid_t = 0;
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGPGRP, &mut pgid) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
+    }
+    if pgid <= 0 {
+        return Ok(());
+    }
+
+    let rc = unsafe { libc::killpg(pgid, libc::SIGWINCH) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(err))
+        }
+    }
 }
 
 /// Scan `chunk` for DA1 (`ESC [ c` / `ESC [ 0 c`) and DA2 (`ESC [ > c` / `ESC [ > 0 c`)
@@ -2387,7 +2461,7 @@ fn intercept_terminal_queries(file: &mut std::fs::File, chunk: &[u8]) -> Option<
 fn spawn_pty_relay(
     pid: u32,
     relay_fd: OwnedFd,
-    pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>>,
+    pty_scrollback: Arc<Mutex<BTreeMap<u32, PtyScrollbackState>>>,
     pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>>,
 ) {
     std::thread::spawn(move || {
@@ -2411,10 +2485,10 @@ fn spawn_pty_relay(
 
             {
                 let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
-                let ring = guard
+                let state = guard
                     .entry(pid)
-                    .or_insert_with(|| VecDeque::with_capacity(PTY_SCROLLBACK_CAP));
-                append_pty_scrollback(ring, broadcast_chunk);
+                    .or_insert_with(|| PtyScrollbackState::new(PTY_SCROLLBACK_CAP));
+                append_pty_scrollback(state, broadcast_chunk);
             }
 
             let tx_opt = {
@@ -2437,8 +2511,8 @@ async fn handle_up_client(
     simulate_protocol_no_upgrade: bool,
     simulate_slow_shutdown: bool,
     mut log_rx: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
-    raw_logs: Arc<Mutex<BTreeMap<u32, VecDeque<diag::RawLog>>>>,
-    pty_scrollback: Arc<Mutex<BTreeMap<u32, VecDeque<u8>>>>,
+    raw_logs: Arc<Mutex<BTreeMap<u32, RawLogRingState>>>,
+    pty_scrollback: Arc<Mutex<BTreeMap<u32, PtyScrollbackState>>>,
     pty_masters: Arc<Mutex<BTreeMap<u32, OwnedFd>>>,
     pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>>,
     exit_broadcast_tx: Arc<tokio::sync::broadcast::Sender<u32>>,
@@ -2548,6 +2622,7 @@ async fn handle_up_client(
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                     diag::DaemonRequest::Spawn { args } => {
+                        let raw_log_cap = ringbuf_cap_from_args(&args, diag::RAW_LOG_RING_CAP);
                         let ns_alive = read_ns_alive(&ns_meta)?;
                         let (child, stdout_r, stderr_r) = spawn_daemon_process(&args, &ns_alive)?;
                         let child_pid = match child {
@@ -2572,8 +2647,20 @@ async fn handle_up_client(
                         );
                         state.store(Arc::new(new));
 
-                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stdout, stdout_r, raw_logs.clone());
-                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
+                        spawn_pipe_reader(
+                            child_pid,
+                            diag::RawLogKind::Stdout,
+                            stdout_r,
+                            raw_logs.clone(),
+                            raw_log_cap,
+                        );
+                        spawn_pipe_reader(
+                            child_pid,
+                            diag::RawLogKind::Stderr,
+                            stderr_r,
+                            raw_logs.clone(),
+                            raw_log_cap,
+                        );
 
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
                         write_up_unstable_frame(&mut write_half, &spawned).await?;
@@ -2640,8 +2727,20 @@ async fn handle_up_client(
                         }
                         state.store(Arc::new(new));
 
-                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stdout, stdout_r, raw_logs.clone());
-                        spawn_pipe_reader(child_pid, diag::RawLogKind::Stderr, stderr_r, raw_logs.clone());
+                        spawn_pipe_reader(
+                            child_pid,
+                            diag::RawLogKind::Stdout,
+                            stdout_r,
+                            raw_logs.clone(),
+                            diag::RAW_LOG_RING_CAP,
+                        );
+                        spawn_pipe_reader(
+                            child_pid,
+                            diag::RawLogKind::Stderr,
+                            stderr_r,
+                            raw_logs.clone(),
+                            diag::RAW_LOG_RING_CAP,
+                        );
 
                         let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
                         write_up_unstable_frame(&mut write_half, &spawned).await?;
@@ -2670,6 +2769,7 @@ async fn handle_up_client(
                     }
                     diag::DaemonRequest::SpawnPty { args } => {
                         let ns_alive = read_ns_alive(&ns_meta)?;
+                        let pty_scrollback_cap = ringbuf_cap_from_args(&args, PTY_SCROLLBACK_CAP);
                         let (child_pid, master_fd) = spawn_pty_process(&args, &ns_alive)?;
                         let relay_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };
                         if relay_raw < 0 {
@@ -2690,7 +2790,7 @@ async fn handle_up_client(
                             let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
                             guard
                                 .entry(child_pid)
-                                .or_insert_with(|| VecDeque::with_capacity(PTY_SCROLLBACK_CAP));
+                                .or_insert_with(|| PtyScrollbackState::new(pty_scrollback_cap));
                         }
                         {
                             let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
@@ -2742,7 +2842,7 @@ async fn handle_up_client(
                             let guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
                             guard
                                 .get(&pid)
-                                .map(|ring| ring.iter().copied().collect::<Vec<u8>>())
+                                .map(|state| state.ring.iter().copied().collect::<Vec<u8>>())
                                 .unwrap_or_default()
                         };
                         let evt = diag::DaemonEvent::PtyScrollback {
@@ -2796,7 +2896,7 @@ async fn handle_up_client(
                         }
                     }
                     diag::DaemonRequest::PtyResize { pid, cols, rows } => {
-                        let resize_result = {
+                        let (resize_result, refresh_result) = {
                             let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(fd) = guard.get(&pid) {
                                 let ws = libc::winsize {
@@ -2807,12 +2907,12 @@ async fn handle_up_client(
                                 };
                                 let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
                                 if rc == 0 {
-                                    Ok(())
+                                    (Ok(()), signal_pty_foreground_process_group(fd.as_raw_fd()))
                                 } else {
-                                    Err(anyhow!(std::io::Error::last_os_error()))
+                                    (Err(anyhow!(std::io::Error::last_os_error())), Ok(()))
                                 }
                             } else {
-                                Err(anyhow!("pty pid {} not found", pid))
+                                (Err(anyhow!("pty pid {} not found", pid)), Ok(()))
                             }
                         };
                         if let Err(e) = resize_result {
@@ -2820,6 +2920,8 @@ async fn handle_up_client(
                                 msg: format!("pty resize failed for pid {}: {}", pid, e),
                             };
                             write_up_unstable_frame(&mut write_half, &evt).await?;
+                        } else if let Err(e) = refresh_result {
+                            warn!(%e, pid, "pty refresh signal failed after resize");
                         }
                     }
                     diag::DaemonRequest::Stop => {
@@ -2847,9 +2949,9 @@ async fn handle_up_client(
                         let logs = {
                             let guard = raw_logs.lock().unwrap_or_else(|e| e.into_inner());
                             guard.get(&pid)
-                                .map(|ring| {
-                                    let skip = ring.len().saturating_sub(limit);
-                                    ring.iter().skip(skip).cloned().collect::<Vec<_>>()
+                                .map(|state| {
+                                    let skip = state.ring.len().saturating_sub(limit);
+                                    state.ring.iter().skip(skip).cloned().collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default()
                         };
@@ -2875,10 +2977,6 @@ async fn handle_up_client(
                         }
                         {
                             let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.remove(&pid);
-                        }
-                        {
-                            let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
                             guard.remove(&pid);
                         }
                         let exit_evt = diag::DaemonEvent::ProcessExit { pid };
