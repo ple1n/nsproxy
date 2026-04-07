@@ -203,3 +203,9 @@ make user turn off systemd-dns? and keep a resolv.conf
 problems
 
 - can not proxy raw IPs
+
+# idea, stealh mode
+
+- change user name, hostname within a container? 
+- this may cause breakage. there should be enough change for sharing anonymously on screenshot but not enough to cause breakage.
+

@@ -1094,6 +1094,10 @@ pub struct SpawnArgs {
     pub cwd: Option<PathBuf>,
     pub gids: Vec<u32>,
     pub args: Vec<String>,
+    /// Optional process output ring buffer limit.
+    /// For PTY mode this is retained bytes; for output mode this is retained log entries.
+    /// `None` means use the daemon default for that mode.
+    pub ringbuf_size: Option<u32>,
     pub ns: NamespaceSpawn,
 }
 

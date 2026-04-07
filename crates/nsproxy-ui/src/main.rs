@@ -410,14 +410,16 @@ struct RunCommandDraft {
 
 impl Default for RunCommandDraft {
     fn default() -> Self {
-        Self {
-            command_line: String::new(),
+        let mut draft = Self {
+            command_line: default_spawn_shell_command_line(),
             pending_spawn_args: None,
             parse_error: None,
             status: None,
             spawn_inside_container: true,
-            spawn_as_pty: false,
-        }
+            spawn_as_pty: true,
+        };
+        refresh_run_command_preview(&mut draft);
+        draft
     }
 }
 
@@ -700,6 +702,32 @@ fn format_shell_args(args: &ShellArgs) -> String {
     }
 }
 
+fn default_spawn_identity() -> (Option<u32>, Option<u32>, Vec<u32>) {
+    let uid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
+    let gids = nix::unistd::getgroups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g: nix::unistd::Gid| g.as_raw())
+        .collect();
+    (Some(uid), Some(gid), gids)
+}
+
+fn apply_default_spawn_user(args: &mut diag::SpawnArgs) {
+    let (uid, gid, gids) = default_spawn_identity();
+    args.uid = uid;
+    args.gid = gid;
+    args.gids = gids;
+}
+
+fn default_spawn_shell_command_line() -> String {
+    nsproxy_core::sys::your_shell(None, nix::unistd::getuid().as_raw().into())
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("SHELL").ok().filter(|shell| !shell.trim().is_empty()))
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
 fn parse_command_line_to_spawn_args(
     command_line: &str,
     spawn_inside_container: bool,
@@ -723,19 +751,38 @@ fn parse_command_line_to_spawn_args(
             Err(_) => exec_str.clone(), // Fall back to original if not found in PATH
         }
     };
-    Ok(diag::SpawnArgs {
+    let mut args = diag::SpawnArgs {
         uid: None,
         gid: None,
         exec: Some(exec_resolved),
         cwd: None,
         gids: Vec::new(),
         args: tokens,
+        ringbuf_size: None,
         ns: if spawn_inside_container {
             diag::NamespaceSpawn::Inside
         } else {
             diag::NamespaceSpawn::Outside
         },
-    })
+    };
+    apply_default_spawn_user(&mut args);
+    Ok(args)
+}
+
+fn refresh_run_command_preview(run_command: &mut RunCommandDraft) {
+    match parse_command_line_to_spawn_args(
+        &run_command.command_line,
+        run_command.spawn_inside_container,
+    ) {
+        Ok(args) => {
+            run_command.pending_spawn_args = Some(args);
+            run_command.parse_error = None;
+        }
+        Err(err) => {
+            run_command.pending_spawn_args = None;
+            run_command.parse_error = Some(err);
+        }
+    }
 }
 
 impl App {
@@ -1389,6 +1436,24 @@ impl App {
         value: &mut Option<u32>,
         value_changed: bool,
     ) -> bool {
+        Self::render_optional_u32_with_default(
+            ui,
+            int_input,
+            label,
+            value,
+            value_changed,
+            0,
+        )
+    }
+
+    fn render_optional_u32_with_default(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        label: &str,
+        value: &mut Option<u32>,
+        value_changed: bool,
+        default_value: u32,
+    ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             let state_id = ui.make_persistent_id(("optional-u32-enabled", label));
@@ -1399,7 +1464,7 @@ impl App {
             if ui.checkbox(&mut enabled, label).changed() {
                 changed = true;
                 if enabled && value.is_none() {
-                    *value = Some(0);
+                    *value = Some(default_value);
                 }
                 if !enabled {
                     *value = None;
@@ -2192,6 +2257,7 @@ impl App {
                 ui.label(format!("exec: {:?}", args.exec));
                 ui.label(format!("cwd: {:?}", args.cwd));
                 ui.label(format!("gids: {:?}", args.gids));
+                ui.label(format!("ringbuf_size: {:?}", args.ringbuf_size));
                 ui.label("argv:");
                 for (i, arg) in args.args.iter().enumerate() {
                     ui.monospace(format!("  [{i}] {arg}"));
@@ -2203,16 +2269,7 @@ impl App {
             let mut uid_gid_value_changed = false;
             ui.horizontal(|ui| {
                 if ui.button("default user").clicked() {
-                    let uid = nix::unistd::getuid().as_raw();
-                    let gid = nix::unistd::getgid().as_raw();
-                    let gids = nix::unistd::getgroups()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|g: nix::unistd::Gid| g.as_raw())
-                        .collect();
-                    args.uid = Some(uid);
-                    args.gid = Some(gid);
-                    args.gids = gids;
+                    apply_default_spawn_user(args);
                     changed = true;
                     uid_gid_value_changed = true;
                 }
@@ -2281,6 +2338,17 @@ impl App {
                     changed = true;
                 }
             });
+
+            if Self::render_optional_u32_with_default(
+                ui,
+                int_input,
+                "ringbuf_size",
+                &mut args.ringbuf_size,
+                false,
+                diag::RAW_LOG_RING_CAP as u32,
+            ) {
+                changed = true;
+            }
 
             ui.label("argv (args)");
             let mut remove_ix: Option<usize> = None;
@@ -2728,11 +2796,7 @@ impl eframe::App for App {
             if let Some(target) = self.snapshot.auto_open_logs_target.as_ref() {
                 if target.token > self.last_auto_open_logs_token {
                     self.selected_process_logs = Some((target.profile.clone(), target.pid));
-                    self.supervisor.send(SupervisorCommand::QueryRawLogs {
-                        profile: target.profile.clone(),
-                        pid: target.pid,
-                        limit: diag::RAW_LOG_RING_CAP,
-                    });
+                    self.request_process_logs(&target.profile, target.pid);
                     self.last_auto_open_logs_token = target.token;
                 }
             }
@@ -4257,16 +4321,7 @@ impl App {
         }
         if let Some((profile, pid)) = logs_request {
             self.selected_process_logs = Some((profile.clone(), pid));
-            if self.is_pty_process(&profile, pid) {
-                self.supervisor
-                    .send(SupervisorCommand::AttachPty { profile, pid });
-            } else {
-                self.supervisor.send(SupervisorCommand::QueryRawLogs {
-                    profile,
-                    pid,
-                    limit: diag::RAW_LOG_RING_CAP,
-                });
-            }
+            self.request_process_logs(&profile, pid);
         }
         if let Some((profile, pid, title)) = open_dedicated_pty_request {
             self.open_dedicated_pty_window(profile, pid, title);
@@ -4349,6 +4404,36 @@ impl App {
             .and_then(|snap| snap.procs.get(&slot_pid))
             .map(|entry| matches!(entry.meta, diag::SpawnedEntry::Pty(_)))
             .unwrap_or(false)
+    }
+
+    fn process_ringbuf_limit(&self, profile: &ContainerName, slot_pid: u32) -> usize {
+        self.snapshot
+            .profiles
+            .get(profile)
+            .and_then(|p| p.process_list_snapshot.as_ref())
+            .and_then(|snap| snap.procs.get(&slot_pid))
+            .and_then(|entry| match &entry.meta {
+                diag::SpawnedEntry::Args(args) | diag::SpawnedEntry::Pty(args) => {
+                    args.ringbuf_size.map(|size| size as usize)
+                }
+                diag::SpawnedEntry::Cli(_) => None,
+            })
+            .unwrap_or(diag::RAW_LOG_RING_CAP)
+    }
+
+    fn request_process_logs(&self, profile: &ContainerName, pid: u32) {
+        if self.is_pty_process(profile, pid) {
+            self.supervisor.send(SupervisorCommand::AttachPty {
+                profile: profile.clone(),
+                pid,
+            });
+        } else {
+            self.supervisor.send(SupervisorCommand::QueryRawLogs {
+                profile: profile.clone(),
+                pid,
+                limit: self.process_ringbuf_limit(profile, pid),
+            });
+        }
     }
 
     fn selected_process_is_pty(&self) -> bool {
@@ -4501,11 +4586,7 @@ impl App {
                     return;
                 }
                 if ui.small_button("Refresh").clicked() {
-                    self.supervisor.send(SupervisorCommand::QueryRawLogs {
-                        profile: profile.clone(),
-                        pid: slot_pid,
-                        limit: diag::RAW_LOG_RING_CAP,
-                    });
+                    self.request_process_logs(&profile, slot_pid);
                 }
                 let details_label = if self.raw_log_show_details {
                     "Hide details"
@@ -4604,25 +4685,10 @@ impl App {
                         });
                         self.run_command.status = Some("Output-mode spawn request sent".to_string());
                     }
-                    self.run_command.pending_spawn_args = None;
                     self.run_command.parse_error = None;
                 } else {
-                    match parse_command_line_to_spawn_args(
-                        &self.run_command.command_line,
-                        self.run_command.spawn_inside_container,
-                    ) {
-                        Ok(args) => {
-                            self.run_command.pending_spawn_args = Some(args);
-                            self.run_command.parse_error = None;
-                            self.run_command.status = Some(
-                                "Review parsed SpawnArgs, then click Run to confirm".to_string(),
-                            );
-                        }
-                        Err(err) => {
-                            self.run_command.parse_error = Some(err);
-                            self.run_command.status = None;
-                        }
-                    }
+                    refresh_run_command_preview(&mut self.run_command);
+                    self.run_command.status = None;
                 }
             }
         });
@@ -4647,25 +4713,10 @@ impl App {
                     });
                     self.run_command.status = Some("Output-mode spawn request sent".to_string());
                 }
-                self.run_command.pending_spawn_args = None;
                 self.run_command.parse_error = None;
             } else if response.lost_focus() {
-                match parse_command_line_to_spawn_args(
-                    &self.run_command.command_line,
-                    self.run_command.spawn_inside_container,
-                ) {
-                    Ok(args) => {
-                        self.run_command.pending_spawn_args = Some(args);
-                        self.run_command.parse_error = None;
-                        self.run_command.status = Some(
-                            "Review parsed SpawnArgs, then click Run to confirm".to_string(),
-                        );
-                    }
-                    Err(err) => {
-                        self.run_command.parse_error = Some(err);
-                        self.run_command.status = None;
-                    }
-                }
+                refresh_run_command_preview(&mut self.run_command);
+                self.run_command.status = None;
             }
         }
 
@@ -4684,9 +4735,8 @@ impl App {
             .changed();
 
         if edited || ns_toggled || mode_toggled {
-            self.run_command.pending_spawn_args = None;
-            self.run_command.parse_error = None;
             self.run_command.status = None;
+            refresh_run_command_preview(&mut self.run_command);
         }
 
         if let Some(err) = self.run_command.parse_error.as_ref() {
@@ -5870,14 +5920,6 @@ fn bucket_avg_latency(
                 None
             }
         })
-        .collect()
-}
-
-/// Convert a slice of Option<TsPoint> to PlotPoints, only including Some values.
-fn opt_ts_to_plot(pts: &[Option<TsPoint>]) -> PlotPoints {
-    pts.iter()
-        .filter_map(|p| p.as_ref())
-        .map(|p| [p.x, p.val])
         .collect()
 }
 
