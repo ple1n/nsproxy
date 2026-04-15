@@ -158,7 +158,6 @@ enum RightTab {
     Proxies,
     Processes,
     Traffic,
-    Dns,
     Hotconfig,
     ProfileEditor,
 }
@@ -516,6 +515,7 @@ impl IntInput {
 
 struct App {
     selected_profile: Option<ContainerName>,
+    remove_containers_armed: bool,
     right_tab: RightTab,
     proxies: BTreeMap<ProxyID, ProxyItem>,
     nym_to_id: BTreeMap<String, ProxyID>,
@@ -1005,6 +1005,7 @@ impl App {
 
         Self {
             selected_profile: None,
+            remove_containers_armed: false,
             right_tab: RightTab::Proxies,
             proxies,
             nym_to_id,
@@ -1076,7 +1077,6 @@ impl App {
             RightTab::Proxies => "Proxies",
             RightTab::Processes => "Processes",
             RightTab::Traffic => "Traffic",
-            RightTab::Dns => "Dns",
             RightTab::Hotconfig => "Hotconfig",
             RightTab::ProfileEditor => "ProfileEditor",
         }
@@ -1261,19 +1261,6 @@ impl App {
             return;
         };
 
-        if self.hotconfig_editor_error.is_some() {
-            self.hotconfig_editor_status = Some("Fix JSON errors before saving.".to_string());
-            return;
-        }
-
-        let path = state_paths::hot_config(profile_name.as_str());
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                self.hotconfig_editor_status = Some(format!("Create dir failed: {err}"));
-                return;
-            }
-        }
-
         let content = match serde_json::to_string_pretty(&self.hotconfig_editor_value) {
             Ok(content) => content,
             Err(err) => {
@@ -1282,16 +1269,42 @@ impl App {
             }
         };
 
-        if let Err(err) = std::fs::write(&path, content) {
-            self.hotconfig_editor_status = Some(format!("Save failed: {err}"));
-            return;
+        self.apply_hotconfig_live(
+            profile_name,
+            self.hotconfig_editor_value.clone(),
+            content,
+            "Saved hotconfig".to_string(),
+        );
+    }
+
+    fn update_local_hotconfig_state(&mut self, profile_name: &str, hot: &HotConfig) {
+        if let Some(state) = self.snapshot.profiles.get_mut(profile_name) {
+            state.hotconfig = hot.clone();
+            state.hotconfig_value =
+                serde_json::to_value(hot).unwrap_or_else(|_| serde_json::json!({}));
         }
 
-        self.supervisor
-            .send(SupervisorCommand::ReloadHotconfig(profile_name.clone()));
-        self.supervisor
-            .send(SupervisorCommand::LoadProfile(profile_name.clone()));
-        self.hotconfig_editor_status = Some(format!("Saved hotconfig for {}", profile_name));
+        if self.selected_profile.as_deref() == Some(profile_name) {
+            self.hotconfig_editor_value = hot.clone();
+            self.hotconfig_editor_json =
+                serde_json::to_string_pretty(hot).unwrap_or_else(|_| "{}".to_string());
+            self.hotconfig_editor_error = None;
+        }
+    }
+
+    fn apply_hotconfig_live(
+        &mut self,
+        profile_name: ContainerName,
+        hot: HotConfig,
+        content: String,
+        status: String,
+    ) {
+        self.update_local_hotconfig_state(&profile_name, &hot);
+        self.supervisor.send(SupervisorCommand::Ctrl {
+            profile: profile_name,
+            cmd: diag::ControlCommand::ApplyHotConfig { content },
+        });
+        self.hotconfig_editor_status = Some(status);
     }
 
     fn refresh_profile_editor_target(&mut self) {
@@ -2089,16 +2102,62 @@ impl App {
             changed = true;
         }
 
-        ui.group(|ui| {
-            ui.strong("tun");
-            ui.small("Edit via JSON panel (right) for arbitrary nested values.");
-            ui.small(format!("entries: {}", hot.tun.len()));
-        });
 
         ui.group(|ui| {
-            ui.strong("dns_capture");
-            ui.small("Edit via JSON panel (right) for exact network set semantics.");
-            ui.small(format!("entries: {}", hot.dns_capture.len()));
+            ui.strong("dns runtime");
+            let captured_resolv_conf_dns = "100.68.0.1";
+            ui.horizontal(|ui| {
+                let mut use_internal_dns =
+                    hot.resolv_conf_dns == nsproxy_core::INTERNAL_RESOLV_CONF_DNS
+                        && !hot.dns_capture_enabled();
+                if ui.checkbox(&mut use_internal_dns, "route to local dns").changed() {
+                    if use_internal_dns {
+                        hot.resolv_conf_dns = nsproxy_core::INTERNAL_RESOLV_CONF_DNS.to_string();
+                        hot.set_dns_capture_enabled(false);
+                    } else {
+                        if hot.resolv_conf_dns == nsproxy_core::INTERNAL_RESOLV_CONF_DNS {
+                            hot.resolv_conf_dns = nsproxy_core::CAPTURED_RESOLV_CONF_DNS.to_string();
+                        }
+                        hot.set_dns_capture_enabled(true);
+                    }
+                    changed = true;
+                }
+
+                let mut dns_capture_enabled = hot.dns_capture_enabled();
+                let dns_capture_label = if dns_capture_enabled {
+                    "capture all dns"
+                } else {
+                    "no dns capture"
+                };
+                if ui
+                    .toggle_value(&mut dns_capture_enabled, dns_capture_label)
+                    .changed()
+                {
+                    hot.set_dns_capture_enabled(dns_capture_enabled);
+                    if dns_capture_enabled {
+                        hot.resolv_conf_dns = captured_resolv_conf_dns.to_string();
+                    }
+                    changed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("resolv_conf_dns");
+                let mut resolv_conf_dns = hot.resolv_conf_dns.clone();
+                if ui.text_edit_singleline(&mut resolv_conf_dns).changed() {
+                    hot.resolv_conf_dns = resolv_conf_dns;
+                    changed = true;
+                }
+                if ui.button("127.0.0.1").clicked() {
+                    hot.resolv_conf_dns = "127.0.0.1".to_string();
+                    changed = true;
+                }
+                if ui.button("100.68.0.1").clicked() {
+                    hot.resolv_conf_dns = captured_resolv_conf_dns.to_string();
+                    changed = true;
+                }
+            });
+            ui.small("DNS edits stay local until Save.");
         });
 
         changed
@@ -2527,15 +2586,8 @@ impl App {
     }
 
     fn reload_all_ns_alive(&self) {
-        let profiles: Vec<_> = self.snapshot.profiles.keys().cloned().collect();
-        if !profiles.is_empty() {
-            info!(
-                profile_count = profiles.len(),
-                "requesting status reload for all profiles"
-            );
-            self.supervisor
-                .send(supervisor::SupervisorCommand::LoadProfiles(profiles));
-        }
+        info!("requesting authoritative profile rescan from disk");
+        self.supervisor.send(supervisor::SupervisorCommand::Init);
     }
 
     fn apply_filters(&mut self) {
@@ -2800,12 +2852,39 @@ impl eframe::App for App {
                     self.last_auto_open_logs_token = target.token;
                 }
             }
+            if self
+                .selected_profile
+                .as_ref()
+                .is_some_and(|profile| !self.snapshot.profiles.contains_key(profile))
+            {
+                self.selected_profile = None;
+            }
+            if self
+                .selected_process_logs
+                .as_ref()
+                .is_some_and(|(profile, _)| !self.snapshot.profiles.contains_key(profile))
+            {
+                self.selected_process_logs = None;
+            }
             info!(
                 frame = self.ui_frame_seq,
                 drained_snapshots,
                 profiles = self.snapshot.profiles.len(),
                 "applied supervisor snapshot updates"
             );
+        }
+
+        let delete_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
+        let delete_requested = self.remove_containers_armed
+            && self.selected_profile.is_some()
+            && !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_shortcut(&delete_shortcut));
+        if delete_requested {
+            if let Some(profile_name) = self.selected_profile.clone() {
+                info!(profile = profile_name.as_str(), "ui shortcut requested container delete");
+                self.supervisor
+                    .send(SupervisorCommand::DeleteContainer { profile: profile_name });
+            }
         }
 
         egui::SidePanel::left("left_sidebar")
@@ -2823,6 +2902,12 @@ impl eframe::App for App {
                             self.reload_all_ns_alive();
                         }
                     });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.toggle_value(&mut self.remove_containers_armed, "remove containers")
+                        .on_hover_text("Enable Ctrl+D to remove the selected container");
                 });
 
                 ui.add_space(6.0);
@@ -3002,19 +3087,6 @@ impl eframe::App for App {
                     }
                 }
                 if ui
-                    .selectable_label(self.right_tab == RightTab::Dns, "DNS")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Dns;
-                    if let Some(profile_name) = &self.selected_profile {
-                        self.supervisor
-                            .send(supervisor::SupervisorCommand::OnTabOpen {
-                                profile: profile_name.clone(),
-                                tab: supervisor::TabKind::Dns,
-                            });
-                    }
-                }
-                if ui
                     .selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig")
                     .clicked()
                 {
@@ -3086,7 +3158,6 @@ impl eframe::App for App {
                     RightTab::Proxies => self.render_proxies_tab(ui),
                     RightTab::Processes => self.render_processes_tab(ui),
                     RightTab::Traffic => self.render_traffic_tab(ui),
-                    RightTab::Dns => self.render_dns_tab(ui),
                     RightTab::Hotconfig => self.render_hotconfig_tab(ui),
                     RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
                 });
@@ -5458,11 +5529,6 @@ impl App {
         }
     }
 
-    fn render_dns_tab(&self, ui: &mut egui::Ui) {
-        ui.heading("DNS");
-        ui.label("DNS settings are not implemented yet (placeholder).");
-    }
-
     fn render_hotconfig_tab(&mut self, ui: &mut egui::Ui) {
         self.refresh_hotconfig_editor_target();
 
@@ -5487,6 +5553,20 @@ impl App {
         });
         if let Some(status) = &self.hotconfig_editor_status {
             ui.label(status);
+        }
+        if let Some(profile) = self.snapshot.profiles.get(&profile_name) {
+            if let Some(dns_state) = &profile.dns_state {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "DNS: {} domains, {} IPv4, {} IPv6",
+                        dns_state.domain_count, dns_state.ip4_count, dns_state.ip6_count
+                    ));
+                    if dns_state.aaaa_only {
+                        ui.label(RichText::new("AAAA stripped").color(Color32::LIGHT_BLUE));
+                    }
+                });
+            }
         }
         ui.add_space(6.0);
 

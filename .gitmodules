@@ -58,3 +58,6 @@
 	path = crates/warp
 	url = https://github.com/ple1n/warp
 	branch = master
+[submodule "crates/hickory-dns"]
+	path = crates/hickory-dns
+	url = https://github.com/ple1n/hickory-dns

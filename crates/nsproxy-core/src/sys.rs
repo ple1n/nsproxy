@@ -27,13 +27,13 @@ use std::{
     env::{set_current_dir, var},
     ffi::{CStr, CString},
     fs::{
-        File, FileType, OpenOptions, create_dir, create_dir_all, read_dir, remove_dir_all,
-        remove_file,
+        File, FileType, OpenOptions, create_dir, create_dir_all, read_dir, remove_dir,
+        remove_dir_all, remove_file,
     },
     io::{BufRead, BufReader, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::{ffi::OsStrExt, net::UnixStream},
+        unix::{ffi::{OsStrExt, OsStringExt}, net::UnixStream},
     },
     path::{Path, PathBuf},
     process::{ExitStatus, exit},
@@ -55,6 +55,58 @@ use nix::{
 };
 
 use crate::{Paths, PathsBinds, aok};
+
+fn decode_mountinfo_path(path: &str) -> PathBuf {
+    let mut decoded = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            let octal = &path[index + 1..index + 4];
+            if let Ok(value) = u8::from_str_radix(octal, 8) {
+                decoded.push(value);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    PathBuf::from(std::ffi::OsString::from_vec(decoded))
+}
+
+pub struct MountInfo {
+    mount_points: HashSet<PathBuf>,
+}
+
+impl MountInfo {
+    pub fn load() -> Result<Self> {
+        let file = std::fs::File::open("/proc/self/mountinfo")?;
+        let reader = std::io::BufReader::new(file);
+        let mut mount_points = HashSet::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 6 {
+                continue;
+            }
+            mount_points.insert(decode_mountinfo_path(fields[4]));
+        }
+
+        Ok(Self { mount_points })
+    }
+
+    pub fn target_is_mountpoint(&self, target: &Path) -> bool {
+        self.mount_points.contains(target)
+    }
+}
+
+pub fn path_is_mountpoint(target: &Path) -> Result<bool> {
+    Ok(MountInfo::load()?.target_is_mountpoint(target))
+}
 
 fn mount_single(pid: &PidPath, bind_at: &Path, dry_run: bool, name: &str) -> Result<()> {
     let path: PathBuf = ["/proc/", pid.to_str().as_ref(), "ns", name]
@@ -514,10 +566,18 @@ pub fn mount_bind_root() -> Result<()> {
     Ok(())
 }
 
+/// Will never remove if its a file.
 pub fn rm_mount(dst: &Path) -> Result<()> {
-    warn!("remove bind-mount {:?}", dst);
-    umount(dst)?;
-    remove_file(dst)?;
+    warn!("remove bind-mount target {:?}", dst);
+
+    if !dst.exists() {
+        return Ok(());
+    }
+
+    if path_is_mountpoint(dst)? {
+        umount(dst)?;
+    }
+
     Ok(())
 }
 
@@ -569,6 +629,15 @@ pub fn mount_file_content(content: &[u8], target: &Path) -> Result<()> {
 pub fn mount_resolv_conf(nameserver: &str) -> Result<()> {
     let content = format!("nameserver {}\n", nameserver);
     mount_file_content(content.as_bytes(), Path::new("/etc/resolv.conf"))?;
+    info!("mounted resolv.conf with nameserver: {}", nameserver);
+    Ok(())
+}
+
+pub fn replace_mount_resolv_conf(nameserver: &str) -> Result<()> {
+    let p  = Path::new("/etc/resolv.conf");
+    let content = format!("nameserver {}\n", nameserver);
+    let _ = rm_mount(p);
+    mount_file_content(content.as_bytes(), p)?;
     info!("mounted resolv.conf with nameserver: {}", nameserver);
     Ok(())
 }

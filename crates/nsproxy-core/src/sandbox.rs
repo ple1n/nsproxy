@@ -4,26 +4,80 @@
 //! the binary's `Run` / `Up` command handlers.
 
 use std::io::BufRead;
+use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use nix::mount::{MsFlags, mount as nix_mount};
+use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount2};
 use nix::unistd::{Gid, Uid, chown};
 use std::os::unix::fs::PermissionsExt;
 use tracing::{info, warn};
 
 use crate::{
     PathExpansionState, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
-    sys::{mount_bind_ro_explicit, mount_bind_rw_explicit, mount_tmpfs, pivot_root_into},
+    sys::{MountInfo, mount_bind_ro_explicit, mount_bind_rw_explicit, mount_tmpfs, pivot_root_into},
 };
 
 /// Apply a list of profile mounts, resolving source/target paths through
 /// `vars` (which carries `@`/`~` variable expansion and optional chroot roots).
+fn bind_target_matches_source(source: &Path, target: &Path) -> Result<bool> {
+    let src_meta = match std::fs::metadata(source) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return Err(err.into());
+        }
+    };
+    let dst_meta = match std::fs::metadata(target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(err) => {
+            return Err(err.into());
+        }
+    };
+
+    Ok(src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+}
+
+fn bind_target_has_desired_state(mount_info: &MountInfo, source: &Path, target: &Path) -> Result<bool> {
+    if !mount_info.target_is_mountpoint(target) {
+        return Ok(false);
+    }
+
+    bind_target_matches_source(source, target)
+}
+
+fn reconcile_bind_target(mount_info: &MountInfo, source: &Path, target: &Path) -> Result<bool> {
+    if bind_target_has_desired_state(mount_info, source, target)? {
+        return Ok(false);
+    }
+
+    if mount_info.target_is_mountpoint(target) {
+        info!(
+            "detaching existing mount at {:?} before remounting source {:?}",
+            target, source
+        );
+        umount2(target, MntFlags::MNT_DETACH)?;
+    }
+
+    Ok(true)
+}
+
 pub fn apply_mounts(vars: &PathExpansionState, mounts: &[ProfileMount]) -> Result<()> {
+    let mount_info = MountInfo::load()?;
+
     for m in mounts {
         let src = vars.expand_source(&m.source);
         let dst = vars.expand_target(&m.target);
+        if !reconcile_bind_target(&mount_info, &src, &dst)? {
+            info!(
+                "skipping bind mount for {:?}: target {:?} already resolves to source",
+                src, dst
+            );
+            continue;
+        }
         if m.read_only {
             mount_bind_ro_explicit(&src, &dst, m.recursive)?;
         } else {

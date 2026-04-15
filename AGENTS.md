@@ -147,6 +147,8 @@ Supporting privileged wrapper:
   - Search: `spawn_nsproxy_cli`, `nsproxy_path`, `main`, `sudo_check`
   - Files: `crates/nsproxy-ui/src/supervisor.rs`, `crates/nsproxy-core/src/bin/sproxy.rs`
 
+`fn spawn_cli_process` can be used for spawning sproxy instances through memfd to pass args, instead of as string arguments
+
 ### non daemonized variant
 
 Use when the action should run now and exit with the user process (interactive shell/tooling style), not managed by `sp up` process table.

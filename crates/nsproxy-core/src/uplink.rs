@@ -1957,7 +1957,7 @@ mod tests {
 
         // Verify stats data is preserved (check one entry in detail)
         let trojan_stats = deserialized.stats.get(&trojan_id).expect("Trojan stats missing");
-        assert!(!trojan_stats.data.is_empty(), "Trojan stats should have data");
+        assert!(!trojan_stats.minute_data.is_empty(), "Trojan stats should have data");
     }
 
     #[test]

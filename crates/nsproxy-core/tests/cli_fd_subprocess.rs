@@ -2,9 +2,12 @@
 //! `Cli` passed via an inheritable memfd.  The `Id` subcommand is used because
 //! it is stateless, requires no privileges, and exits immediately.
 
+use std::fs::create_dir_all;
 use std::io::{Seek, SeekFrom};
 use std::os::unix::io::FromRawFd;
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nsproxy_core::{Cli, MainCommand};
 
@@ -34,10 +37,18 @@ fn cli_to_inheritable_memfd(cli: &Cli) -> i32 {
 
 #[test]
 fn subprocess_id_via_memfd() {
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after UNIX_EPOCH")
+        .as_nanos();
+    let root = PathBuf::from(format!("/tmp/nsproxy-core-test-{unique_suffix}"));
+    create_dir_all(&root).expect("create temp root");
+
     let cli = Cli {
         conf: None,
-        root: None,
+        root: Some(root.clone()),
         no_wrap_check: false,
+        control_socket: None,
         cmd: MainCommand::Id { pid: None },
     };
 
