@@ -55,6 +55,15 @@ debug = true
 # Just strip manually
 
 
+[patch.crates-io]
+nsproxy-hickory-proto = { path = "../hickory-dns/crates/proto" }
+nsproxy-hickory-client = { path = "../hickory-dns/crates/client" }
+nsproxy-hickory-resolver = { path = "../hickory-dns/crates/resolver" }
+nsproxy-hickory-recursor = { path = "../hickory-dns/crates/recursor" }
+nsproxy-hickory-server = { path = "../hickory-dns/crates/server" }
+nsproxy-hickory-dns = { path = "../hickory-dns/bin" }
+nsproxy-hickory-util = { path = "../hickory-dns/util" }
+
 [workspace.dependencies]
 tun-rs = { version = "2.7.2", features = ["async_io"] }
 flume = "0.11.1"

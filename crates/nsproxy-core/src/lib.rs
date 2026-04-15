@@ -58,6 +58,7 @@ pub mod cmd_common;
 pub mod cmd_uplink;
 pub mod env;
 pub mod hot_reload;
+pub mod internal_dns;
 pub mod prelude;
 pub mod sandbox;
 pub mod shell;
@@ -116,6 +117,13 @@ pub trait NetlinkParse {
 }
 
 use ipnetwork::IpNetwork;
+
+pub const CAPTURED_RESOLV_CONF_DNS: &str = "100.68.0.2";
+pub const INTERNAL_RESOLV_CONF_DNS: &str = "127.0.0.1";
+
+fn default_resolv_conf_dns() -> String {
+    CAPTURED_RESOLV_CONF_DNS.to_string()
+}
 
 #[derive(Default)]
 pub struct AddressResponse {
@@ -274,6 +282,7 @@ mod tests {
                 },
                 locals: HashMap::new(),
                 dns_capture: Default::default(),
+                resolv_conf_dns: default_resolv_conf_dns(),
                 mounts: Vec::new(),
                 daemons: Vec::new(),
             }),
@@ -878,6 +887,9 @@ pub struct HotConfig {
     /// When absent or empty, all IPs are captured.
     #[serde(default)]
     pub dns_capture: HashSet<IpNetwork>,
+    /// Nameserver written into `/etc/resolv.conf` inside the running namespace.
+    #[serde(default = "default_resolv_conf_dns")]
+    pub resolv_conf_dns: String,
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
@@ -1058,6 +1070,20 @@ impl HotConfig {
     /// An empty `dns_capture` set means "capture all".
     pub fn captures_dns(&self, ip: IpAddr) -> bool {
         self.dns_capture.is_empty() || self.dns_capture.iter().any(|net| net.contains(ip))
+    }
+
+    pub fn dns_capture_enabled(&self) -> bool {
+        self.dns_capture
+            .iter()
+            .all(|net| net != &"0.0.0.0/32".parse().unwrap())
+    }
+
+    pub fn set_dns_capture_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.dns_capture.clear();
+        } else {
+            self.disable_dns_capture();
+        }
     }
 
     /// Override `dns_capture` with a sentinel that matches no real IP,
@@ -1717,6 +1743,13 @@ pub enum MainCommand {
         #[arg(short, long)]
         update: bool,
     },
+    /// Clone an existing profile into a new profile directory
+    Clone {
+        /// Name of the new profile to create
+        name: String,
+        /// Existing profile name to clone from
+        from: String,
+    },
     /// Create and persist a set of namespaces for a profile.
     /// A minimal long-lived process keeps the namespaces alive.
     /// Use `tun` and `veth` subcommands afterwards to attach networking.
@@ -1740,6 +1773,9 @@ pub enum MainCommand {
     Down {
         /// Profile name
         profile: String,
+        /// Remove the entire profile directory under the state root after teardown.
+        #[arg(long)]
+        rm: bool,
     },
     /// Attach a TUN device + tun2socks5 proxy to an already-up profile namespace.
     /// Only one TUN process may exist per profile at a time.
@@ -1762,9 +1798,14 @@ pub enum MainCommand {
         /// Use Clash uplink profile for all TUN connections
         #[arg(long)]
         clash: Option<String>,
-        // Convenience option to modify HotConfig
-        #[arg(long)]
-        no_dns_capture: bool,
+        // Optional override for HotConfig. When omitted, honor hot.json.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        no_dns_capture: Option<bool>,
+        /// Use internal DNS server by default
+        /// This server strips off IPv6 records. For compatilibty with certain proxies.
+        /// This was intended for Geph, because at the point of writing Geph doesn't work with IPv6 properly
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        internal_dns_server: Option<bool>,
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {
@@ -1794,17 +1835,22 @@ pub enum MainCommand {
     #[command(alias = "v")]
     Version,
     /// Pivot-root sandbox: enters an existing namespace, builds a tmpfs pivot
-    /// root from a profile's TemplateConfig, and watches HotConfig for changes.
-    /// Deprecated/Scheduled for refactor. This command currently runs a daemon which is bad.
+    /// root from a profile's TemplateConfig
+    /// This command is run whenever any change is supposed to be made to the sandbox
+    // Pass by FD if this is supposed to be a subprocess, instead of string args
     #[command(alias = "sb")]
     Sandbox {
         /// Profile name (must have been created with `profile` and brought up with `up`)
         profile: String,
-        #[command(flatten)]
-        sargs: ShellArgs,
     },
     /// Accept args as a serialized file
     File { path: PathBuf },
+    /// Nsproxy can be used as sudo. 
+    /// The difference is nsproxy does not change anything about Wayland other display protocol, introducing minimal context change
+    Sudo {
+        #[command(flatten)]
+        sargs: ShellArgs,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
@@ -2044,6 +2090,7 @@ mod cli_fd_tests {
             conf: None,
             root: None,
             no_wrap_check: false,
+            control_socket: None,
             cmd: MainCommand::Serve {
                 profile: "myvpn".into(),
                 tun_name: Some("tun42".into()),
@@ -2051,7 +2098,8 @@ mod cli_fd_tests {
                 no_default: false,
                 log: Some(LevelFilter::DEBUG),
                 clash: None,
-                no_dns_capture: true,
+                no_dns_capture: Some(true),
+                internal_dns_server: Some(false),
             },
         });
     }
@@ -2062,6 +2110,7 @@ mod cli_fd_tests {
             conf: None,
             root: Some("/nsp3".into()),
             no_wrap_check: true,
+            control_socket: None,
             cmd: MainCommand::Up {
                 profile: "myprofile".into(),
                 cmd: None,
@@ -2078,6 +2127,7 @@ mod cli_fd_tests {
             conf: None,
             root: None,
             no_wrap_check: false,
+            control_socket: None,
             cmd: MainCommand::Veth {
                 profile: "p1".into(),
                 veth_name: None,
@@ -2092,10 +2142,39 @@ mod cli_fd_tests {
             conf: None,
             root: None,
             no_wrap_check: false,
+            control_socket: None,
             cmd: MainCommand::Veth {
                 profile: "p2".into(),
                 veth_name: Some("v_custom".into()),
                 log: Some(LevelFilter::WARN),
+            },
+        });
+    }
+
+    #[test]
+    fn roundtrip_down_with_rm() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: None,
+            cmd: MainCommand::Down {
+                profile: "p3".into(),
+                rm: true,
+            },
+        });
+    }
+
+    #[test]
+    fn roundtrip_clone_profile() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: None,
+            cmd: MainCommand::Clone {
+                name: "p4-copy".into(),
+                from: "p4".into(),
             },
         });
     }

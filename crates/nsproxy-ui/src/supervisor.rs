@@ -208,6 +208,9 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         args: diag::SpawnArgs,
     },
+    DeleteContainer {
+        profile: ContainerName,
+    },
     StopContainer {
         profile: ContainerName,
     },
@@ -535,6 +538,7 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StopServe { .. } => "StopServe",
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
         SupervisorCommand::SpawnPty { .. } => "SpawnPty",
+        SupervisorCommand::DeleteContainer { .. } => "DeleteContainer",
         SupervisorCommand::StopContainer { .. } => "StopContainer",
         SupervisorCommand::KillContainer { .. } => "KillContainer",
         SupervisorCommand::KillManagedProcess { .. } => "KillManagedProcess",
@@ -560,6 +564,7 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         SupervisorCommand::StartUp { profile }
         | SupervisorCommand::StartServe { profile }
         | SupervisorCommand::StopServe { profile }
+        | SupervisorCommand::DeleteContainer { profile }
         | SupervisorCommand::StopContainer { profile }
         | SupervisorCommand::KillContainer { profile }
         | SupervisorCommand::ReloadHotconfig(profile)
@@ -987,7 +992,8 @@ impl Supervisor {
                         no_default: false,
                         log: None,
                         clash: None,
-                        no_dns_capture: false,
+                        no_dns_capture: None,
+                        internal_dns_server: None,
                     },
                 };
                 match bincode::serialize(&cli) {
@@ -1044,6 +1050,80 @@ impl Supervisor {
                 self.ensure_up_client(&profile);
                 if let Some(tx) = self.up_cmd.get(&profile) {
                     let _ = tx.send(diag::DaemonRequest::SpawnPty { args });
+                }
+            }
+            SupervisorCommand::DeleteContainer { profile } => {
+                info!(profile = profile.as_str(), "deleting container via sp down --rm");
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    diag::LogEntry {
+                        ts: diag::Timestamp::now(),
+                        level: "INFO".to_string(),
+                        target: "supervisor".to_string(),
+                        message: "Deleting container...".to_string(),
+                    },
+                );
+                let cli = Cli {
+                    conf: None,
+                    root: None,
+                    no_wrap_check: false,
+                    control_socket: None,
+                    cmd: MainCommand::Down {
+                        profile: profile.clone(),
+                        rm: true,
+                    },
+                };
+                match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+                    Ok(spawned) => {
+                        spawn_child_log_reader(
+                            profile.clone(),
+                            BootstrapLogStream::Stdout,
+                            spawned.stdout_r,
+                            self.event_tx.clone(),
+                            |profile, stream, line| SupervisorEvent::DeleteProcessLog {
+                                profile,
+                                stream,
+                                line,
+                            },
+                        );
+                        spawn_child_log_reader(
+                            profile.clone(),
+                            BootstrapLogStream::Stderr,
+                            spawned.stderr_r,
+                            self.event_tx.clone(),
+                            |profile, stream, line| SupervisorEvent::DeleteProcessLog {
+                                profile,
+                                stream,
+                                line,
+                            },
+                        );
+                        spawn_child_waiter(
+                            profile,
+                            spawned.pid,
+                            self.event_tx.clone(),
+                            |profile, success, detail| {
+                                SupervisorEvent::DeleteContainerFinished {
+                                    profile,
+                                    success,
+                                    detail,
+                                }
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        warn!(profile = profile.as_str(), "failed to spawn sp down: {err:?}");
+                        push_up_log(
+                            &mut self.up_logs,
+                            &profile,
+                            diag::LogEntry {
+                                ts: diag::Timestamp::now(),
+                                level: "WARN".to_string(),
+                                target: "supervisor".to_string(),
+                                message: format!("Failed to delete container: {err}"),
+                            },
+                        );
+                    }
                 }
             }
             SupervisorCommand::StopContainer { profile } => {
@@ -1289,6 +1369,16 @@ impl Supervisor {
             SupervisorCommand::Init => {
                 info!("initializing supervisor profiles from disk");
                 if let Ok(profile_infos) = crate::profile_loader::list_profiles() {
+                    let discovered: HashSet<_> = profile_infos
+                        .iter()
+                        .map(|info| info.name.clone())
+                        .collect();
+                    let existing: Vec<_> = self.known_profiles.iter().cloned().collect();
+                    for profile in existing {
+                        if !discovered.contains(&profile) {
+                            self.remove_profile(profile.as_str());
+                        }
+                    }
                     info!(
                         profile_count = profile_infos.len(),
                         "discovered profiles on disk"
@@ -1788,8 +1878,141 @@ impl Supervisor {
                     );
                 }
             }
+            SupervisorEvent::DeleteProcessLog {
+                profile,
+                stream,
+                line,
+            } => {
+                let level = match stream {
+                    BootstrapLogStream::Stdout => "INFO",
+                    BootstrapLogStream::Stderr => "WARN",
+                };
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    diag::LogEntry {
+                        ts: diag::Timestamp::now(),
+                        level: level.to_string(),
+                        target: "sp-down".to_string(),
+                        message: line,
+                    },
+                );
+            }
+            SupervisorEvent::DeleteContainerFinished {
+                profile,
+                success,
+                detail,
+            } => {
+                if success {
+                    info!(profile = profile.as_str(), "container deleted: {detail}");
+                    push_up_log(
+                        &mut self.up_logs,
+                        &profile,
+                        diag::LogEntry {
+                            ts: diag::Timestamp::now(),
+                            level: "INFO".to_string(),
+                            target: "supervisor".to_string(),
+                            message: "Container deleted from disk. Refresh to remove from list."
+                                .to_string(),
+                        },
+                    );
+                    self.finalize_deleted_profile_view(profile.as_str());
+                } else {
+                    warn!(profile = profile.as_str(), "container delete failed: {detail}");
+                    push_up_log(
+                        &mut self.up_logs,
+                        &profile,
+                        diag::LogEntry {
+                            ts: diag::Timestamp::now(),
+                            level: "WARN".to_string(),
+                            target: "supervisor".to_string(),
+                            message: format!("Delete failed: {detail}"),
+                        },
+                    );
+                    self.refresh_profile_status(&profile);
+                }
+            }
         }
         self.ectx.request_repaint();
+    }
+
+    fn remove_profile(&mut self, profile: &str) {
+        self.known_profiles.remove(profile);
+        self.daemon_catalog.remove(profile);
+        self.process_list_snapshot.remove(profile);
+        self.up_cmd.remove(profile);
+        self.diag_cmd.remove(profile);
+        self.up_connection.remove(profile);
+        self.diag_connection.remove(profile);
+        self.diag_state.remove(profile);
+        self.ns_alive_status.remove(profile);
+        self.up_logs.remove(profile);
+        self.container_lifecycle.remove(profile);
+        self.up_attempt.remove(profile);
+        self.diag_attempt.remove(profile);
+        self.config_cache.remove(profile);
+        self.ns_alive_cache.remove(profile);
+        self.profile_ns_cache.remove(profile);
+        self.process_raw_logs.remove(profile);
+        self.pending_auto_open_logs.remove(profile);
+        self.up_start_time.remove(profile);
+        self.spawned_daemons
+            .retain(|key| !key.starts_with(&format!("{}:", profile)));
+        if let Ok(mut guard) = self.pty_buf.lock() {
+            guard.remove(profile);
+        }
+        if let Ok(mut guard) = self.pty_wake_state.generations.lock() {
+            guard.remove(profile);
+        }
+        if self
+            .auto_open_logs_target
+            .as_ref()
+            .is_some_and(|target| target.profile == profile)
+        {
+            self.auto_open_logs_target = None;
+        }
+    }
+
+    fn finalize_deleted_profile_view(&mut self, profile: &str) {
+        self.process_list_snapshot.remove(profile);
+        self.up_cmd.remove(profile);
+        self.diag_cmd.remove(profile);
+        self.up_connection.remove(profile);
+        self.diag_connection.remove(profile);
+        self.diag_state.remove(profile);
+        self.ns_alive_status.insert(
+            profile.to_string(),
+            NsAliveStatus {
+                profile: profile.to_string(),
+                child_alive: false,
+                child_pid: None,
+                serve_alive: false,
+                serve_pid: None,
+                up_alive: false,
+                up_pid: None,
+            },
+        );
+        self.set_container_lifecycle(&profile.to_string(), ContainerLifecycleState::Stopped);
+        self.ns_alive_cache.remove(profile);
+        self.profile_ns_cache.remove(profile);
+        self.process_raw_logs.remove(profile);
+        self.pending_auto_open_logs.remove(profile);
+        self.up_start_time.remove(profile);
+        self.spawned_daemons
+            .retain(|key| !key.starts_with(&format!("{}:", profile)));
+        if let Ok(mut guard) = self.pty_buf.lock() {
+            guard.remove(profile);
+        }
+        if let Ok(mut guard) = self.pty_wake_state.generations.lock() {
+            guard.remove(profile);
+        }
+        if self
+            .auto_open_logs_target
+            .as_ref()
+            .is_some_and(|target| target.profile == profile)
+        {
+            self.auto_open_logs_target = None;
+        }
     }
 
     fn send_diag_cmd(&mut self, profile: &ContainerName, cmd: ControlCommand) -> bool {
@@ -2184,6 +2407,16 @@ enum SupervisorEvent {
         profile: ContainerName,
         stream: BootstrapLogStream,
         line: String,
+    },
+    DeleteProcessLog {
+        profile: ContainerName,
+        stream: BootstrapLogStream,
+        line: String,
+    },
+    DeleteContainerFinished {
+        profile: ContainerName,
+        success: bool,
+        detail: String,
     },
 }
 
@@ -2941,6 +3174,25 @@ fn spawn_bootstrap_log_reader(
     fd: i32,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
+    spawn_child_log_reader(profile, stream, fd, event_tx, |profile, stream, line| {
+        SupervisorEvent::BootstrapUpLog {
+            profile,
+            stream,
+            line,
+        }
+    });
+}
+
+fn spawn_child_log_reader<F>(
+    profile: ContainerName,
+    stream: BootstrapLogStream,
+    fd: i32,
+    event_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    event_builder: F,
+)
+where
+    F: Fn(ContainerName, BootstrapLogStream, String) -> SupervisorEvent + Send + 'static,
+{
     tokio::task::spawn_blocking(move || {
         let file = unsafe { File::from_raw_fd(fd) };
         let mut reader = BufReader::new(file);
@@ -2954,22 +3206,52 @@ fn spawn_bootstrap_log_reader(
                     if msg.is_empty() {
                         continue;
                     }
-                    let _ = event_tx.send(SupervisorEvent::BootstrapUpLog {
-                        profile: profile.clone(),
-                        stream,
-                        line: msg,
-                    });
+                    let _ = event_tx.send(event_builder(profile.clone(), stream, msg));
                 }
                 Err(err) => {
-                    let _ = event_tx.send(SupervisorEvent::BootstrapUpLog {
-                        profile: profile.clone(),
+                    let _ = event_tx.send(event_builder(
+                        profile.clone(),
                         stream,
-                        line: format!("bootstrap log read error: {err}"),
-                    });
+                        format!("log read error: {err}"),
+                    ));
                     break;
                 }
             }
         }
+    });
+}
+
+fn spawn_child_waiter<F>(
+    profile: ContainerName,
+    pid: Pid,
+    event_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    event_builder: F,
+)
+where
+    F: FnOnce(ContainerName, bool, String) -> SupervisorEvent + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut status: libc::c_int = 0;
+        let wait_rc = unsafe { libc::waitpid(pid.as_raw(), &mut status, 0) };
+        let (success, detail) = if wait_rc < 0 {
+            (
+                false,
+                format!(
+                    "waitpid failed for pid {}: {}",
+                    pid.as_raw(),
+                    std::io::Error::last_os_error()
+                ),
+            )
+        } else if unsafe { libc::WIFEXITED(status) } {
+            let code = unsafe { libc::WEXITSTATUS(status) };
+            (code == 0, format!("exit code {code}"))
+        } else if unsafe { libc::WIFSIGNALED(status) } {
+            let signal = unsafe { libc::WTERMSIG(status) };
+            (false, format!("terminated by signal {signal}"))
+        } else {
+            (false, format!("unexpected wait status {status}"))
+        };
+        let _ = event_tx.send(event_builder(profile, success, detail));
     });
 }
 

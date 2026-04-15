@@ -34,12 +34,13 @@ use nix::{
     sched::{CloneFlags, unshare},
     unistd::{
         ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, getresuid, pipe,
-        setsid,
-        setgroups, setresgid, setresuid,
+        setgroups, setresgid, setresuid, setsid,
     },
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use nsproxy_common::{ExactNS, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile, forever};
+use nsproxy_common::{
+    ExactNS, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile, forever,
+};
 use nsproxy_core::{
     BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
     SandboxMode, TemplateConfig, TunMaker,
@@ -55,7 +56,8 @@ use nsproxy_core::{
     sys::{
         Clone3Result, NSEnter, check_capsys, check_selfns, enable_ping_all, mount_bind,
         mount_bind_ro_explicit, mount_bind_root, mount_bind_rw_explicit, mount_ns,
-        mount_nsswitch_conf, mount_resolv_conf, mount_tmpfs, pivot_root_into, rm_mount,
+        mount_nsswitch_conf, mount_resolv_conf, mount_tmpfs, pivot_root_into,
+        replace_mount_resolv_conf, rm_mount,
     },
     tokio_netlink_conn,
     utils::ToExactNs,
@@ -76,7 +78,6 @@ use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
-    sync::Mutex,
     convert::Infallible,
     ffi::OsStr,
     fs::{self, Permissions},
@@ -95,6 +96,7 @@ use std::{
     pin::Pin,
     process::exit,
     str::FromStr,
+    sync::Mutex,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -111,6 +113,8 @@ use tun2socks5::{
     ipstack::stream::{IpStackStream, IpStackTcpStream},
     tun_rs::AsyncDevice,
 };
+
+use nsproxy_core::internal_dns::run_dns_ipv4_only;
 
 const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
 const PTY_BROADCAST_CAP: usize = 128;
@@ -407,7 +411,8 @@ fn main() -> anyhow::Result<()> {
             }
 
             if let Some(proc) = target_ns {
-                let target_pid = target_pid.expect("pid must exist when proc namespaces were built");
+                let target_pid =
+                    target_pid.expect("pid must exist when proc namespaces were built");
                 println!();
                 println!(
                     "{} {}",
@@ -483,11 +488,15 @@ fn main() -> anyhow::Result<()> {
                 print_divider(&pid_widths);
             }
 
-            let mount_ns = (std::fs::metadata("/proc/self/ns/mnt"), std::fs::metadata("/proc/1/ns/mnt"));
+            let mount_ns = (
+                std::fs::metadata("/proc/self/ns/mnt"),
+                std::fs::metadata("/proc/1/ns/mnt"),
+            );
             println!();
             match mount_ns {
                 (Ok(self_mnt), Ok(init_mnt)) => {
-                    let isolated = self_mnt.dev() != init_mnt.dev() || self_mnt.ino() != init_mnt.ino();
+                    let isolated =
+                        self_mnt.dev() != init_mnt.dev() || self_mnt.ino() != init_mnt.ino();
                     println!(
                         "{} {} {}",
                         "mount_ns".bold().bright_blue(),
@@ -510,6 +519,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             println!();
+        }
+        MainCommand::Sudo { sargs } => {
+            let mut shell_prefs = ShellPrefs::default();
+            shell_prefs.take_args(sargs);
+            shell_prefs.uid = shell_prefs.uid.or(Some(0));
+            shell_prefs.adjust();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            rt.block_on(async {
+                let rx = shell_prefs.spawn()?;
+                rx.wait_for_child().await?;
+
+                aok!()
+            })?;
         }
         /// We are just putting state in proc now, basically. Seems cleaner
         MainCommand::Enter { sargs, target } => {
@@ -988,6 +1013,58 @@ fn main() -> anyhow::Result<()> {
                 info!("Hot config: {:?}", new_profile.hot);
             }
         }
+        MainCommand::Clone { name, from } => {
+            let clean_name = {
+                let name_path = PathBuf::from(&name);
+                name_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&name)
+                    .to_string()
+            };
+
+            if clean_name.contains('/') {
+                bail!("new profile name must not contain '/'");
+            }
+            if from.contains('/') {
+                bail!("source profile name must not contain '/'");
+            }
+            if clean_name == from {
+                bail!("new profile name must differ from source profile name");
+            }
+
+            let source_profile_path = state_paths::profile_config(&from);
+            if !source_profile_path.exists() {
+                bail!("source profile does not exist at {:?}", source_profile_path);
+            }
+
+            let target_dir = state_paths::profile_dir(&clean_name);
+            if target_dir.exists() {
+                bail!("target profile directory already exists: {:?}", target_dir);
+            }
+
+            let target_profile_path = state_paths::profile_config(&clean_name);
+            let target_hot_path = state_paths::hot_config(&clean_name);
+            let source_hot_path = state_paths::hot_config(&from);
+
+            info!("Cloning profile '{}' -> '{}'", from, clean_name);
+            std::fs::create_dir_all(&target_dir)?;
+
+            let mut profile = TemplateConfig::load(&source_profile_path)?;
+            let hot = load_hot_config_from_disk_or_default(&source_hot_path);
+
+            hot.save(&target_hot_path)?;
+            profile.hot = PathBuf::from("@/hot.json");
+            profile.hot_init = Some(hot);
+
+            let profile_json = serde_json::to_string_pretty(&profile)?;
+            std::fs::write(&target_profile_path, profile_json)?;
+
+            info!("✓ Profile cloned successfully");
+            info!("Source: {:?}", source_profile_path);
+            info!("Config: {:?}", target_profile_path);
+            info!("Hot config: {:?}", target_hot_path);
+        }
         MainCommand::Up {
             profile,
             cmd,
@@ -1123,8 +1200,7 @@ fn main() -> anyhow::Result<()> {
                         if let Some(target_pid) = upkeeper_pid {
                             warn!(
                                 profile = profile.as_str(),
-                                target_pid,
-                                "up child: entering existing namespaces"
+                                target_pid, "up child: entering existing namespaces"
                             );
                             enter_all_profile_namespaces_of_pid(target_pid)?;
                         }
@@ -1184,8 +1260,7 @@ fn main() -> anyhow::Result<()> {
                         let bind_net = ExactNS::from_source(bind_mount.clone())?;
                         info!(
                             "up ns indicator bind_mount[mnt_path={:?},net={}]",
-                            bind_mount,
-                            bind_net.unique
+                            bind_mount, bind_net.unique
                         );
 
                         NamespacesRegistry::update_locked(|registry| {
@@ -1211,7 +1286,9 @@ fn main() -> anyhow::Result<()> {
                         })?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
-                        if let Some(old_up_pid) = existing_up_daemon_pid.filter(|pid| pid_is_alive(*pid)) {
+                        if let Some(old_up_pid) =
+                            existing_up_daemon_pid.filter(|pid| pid_is_alive(*pid))
+                        {
                             warn!(
                                 profile = profile.as_str(),
                                 old_up_pid,
@@ -1245,8 +1322,7 @@ fn main() -> anyhow::Result<()> {
                             })?;
                             warn!(
                                 profile = profile.as_str(),
-                                old_up_pid,
-                                "up replacement: old up daemon shutdown acknowledged"
+                                old_up_pid, "up replacement: old up daemon shutdown acknowledged"
                             );
                         }
 
@@ -1270,9 +1346,10 @@ fn main() -> anyhow::Result<()> {
                 Err(er) => report_clone3_err(&er)?,
             }
         }
-        MainCommand::Down { profile } => {
+        MainCommand::Down { profile, rm } => {
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let bind_mount = state_paths::profile_netns_bind(&profile);
+            let profile_dir = state_paths::profile_dir(&profile);
 
             // Kill the keeper process if we know its PID.
             if ns_meta.exists() {
@@ -1280,14 +1357,14 @@ fn main() -> anyhow::Result<()> {
                     if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
                         if let Some(pid) = ns_alive.child_pid {
                             let proc_path = PathBuf::from("/proc").join(pid.to_string());
-                        if proc_path.exists() {
-                            warn!("killing keeper process pid={}", pid);
-                            if !kill_and_wait_for_exit(pid, Duration::from_secs(5)) {
-                                warn!("keeper pid {} did not exit within 5 seconds", pid);
+                            if proc_path.exists() {
+                                warn!("killing keeper process pid={}", pid);
+                                if !kill_and_wait_for_exit(pid, Duration::from_secs(5)) {
+                                    warn!("keeper pid {} did not exit within 5 seconds", pid);
+                                }
+                            } else {
+                                info!("keeper process pid={} is already gone", pid);
                             }
-                        } else {
-                            info!("keeper process pid={} is already gone", pid);
-                        }
                         }
                     }
                 }
@@ -1303,17 +1380,35 @@ fn main() -> anyhow::Result<()> {
             })?;
 
             // Unmount and remove the bind-mount file.
+            let mut bind_mount_removed = !bind_mount.exists();
             if bind_mount.exists() {
                 if let Err(e) = rm_mount(&bind_mount) {
                     warn!("failed to remove bind mount {:?}: {:?}", bind_mount, e);
                 } else {
                     info!("removed bind mount {:?}", bind_mount);
+                    bind_mount_removed = true;
                 }
             } else {
                 warn!(
                     "bind mount {:?} does not exist, nothing to unmount",
                     bind_mount
                 );
+            }
+
+            if rm {
+                if bind_mount_removed {
+                    if profile_dir.exists() {
+                        std::fs::remove_dir_all(&profile_dir)?;
+                        info!("removed profile directory {:?}", profile_dir);
+                    } else {
+                        warn!("profile directory {:?} does not exist", profile_dir);
+                    }
+                } else {
+                    warn!(
+                        "skipping profile directory removal for {:?} because bind mount cleanup failed",
+                        profile_dir
+                    );
+                }
             }
 
             warn!("profile '{}' is down", profile);
@@ -1326,6 +1421,7 @@ fn main() -> anyhow::Result<()> {
             log,
             clash,
             no_dns_capture,
+            internal_dns_server,
         } => cmd_serve(
             profile,
             tun_name,
@@ -1339,6 +1435,7 @@ fn main() -> anyhow::Result<()> {
                 reload_handle.modify(|k| *k.filter_mut() = level)?;
                 Ok(())
             },
+            internal_dns_server,
         )?,
         MainCommand::Veth {
             profile,
@@ -1498,15 +1595,14 @@ fn main() -> anyhow::Result<()> {
         MainCommand::StateTree => {
             let tree = nsproxy_core::state_blueprint::global_state_tree();
             println!("{}", tree.render_tree());
-        },
+        }
         MainCommand::Version => {
             println!("hash={}", nsproxy_core::build_tree_hash());
             println!("epoch={}", nsproxy_core::build_epoch_secs());
-        },
+        }
         MainCommand::Uplink { kind } => cmd_uplink(kind)?,
-        MainCommand::Sandbox { profile, sargs } => {
-            // Pivot-root sandbox: enter an existing namespace, apply
-            // TemplateConfig pivot, then watch HotConfig for mount changes.
+        MainCommand::Sandbox { profile } => {
+            // Pivot-root sandbox: enter an existing namespace,
             check_capsys()?;
 
             let profile_path = state_paths::profile_config(&profile);
@@ -1575,39 +1671,52 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-
-            let mut shell_prefs = ShellPrefs::default();
-            shell_prefs.take_args(sargs);
-            if profile_conf.sargs.shell.is_some() {
-                shell_prefs.take_args(profile_conf.sargs.clone());
-            }
-            apply_ns_env(&mut shell_prefs, &ns_alive);
-            shell_prefs.adjust()?;
-
-            // Spawn shell and watch hot config for mount changes.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
-                let child = shell_prefs.spawn()?;
-
-                // Watch hot config for changes in a background task.
-                let hot_watch_path = hot_path.clone();
-                let hot_watch_vars = hot_vars.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = watch_hot_mounts(&hot_watch_path, hot_watch_vars).await {
-                        warn!("hot config watcher exited: {}", e);
-                    }
-                });
-
-                child.wait_for_child().await?;
-                aok!()
-            })?;
         }
         _ => unimplemented!(),
     }
 
     Ok(())
+}
+
+fn load_hot_config_from_disk_or_default(path: &Path) -> HotConfig {
+    match std::fs::read_to_string(path) {
+        Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
+            Ok(conf) => conf,
+            Err(e) => {
+                warn!(
+                    "failed to parse hot config {:?} at startup: {}, using default",
+                    path, e
+                );
+                HotConfig::default()
+            }
+        },
+        Err(e) => {
+            warn!(
+                "failed to read hot config {:?} at startup: {}, using default",
+                path, e
+            );
+            HotConfig::default()
+        }
+    }
+}
+
+fn load_hot_config_with_serve_dns_overrides(
+    path: &Path,
+    no_dns_capture: Option<bool>,
+    internal_dns_server: Option<bool>,
+) -> HotConfig {
+    let mut hot = load_hot_config_from_disk_or_default(path);
+    if let Some(no_dns_capture) = no_dns_capture {
+        hot.set_dns_capture_enabled(!no_dns_capture);
+    }
+    if let Some(internal_dns_server) = internal_dns_server {
+        hot.resolv_conf_dns = if internal_dns_server {
+            nsproxy_core::INTERNAL_RESOLV_CONF_DNS.to_string()
+        } else {
+            nsproxy_core::CAPTURED_RESOLV_CONF_DNS.to_string()
+        };
+    }
+    hot
 }
 
 fn cmd_serve(
@@ -1617,9 +1726,10 @@ fn cmd_serve(
     no_default: bool,
     log: Option<LevelFilter>,
     _clash: Option<String>,
-    no_dns_capture: bool,
+    no_dns_capture: Option<bool>,
     control_socket: Option<PathBuf>,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
+    internal_dns_server: Option<bool>,
 ) -> Result<()> {
     let ns_meta = state_paths::profile_ns_meta(&profile);
     let ns_alive = read_ns_alive(&ns_meta)?;
@@ -1662,6 +1772,13 @@ fn cmd_serve(
                 ns_source.enter(CloneFlags::CLONE_NEWNS)?;
                 ns_source.enter(CloneFlags::CLONE_NEWNET)?;
 
+                let initial_hot = load_hot_config_with_serve_dns_overrides(
+                    &hot_conf,
+                    no_dns_capture,
+                    internal_dns_server,
+                );
+                replace_mount_resolv_conf(&initial_hot.resolv_conf_dns)?;
+
                 let mut tun = TunMaker::default();
                 tun.name = tun_name.clone();
                 tun.mtu = mtu;
@@ -1682,6 +1799,7 @@ fn cmd_serve(
                     use tokio_send_fd::SendFd;
                     tx.set_nonblocking(true)?;
                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
                     let nl = tokio_netlink_conn()?;
                     nl.up_lo().await?;
@@ -1706,6 +1824,19 @@ fn cmd_serve(
                         nl.ip_add_default_route(tun_state.dev_index).await?;
                     }
 
+                    warn!("start internal DNS server");
+                    let mut dns_shutdown_rx = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            rx = run_dns_ipv4_only() => {
+                                warn!("{:?}", rx);
+                            }
+                            _ = dns_shutdown_rx.changed() => {
+                                warn!("internal DNS server stopped after control socket closed");
+                            }
+                        }
+                    });
+
                     tokio::spawn(async move {
                         let conf = Some(hot_conf);
                         if let Some(conf) = conf {
@@ -1716,12 +1847,14 @@ fn cmd_serve(
                                 let k = tx.read(&mut read[..]).await?;
                                 if k < 1 {
                                     error!("in-ns config watcher exits due to EOF");
+                                    let _ = shutdown_tx.send(true);
                                     break;
                                 }
                                 info!("in-ns reload config");
                                 let fc = tokio::fs::read_to_string(&conf).await?;
                                 match serde_json::from_str::<HotConfig>(&fc) {
                                     Ok(newconf) => {
+                                        replace_mount_resolv_conf(&newconf.resolv_conf_dns)?;
                                         tx.write(&[0, 0, 0, 0]).await?;
                                         for (in_port, _dst) in &newconf.locals {
                                             let bind = std::net::TcpListener::bind(format!(
@@ -1738,13 +1871,16 @@ fn cmd_serve(
                                     }
                                     _ => {}
                                 }
+
+                                // TODO: DNS
                             }
                         }
 
                         aok!()
                     });
 
-                    std::future::pending::<()>().await;
+                    let mut shutdown_rx = shutdown_rx;
+                    let _ = shutdown_rx.changed().await;
                     aok!()
                 })?;
             }
@@ -1789,33 +1925,14 @@ fn cmd_serve(
                     let (st_sx, acceptor) = flume::unbounded();
                     let (hot_reload_tx, hot_reload_rx) = tokio::sync::mpsc::channel(8);
 
-                    let initial_hot = match tokio::fs::read_to_string(&hot_conf).await {
-                        Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
-                            Ok(conf) => conf,
-                            Err(e) => {
-                                warn!(
-                                    "failed to parse hot config {:?} at startup: {}, using default",
-                                    hot_conf, e
-                                );
-                                HotConfig::default()
-                            }
-                        },
-                        Err(e) => {
-                            warn!(
-                                "failed to read hot config {:?} at startup: {}, using default",
-                                hot_conf, e
-                            );
-                            HotConfig::default()
-                        }
-                    };
-                    let initial_hot = if no_dns_capture {
-                        let mut h = initial_hot;
-                        h.disable_dns_capture();
-                        h.save(&hot_conf)?;
-                        h
-                    } else {
-                        initial_hot
-                    };
+                    let mut initial_hot = load_hot_config_with_serve_dns_overrides(
+                        &hot_conf,
+                        no_dns_capture,
+                        internal_dns_server,
+                    );
+                    if no_dns_capture.is_some() || internal_dns_server.is_some() {
+                        initial_hot.save(&hot_conf)?;
+                    }
 
                     let (hot_tx, hot_rx) = tokio::sync::watch::channel(initial_hot.clone());
                     let shared_hot = Arc::new(hot_rx);
@@ -2257,11 +2374,16 @@ async fn run_up_daemon(
                         pty_masters2,
                         pty_streams2,
                         exit_broadcast2,
-                    ).await {
+                    )
+                    .await
+                    {
                         warn!("up daemon reversed client error: {}", e);
                     }
                 }
-                Err(e) => warn!("up daemon: failed to connect to control socket {:?}: {}", ctrl_path, e),
+                Err(e) => warn!(
+                    "up daemon: failed to connect to control socket {:?}: {}",
+                    ctrl_path, e
+                ),
             }
         });
     }
@@ -2270,7 +2392,10 @@ async fn run_up_daemon(
         let (mut stream, _addr) = listener.accept().await?;
 
         if simulate_conn_close {
-            warn!(profile, "up daemon mock mode: simulate_conn_close=true, dropping accepted connection");
+            warn!(
+                profile,
+                "up daemon mock mode: simulate_conn_close=true, dropping accepted connection"
+            );
             continue;
         }
 
@@ -2303,7 +2428,9 @@ async fn run_up_daemon(
                 pty_masters_conn,
                 pty_streams_conn,
                 exit_broadcast_conn,
-            ).await {
+            )
+            .await
+            {
                 warn!("up daemon client error: {}", e);
             }
         });
@@ -2369,7 +2496,8 @@ fn append_pty_scrollback(state: &mut PtyScrollbackState, data: &[u8]) {
     }
     if data.len() >= state.cap {
         state.ring.clear();
-        state.ring
+        state
+            .ring
             .extend(data[data.len().saturating_sub(state.cap)..].iter().copied());
         return;
     }
@@ -3052,7 +3180,10 @@ async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid:
         }
     }
 
-    warn!(keeper_pid, "up daemon stop: waiting for keeper process exit");
+    warn!(
+        keeper_pid,
+        "up daemon stop: waiting for keeper process exit"
+    );
     let keeper_dead = kill_and_wait_for_exit_async(keeper_pid, Duration::from_secs(5)).await;
 
     if !keeper_dead {
@@ -3065,7 +3196,9 @@ async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid:
     reap_dead_children_into_state(state);
     wait_all_children_async(state, Duration::from_secs(5)).await;
     if any_child_alive(state) {
-        warn!("up daemon stop: keeper is dead but children still alive; keeping socket loop running");
+        warn!(
+            "up daemon stop: keeper is dead but children still alive; keeping socket loop running"
+        );
         return false;
     }
 
@@ -3093,19 +3226,20 @@ fn any_child_alive(state: &Arc<ArcSwap<UpDaemonState>>) -> bool {
 /// after the fd fires.
 async fn wait_for_child_exit_async(pid: u32) {
     use std::os::unix::io::AsRawFd as _;
-    use tokio::io::unix::AsyncFd;
     use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
 
-    let pidfd = unsafe { pidfd::PidFd::open(pid as libc::pid_t, 0) }
-        .expect("pidfd_open failed");
+    let pidfd = unsafe { pidfd::PidFd::open(pid as libc::pid_t, 0) }.expect("pidfd_open failed");
     // O_NONBLOCK is required by tokio's AsyncFd.
     unsafe {
         let flags = libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL, 0);
         libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
-    let async_fd = AsyncFd::with_interest(pidfd, Interest::READABLE)
-        .expect("AsyncFd creation failed");
-    let mut guard = async_fd.readable().await
+    let async_fd =
+        AsyncFd::with_interest(pidfd, Interest::READABLE).expect("AsyncFd creation failed");
+    let mut guard = async_fd
+        .readable()
+        .await
         .expect("AsyncFd readable wait failed");
     guard.retain_ready();
     // Reap the zombie.
@@ -3201,7 +3335,9 @@ fn spawn_cli_process(
 async fn connect_and_greet_up(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
     let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
     diag::control_handshake_client(&mut stream).await?;
-    let greeting = diag::ControlSocketGreeting::UpDaemon { name: profile.to_string() };
+    let greeting = diag::ControlSocketGreeting::UpDaemon {
+        name: profile.to_string(),
+    };
     let frame = diag::encode_control_greeting(&greeting)?;
     use tokio::io::AsyncWriteExt as _;
     stream.write_all(&frame).await?;
@@ -3210,10 +3346,15 @@ async fn connect_and_greet_up(ctrl_path: &Path, profile: &str) -> Result<tokio::
 
 /// Connect to the UI control socket, send a `ControlSocketGreeting::ServeDaemon` frame,
 /// and return the stream ready to be handed to `DiagServer::add_reversed_client`.
-async fn connect_and_greet_serve(ctrl_path: &Path, profile: &str) -> Result<tokio::net::UnixStream> {
+async fn connect_and_greet_serve(
+    ctrl_path: &Path,
+    profile: &str,
+) -> Result<tokio::net::UnixStream> {
     let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
     diag::control_handshake_client(&mut stream).await?;
-    let greeting = diag::ControlSocketGreeting::ServeDaemon { name: profile.to_string() };
+    let greeting = diag::ControlSocketGreeting::ServeDaemon {
+        name: profile.to_string(),
+    };
     let frame = diag::encode_control_greeting(&greeting)?;
     use tokio::io::AsyncWriteExt as _;
     stream.write_all(&frame).await?;
@@ -3223,7 +3364,11 @@ async fn connect_and_greet_serve(ctrl_path: &Path, profile: &str) -> Result<toki
 fn spawn_daemon_process(
     args: &diag::SpawnArgs,
     ns_alive: &nsproxy_core::NsAlive,
-) -> Result<(Clone3Result, std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
+) -> Result<(
+    Clone3Result,
+    std::os::unix::io::RawFd,
+    std::os::unix::io::RawFd,
+)> {
     let exec = args
         .exec
         .clone()
@@ -3622,12 +3767,17 @@ async fn write_bincode_frame_async<T: Serialize, W: tokio::io::AsyncWriteExt + U
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let payload = bincode::serialize(val)?;
-    stream.write_all(&(payload.len() as u32).to_le_bytes()).await?;
+    stream
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .await?;
     stream.write_all(&payload).await?;
     Ok(())
 }
 
-async fn read_bincode_frame_async<T: for<'de> Deserialize<'de>, R: tokio::io::AsyncReadExt + Unpin>(
+async fn read_bincode_frame_async<
+    T: for<'de> Deserialize<'de>,
+    R: tokio::io::AsyncReadExt + Unpin,
+>(
     stream: &mut R,
 ) -> Result<Option<T>> {
     use tokio::io::AsyncReadExt as _;

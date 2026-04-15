@@ -109,6 +109,10 @@ flume.workspace = true
 tun-rs.workspace = true
 thiserror = "1.0"
 ctrlc2 = { version = "3.5", features = ["tokio", "termination"] }
+nsproxy-hickory-client = "0.25"
+nsproxy-hickory-dns = "0.25"
+nsproxy-hickory-server = { version = "0.25", features = ["recursor", "resolver"]}
+nsproxy-hickory-resolver = { version = "0.25", features = ["tokio"] }
 
 [lints.clippy]
 all = "allow"
