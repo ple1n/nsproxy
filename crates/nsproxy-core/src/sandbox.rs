@@ -13,6 +13,7 @@ use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount2};
 use nix::unistd::{Gid, Uid, chown};
 use std::os::unix::fs::PermissionsExt;
 use tracing::{info, warn};
+use nsproxy_common::{ExactNS, NSFrom, PidPath};
 
 use crate::{
     PathExpansionState, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
@@ -234,25 +235,19 @@ pub enum SandboxState {
     AlreadyPivoted,
 }
 
-/// Check whether we are in an isolated mount namespace (not the host's).
+/// Check whether the current process is in the expected profile mount namespace.
 ///
-/// Compares the mount-namespace inode of this process against PID 1 (init).
-/// Also verifies the root mount is not `shared:`, which would propagate
-/// changes back to the host.
-///
-/// Returns `Ok(())` if isolated, `Err` if we appear to be in the host ns.
-pub fn assert_mount_ns_isolated() -> Result<()> {
-    let self_mnt = std::fs::metadata("/proc/self/ns/mnt")?;
-    let init_mnt = std::fs::metadata("/proc/1/ns/mnt")?;
+/// This avoids relying on `/proc/1`, which is not a stable host reference once
+/// PID namespaces are unshared. The expected namespace identity comes from the
+/// persisted profile namespace registry.
+pub fn assert_mount_ns_matches(expected_mnt: &ExactNS) -> Result<()> {
+    let self_mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))?;
 
-    // Device + inode uniquely identifies a namespace.
-    if self_mnt.dev() == init_mnt.dev() && self_mnt.ino() == init_mnt.ino() {
+    if self_mnt.unique != expected_mnt.unique {
         bail!(
-            "refusing to sandbox: this process shares the host mount namespace \
-             (mnt ns inode {} == init mnt ns inode {}). \
-             The profile must be brought up with `sp up` first.",
-            self_mnt.ino(),
-            init_mnt.ino()
+            "refusing to sandbox: current mount namespace {} does not match expected profile mount namespace {}",
+            self_mnt.unique,
+            expected_mnt.unique
         );
     }
 
@@ -265,9 +260,8 @@ pub fn assert_mount_ns_isolated() -> Result<()> {
     }
 
     info!(
-        "mount namespace isolated (self ino={}, init ino={})",
-        self_mnt.ino(),
-        init_mnt.ino()
+        "mount namespace validated against profile registry ({})",
+        self_mnt.unique
     );
     Ok(())
 }

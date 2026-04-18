@@ -927,6 +927,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: "Starting container...".to_string(),
+                        fields: Vec::new(),
                     },
                 );
                 match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
@@ -978,6 +979,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: "Starting sp serve...".to_string(),
+                        fields: Vec::new(),
                     },
                 );
                 let cli = Cli {
@@ -1062,6 +1064,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: "Deleting container...".to_string(),
+                        fields: Vec::new(),
                     },
                 );
                 let cli = Cli {
@@ -1121,6 +1124,7 @@ impl Supervisor {
                                 level: "WARN".to_string(),
                                 target: "supervisor".to_string(),
                                 message: format!("Failed to delete container: {err}"),
+                                fields: Vec::new(),
                             },
                         );
                     }
@@ -1140,6 +1144,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: "Stopping container...".to_string(),
+                        fields: Vec::new(),
                     },
                 );
                 self.refresh_profile_state_only(&profile);
@@ -1162,6 +1167,7 @@ impl Supervisor {
                             level: "INFO".to_string(),
                             target: "supervisor".to_string(),
                             message: "Profile already stopped".to_string(),
+                            fields: Vec::new(),
                         },
                     );
                     self.refresh_profile_status(&profile);
@@ -1192,6 +1198,7 @@ impl Supervisor {
                                 level: "INFO".to_string(),
                                 target: "supervisor".to_string(),
                                 message: "Requested graceful stop via sp up daemon".to_string(),
+                                fields: Vec::new(),
                             },
                         );
                     } else {
@@ -1206,6 +1213,7 @@ impl Supervisor {
                                 message:
                                     "Failed to send graceful stop; retry to force kill container"
                                         .to_string(),
+                                fields: Vec::new(),
                             },
                         );
                     }
@@ -1220,6 +1228,7 @@ impl Supervisor {
                             target: "supervisor".to_string(),
                             message: "sp up daemon unavailable; retry to force kill container"
                                 .to_string(),
+                            fields: Vec::new(),
                         },
                     );
                 }
@@ -1239,6 +1248,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: "Killing container...".to_string(),
+                        fields: Vec::new(),
                     },
                 );
                 self.refresh_profile_state_only(&profile);
@@ -1257,6 +1267,7 @@ impl Supervisor {
                             level: "INFO".to_string(),
                             target: "supervisor".to_string(),
                             message: "Profile already stopped".to_string(),
+                            fields: Vec::new(),
                         },
                     );
                     self.refresh_profile_status(&profile);
@@ -1845,6 +1856,7 @@ impl Supervisor {
                             level: "INFO".to_string(),
                             target: "supervisor".to_string(),
                             message: "Container stopped".to_string(),
+                            fields: Vec::new(),
                         },
                     );
                     self.refresh_profile_status(&profile);
@@ -1874,6 +1886,7 @@ impl Supervisor {
                             level: level.to_string(),
                             target: "sp-up-bootstrap".to_string(),
                             message: line,
+                            fields: Vec::new(),
                         },
                     );
                 }
@@ -1895,6 +1908,7 @@ impl Supervisor {
                         level: level.to_string(),
                         target: "sp-down".to_string(),
                         message: line,
+                        fields: Vec::new(),
                     },
                 );
             }
@@ -1914,6 +1928,7 @@ impl Supervisor {
                             target: "supervisor".to_string(),
                             message: "Container deleted from disk. Refresh to remove from list."
                                 .to_string(),
+                            fields: Vec::new(),
                         },
                     );
                     self.finalize_deleted_profile_view(profile.as_str());
@@ -1927,6 +1942,7 @@ impl Supervisor {
                             level: "WARN".to_string(),
                             target: "supervisor".to_string(),
                             message: format!("Delete failed: {detail}"),
+                            fields: Vec::new(),
                         },
                     );
                     self.refresh_profile_status(&profile);
@@ -2066,6 +2082,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: format!("{} connected", target.label()),
+                        fields: Vec::new(),
                     },
                 ),
                 ConnectionState::Disconnected => push_up_log(
@@ -2076,6 +2093,7 @@ impl Supervisor {
                         level: "INFO".to_string(),
                         target: "supervisor".to_string(),
                         message: format!("{} disconnected", target.label()),
+                        fields: Vec::new(),
                     },
                 ),
                 ConnectionState::NoRetry => push_up_log(
@@ -2086,6 +2104,7 @@ impl Supervisor {
                         level: "WARN".to_string(),
                         target: "supervisor".to_string(),
                         message: format!("{} upgrade rejected — no further retries", target.label()),
+                        fields: Vec::new(),
                     },
                 ),
                 ConnectionState::Connecting => {}
@@ -2102,6 +2121,7 @@ impl Supervisor {
                         level: "WARN".to_string(),
                         target: "supervisor".to_string(),
                         message: format!("{} error: {}", target.label(), err),
+                        fields: Vec::new(),
                     },
                 );
             }
@@ -2131,6 +2151,7 @@ impl Supervisor {
                 level: "WARN".to_string(),
                 target: "supervisor".to_string(),
                 message: format!("{} error: {}", target.label(), error),
+                fields: Vec::new(),
             },
         );
     }
@@ -3495,6 +3516,7 @@ fn fallback_stop_profile_from_metadata(
                 level: "WARN".to_string(),
                 target: "supervisor".to_string(),
                 message: "No ns metadata available for container kill fallback".to_string(),
+                fields: Vec::new(),
             },
         );
         return;
@@ -3519,6 +3541,7 @@ fn fallback_stop_profile_from_metadata(
                         "Container kill fallback sent SIGKILL to {} pid {}",
                         label, pid
                     ),
+                    fields: Vec::new(),
                 },
             );
             killed_any = true;
@@ -3534,8 +3557,19 @@ fn fallback_stop_profile_from_metadata(
                 level: "INFO".to_string(),
                 target: "supervisor".to_string(),
                 message: "Container kill fallback found no live up/keeper pid".to_string(),
+                fields: Vec::new(),
             },
         );
+    }
+}
+
+fn plain_log_entry(level: &str, target: &str, message: impl Into<String>) -> LogEntry {
+    LogEntry {
+        ts: diag::Timestamp::now(),
+        level: level.to_string(),
+        target: target.to_string(),
+        message: message.into(),
+        fields: Vec::new(),
     }
 }
 

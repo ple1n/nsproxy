@@ -283,6 +283,7 @@ mod tests {
                 locals: HashMap::new(),
                 dns_capture: Default::default(),
                 resolv_conf_dns: default_resolv_conf_dns(),
+                route: HotRoute::None,
                 mounts: Vec::new(),
                 daemons: Vec::new(),
             }),
@@ -486,7 +487,7 @@ use utils::MapExt;
 use crate::shell::ShellArgs;
 use crate::utils::dump_as_json;
 use crate::utils::dump_as_toml;
-use nsproxy_common::routing::ProxyNym;
+use nsproxy_common::routing::{ProxyID, ProxyNym};
 
 impl NetlinkOps for Handle {
     async fn fetch_routing_table(&self) -> Result<RoutingTable> {
@@ -869,6 +870,18 @@ pub macro aok {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
+pub enum HotRoute {
+    /// No explicit runtime route is configured.
+    #[default]
+    None,
+    /// Route all normal proxyable traffic through one specific uplink proxy.
+    SimpleProxy { proxy_id: ProxyID },
+}
+
+impl HotRoute {
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
@@ -890,6 +903,9 @@ pub struct HotConfig {
     /// Nameserver written into `/etc/resolv.conf` inside the running namespace.
     #[serde(default = "default_resolv_conf_dns")]
     pub resolv_conf_dns: String,
+    /// Persisted live routing selection for the running serve process.
+    #[serde(default)]
+    pub route: HotRoute,
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
@@ -1032,6 +1048,20 @@ impl HotConfig {
             mount.source = vars.expand(&mount.source);
             mount.target = vars.expand(&mount.target);
         }
+
+        for daemon in &mut self.daemons {
+            if let Some(cwd) = daemon.cwd.clone() {
+                daemon.cwd = Some(vars.expand(&cwd));
+            }
+            if let Some(shell) = daemon.shell.clone() {
+                let shell_path = PathBuf::from(&shell);
+                if PathExpansionState::is_home_variable(&shell_path)
+                    || PathExpansionState::is_instance_variable(&shell_path)
+                {
+                    daemon.shell = Some(vars.expand(&shell_path).to_string_lossy().to_string());
+                }
+            }
+        }
     }
 
     /// Merge shorthand `mnt` entries with explicit `mounts`.
@@ -1098,6 +1128,7 @@ impl HotConfig {
         std::fs::write(path, json)?;
         Ok(())
     }
+
 }
 
 /// Explicit, stable profile config for filesystem isolation and app launch

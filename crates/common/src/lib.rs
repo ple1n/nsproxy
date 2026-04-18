@@ -6,6 +6,7 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
+use std::future::Future;
 use std::hash::Hash;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -567,6 +568,29 @@ where
         tracing::error!("{err}");
     }
     result
+}
+
+#[track_caller]
+pub fn trace_spawn_result<F, T, E>(
+    task_name: &'static str,
+    future: F,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    F: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    E: Display,
+{
+    let location = std::panic::Location::caller();
+    async move {
+        if let Err(error) = future.await {
+            tracing::error!(
+                task = task_name,
+                file = location.file(),
+                line = location.line(),
+                error = %error,
+                "spawned task failed"
+            );
+        }
+    }
 }
 
 #[test]

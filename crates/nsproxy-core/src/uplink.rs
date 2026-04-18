@@ -391,6 +391,14 @@ pub fn preferred_addr(a: WireAddress, b: WireAddress) -> WireAddress {
     }
 }
 
+pub fn no_routing() -> RoutingFunction {
+    Arc::new(|_ctx: &RoutingContext, _hub: &UplinkHub| {
+        RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
+            "no routing function set",
+        )))
+    })
+}
+
 pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     Arc::new(move |ctx: &RoutingContext, _hub: &UplinkHub| {
         if ctx.attempt_num > 0 {
@@ -537,11 +545,7 @@ impl UplinkHub {
     pub fn new() -> Self {
         Self {
             proxies: HashMap::new(),
-            routing_fn: Arc::new(|_ctx: &RoutingContext, _hub: &UplinkHub| {
-                RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
-                    "no routing function set",
-                )))
-            }),
+            routing_fn: no_routing(),
             clash: None,
             stats: HashMap::new(),
             stats_clear: Timestamp::default(),
