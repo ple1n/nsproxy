@@ -430,9 +430,8 @@ struct StringMapEditorState {
 
 #[derive(Clone)]
 struct U32MapEditorState {
-    pairs: Vec<(u32, u32)>,
+    rows: Vec<(String, String)>,
     snapshot: Vec<(u32, u32)>,
-    text_buffers: std::collections::HashMap<usize, (String, String)>,
 }
 
 struct IntInput {
@@ -1811,156 +1810,153 @@ impl App {
         let mut state = ui
             .data_mut(|d| d.get_temp::<U32MapEditorState>(state_id))
             .unwrap_or_else(|| U32MapEditorState {
-                pairs: snapshot.clone(),
+                rows: snapshot
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
                 snapshot: snapshot.clone(),
-                text_buffers: std::collections::HashMap::new(),
             });
         if state.snapshot != snapshot {
-            state.pairs = snapshot.clone();
+            state.rows = snapshot
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             state.snapshot = snapshot.clone();
-            state.text_buffers.clear();
         }
-        let mut pairs = state.pairs;
+        let mut rows = state.rows;
 
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.strong(title);
                 if ui.button("+ Add").clicked() {
-                    pairs.push((0, 0));
-                    changed = true;
+                    if !rows
+                        .iter()
+                        .any(|(key_text, value_text)| key_text.is_empty() && value_text.is_empty())
+                    {
+                        rows.push((String::new(), String::new()));
+                    }
                 }
             });
 
             let mut remove_ixs = Vec::new();
-            for (i, (k, v)) in pairs.iter_mut().enumerate() {
-                ui.push_id((id_prefix, title, i), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+            let mut empty_row_seen = false;
+            egui::Grid::new(format!("{id_prefix}-{title}-u32-map-grid"))
+                .num_columns(2)
+                .spacing([4.0, 4.0])
+                .striped(false)
+                .show(ui, |ui| {
+                    if title == "locals" {
+                        ui.label("container port");
+                        ui.label("host port");
+                    } else {
+                        ui.label("key");
+                        ui.label("value");
+                    }
+                    ui.end_row();
 
-                        let (mut k_str, mut v_str) = state
-                            .text_buffers
-                            .entry(i)
-                            .or_insert_with(|| (k.to_string(), v.to_string()))
-                            .clone();
-
-                        if title == "locals" {
-                            let k_valid = Self::is_valid_port(*k);
-                            let k_bg_color = if k_str.is_empty() {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            } else if k_valid {
-                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                    for (i, (k_str, v_str)) in rows.iter_mut().enumerate() {
+                        ui.push_id((id_prefix, title, i, "key"), |ui| {
+                            if title == "locals" {
+                                let k_valid =
+                                    k_str.parse::<u32>().ok().is_some_and(Self::is_valid_port);
+                                let k_bg_color = if k_str.is_empty() {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                } else if k_valid {
+                                    egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                };
+                                let visuals = ui.visuals_mut();
+                                let old_k_bg = visuals.extreme_bg_color;
+                                visuals.extreme_bg_color = k_bg_color;
+                                ui.text_edit_singleline(k_str);
+                                ui.visuals_mut().extreme_bg_color = old_k_bg;
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            };
-                            let visuals = ui.visuals_mut();
-                            let old_k_bg = visuals.extreme_bg_color;
-                            visuals.extreme_bg_color = k_bg_color;
-                            let k_resp = ui.text_edit_singleline(&mut k_str);
-                            ui.visuals_mut().extreme_bg_color = old_k_bg;
-                            if k_resp.lost_focus() {
-                                if k_str.is_empty() {
-                                    remove_ixs.push(i);
-                                    changed = true;
-                                } else if let Ok(parsed) = k_str.parse::<u32>() {
-                                    *k = parsed;
-                                    changed = true;
-                                }
+                                let k_bg_color = if k_str.is_empty() {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                } else if k_str.parse::<u32>().is_ok() {
+                                    egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                };
+                                let visuals = ui.visuals_mut();
+                                let old_k_bg = visuals.extreme_bg_color;
+                                visuals.extreme_bg_color = k_bg_color;
+                                ui.text_edit_singleline(k_str);
+                                ui.visuals_mut().extreme_bg_color = old_k_bg;
                             }
+                        });
 
-                            let v_valid = Self::is_valid_port(*v);
-                            let v_bg_color = if v_str.is_empty() {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            } else if v_valid {
-                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                        ui.push_id((id_prefix, title, i, "value"), |ui| {
+                            if title == "locals" {
+                                let v_valid =
+                                    v_str.parse::<u32>().ok().is_some_and(Self::is_valid_port);
+                                let v_bg_color = if v_str.is_empty() {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                } else if v_valid {
+                                    egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                };
+                                let visuals = ui.visuals_mut();
+                                let old_v_bg = visuals.extreme_bg_color;
+                                visuals.extreme_bg_color = v_bg_color;
+                                ui.text_edit_singleline(v_str);
+                                ui.visuals_mut().extreme_bg_color = old_v_bg;
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            };
-                            let visuals = ui.visuals_mut();
-                            let old_v_bg = visuals.extreme_bg_color;
-                            visuals.extreme_bg_color = v_bg_color;
-                            let v_resp = ui.text_edit_singleline(&mut v_str);
-                            ui.visuals_mut().extreme_bg_color = old_v_bg;
-                            if v_resp.lost_focus() {
-                                if v_str.is_empty() {
-                                    remove_ixs.push(i);
-                                    changed = true;
-                                } else if let Ok(parsed) = v_str.parse::<u32>() {
-                                    *v = parsed;
-                                    changed = true;
-                                }
+                                let v_bg_color = if v_str.is_empty() {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                } else if v_str.parse::<u32>().is_ok() {
+                                    egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+                                };
+                                let visuals = ui.visuals_mut();
+                                let old_v_bg = visuals.extreme_bg_color;
+                                visuals.extreme_bg_color = v_bg_color;
+                                ui.text_edit_singleline(v_str);
+                                ui.visuals_mut().extreme_bg_color = old_v_bg;
                             }
-                        } else {
-                            let k_bg_color = if k_str.is_empty() {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            } else if k_str.parse::<u32>().is_ok() {
-                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
-                            } else {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            };
-                            let visuals = ui.visuals_mut();
-                            let old_k_bg = visuals.extreme_bg_color;
-                            visuals.extreme_bg_color = k_bg_color;
-                            let k_resp = ui.text_edit_singleline(&mut k_str);
-                            ui.visuals_mut().extreme_bg_color = old_k_bg;
-                            if k_resp.lost_focus() {
-                                if k_str.is_empty() {
-                                    remove_ixs.push(i);
-                                    changed = true;
-                                } else if let Ok(parsed) = k_str.parse::<u32>() {
-                                    *k = parsed;
-                                    changed = true;
-                                }
-                            }
+                        });
 
-                            let v_bg_color = if v_str.is_empty() {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            } else if v_str.parse::<u32>().is_ok() {
-                                egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+                        if k_str.is_empty() && v_str.is_empty() {
+                            if empty_row_seen {
+                                remove_ixs.push(i);
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
-                            };
-                            let visuals = ui.visuals_mut();
-                            let old_v_bg = visuals.extreme_bg_color;
-                            visuals.extreme_bg_color = v_bg_color;
-                            let v_resp = ui.text_edit_singleline(&mut v_str);
-                            ui.visuals_mut().extreme_bg_color = old_v_bg;
-                            if v_resp.lost_focus() {
-                                if v_str.is_empty() {
-                                    remove_ixs.push(i);
-                                    changed = true;
-                                } else if let Ok(parsed) = v_str.parse::<u32>() {
-                                    *v = parsed;
-                                    changed = true;
-                                }
+                                empty_row_seen = true;
                             }
                         }
-
-                        state.text_buffers.insert(i, (k_str, v_str));
-                    });
+                        if !(k_str.is_empty() && v_str.is_empty()) {
+                            // Invalid non-empty rows stay visible so the user can fix them.
+                        }
+                        ui.end_row();
+                    }
                 });
-            }
+
             for &ix in remove_ixs.iter().rev() {
-                pairs.remove(ix);
-                changed = true;
-            }
-            // Clear text buffers after any deletions to sync with new pair indices
-            if !remove_ixs.is_empty() {
-                state.text_buffers.clear();
+                rows.remove(ix);
             }
         });
 
-        if changed {
-            map.clear();
-            let mut ordered_pairs = Vec::new();
-            for (k, v) in pairs {
-                ordered_pairs.push((k, v));
-                map.insert(k, v);
+        let mut next_map = HashMap::new();
+        for (k_str, v_str) in &rows {
+            let (Ok(k), Ok(v)) = (k_str.parse::<u32>(), v_str.parse::<u32>()) else {
+                continue;
+            };
+            if title == "locals" && (!Self::is_valid_port(k) || !Self::is_valid_port(v)) {
+                continue;
             }
-            state.snapshot = Self::snapshot_u32_map(map);
-            state.pairs = ordered_pairs;
-        } else {
-            state.pairs = pairs;
+            next_map.insert(k, v);
         }
+
+        let next_snapshot = Self::snapshot_u32_map(&next_map);
+        if next_snapshot != snapshot {
+            *map = next_map;
+            changed = true;
+        }
+
+        state.snapshot = next_snapshot;
+        state.rows = rows;
         ui.data_mut(|d| d.insert_temp(state_id, state));
         changed
     }
@@ -3971,7 +3967,6 @@ impl App {
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
-                let row_h = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
                 let total = entries.len();
 
                 egui::ScrollArea::both()
@@ -3979,57 +3974,57 @@ impl App {
                     .max_height(500.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(format!("log_panel_rows_{}", profile_name))
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show_rows(ui, row_h, total, |ui, row_range| {
-                                if total == 0 {
-                                    ui.colored_label(
-                                        Color32::from_gray(110),
-                                        "no logs yet — start the container to see output",
-                                    );
-                                    return;
-                                }
-                                for i in row_range {
-                                    let entry = &entries[i];
-                                    let is_serve = matches!(entry.src, LogSource::Serve);
-                                    // Retrieve cached ANSI-parsed parts; compute and cache on miss.
-                                    cached_log
-                                        .entry(entry.log.message.clone())
-                                        .or_insert_with(|| {
-                                            egui_sgr::ansi_to_rich_text(&entry.log.message)
-                                        });
-                                    ui.horizontal(|ui| {
-                                        let (badge_text, badge_color) = if is_serve {
-                                            ("serve", Color32::from_rgb(100, 180, 130))
-                                        } else {
-                                            ("up", Color32::from_rgb(100, 150, 210))
-                                        };
-                                        ui.colored_label(badge_color, badge_text);
+                        if total == 0 {
+                            ui.colored_label(
+                                Color32::from_gray(110),
+                                "no logs yet — start the container to see output",
+                            );
+                            return;
+                        }
 
-                                        let level_color = match entry.log.level.as_str() {
-                                            "ERROR" => Color32::from_rgb(220, 80, 80),
-                                            "WARN" => Color32::from_rgb(210, 160, 60),
-                                            "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                            _ => Color32::from_gray(200),
-                                        };
-                                        ui.colored_label(level_color, &entry.log.level);
+                        for entry in entries {
+                            let is_serve = matches!(entry.src, LogSource::Serve);
+                            cached_log
+                                .entry(entry.log.message.clone())
+                                .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.log.message));
+                            ui.horizontal(|ui| {
+                                let (badge_text, badge_color) = if is_serve {
+                                    ("serve", Color32::from_rgb(100, 180, 130))
+                                } else {
+                                    ("up", Color32::from_rgb(100, 150, 210))
+                                };
+                                ui.colored_label(badge_color, badge_text);
 
-                                        ui.colored_label(
-                                            Color32::from_gray(100),
-                                            format!("[{}]", entry.log.target),
-                                        );
+                                let level_color = match entry.log.level.as_str() {
+                                    "ERROR" => Color32::from_rgb(220, 80, 80),
+                                    "WARN" => Color32::from_rgb(210, 160, 60),
+                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                    _ => Color32::from_gray(200),
+                                };
+                                ui.colored_label(level_color, &entry.log.level);
 
-                                        if let Some(ansi_parts) = cached_log.get(&entry.log.message)
-                                        {
-                                            for part in ansi_parts {
-                                                ui.label(part.clone());
-                                            }
+                                ui.colored_label(
+                                    Color32::from_gray(100),
+                                    format!("[{}]", entry.log.target),
+                                );
+
+                                if let Some(ansi_parts) = cached_log.get(&entry.log.message) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for part in ansi_parts {
+                                            ui.label(part.clone());
+                                        }
+                                        for field in &entry.log.fields {
+                                            ui.add_space(6.0);
+                                            ui.colored_label(
+                                                Color32::from_gray(110),
+                                                format!("{}=", field.name),
+                                            );
+                                            ui.monospace(&field.value);
                                         }
                                     });
                                 }
                             });
+                        }
                     });
             });
     }
@@ -6201,6 +6196,11 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
             ui.horizontal_wrapped(|ui| {
                 for part in egui_sgr::ansi_to_rich_text(&entry.message) {
                     ui.label(part);
+                }
+                for field in &entry.fields {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_gray(110), format!("{}=", field.name));
+                    ui.monospace(&field.value);
                 }
             });
         }

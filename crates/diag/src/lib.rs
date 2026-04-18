@@ -13,7 +13,9 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    io::Write,
     os::unix::fs::PermissionsExt,
+    os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
     sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
@@ -135,6 +137,13 @@ pub enum DiagEvent {
 
 /// A single tracing log record, usable across multiple transport protocols.
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct LogField {
+    pub name: String,
+    pub value: String,
+}
+
+/// A single tracing log record, usable across multiple transport protocols.
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct LogEntry {
     pub ts: Timestamp,
     /// Tracing level string: "TRACE", "DEBUG", "INFO", "WARN", or "ERROR".
@@ -143,6 +152,9 @@ pub struct LogEntry {
     pub target: String,
     /// The formatted log message.
     pub message: String,
+    /// Additional structured fields attached to the tracing event.
+    #[serde(default)]
+    pub fields: Vec<LogField>,
 }
 
 // ── Control commands (client → server) ─────────────────────────────
@@ -948,11 +960,25 @@ static UP_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sy
 /// that are not running inside a [`DiagServer::scope`].
 static SERVE_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sync::OnceLock::new();
 
+/// Child-process log forward sink used by forked helpers that cannot emit directly to UI.
+///
+/// When installed, [`DiagTracingLayer`] serializes each [`LogEntry`] and writes it to this
+/// stream. The parent process can decode and relay those entries into the normal diag path.
+static CHILD_LOG_FORWARD: OnceLock<Arc<Mutex<StdUnixStream>>> = OnceLock::new();
+
 /// Initialise the global up-daemon log broadcast channel.
 /// Safe to call multiple times; only the first call takes effect.
 pub fn init_up_log_broadcast() {
     let (tx, _) = broadcast::channel(1024);
     let _ = UP_LOG_TX.set(tx);
+}
+
+/// Install a child-process log forward stream.
+///
+/// Intended for forked serve children: the child writes framed [`LogEntry`] payloads to this
+/// stream and the parent relays them as ordinary diag log events.
+pub fn install_child_log_forward(stream: StdUnixStream) {
+    let _ = CHILD_LOG_FORWARD.set(Arc::new(Mutex::new(stream)));
 }
 
 /// Subscribe to the up-daemon log broadcast, receiving pre-encoded `DaemonEvent::Log` frames.
@@ -1016,19 +1042,31 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        // Collect the message field from the event once.
-        let mut visitor = MessageVisitor(String::new());
+        // Collect the rendered message and flat structured fields from the event once.
+        let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
         let entry = LogEntry {
             ts: Timestamp::now(),
             level: event.metadata().level().to_string(),
             target: event.metadata().target().to_string(),
-            message: visitor.0,
+            message: visitor.message,
+            fields: visitor.fields,
         };
 
         // Always push to the in-process ring buffer so clients can query history.
         push_log_ring(&entry);
+
+        // Forked children can forward log entries to their parent, which then re-emits them
+        // through the normal diag/UI path.
+        if let Some(forward) = CHILD_LOG_FORWARD.get() {
+            if let Ok(frame) = encode_frame(&entry) {
+                if let Ok(mut stream) = forward.lock() {
+                    let _ = stream.write_all(&frame);
+                }
+            }
+            return;
+        }
 
         // Forward to the per-task diag socket when inside a serve scope.
         let sent_to_diag = TASK_DIAG
@@ -1059,20 +1097,70 @@ where
     }
 }
 
-/// Minimal `tracing::field::Visit` impl that collects the `message` field.
-struct MessageVisitor(String);
+/// `tracing::field::Visit` impl that keeps the rendered log message plus flat fields.
+#[derive(Default)]
+struct LogVisitor {
+    message: String,
+    fields: Vec<LogField>,
+}
 
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+impl LogVisitor {
+    fn record_rendered(&mut self, field: &tracing::field::Field, value: String) {
         if field.name() == "message" {
-            self.0 = format!("{:?}", value);
+            self.message = value;
+            return;
         }
+
+        self.fields.push(LogField {
+            name: field.name().to_owned(),
+            value,
+        });
+    }
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.record_rendered(field, value.to_string());
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.0 = value.to_owned();
-        }
+        self.record_rendered(field, value.to_owned());
+    }
+
+    fn record_bytes(&mut self, field: &tracing::field::Field, value: &[u8]) {
+        self.record_rendered(field, format!("{:?}", value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.record_rendered(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.record_rendered(field, format!("{:?}", value));
     }
 }
 

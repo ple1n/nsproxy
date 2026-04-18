@@ -115,6 +115,7 @@ use tun2socks5::{
 };
 
 use nsproxy_core::internal_dns::run_dns_ipv4_only;
+use nsproxy_core::HotRoute;
 
 const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
 const PTY_BROADCAST_CAP: usize = 128;
@@ -1619,13 +1620,18 @@ fn main() -> anyhow::Result<()> {
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let ns_alive = read_ns_alive(&ns_meta)?;
             let bind_mount = state_paths::profile_netns_bind(&profile);
+            let registry = NamespacesRegistry::load_locked()?;
+            let profile_namespaces = registry
+                .profiles
+                .get(&profile)
+                .ok_or_else(|| anyhow!("profile namespace registry entry missing for {}", profile))?;
 
             // Enter the existing mount namespace.
             enter_ns(&ns_alive, &bind_mount)?;
 
-            // Rigorous safety check: refuse to proceed if we're still in
-            // the host mount namespace. This prevents corrupting the host.
-            nsproxy_core::sandbox::assert_mount_ns_isolated()?;
+            // Rigorous safety check: refuse to proceed unless we are in the
+            // exact mount namespace recorded for this profile.
+            nsproxy_core::sandbox::assert_mount_ns_matches(&profile_namespaces.mnt)?;
 
             // Check if a previous sandbox is already in place (restart case).
             let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state()?;
@@ -1719,6 +1725,15 @@ fn load_hot_config_with_serve_dns_overrides(
     hot
 }
 
+fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, route: &HotRoute) {
+    match route {
+        HotRoute::None => uplink.set_routing(nsproxy_core::uplink::no_routing()),
+        HotRoute::SimpleProxy { proxy_id } => {
+            uplink.set_routing(nsproxy_core::uplink::simple_routing(proxy_id.clone()));
+        }
+    }
+}
+
 fn cmd_serve(
     profile: String,
     tun_name: Option<String>,
@@ -1733,6 +1748,15 @@ fn cmd_serve(
 ) -> Result<()> {
     let ns_meta = state_paths::profile_ns_meta(&profile);
     let ns_alive = read_ns_alive(&ns_meta)?;
+    let registry = NamespacesRegistry::load_locked()?;
+    let profile_namespaces = registry
+        .profiles
+        .get(&profile)
+        .cloned()
+        .ok_or_else(|| anyhow!("no persisted namespace metadata found for profile {}", profile))?;
+    let profile_path = state_paths::profile_config(&profile);
+    let profile_conf = TemplateConfig::load(&profile_path)?;
+    let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
 
     let child_pid = ns_alive
         .child_pid
@@ -1762,15 +1786,21 @@ fn cmd_serve(
     }
     let mtu = 1500;
     let tun_name = tun_name.unwrap_or_else(|| "tun2".to_owned());
+    let (child_log_parent, child_log_child) = UnixStream::pair()?;
 
     let clone = nsproxy_core::sys::clone3::<false>(false, false);
     match clone {
         Ok(clone) => match clone {
             Clone3Result::IsChild { mut tx } => {
+                drop(child_log_parent);
+                diag::install_child_log_forward(child_log_child);
                 let hot_conf = hot_conf.clone();
+                let is_pivot_mode = is_pivot_mode;
+                let expected_mnt = profile_namespaces.mnt.clone();
                 let ns_source = NSSource::Pid(child_pid as i32);
                 ns_source.enter(CloneFlags::CLONE_NEWNS)?;
                 ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                nsproxy_core::sandbox::assert_mount_ns_matches(&expected_mnt)?;
 
                 let initial_hot = load_hot_config_with_serve_dns_overrides(
                     &hot_conf,
@@ -1837,37 +1867,101 @@ fn cmd_serve(
                         }
                     });
 
-                    tokio::spawn(async move {
+                    tokio::spawn(nsproxy_common::trace_spawn_result(
+                        "serve child hot reload watcher",
+                        async move {
+                        use std::collections::HashSet;
+
                         let conf = Some(hot_conf);
                         if let Some(conf) = conf {
-                            let mut mnt: HashMap<PathBuf, PathBuf> = Default::default();
-                            let mut read = [0u8; 24];
+                            let mut mounted_targets: HashSet<PathBuf> = HashSet::new();
+                            let mut read = [0u8; 1];
+                            let mut len_buf = [0u8; 4];
                             loop {
                                 info!("in-ns wait for config");
-                                let k = tx.read(&mut read[..]).await?;
-                                if k < 1 {
+                                if tx.read_exact(&mut read[..]).await.is_err() {
                                     error!("in-ns config watcher exits due to EOF");
                                     let _ = shutdown_tx.send(true);
                                     break;
                                 }
                                 info!("in-ns reload config");
-                                let fc = tokio::fs::read_to_string(&conf).await?;
-                                match serde_json::from_str::<HotConfig>(&fc) {
-                                    Ok(newconf) => {
+                                if read[0] != 1 {
+                                    warn!("in-ns unknown config command {}", read[0]);
+                                    continue;
+                                }
+                                tx.read_exact(&mut len_buf).await?;
+                                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                                let mut payload = vec![0u8; payload_len];
+                                tx.read_exact(&mut payload).await?;
+                                match serde_json::from_slice::<nsproxy_core::hot_reload::ChildHotReloadRequest>(&payload) {
+                                    Ok(request) => {
+                                        let mut newconf = request.config;
+                                        let instance_root = conf.parent().unwrap_or(std::path::Path::new("/"));
+                                        let base_hot_vars = nsproxy_core::PathExpansionState::for_instance(instance_root);
+                                        let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state()?;
                                         replace_mount_resolv_conf(&newconf.resolv_conf_dns)?;
+
+                                        if is_pivot_mode
+                                            && matches!(sandbox_state, nsproxy_core::sandbox::SandboxState::Virgin)
+                                        {
+                                            warn!(
+                                                "skipping live hot bind-mount reconcile: profile expects pivot sandbox but namespace root is not pivoted"
+                                            );
+                                        } else {
+                                            let hot_vars = match sandbox_state {
+                                                nsproxy_core::sandbox::SandboxState::AlreadyPivoted => {
+                                                    if is_pivot_mode {
+                                                        base_hot_vars.with_src_chroot(std::path::Path::new("/pivot"))
+                                                    } else {
+                                                        base_hot_vars
+                                                    }
+                                                }
+                                                nsproxy_core::sandbox::SandboxState::Virgin => {
+                                                    base_hot_vars
+                                                }
+                                            };
+                                            newconf.expand_with(&hot_vars);
+
+                                            match newconf.merged_mounts() {
+                                                Ok(mounts) => {
+                                                    let desired_targets: HashSet<PathBuf> = mounts
+                                                        .iter()
+                                                        .map(|mount| hot_vars.expand_target(&mount.target))
+                                                        .collect();
+                                                    for removed in mounted_targets.difference(&desired_targets) {
+                                                        if let Err(err) = rm_mount(removed) {
+                                                            warn!("failed to detach removed hot mount {:?}: {}", removed, err);
+                                                        }
+                                                    }
+                                                    if !mounts.is_empty() {
+                                                        nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
+                                                    }
+                                                    mounted_targets = desired_targets;
+                                                }
+                                                Err(err) => warn!("failed to merge hot mounts during live apply: {}", err),
+                                            }
+                                        }
+
                                         tx.write(&[0, 0, 0, 0]).await?;
-                                        for (in_port, _dst) in &newconf.locals {
-                                            let bind = std::net::TcpListener::bind(format!(
-                                                "127.0.0.1:{}",
-                                                in_port
-                                            ))?;
-                                            let raw = bind.as_raw_fd();
-                                            tx.write(&in_port.to_le_bytes()).await?;
-                                            tx.send_fd(raw).await?;
+                                        for in_port in request.requested_local_ports {
+                                            match std::net::TcpListener::bind(format!("127.0.0.1:{}", in_port)) {
+                                                Ok(bind) => {
+                                                    let raw = bind.as_raw_fd();
+                                                    tx.write(&in_port.to_le_bytes()).await?;
+                                                    tx.send_fd(raw).await?;
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        "failed to bind refreshed local forward listener on 127.0.0.1:{}: {}",
+                                                        in_port,
+                                                        err
+                                                    );
+                                                }
+                                            }
                                         }
                                         tx.write(&[0, 0, 0, 0]).await?;
 
-                                        let _ = sync_links(None, &newconf).await;
+                                        let _ = sync_links(None, &newconf.devs).await;
                                     }
                                     _ => {}
                                 }
@@ -1877,7 +1971,8 @@ fn cmd_serve(
                         }
 
                         aok!()
-                    });
+                    },
+                    ));
 
                     let mut shutdown_rx = shutdown_rx;
                     let _ = shutdown_rx.changed().await;
@@ -1889,6 +1984,7 @@ fn cmd_serve(
                 child_pidfd,
                 mut tx,
             } => {
+                drop(child_log_child);
                 let hot_conf = hot_conf.clone();
                 info!("recved fd");
                 let dev = tx.recv_fd()?;
@@ -1908,18 +2004,23 @@ fn cmd_serve(
                 })?;
                 info!("recorded serve_pid={} to {:?}", serve_pid, &ns_meta);
 
-                rt.spawn(async move {
+                rt.spawn(nsproxy_common::trace_spawn_result(
+                    "serve child pidfd watcher",
+                    async move {
                     let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
                     let _ = fd.into_future().await?;
                     warn!("tun helper exited");
                     aok!()
-                });
+                },
+                ));
 
                 rt.block_on(async move {
                     use tokio::io::AsyncWriteExt;
 
                     tx.set_nonblocking(true)?;
                     let mut tx = tokio::net::UnixStream::from_std(tx)?;
+                    child_log_parent.set_nonblocking(true)?;
+                    let mut child_log_stream = tokio::net::UnixStream::from_std(child_log_parent)?;
 
                     let (mut vdns_sx, vdns_rx) = mpsc::channel(1);
                     let (st_sx, acceptor) = flume::unbounded();
@@ -1936,14 +2037,27 @@ fn cmd_serve(
 
                     let (hot_tx, hot_rx) = tokio::sync::watch::channel(initial_hot.clone());
                     let shared_hot = Arc::new(hot_rx);
+                    let live_hot = Arc::new(tokio::sync::RwLock::new(initial_hot.clone()));
 
-                    let hub = load_saved_uplink_hub()?;
+                    let mut hub = load_saved_uplink_hub()?;
                     let router_conf = nsproxy_core::uplink::router::RouterConfig {
                         mtu,
                         packet_info: false,
                         udp_timeout: Duration::from_secs(20),
                         diag_sock: Some(diag_path.clone()),
                     };
+
+                    if let Some(nym) = simple {
+                        let proxy_id = hub.nym_map.get(&nym).cloned().ok_or_else(|| {
+                            anyhow!("Simple route proxy not found for nym {}", nym)
+                        })?;
+                        initial_hot.route = HotRoute::SimpleProxy { proxy_id };
+                        initial_hot.save(&hot_conf)?;
+                        let _ = hot_tx.send(initial_hot.clone());
+                    }
+
+                    apply_hot_route_to_uplink(&mut hub, &initial_hot.route);
+
                     let mut router = nsproxy_core::uplink::router::Router::new(
                         dev,
                         router_conf,
@@ -1952,23 +2066,28 @@ fn cmd_serve(
                         shared_hot,
                     )?;
 
-                    let mut selected_proxy: Option<nsproxy_common::routing::ProxyID> = None;
-
-                    if let Some(nym) = simple {
-                        let proxy_id = {
-                            let uplink = router.uplink().await;
-                            uplink.nym_map.get(&nym).cloned().ok_or_else(|| {
-                                anyhow!("Simple route proxy not found for nym {}", nym)
-                            })?
-                        };
-
-                        router
-                            .set_routing(nsproxy_core::uplink::simple_routing(proxy_id.clone()))
-                            .await;
-                        selected_proxy = Some(proxy_id);
-                    }
+                    let selected_proxy = match &initial_hot.route {
+                        HotRoute::None => None,
+                        HotRoute::SimpleProxy { proxy_id } => Some(proxy_id.clone()),
+                    };
 
                     router.init_diag(&diag_path).await?;
+
+                    let diag_srv = router.diag_handle();
+                    tokio::spawn(async move {
+                        loop {
+                            match read_bincode_frame_async::<diag::LogEntry, _>(&mut child_log_stream)
+                                .await
+                            {
+                                Ok(Some(entry)) => diag_srv.emit(diag::DiagEvent::Log(entry)),
+                                Ok(None) => break,
+                                Err(err) => {
+                                    warn!("serve child log relay failed: {}", err);
+                                    break;
+                                }
+                            }
+                        }
+                    });
 
                     // If the UI passed a control socket, connect to it now (after the diag
                     // server is ready) and register the reversed connection as a diag client.
@@ -2000,31 +2119,29 @@ fn cmd_serve(
                         let reload_tx = hot_reload_tx.clone();
                         let diag_srv = router.diag_handle();
                         let dns_handle = router.dns_handle();
-                        let mut selected_proxy = selected_proxy.clone();
+                        let live_hot_cmd = live_hot.clone();
                         tokio::spawn(scope_for_cmd.scope(async move {
                             while let Some(cmd) = cmd_rx.recv().await {
                                 match cmd {
                                     diag::ControlCommand::ReloadUplink => {
                                         if let Ok(hub) = nsproxy_core::cmd_uplink::load_saved_uplink_hub() {
+                                            let mut hub = hub;
+                                            let current_hot = live_hot_cmd.read().await.clone();
+                                            apply_hot_route_to_uplink(&mut hub, &current_hot.route);
                                             let mut u = uplink_cmd.write().await;
                                             *u = hub;
                                             info!("uplink reloaded via diag cmd");
                                         }
                                     }
                                     diag::ControlCommand::ReloadHotConfig => {
-                                        let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::DirectReload).await;
                                         match tokio::fs::read_to_string(&hot_conf_cmd).await {
                                             Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
                                                 Ok(cfg) => {
-                                                    let _ = hot_tx.send(cfg);
-                                                    diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
-                                                        ts: diag::Timestamp::now(),
-                                                        ok: true,
-                                                        changed: true,
-                                                        source: "direct".to_string(),
-                                                        error: None,
-                                                    });
-                                                    info!("hot config reloaded");
+                                                    let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                                        source: "direct",
+                                                        persist_backup: false,
+                                                        config: Arc::new(cfg),
+                                                    }).await;
                                                 }
                                                 Err(e) => {
                                                     diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
@@ -2050,16 +2167,15 @@ fn cmd_serve(
                                         }
                                     }
                                     diag::ControlCommand::SetSimpleRouting { proxy_id } => {
-                                        let fn_ = nsproxy_core::uplink::simple_routing(proxy_id.clone());
-                                        uplink_cmd.write().await.set_routing(fn_);
-                                        selected_proxy = Some(proxy_id);
-                                        diag_srv.emit(diag::DiagEvent::RoutingState {
-                                            ts: diag::Timestamp::now(),
-                                            state: diag::RoutingState {
-                                                selected_proxy: selected_proxy.clone(),
-                                            },
-                                        });
-                                        info!("routing updated via diag cmd");
+                                        let mut next_hot = live_hot_cmd.read().await.clone();
+                                        next_hot.route = HotRoute::SimpleProxy {
+                                            proxy_id: proxy_id.clone(),
+                                        };
+                                        let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                            source: "route",
+                                            persist_backup: true,
+                                            config: Arc::new(next_hot),
+                                        }).await;
                                     }
                                     diag::ControlCommand::QueryDnsState => {
                                         let stats = dns_handle.stats();
@@ -2074,15 +2190,21 @@ fn cmd_serve(
                                         });
                                     }
                                     diag::ControlCommand::QueryRoutingState => {
+                                        let current_hot = live_hot_cmd.read().await.clone();
+                                        let selected_proxy = match &current_hot.route {
+                                            HotRoute::None => None,
+                                            HotRoute::SimpleProxy { proxy_id } => Some(proxy_id.clone()),
+                                        };
                                         diag_srv.emit(diag::DiagEvent::RoutingState {
                                             ts: diag::Timestamp::now(),
                                             state: diag::RoutingState {
-                                                selected_proxy: selected_proxy.clone(),
+                                                selected_proxy,
                                             },
                                         });
                                     }
                                     diag::ControlCommand::QueryHotConfig => {
-                                        match tokio::fs::read_to_string(&hot_conf_cmd).await {
+                                        let current_hot = live_hot_cmd.read().await.clone();
+                                        match serde_json::to_string_pretty(&current_hot) {
                                             Ok(content) => {
                                                 diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
                                                     ts: diag::Timestamp::now(),
@@ -2104,22 +2226,45 @@ fn cmd_serve(
                                     diag::ControlCommand::ApplyHotConfig { content } => {
                                         match serde_json::from_str::<HotConfig>(&content) {
                                             Ok(cfg) => {
-                                                if tokio::fs::write(&hot_conf_cmd, &content).await.is_ok() {
-                                                    let _ = hot_tx.send(cfg);
-                                                    let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::DirectReload).await;
-                                                    diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
-                                                        ts: diag::Timestamp::now(),
-                                                        ok: true,
-                                                        content: Some(content),
-                                                        error: None,
-                                                    });
-                                                } else {
-                                                    diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
-                                                        ts: diag::Timestamp::now(),
-                                                        ok: false,
-                                                        content: None,
-                                                        error: Some("failed to write hot config".to_string()),
-                                                    });
+                                                match serde_json::to_string_pretty(&cfg) {
+                                                    Ok(saved_content) => {
+                                                        if let Err(err) = tokio::fs::write(&hot_conf_cmd, &saved_content).await {
+                                                            diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                                ts: diag::Timestamp::now(),
+                                                                ok: false,
+                                                                content: None,
+                                                                error: Some(err.to_string()),
+                                                            });
+                                                            warn!("hot config persist error: {err}");
+                                                        } else if let Err(err) = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                                            source: "direct",
+                                                            persist_backup: false,
+                                                            config: Arc::new(cfg),
+                                                        }).await {
+                                                            diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                                ts: diag::Timestamp::now(),
+                                                                ok: false,
+                                                                content: Some(saved_content),
+                                                                error: Some(err.to_string()),
+                                                            });
+                                                            warn!("hot config reload enqueue error: {err}");
+                                                        } else {
+                                                            diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                                ts: diag::Timestamp::now(),
+                                                                ok: true,
+                                                                content: Some(saved_content),
+                                                                error: None,
+                                                            });
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                            ts: diag::Timestamp::now(),
+                                                            ok: false,
+                                                            content: None,
+                                                            error: Some(err.to_string()),
+                                                        });
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -2168,10 +2313,26 @@ fn cmd_serve(
                         }));
                     }
 
+                    let uplink_route = router.uplink.clone();
+                    let mut route_rx = hot_tx.subscribe();
+                    tokio::spawn(scope_for_cmd.scope(async move {
+                        loop {
+                            let cfg = route_rx.borrow().clone();
+                            {
+                                let mut uplink = uplink_route.write().await;
+                                apply_hot_route_to_uplink(&mut uplink, &cfg.route);
+                            }
+                            if route_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+
                     let _ = vdns_sx.send(Some(router.dns_handle())).await;
 
                     let diag_srv = router.diag_handle();
                     let hot_tx_spawn = hot_tx.clone();
+                    let live_hot_spawn = live_hot.clone();
                     tokio::spawn(scope_for_watch.scope(async move {
                         let x = watch_hot(
                             vdns_rx,
@@ -2182,6 +2343,7 @@ fn cmd_serve(
                             None,
                             diag_srv,
                             hot_reload_rx,
+                            live_hot_spawn,
                             hot_tx_spawn,
                         )
                         .await;
