@@ -1856,16 +1856,20 @@ fn cmd_serve(
 
                     warn!("start internal DNS server");
                     let mut dns_shutdown_rx = shutdown_rx.clone();
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            rx = run_dns_ipv4_only() => {
-                                warn!("{:?}", rx);
+                    tokio::spawn(nsproxy_common::trace_spawn_result(
+                        "internal DNS server",
+                        async move {
+                            tokio::select! {
+                                rx = run_dns_ipv4_only() => {
+                                    warn!("{:?}", rx);
+                                }
+                                _ = dns_shutdown_rx.changed() => {
+                                    warn!("internal DNS server stopped after control socket closed");
+                                }
                             }
-                            _ = dns_shutdown_rx.changed() => {
-                                warn!("internal DNS server stopped after control socket closed");
-                            }
-                        }
-                    });
+                            aok!()
+                        },
+                    ));
 
                     tokio::spawn(nsproxy_common::trace_spawn_result(
                         "serve child hot reload watcher",
