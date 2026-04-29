@@ -114,8 +114,8 @@ use tun2socks5::{
     tun_rs::AsyncDevice,
 };
 
-use nsproxy_core::internal_dns::run_dns_ipv4_only;
 use nsproxy_core::HotRoute;
+use nsproxy_core::internal_dns::run_dns_ipv4_only;
 
 const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
 const PTY_BROADCAST_CAP: usize = 128;
@@ -1621,10 +1621,9 @@ fn main() -> anyhow::Result<()> {
             let ns_alive = read_ns_alive(&ns_meta)?;
             let bind_mount = state_paths::profile_netns_bind(&profile);
             let registry = NamespacesRegistry::load_locked()?;
-            let profile_namespaces = registry
-                .profiles
-                .get(&profile)
-                .ok_or_else(|| anyhow!("profile namespace registry entry missing for {}", profile))?;
+            let profile_namespaces = registry.profiles.get(&profile).ok_or_else(|| {
+                anyhow!("profile namespace registry entry missing for {}", profile)
+            })?;
 
             // Enter the existing mount namespace.
             enter_ns(&ns_alive, &bind_mount)?;
@@ -1749,11 +1748,12 @@ fn cmd_serve(
     let ns_meta = state_paths::profile_ns_meta(&profile);
     let ns_alive = read_ns_alive(&ns_meta)?;
     let registry = NamespacesRegistry::load_locked()?;
-    let profile_namespaces = registry
-        .profiles
-        .get(&profile)
-        .cloned()
-        .ok_or_else(|| anyhow!("no persisted namespace metadata found for profile {}", profile))?;
+    let profile_namespaces = registry.profiles.get(&profile).cloned().ok_or_else(|| {
+        anyhow!(
+            "no persisted namespace metadata found for profile {}",
+            profile
+        )
+    })?;
     let profile_path = state_paths::profile_config(&profile);
     let profile_conf = TemplateConfig::load(&profile_path)?;
     let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
@@ -1856,20 +1856,39 @@ fn cmd_serve(
 
                     warn!("start internal DNS server");
                     let mut dns_shutdown_rx = shutdown_rx.clone();
-                    tokio::spawn(nsproxy_common::trace_spawn_result(
-                        "internal DNS server",
-                        async move {
-                            tokio::select! {
-                                rx = run_dns_ipv4_only() => {
-                                    warn!("{:?}", rx);
-                                }
-                                _ = dns_shutdown_rx.changed() => {
-                                    warn!("internal DNS server stopped after control socket closed");
-                                }
+                    tokio::spawn(async move {
+                        // This server sometimes fails. For now, just restart it until shutdown.
+                        loop {
+                            let mut dns_run_shutdown_rx = dns_shutdown_rx.clone();
+                            nsproxy_common::trace_spawn_result(
+                                "internal DNS server",
+                                async move {
+                                    tokio::select! {
+                                        rx = run_dns_ipv4_only() => {
+                                            warn!("{:?}", rx);
+                                        }
+                                        changed = dns_run_shutdown_rx.changed() => {
+                                            match changed {
+                                                Ok(()) if *dns_run_shutdown_rx.borrow() => {
+                                                    warn!("internal DNS server stopped after control socket closed");
+                                                }
+                                                Ok(()) => {}
+                                                Err(_) => {
+                                                    warn!("internal DNS server stopped because shutdown watcher closed");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    aok!()
+                                },
+                            )
+                            .await;
+
+                            if *dns_shutdown_rx.borrow() {
+                                break;
                             }
-                            aok!()
-                        },
-                    ));
+                        }
+                    });
 
                     tokio::spawn(nsproxy_common::trace_spawn_result(
                         "serve child hot reload watcher",
@@ -2011,11 +2030,11 @@ fn cmd_serve(
                 rt.spawn(nsproxy_common::trace_spawn_result(
                     "serve child pidfd watcher",
                     async move {
-                    let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
-                    let _ = fd.into_future().await?;
-                    warn!("tun helper exited");
-                    aok!()
-                },
+                        let fd = unsafe { PidFd::from_raw_fd(child_pidfd) };
+                        let _ = fd.into_future().await?;
+                        warn!("tun helper exited");
+                        aok!()
+                    },
                 ));
 
                 rt.block_on(async move {
