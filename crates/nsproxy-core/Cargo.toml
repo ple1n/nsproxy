@@ -16,7 +16,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 tokio = "1.47.1"
 toml_edit = { version = "0.23.4", features = ["serde"] }
 tun2socks5.workspace = true
-rtnetlink = { path = "../rtnetlink" }
+rtnetlink.workspace = true
 futures = "0.3.31"
 futures-util = "0.3.31"
 serde = "1.0.219"
@@ -49,7 +49,7 @@ futures-lite = "2.6.1"
 futures_codec = "0.4.1"
 procfs = "=0.18.0"
 chrono = "0.4"
-clone3.path = "../clone3"
+clone3 = { package = "nsproxy-clone3", path = "../clone3" }
 passfd.workspace = true
 tracing-subscriber = "0.3.20"
 which.workspace = true
@@ -57,7 +57,7 @@ multimap = "0.10.1"
 arc-swap = "1"
 notify = "8.2.0"
 notify-rust = "4"
-warp = { path = "../warp", features = ["server"] }
+warp = { package = "nsproxy-warp", path = "../warp", features = ["server"] }
 hyper-util = { version = "0.1.12", features = [
     "server",
     "server-graceful",
@@ -70,7 +70,7 @@ hyper-util = { version = "0.1.12", features = [
 hardware-address = { version = "0.2.0", features = ["std"] }
 atty = "0.2.14"
 strum = { version = "0.27.2", features = ["derive"] }
-socks5-impl = { path = "../socks5-impl" }
+socks5-impl = { package = "nsproxy-socks5-impl", path = "../socks5-impl" }
 reqwest = { version = "0.12.23", features = ["socks"] }
 tokio-send-fd = "0.9.4"
 blake3 = "1.5.1"
