@@ -636,8 +636,11 @@ async fn spawn_terminal_window_process(
 
     let exe = std::env::current_exe().context("resolve current nsproxy-ui executable")?;
     let fd_arg = child_sock.as_raw_fd().to_string();
+    let build_hash = diag::protocol_version().to_string();
 
     let child = Command::new(exe)
+        .arg("--build-hash")
+        .arg(build_hash)
         .arg("--term-window-fd")
         .arg(fd_arg)
         .stdin(Stdio::null())

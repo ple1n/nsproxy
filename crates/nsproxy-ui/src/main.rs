@@ -6,6 +6,7 @@ use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular;
 use egui_plot::{GridInput, GridMark, Line, LineStyle, PlotPoints};
+use clap::Parser;
 use nsproxy_common::crdt::CRDT;
 use nsproxy_common::normalize_domain;
 use nsproxy_common::routing::ProxyID;
@@ -39,14 +40,22 @@ mod alacritty_window;
 mod profile_loader;
 mod supervisor;
 
-use alacritty_window::{
-    parse_term_window_fd_arg, run_term_window_process, ExternalTermWindowClient,
-};
+use alacritty_window::{run_term_window_process, ExternalTermWindowClient};
 use profile_loader::ProfileInfo;
 use supervisor::{
     ContainerName, EditorStatus, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle,
 };
 use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
+
+#[derive(Debug, Parser)]
+#[command(author, version, about = "nsproxy UI dashboard", long_about = None)]
+struct UiCli {
+    /// Override the advertised build hash for protocol/version handshakes.
+    #[arg(long)]
+    build_hash: Option<String>,
+    #[arg(long, hide = true)]
+    term_window_fd: Option<std::os::fd::RawFd>,
+}
 
 /// `PtyIpc` implementation that routes through the supervisor for a specific
 /// (profile, pid) combination.  Lives in `nsproxy-ui` (debug build) but is
@@ -2949,15 +2958,11 @@ impl eframe::App for App {
                 // Global configuration box at the top
                 let global_selected = self.selected_profile.is_none();
                 let global_status_color = egui::Color32::from_rgb(100, 150, 240);
-                if sidebar_box(ui, "Global", "", global_selected, global_status_color).clicked() {
+                if sidebar_box(ui, "all", "", global_selected, global_status_color).clicked() {
                     self.selected_profile = None;
                 }
 
                 ui.add_space(6.0);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
                 // Profiles
                 if self.snapshot.profiles.is_empty() {
                     ui.label(egui::RichText::new("No profiles found").color(egui::Color32::GRAY));
@@ -3006,77 +3011,89 @@ impl eframe::App for App {
 
                 ui.add_space(2.0);
                 ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("namespaces")
-                            .small()
-                            .color(egui::Color32::GRAY),
+                ui.add_space(6.0);
+
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Namespaces")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("⟳")
+                                .on_hover_text("Refresh namespace view")
+                                .clicked()
+                            {
+                                self.supervisor.send(SupervisorCommand::RefreshNamespaces);
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+
+                    render_namespace_indicator_row(
+                        ui,
+                        "UI",
+                        Some(std::process::id() as i32),
+                        Some(&self.snapshot.ui_ns),
+                        Color32::from_rgb(100, 150, 240),
                     );
-                    if ui
-                        .small_button("⟳")
-                        .on_hover_text("Refresh namespace view")
-                        .clicked()
-                    {
-                        self.supervisor.send(SupervisorCommand::RefreshNamespaces);
+
+                    if let Some(profile_name) = &self.selected_profile {
+                        if let Some(profile_snapshot) = self.snapshot.profiles.get(profile_name) {
+                            let up_pid = profile_snapshot
+                                .ns_alive
+                                .as_ref()
+                                .and_then(|ns| ns.up_pid)
+                                .map(|p| p as i32);
+                            let child_pid = profile_snapshot
+                                .ns_alive
+                                .as_ref()
+                                .and_then(|ns| ns.child_pid)
+                                .map(|p| p as i32);
+
+                            if let Some(pid) = up_pid {
+                                ui.add_space(4.0);
+                                render_namespace_indicator_row(
+                                    ui,
+                                    "up",
+                                    Some(pid),
+                                    profile_snapshot.up_ns.as_ref(),
+                                    Color32::from_rgb(120, 200, 140),
+                                );
+                            }
+                            if let Some(pid) = child_pid {
+                                ui.add_space(4.0);
+                                render_namespace_indicator_row(
+                                    ui,
+                                    "keeper",
+                                    Some(pid),
+                                    profile_snapshot.keeper_ns.as_ref(),
+                                    Color32::from_rgb(220, 180, 90),
+                                );
+                            }
+                            if up_pid.is_none() && child_pid.is_none() {
+                                ui.label(
+                                    egui::RichText::new("Selected profile has no live pid yet")
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Select a profile to compare its namespace state")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
                     }
                 });
-
-                let self_pid = std::process::id() as i32;
-                let self_text = format_namespace_indicator(&self.snapshot.ui_ns);
-                ui.small(format!("ui[{self_pid}] {self_text}"));
-
-                if let Some(profile_name) = &self.selected_profile {
-                    if let Some(profile_snapshot) = self.snapshot.profiles.get(profile_name) {
-                        let up_pid = profile_snapshot
-                            .ns_alive
-                            .as_ref()
-                            .and_then(|ns| ns.up_pid)
-                            .map(|p| p as i32);
-                        let child_pid = profile_snapshot
-                            .ns_alive
-                            .as_ref()
-                            .and_then(|ns| ns.child_pid)
-                            .map(|p| p as i32);
-
-                        if let Some(pid) = up_pid {
-                            let text = profile_snapshot
-                                .up_ns
-                                .as_ref()
-                                .map(format_namespace_indicator)
-                                .unwrap_or_else(|| "unavailable".to_string());
-                            ui.small(format!("up[{pid}] {text}"));
-                        }
-                        if let Some(pid) = child_pid {
-                            let text = profile_snapshot
-                                .keeper_ns
-                                .as_ref()
-                                .map(format_namespace_indicator)
-                                .unwrap_or_else(|| "unavailable".to_string());
-                            ui.small(format!("keeper[{pid}] {text}"));
-                        }
-                        if up_pid.is_none() && child_pid.is_none() {
-                            ui.small("selected profile has no live pid yet");
-                        }
-                    }
-                }
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let btn_label = if self.hide_secret {
-                        "Show secrets"
-                    } else {
-                        "Hide secrets"
-                    };
-                    if ui
-                        .button(btn_label)
-                        .on_hover_text("Toggle masking of sensitive text")
-                        .clicked()
-                    {
-                        self.hide_secret = !self.hide_secret;
-                    }
-                });
-
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -7197,6 +7214,49 @@ fn format_namespace_indicator(ns: &supervisor::NamespaceIndicator) -> String {
     format!("mnt={mnt} net={net} pid={pid_ns}")
 }
 
+fn render_namespace_badge(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: Option<&str>,
+    accent: Color32,
+) {
+    let text = format!("{label} {}", value.unwrap_or("?"));
+    ui.label(
+        RichText::new(text)
+            .small()
+            .background_color(accent.linear_multiply(0.18))
+            .color(Color32::from_gray(220)),
+    );
+}
+
+fn render_namespace_indicator_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    pid: Option<i32>,
+    ns: Option<&supervisor::NamespaceIndicator>,
+    accent: Color32,
+) {
+    let title = pid
+        .map(|pid| format!("{label}[{pid}]"))
+        .unwrap_or_else(|| label.to_string());
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(title).strong().color(accent));
+        if let Some(ns) = ns {
+            render_namespace_badge(ui, "mnt", ns.mnt.as_deref(), accent);
+            render_namespace_badge(ui, "net", ns.net.as_deref(), accent);
+            render_namespace_badge(ui, "pid", ns.pid.as_deref(), accent);
+        } else {
+            ui.label(
+                RichText::new("unavailable")
+                    .small()
+                    .italics()
+                    .color(Color32::GRAY),
+            );
+        }
+    });
+}
+
 /// Helper to draw a large rectangular selectable box used in the left sidebar.
 fn sidebar_box(
     ui: &mut eframe::egui::Ui,
@@ -7424,7 +7484,15 @@ fn run_manual_loop() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|err| err.into())
 }
 
+fn protocol_build_hash(args: &UiCli) -> String {
+    args.build_hash
+        .clone()
+        .unwrap_or_else(nsproxy_core::build_identity)
+}
+
 fn main() {
+    let args = UiCli::parse();
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
@@ -7436,10 +7504,11 @@ fn main() {
         .with_line_number(true)
         .try_init();
 
-    diag::set_protocol_version(nsproxy_core::build_identity());
+    // TODO: eliminate this workaround, and allow version handshake to be purely advisory. UI decides if we continue.
+    let protocol_build_hash = protocol_build_hash(&args);
+    diag::set_protocol_version(protocol_build_hash.clone());
 
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(control_fd) = parse_term_window_fd_arg(&args) {
+    if let Some(control_fd) = args.term_window_fd {
         if let Err(err) = run_term_window_process(control_fd) {
             tracing::error!(%err, "terminal child process failed");
             std::process::exit(1);
@@ -7447,7 +7516,7 @@ fn main() {
         return;
     }
 
-    info!("starting nsproxy-ui");
+    info!(build_hash = %protocol_build_hash, "starting nsproxy-ui");
     info!("launching ui event loop");
     if let Err(err) = run_manual_loop() {
         tracing::error!(%err, "ui event loop failed");
