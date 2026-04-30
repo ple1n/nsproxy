@@ -269,6 +269,7 @@ mod tests {
                 mode: Some(0o755),
                 uid: None,
                 gid: None,
+                mkdir: false,
             }],
             env: HashMap::new(),
             inherit_env: true,
@@ -1234,6 +1235,9 @@ pub struct ProfileChmod {
     pub uid: Option<u32>,
     /// Owner gid
     pub gid: Option<u32>,
+    /// Create it as directory if non existent
+    #[serde(default)]
+    pub mkdir: bool,
 }
 
 fn default_recursive() -> bool {

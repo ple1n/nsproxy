@@ -66,6 +66,12 @@
       "path": "/run/user/1000",
       "uid": 1000,
       "gid": 1000
+    },
+    {
+      "path": "/home",
+      "uid": 1000,
+      "gid": 1000,
+      "mkdir": true
     }
   ],
   "env": {},
