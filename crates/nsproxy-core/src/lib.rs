@@ -70,6 +70,8 @@ pub fn build_tree_hash() -> &'static str {
     option_env!("NSP_BUILD_TREE_HASH").unwrap_or("unknown")
 }
 
+pub const NSPROXY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn build_epoch_secs() -> u64 {
     option_env!("NSP_BUILD_EPOCH_SECS")
         .and_then(|v| v.parse::<u64>().ok())
@@ -260,6 +262,7 @@ mod tests {
                 target: PathBuf::from("@/mnt-dst"),
                 read_only: false,
                 recursive: true,
+                skip_missing: false,
             }],
             chmod: vec![ProfileChmod {
                 path: PathBuf::from("@/chmod-target"),
@@ -296,6 +299,7 @@ mod tests {
                 args: Vec::new(),
             },
             browser_profile: None,
+            rootfs: Rootfs::Default,
         };
 
         profile.expand_placeholders(&instance_root);
@@ -879,8 +883,7 @@ pub enum HotRoute {
     SimpleProxy { proxy_id: ProxyID },
 }
 
-impl HotRoute {
-}
+impl HotRoute {}
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
@@ -1090,6 +1093,7 @@ impl HotConfig {
                 target: target.clone(),
                 read_only: false,
                 recursive: true,
+                skip_missing: false,
             });
         }
 
@@ -1128,7 +1132,6 @@ impl HotConfig {
         std::fs::write(path, json)?;
         Ok(())
     }
-
 }
 
 /// Explicit, stable profile config for filesystem isolation and app launch
@@ -1159,6 +1162,18 @@ pub struct TemplateConfig {
     /// Browser profile name for env isolation (set NSPROXY_PROFILE_BROWSER)
     #[serde(default)]
     pub browser_profile: Option<String>,
+    #[serde(default)]
+    pub rootfs: Rootfs,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub enum Rootfs {
+    #[default]
+    /// Mount it at default nsp3 state path
+    Default,
+    /// Mount rootfs in tmpfs, ie. in memory
+    Tempfs,
+    Path(PathBuf),
 }
 
 impl Default for TemplateConfig {
@@ -1174,6 +1189,7 @@ impl Default for TemplateConfig {
             hot_init: Some(HotConfig::default()),
             sargs: ShellArgs::default(),
             browser_profile: None,
+            rootfs: Rootfs::Default,
         }
     }
 }
@@ -1182,7 +1198,7 @@ fn default_inherit_env() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum SandboxMode {
     /// Keep current root, layer bind-mounts onto it.
     Overlay,
@@ -1190,7 +1206,7 @@ pub enum SandboxMode {
     Pivot,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProfileMount {
     /// Host path
     pub source: PathBuf,
@@ -1202,6 +1218,9 @@ pub struct ProfileMount {
     /// Mount recursively (default: true)
     #[serde(default = "default_recursive")]
     pub recursive: bool,
+    /// Allow the mount to be skipped if src is missing
+    #[serde(default)]
+    pub skip_missing: bool,
 }
 
 /// Permission/ownership operation to apply inside the container root
@@ -1260,7 +1279,7 @@ impl TemplateConfig {
     /// Expand path variables to concrete paths.
     ///
     /// Supported variables:
-    /// - `@` for instance state root (/nsp3/{name})
+    /// - `@` for instance config root (/nsp3/config/{name})
     /// - `~` for HOME
     pub fn expand_placeholders(&mut self, instance_root: &Path) {
         let vars = PathExpansionState::for_instance(instance_root);
@@ -1343,6 +1362,7 @@ impl TemplateConfig {
             },
             chmod: Vec::new(),
             browser_profile: None,
+            rootfs: Rootfs::Default,
         })
     }
 }
@@ -1697,6 +1717,46 @@ impl std::str::FromStr for CliDaemonRequest {
     }
 }
 
+/// Lightweight CLI form of global privileged daemon requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonCliRequest {
+    Ping,
+    Stop,
+    CreateDirAll {
+        path: PathBuf,
+    },
+    WriteFile {
+        path: PathBuf,
+        content: Vec<u8>,
+        #[serde(default)]
+        create_parent: bool,
+    },
+    CreateProfile {
+        name: String,
+        profile_content: String,
+        hot_content: Option<String>,
+    },
+}
+
+impl std::str::FromStr for DaemonCliRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        match t.to_ascii_lowercase().as_str() {
+            "ping" => Ok(DaemonCliRequest::Ping),
+            "stop" => Ok(DaemonCliRequest::Stop),
+            other => {
+                if other.starts_with('{') || other.starts_with('[') {
+                    serde_json::from_str::<DaemonCliRequest>(s).map_err(|e| e.to_string())
+                } else {
+                    Err(format!("unknown privileged daemon cmd: {}", s))
+                }
+            }
+        }
+    }
+}
+
 /// Representation of a namespace input (PID or Path)
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum NsInput {
@@ -1761,7 +1821,7 @@ pub enum MainCommand {
     },
     /// TCP forward
     Forward { src: u32, dst: u32 },
-    /// Create a new profile from a config template
+    /// Create a new container instance from a config template
     Template {
         /// Path to a profile template
         path: PathBuf,
@@ -1785,7 +1845,7 @@ pub enum MainCommand {
     /// A minimal long-lived process keeps the namespaces alive.
     /// Use `tun` and `veth` subcommands afterwards to attach networking.
     Up {
-        /// Profile name (resolves to /nsp3/{name})
+        /// Profile name (config resolves under /nsp3/config/{name})
         profile: String,
         /// Optional daemon request to send to the `up` daemon. Provide JSON matching `CliDaemonRequest`.
         #[arg(long)]
@@ -1804,7 +1864,7 @@ pub enum MainCommand {
     Down {
         /// Profile name
         profile: String,
-        /// Remove the entire profile directory under the state root after teardown.
+        /// Remove both the profile config and runtime mount directories after teardown.
         #[arg(long)]
         rm: bool,
     },
@@ -1874,9 +1934,15 @@ pub enum MainCommand {
         /// Profile name (must have been created with `profile` and brought up with `up`)
         profile: String,
     },
+    /// Global privileged maintenance daemon used for state-tree writes.
+    Daemon {
+        /// Optional one-shot request to send to the global daemon socket.
+        #[arg(long)]
+        cmd: Option<DaemonCliRequest>,
+    },
     /// Accept args as a serialized file
     File { path: PathBuf },
-    /// Nsproxy can be used as sudo. 
+    /// Nsproxy can be used as sudo.
     /// The difference is nsproxy does not change anything about Wayland other display protocol, introducing minimal context change
     Sudo {
         #[command(flatten)]

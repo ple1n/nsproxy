@@ -3,32 +3,40 @@
 //! Centralises the rootfs-isolation logic that was previously inlined in
 //! the binary's `Run` / `Up` command handlers.
 
-use std::io::BufRead;
 use std::collections::HashSet;
+use std::io::BufRead;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount2};
 use nix::unistd::{Gid, Uid, chown};
+use nsproxy_common::{ExactNS, NSFrom, PidPath, UniqueFile};
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use tracing::{info, warn};
-use nsproxy_common::{ExactNS, NSFrom, PidPath};
 
 use crate::{
-    PathExpansionState, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
-    sys::{MountInfo, mount_bind_ro_explicit, mount_bind_rw_explicit, mount_tmpfs, pivot_root_into},
+    PathExpansionState, ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig,
+    sys::{
+        MountInfo, ensure_mountpoint, mount_bind_ro_explicit, mount_bind_rw_explicit,
+        mount_tmpfs, pivot_root_into,
+    },
 };
 
 /// Apply a list of profile mounts, resolving source/target paths through
 /// `vars` (which carries `@`/`~` variable expansion and optional chroot roots).
 fn bind_target_matches_source(source: &Path, target: &Path) -> Result<bool> {
+    info!("syscall: metadata({:?})", source);
     let src_meta = match std::fs::metadata(source) {
         Ok(meta) => meta,
         Err(err) => {
             return Err(err.into());
         }
     };
+    info!("syscall: metadata({:?})", target);
     let dst_meta = match std::fs::metadata(target) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -42,7 +50,11 @@ fn bind_target_matches_source(source: &Path, target: &Path) -> Result<bool> {
     Ok(src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
 }
 
-fn bind_target_has_desired_state(mount_info: &MountInfo, source: &Path, target: &Path) -> Result<bool> {
+fn bind_target_has_desired_state(
+    mount_info: &MountInfo,
+    source: &Path,
+    target: &Path,
+) -> Result<bool> {
     if !mount_info.target_is_mountpoint(target) {
         return Ok(false);
     }
@@ -60,6 +72,7 @@ fn reconcile_bind_target(mount_info: &MountInfo, source: &Path, target: &Path) -
             "detaching existing mount at {:?} before remounting source {:?}",
             target, source
         );
+        info!("syscall: umount2({:?}, MNT_DETACH)", target);
         umount2(target, MntFlags::MNT_DETACH)?;
     }
 
@@ -72,6 +85,13 @@ pub fn apply_mounts(vars: &PathExpansionState, mounts: &[ProfileMount]) -> Resul
     for m in mounts {
         let src = vars.expand_source(&m.source);
         let dst = vars.expand_target(&m.target);
+        if m.skip_missing && !src.try_exists()? {
+            info!(
+                "skipping bind mount for {:?}: source missing and skip_missing is enabled",
+                src
+            );
+            continue;
+        }
         if !reconcile_bind_target(&mount_info, &src, &dst)? {
             info!(
                 "skipping bind mount for {:?}: target {:?} already resolves to source",
@@ -80,8 +100,16 @@ pub fn apply_mounts(vars: &PathExpansionState, mounts: &[ProfileMount]) -> Resul
             continue;
         }
         if m.read_only {
+            info!(
+                "syscall: mount_bind_ro_explicit(source={:?}, target={:?}, recursive={})",
+                src, dst, m.recursive
+            );
             mount_bind_ro_explicit(&src, &dst, m.recursive)?;
         } else {
+            info!(
+                "syscall: mount_bind_rw_explicit(source={:?}, target={:?}, recursive={})",
+                src, dst, m.recursive
+            );
             mount_bind_rw_explicit(&src, &dst, m.recursive)?;
         }
     }
@@ -94,14 +122,17 @@ pub fn apply_chmod(vars: &PathExpansionState, chmods: &[ProfileChmod]) -> Result
         let target = vars.expand_target(&c.path);
 
         if let Some(mode) = c.mode {
+            info!("syscall: metadata({:?})", target);
             let mut perms = std::fs::metadata(&target)?.permissions();
             perms.set_mode(mode);
+            info!("syscall: set_permissions({:?}, {:o})", target, mode);
             std::fs::set_permissions(&target, perms)?;
         }
 
         if c.uid.is_some() || c.gid.is_some() {
             let uid = c.uid.map(Uid::from_raw);
             let gid = c.gid.map(Gid::from_raw);
+            info!("syscall: chown({:?}, uid={:?}, gid={:?})", target, uid, gid);
             chown(&target, uid, gid)?;
         }
     }
@@ -112,9 +143,10 @@ pub fn apply_chmod(vars: &PathExpansionState, chmods: &[ProfileChmod]) -> Result
 ///
 /// This creates stub directories, bind-mounts /usr and /etc read-only,
 /// recreates merged-usr symlinks (or bind-mounts them for non-merged distros),
-/// bind-mounts /dev read-write, and mounts fresh proc/sys/tmp/run.
+/// bind-mounts /nsp3/config and /dev read-write, and mounts fresh proc/sys/tmp/run.
 pub fn build_skeleton(new_root: &Path) -> Result<()> {
     for d in &["usr", "etc", "dev", "proc", "sys", "tmp", "run", "home", "root"] {
+        info!("create_dir_all({:?})", new_root.join(d));
         std::fs::create_dir_all(new_root.join(d))?;
     }
 
@@ -122,6 +154,11 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
     for dir in &["usr", "etc"] {
         let src = PathBuf::from(format!("/{}", dir));
         if src.exists() {
+            info!(
+                "mount_bind_ro_explicit(source={:?}, target={:?}, recursive=true)",
+                src,
+                new_root.join(dir)
+            );
             mount_bind_ro_explicit(&src, &new_root.join(dir), true)?;
         }
     }
@@ -131,20 +168,47 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
     for link in &["bin", "lib", "lib64", "lib32", "sbin"] {
         let host_path = PathBuf::from(format!("/{}", link));
         let dst = new_root.join(link);
+        info!("read_link({:?})", host_path);
         if let Ok(target) = std::fs::read_link(&host_path) {
             if !dst.exists() {
+                info!("symlink({:?} -> {:?})", target, dst);
                 let _ = std::os::unix::fs::symlink(&target, &dst);
             }
         } else if host_path.is_dir() {
+            info!("create_dir_all({:?})", dst);
             std::fs::create_dir_all(&dst)?;
+            info!(
+                "mount_bind_ro_explicit(source={:?}, target={:?}, recursive=true)",
+                host_path, dst
+            );
             mount_bind_ro_explicit(&host_path, &dst, true)?;
         }
     }
 
+    // Expose nsproxy config state within the container.
+    let config_root = crate::state_paths::config_root();
+    let sandbox_config_root = new_root.join("nsp3/config");
+    info!("create_dir_all({:?})", sandbox_config_root);
+    std::fs::create_dir_all(&sandbox_config_root)?;
+    info!(
+        "mount_bind_rw_explicit(source={:?}, target={:?}, recursive=true)",
+        config_root, sandbox_config_root
+    );
+    mount_bind_rw_explicit(&config_root, &sandbox_config_root, true)?;
+
     // Bind-mount /dev read-write so ptys / tty work.
+    info!(
+        "mount_bind_rw_explicit(source={:?}, target={:?}, recursive=true)",
+        Path::new("/dev"),
+        new_root.join("dev")
+    );
     mount_bind_rw_explicit(Path::new("/dev"), &new_root.join("dev"), true)?;
 
     // Mount fresh proc, sysfs, tmpfs for /proc /sys /tmp /run.
+    info!(
+        "mount(source=proc, target={:?}, fstype=proc, flags=0)",
+        new_root.join("proc")
+    );
     nix_mount(
         Some("proc"),
         &new_root.join("proc"),
@@ -152,6 +216,10 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
         MsFlags::empty(),
         None::<&str>,
     )?;
+    info!(
+        "mount(source=sysfs, target={:?}, fstype=sysfs, flags=0)",
+        new_root.join("sys")
+    );
     nix_mount(
         Some("sysfs"),
         &new_root.join("sys"),
@@ -159,6 +227,10 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
         MsFlags::empty(),
         None::<&str>,
     )?;
+    info!(
+        "mount(source=tmpfs, target={:?}, fstype=tmpfs, flags=0, data=mode=1777)",
+        new_root.join("tmp")
+    );
     nix_mount(
         Some("tmpfs"),
         &new_root.join("tmp"),
@@ -166,6 +238,10 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
         MsFlags::empty(),
         Some("mode=1777"),
     )?;
+    info!(
+        "mount(source=tmpfs, target={:?}, fstype=tmpfs, flags=0, data=mode=755)",
+        new_root.join("run")
+    );
     nix_mount(
         Some("tmpfs"),
         &new_root.join("run"),
@@ -187,52 +263,203 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
 /// 2. Build the filesystem skeleton (bind /usr /etc /dev, mount proc/sys/tmp/run)
 /// 3. Apply template mounts
 /// 4. Apply template chmods
-/// 5. Bind the persist root (/nsp3) into the new root
+/// 5. Bind the persistent config root (/nsp3/config) into the new root
 /// 6. `pivot_root` into the new root, old root at `/pivot`
 pub fn apply_pivot(template: &TemplateConfig, profile_name: &str) -> Result<()> {
-    let new_root = crate::state_paths::pivot_root_dir(profile_name);
+    let new_root = match &template.rootfs {
+        Rootfs::Default => crate::state_paths::pivot_root(profile_name),
+        Rootfs::Tempfs => crate::state_paths::pivot_root_mem(profile_name),
+        Rootfs::Path(path) => path.clone(),
+    };
+
     let put_old = new_root.join("pivot");
-
-    // 1. Mount tmpfs as the staging root.
-    mount_tmpfs(&new_root)?;
-
-    // 2. Build skeleton.
+    match &template.rootfs {
+        Rootfs::Tempfs => {
+            info!("mount_tmpfs({:?})", new_root);
+            mount_tmpfs(&new_root)?;
+        }
+        Rootfs::Default | Rootfs::Path(_) => {
+            info!("create_dir_all({:?})", new_root);
+            std::fs::create_dir_all(&new_root)?;
+            ensure_mountpoint(&new_root)?;
+        }
+    }
     build_skeleton(&new_root)?;
-
-    // 3. Apply template mounts.
     if !template.mounts.is_empty() {
         let vars = PathExpansionState::without_instance().with_dst_chroot(&new_root);
         apply_mounts(&vars, &template.mounts)?;
     }
-
-    // 4. Apply chmods.
     if !template.chmod.is_empty() {
         let vars = PathExpansionState::without_instance().with_dst_chroot(&new_root);
         apply_chmod(&vars, &template.chmod)?;
     }
 
-    let persist = crate::state_paths::persist_root();
-    if persist.exists() {
-        let persist_rel = persist.strip_prefix("/").unwrap_or(&persist);
-        let persist_dst = new_root.join(persist_rel);
-        std::fs::create_dir_all(&persist_dst)?;
-        mount_bind_rw_explicit(&persist, &persist_dst, true)?;
-    }
-
-    // 6. Pivot root.
     info!("pivoting root into {:?}", new_root);
+    info!(
+        "pivot_root_into(new_root={:?}, put_old={:?})",
+        new_root, put_old
+    );
     pivot_root_into(&new_root, &put_old)?;
     info!("pivot complete — now inside sandbox root");
 
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SandboxState {
     /// Root is the host filesystem — pivot has not been applied.
-    Virgin,
-    /// Root is already a tmpfs — a previous `apply_pivot` was done.
-    AlreadyPivoted,
+    NoPivot,
+    /// Root matches the persisted sandbox root identity.
+    Pivoted,
+}
+
+pub fn current_rootfs_id() -> Result<UniqueFile> {
+    info!("syscall: stat(/)");
+    let stat = nix::sys::stat::stat("/")?;
+    Ok(stat.into())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxPathStatus {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub kind: Option<String>,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxMountStatus {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub read_only: bool,
+    pub recursive: bool,
+    pub mounted: bool,
+    pub target_matches_source: bool,
+    pub target_status: SandboxPathStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxStatus {
+    pub updated_at_secs: u64,
+    pub configured_mode: SandboxMode,
+    pub detected_state: SandboxState,
+    pub pivot_dir_status: SandboxPathStatus,
+    pub mounts: Vec<SandboxMountStatus>,
+    pub last_error: Option<String>,
+}
+
+fn file_kind(meta: &std::fs::Metadata) -> String {
+    let file_type = meta.file_type();
+    if file_type.is_dir() {
+        "dir".to_string()
+    } else if file_type.is_file() {
+        "file".to_string()
+    } else if file_type.is_symlink() {
+        "symlink".to_string()
+    } else if file_type.is_block_device() {
+        "block".to_string()
+    } else if file_type.is_char_device() {
+        "char".to_string()
+    } else if file_type.is_fifo() {
+        "fifo".to_string()
+    } else if file_type.is_socket() {
+        "socket".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+pub fn inspect_path(path: &Path) -> SandboxPathStatus {
+    info!("syscall: symlink_metadata({:?})", path);
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => SandboxPathStatus {
+            path: path.to_path_buf(),
+            exists: true,
+            kind: Some(file_kind(&meta)),
+            mode: Some(meta.permissions().mode()),
+            uid: Some(meta.uid()),
+            gid: Some(meta.gid()),
+            size: Some(meta.len()),
+            error: None,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => SandboxPathStatus {
+            path: path.to_path_buf(),
+            exists: false,
+            kind: None,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: None,
+            error: None,
+        },
+        Err(err) => SandboxPathStatus {
+            path: path.to_path_buf(),
+            exists: false,
+            kind: None,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+pub fn collect_sandbox_status(
+    configured_mode: SandboxMode,
+    detected_state: SandboxState,
+    mounts: &[ProfileMount],
+    last_error: Option<String>,
+) -> Result<SandboxStatus> {
+    let mount_info = MountInfo::load()?;
+    let mounts = mounts
+        .iter()
+        .map(|mount| {
+            let mounted = mount_info.target_is_mountpoint(&mount.target);
+            let target_matches_source = if mounted {
+                bind_target_matches_source(&mount.source, &mount.target).unwrap_or(false)
+            } else {
+                false
+            };
+            SandboxMountStatus {
+                source: mount.source.clone(),
+                target: mount.target.clone(),
+                read_only: mount.read_only,
+                recursive: mount.recursive,
+                mounted,
+                target_matches_source,
+                target_status: inspect_path(&mount.target),
+            }
+        })
+        .collect();
+
+    Ok(SandboxStatus {
+        updated_at_secs: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        configured_mode,
+        detected_state,
+        pivot_dir_status: inspect_path(Path::new("/pivot")),
+        mounts,
+        last_error,
+    })
+}
+
+pub fn write_sandbox_status(profile_name: &str, status: &SandboxStatus) -> Result<()> {
+    let path = crate::state_paths::sandbox_status(profile_name);
+    if let Some(parent) = path.parent() {
+        info!("syscall: create_dir_all({:?})", parent);
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_vec_pretty(status)?;
+    info!("syscall: write({:?}, {} bytes)", path, content.len());
+    std::fs::write(path, content)?;
+    Ok(())
 }
 
 /// Check whether the current process is in the expected profile mount namespace.
@@ -266,47 +493,33 @@ pub fn assert_mount_ns_matches(expected_mnt: &ExactNS) -> Result<()> {
     Ok(())
 }
 
-/// Detect whether sandboxing (pivot_root onto tmpfs) has already been applied.
-///
-/// Parses `/proc/self/mountinfo` and checks if the root mount (`/`) is a tmpfs.
-pub fn detect_sandbox_state() -> Result<SandboxState> {
-    let f = std::fs::File::open("/proc/self/mountinfo")?;
-    let reader = std::io::BufReader::new(f);
+/// Detect whether sandboxing has already been applied by comparing the current
+/// root directory identity against the persisted runtime sandbox root id.
+pub fn detect_sandbox_state(expected_rootfs: Option<UniqueFile>) -> Result<SandboxState> {
+    let Some(expected_rootfs) = expected_rootfs else {
+        info!("no persisted rootfs identity found — sandbox not yet applied");
+        return Ok(SandboxState::NoPivot);
+    };
 
-    for line in reader.lines() {
-        let line = line?;
-        // mountinfo format: id parent major:minor root mount_point opts ... - fstype source super_opts
-        // We want the line where mount_point is "/"
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 6 {
-            continue;
-        }
-        let mount_point = fields[4];
-        if mount_point != "/" {
-            continue;
-        }
-        // Find the separator "-" then fstype is the next field.
-        if let Some(sep_pos) = fields.iter().position(|&f| f == "-") {
-            if sep_pos + 1 < fields.len() {
-                let fstype = fields[sep_pos + 1];
-                if fstype == "tmpfs" {
-                    info!("root is tmpfs — sandbox already applied");
-                    return Ok(SandboxState::AlreadyPivoted);
-                } else {
-                    info!("root fstype is '{}' — sandbox not yet applied", fstype);
-                    return Ok(SandboxState::Virgin);
-                }
-            }
-        }
+    let current_rootfs = current_rootfs_id()?;
+    if current_rootfs == expected_rootfs {
+        info!(
+            "current rootfs identity {} matches persisted sandbox root {}",
+            current_rootfs, expected_rootfs
+        );
+        Ok(SandboxState::Pivoted)
+    } else {
+        info!(
+            "current rootfs identity {} does not match persisted sandbox root {}",
+            current_rootfs, expected_rootfs
+        );
+        Ok(SandboxState::NoPivot)
     }
-
-    // Couldn't determine — treat as not pivoted, let apply_pivot attempt it.
-    warn!("could not determine root fstype from mountinfo, assuming virgin");
-    Ok(SandboxState::Virgin)
 }
 
 /// Check whether the root mount (`/`) has shared propagation.
 fn is_root_shared() -> Result<bool> {
+    info!("syscall: File::open(/proc/self/mountinfo)");
     let f = std::fs::File::open("/proc/self/mountinfo")?;
     let reader = std::io::BufReader::new(f);
 

@@ -102,6 +102,24 @@ impl MountInfo {
     pub fn target_is_mountpoint(&self, target: &Path) -> bool {
         self.mount_points.contains(target)
     }
+
+    pub fn mount_points_under(&self, root: &Path) -> Vec<PathBuf> {
+        let mut mount_points: Vec<PathBuf> = self
+            .mount_points
+            .iter()
+            .filter(|mount_point| mount_point.starts_with(root))
+            .cloned()
+            .collect();
+
+        mount_points.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| right.cmp(left))
+        });
+        mount_points
+    }
 }
 
 pub fn path_is_mountpoint(target: &Path) -> Result<bool> {
@@ -535,21 +553,39 @@ pub fn mount_tmpfs(dst: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_mountpoint(target: &Path) -> Result<()> {
+    create_dir_all(target)?;
+    if !path_is_mountpoint(target)? {
+        info!(
+            "bind-mounting {:?} onto itself so it becomes a mount point",
+            target
+        );
+        mount(
+            Some(target),
+            target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+    }
+
+    Ok(())
+}
+
 pub fn pivot_root_into(new_root: &Path, put_old: &Path) -> Result<()> {
     create_dir_all(new_root)?;
     create_dir_all(put_old)?;
+    info!("pivot_root: new_root={:?}, put_old={:?}", new_root, put_old);
     pivot_root(new_root, put_old)?;
     set_current_dir("/")?;
-    // After pivot_root the filesystem root is now `new_root`.  Paths that were
-    // absolute before pivot are no longer valid — strip the `new_root` prefix
-    // to get the path as seen from inside the new root.
-    let rel = put_old
-        .strip_prefix(new_root)
-        .unwrap_or_else(|_| put_old.strip_prefix("/").unwrap_or(put_old));
-    let put_old_inner = PathBuf::from("/").join(rel);
-    umount2(&put_old_inner, MntFlags::MNT_DETACH)?;
-    remove_dir_all(&put_old_inner)?;
 
+    Ok(())
+}
+
+/// Make old root not visible to container after pivot_root
+pub fn hide_old_root(mount: &Path) -> Result<()> {
+    umount2(mount, MntFlags::MNT_DETACH)?;
+    remove_dir(&mount)?;
     Ok(())
 }
 
@@ -576,6 +612,25 @@ pub fn rm_mount(dst: &Path) -> Result<()> {
 
     if path_is_mountpoint(dst)? {
         umount(dst)?;
+    }
+
+    Ok(())
+}
+
+pub fn umount_detach_targets(targets: &[&Path]) -> Result<()> {
+    let mount_info = MountInfo::load()?;
+
+    for &target in targets {
+        if !mount_info.target_is_mountpoint(target) {
+            continue;
+        }
+
+        info!("detaching mount {:?}", target);
+        match umount2(target, MntFlags::MNT_DETACH) {
+            Ok(()) => {}
+            Err(Errno::EINVAL) | Err(Errno::ENOENT) => {}
+            Err(err) => return Err(err.into()),
+        }
     }
 
     Ok(())

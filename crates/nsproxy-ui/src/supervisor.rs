@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
 use std::{
     fs::File,
@@ -21,6 +22,7 @@ use nsproxy_common::stats::ProxyStats;
 use nsproxy_common::NsAlive;
 use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_core::cmd_common::read_ns_alive;
+use nsproxy_core::sandbox::SandboxStatus;
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{cli_to_inheritable_fd, to_cstr, Cli, HotConfig, MainCommand, TemplateConfig};
 use serde::{Deserialize, Serialize};
@@ -50,17 +52,30 @@ pub struct TrafficSnapshot {
 /// A log entry combined with its source (up-daemon or serve process).
 #[derive(Clone)]
 pub struct LogEntryOf {
+    pub hash: u64,
     pub log: LogEntry,
     pub src: LogSource,
 }
 
 /// Source of a [`LogEntryOf`] entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LogSource {
     Up,
     Serve,
+    RootDaemon,
     Pid(u32),
 }
+
+fn fast_hash_log_entry(entry: &LogEntry) -> u64 {
+    let mut hasher = twox_hash::XxHash3_64::default();
+    entry.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub type LevelLogRings = BTreeMap<String, VecDeque<Arc<LogEntryOf>>>;
+pub type SharedLevelLogRings = Arc<RwLock<LevelLogRings>>;
+pub type ProcessRawLogs = HashMap<u32, Vec<diag::RawLog>>;
+pub type SharedProcessRawLogs = Arc<RwLock<ProcessRawLogs>>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NamespaceIndicator {
@@ -84,6 +99,7 @@ pub struct ContainerState {
     pub diag_error: Option<String>,
     pub hotconfig: HotConfig,
     pub template: TemplateConfig,
+    pub sandbox_status: Option<SandboxStatus>,
     /// None = valid, Some(msg) = missing or parse error
     pub template_error: Option<String>,
     pub routing_state: Option<diag::RoutingState>,
@@ -100,13 +116,9 @@ pub struct ContainerState {
     pub ns_alive: Option<NsAlive>,
     pub up_ns: Option<NamespaceIndicator>,
     pub keeper_ns: Option<NamespaceIndicator>,
-    /// Logs from the `sp up` process (forwarded via up-daemon log protocol, or converted from
-    /// stdout capture while that transition is in progress).
+    /// Client-side log storage keyed by normalized log level.
     #[serde(skip)]
-    pub up_logs: Vec<LogEntry>,
-    /// Logs from `sp serve` forwarded via the diag socket tracing layer.
-    #[serde(skip)]
-    pub serve_logs: Vec<LogEntry>,
+    pub logs_by_level: SharedLevelLogRings,
     /// Local rolling copy of raw `DiagEvent`s received from tun_diag.sock.
     /// Used by the Traffic tab Logs sub-view.
     #[serde(skip)]
@@ -115,13 +127,9 @@ pub struct ContainerState {
     /// Used by the Traffic tab Connections sub-view.
     #[serde(skip)]
     pub conns_state: diag::ConnsState,
-    /// Precomputed merged log (up + serve) sorted by timestamp.
-    /// Built in `emit_snapshot`; used directly by the log panel render.
-    #[serde(skip)]
-    pub merged_logs: Vec<Arc<LogEntryOf>>,
     /// Raw stdout/stderr captured from managed processes, keyed by slot PID.
     #[serde(skip)]
-    pub process_raw_logs: HashMap<u32, Vec<diag::RawLog>>,
+    pub process_raw_logs: SharedProcessRawLogs,
     /// Raw PTY bytes received since the previous snapshot, keyed by slot PID.
     #[serde(skip)]
     pub pty_streams: HashMap<u32, Vec<u8>>,
@@ -131,6 +139,12 @@ pub struct ContainerState {
 pub struct SupervisorSnapshot {
     pub profiles: BTreeMap<ContainerName, ContainerState>,
     pub ui_ns: NamespaceIndicator,
+    pub root_daemon_connection: ConnectionState,
+    pub root_daemon_error: Option<String>,
+    pub hotconfig_editor_status: Option<EditorStatus>,
+    pub profile_editor_status: Option<EditorStatus>,
+    #[serde(skip)]
+    pub root_daemon_logs: SharedLevelLogRings,
     pub auto_open_logs_target: Option<AutoOpenLogsTarget>,
     pub generated_at: SystemTime,
 }
@@ -140,6 +154,14 @@ pub struct AutoOpenLogsTarget {
     pub profile: ContainerName,
     pub pid: u32,
     pub token: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EditorStatus {
+    pub token: u64,
+    pub ok: bool,
+    pub profile: Option<ContainerName>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +225,23 @@ pub enum SupervisorCommand {
     StartDaemon {
         profile: ContainerName,
         args: diag::SpawnArgs,
+    },
+    SaveHotconfigPrivileged {
+        profile: ContainerName,
+        content: String,
+    },
+    SaveProfilePrivileged {
+        profile: ContainerName,
+        content: String,
+    },
+    CreateProfilePrivileged {
+        name: ContainerName,
+        profile_content: String,
+        hot_content: Option<String>,
+    },
+    RunSandbox {
+        profile: ContainerName,
+        reason: String,
     },
     SpawnPty {
         profile: ContainerName,
@@ -349,6 +388,11 @@ impl SupervisorHandle {
         let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(SupervisorSnapshot {
             profiles: BTreeMap::new(),
             ui_ns: NamespaceIndicator::default(),
+            root_daemon_connection: ConnectionState::Disconnected,
+            root_daemon_error: None,
+            hotconfig_editor_status: None,
+            profile_editor_status: None,
+            root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
             auto_open_logs_target: None,
             generated_at: SystemTime::now(),
         });
@@ -469,7 +513,6 @@ struct DiagState {
     dns_state: Option<diag::DnsState>,
     routing_state: Option<diag::RoutingState>,
     proxy_stats: HashMap<ProxyID, ProxyStats>,
-    serve_logs: VecDeque<LogEntry>,
     /// Rolling local copy of raw `DiagEvent`s (traffic log).
     /// Gets pre-populated via `QueryRecentDiagEvents` when first accessed.
     diag_event_log: VecDeque<DiagEvent>,
@@ -487,7 +530,15 @@ struct CachedProfileConfig {
     hotconfig_value: serde_json::Value,
     template: TemplateConfig,
     template_value: serde_json::Value,
+    sandbox_status: Option<SandboxStatus>,
     template_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingRootDaemonOp {
+    SaveHotconfig { profile: ContainerName },
+    SaveProfile { profile: ContainerName },
+    CreateProfile { name: ContainerName },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -518,7 +569,6 @@ impl Default for DiagState {
             dns_state: None,
             routing_state: None,
             proxy_stats: HashMap::new(),
-            serve_logs: VecDeque::new(),
             diag_event_log: VecDeque::new(),
             conns_state: diag::ConnsState::default(),
         }
@@ -537,6 +587,10 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StartServe { .. } => "StartServe",
         SupervisorCommand::StopServe { .. } => "StopServe",
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
+        SupervisorCommand::SaveHotconfigPrivileged { .. } => "SaveHotconfigPrivileged",
+        SupervisorCommand::SaveProfilePrivileged { .. } => "SaveProfilePrivileged",
+        SupervisorCommand::CreateProfilePrivileged { .. } => "CreateProfilePrivileged",
+        SupervisorCommand::RunSandbox { .. } => "RunSandbox",
         SupervisorCommand::SpawnPty { .. } => "SpawnPty",
         SupervisorCommand::DeleteContainer { .. } => "DeleteContainer",
         SupervisorCommand::StopContainer { .. } => "StopContainer",
@@ -564,6 +618,8 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         SupervisorCommand::StartUp { profile }
         | SupervisorCommand::StartServe { profile }
         | SupervisorCommand::StopServe { profile }
+        | SupervisorCommand::SaveHotconfigPrivileged { profile, .. }
+        | SupervisorCommand::SaveProfilePrivileged { profile, .. }
         | SupervisorCommand::DeleteContainer { profile }
         | SupervisorCommand::StopContainer { profile }
         | SupervisorCommand::KillContainer { profile }
@@ -573,6 +629,7 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::StartHotconfigDaemons { profile }
         | SupervisorCommand::OnTabOpen { profile, .. } => Some(profile.as_str()),
         SupervisorCommand::StartDaemon { profile, .. }
+        | SupervisorCommand::RunSandbox { profile, .. }
         | SupervisorCommand::SpawnPty { profile, .. }
         | SupervisorCommand::KillManagedProcess { profile, .. }
         | SupervisorCommand::QueryRawLogs { profile, .. }
@@ -581,6 +638,7 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::PtyInput { profile, .. }
         | SupervisorCommand::PtyResize { profile, .. }
         | SupervisorCommand::Ctrl { profile, .. } => Some(profile.as_str()),
+        SupervisorCommand::CreateProfilePrivileged { name, .. } => Some(name.as_str()),
         SupervisorCommand::LoadProfiles(_)
         | SupervisorCommand::RefreshNamespaces
         | SupervisorCommand::Init => None,
@@ -641,9 +699,17 @@ struct Supervisor {
     diag_cmd: HashMap<ContainerName, mpsc::UnboundedSender<ControlCommand>>,
     up_connection: HashMap<ContainerName, ConnectionStatus>,
     diag_connection: HashMap<ContainerName, ConnectionStatus>,
+    root_daemon_cmd: Option<mpsc::UnboundedSender<diag::RootDaemonRequest>>,
+    root_daemon_connection: ConnectionStatus,
+    root_daemon_attempt: Arc<Mutex<ConnectionBackoff>>,
+    pending_root_daemon_ops: HashMap<u64, PendingRootDaemonOp>,
+    next_root_daemon_op_id: u64,
+    hotconfig_editor_status: Option<EditorStatus>,
+    profile_editor_status: Option<EditorStatus>,
+    root_daemon_logs: SharedLevelLogRings,
     diag_state: HashMap<ContainerName, DiagState>,
     ns_alive_status: HashMap<ContainerName, NsAliveStatus>,
-    up_logs: HashMap<ContainerName, VecDeque<LogEntry>>,
+    up_logs: HashMap<ContainerName, SharedLevelLogRings>,
     container_lifecycle: HashMap<ContainerName, ContainerLifecycleState>,
     up_attempt: HashMap<ContainerName, Arc<Mutex<ConnectionBackoff>>>,
     diag_attempt: HashMap<ContainerName, Arc<Mutex<ConnectionBackoff>>>,
@@ -656,7 +722,7 @@ struct Supervisor {
     /// Cached namespace indicators for the UI process itself.
     ui_ns_cache: NamespaceIndicator,
     /// Per-process raw stdout/stderr log ring (profile -> pid -> lines).
-    process_raw_logs: HashMap<ContainerName, HashMap<u32, Vec<diag::RawLog>>>,
+    process_raw_logs: HashMap<ContainerName, SharedProcessRawLogs>,
     /// Shared PTY byte buffer — written here, drained by UI thread.
     pty_buf: SharedPtyBuf,
     /// Event-driven wake state for PTY readers waiting on new bytes.
@@ -670,6 +736,8 @@ struct Supervisor {
     /// Baseline slot PID set captured when the UI requests StartDaemon.
     /// Used on the actor thread to detect newly spawned process slots.
     pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
+    sandbox_in_flight: HashSet<ContainerName>,
+    pending_start_sandbox: HashSet<ContainerName>,
     /// Last computed "open raw logs for this process" target sent to UI.
     auto_open_logs_target: Option<AutoOpenLogsTarget>,
     /// Monotonic token for auto-open targets so UI can consume each target once.
@@ -683,6 +751,49 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn next_editor_status_token(&mut self) -> u64 {
+        let token = self.next_root_daemon_op_id;
+        self.next_root_daemon_op_id = self.next_root_daemon_op_id.saturating_add(1);
+        token
+    }
+
+    fn publish_editor_status(
+        &mut self,
+        op: &PendingRootDaemonOp,
+        ok: bool,
+        token: u64,
+        message: impl Into<String>,
+    ) {
+        let profile = match op {
+            PendingRootDaemonOp::SaveHotconfig { profile }
+            | PendingRootDaemonOp::SaveProfile { profile } => Some(profile.clone()),
+            PendingRootDaemonOp::CreateProfile { name } => Some(name.clone()),
+        };
+        let status = EditorStatus {
+            token,
+            ok,
+            profile,
+            message: message.into(),
+        };
+        match op {
+            PendingRootDaemonOp::SaveHotconfig { .. } => {
+                self.hotconfig_editor_status = Some(status);
+            }
+            PendingRootDaemonOp::SaveProfile { .. } | PendingRootDaemonOp::CreateProfile { .. } => {
+                self.profile_editor_status = Some(status);
+            }
+        }
+    }
+
+    fn fail_inflight_root_daemon_ops(&mut self, message: impl AsRef<str>) {
+        let message = message.as_ref().to_string();
+        let ops = std::mem::take(&mut self.pending_root_daemon_ops);
+        for (_op_id, op) in ops {
+            let token = self.next_editor_status_token();
+            self.publish_editor_status(&op, false, token, message.clone());
+        }
+    }
+
     fn new(
         _cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
         cmd_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
@@ -710,6 +821,14 @@ impl Supervisor {
             diag_cmd: HashMap::new(),
             up_connection: HashMap::new(),
             diag_connection: HashMap::new(),
+            root_daemon_cmd: None,
+            root_daemon_connection: ConnectionStatus::default(),
+            root_daemon_attempt: Arc::new(Mutex::new(ConnectionBackoff::default())),
+            pending_root_daemon_ops: HashMap::new(),
+            next_root_daemon_op_id: 1,
+            hotconfig_editor_status: None,
+            profile_editor_status: None,
+            root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
             diag_state: HashMap::new(),
             ns_alive_status: HashMap::new(),
             up_logs: HashMap::new(),
@@ -726,6 +845,8 @@ impl Supervisor {
             pty_viewport_id,
             pty_repaint_notify: Arc::new(tokio::sync::Notify::new()),
             pending_auto_open_logs: HashMap::new(),
+            sandbox_in_flight: HashSet::new(),
+            pending_start_sandbox: HashSet::new(),
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
             control_sock_path,
@@ -808,6 +929,7 @@ impl Supervisor {
             Err(e) => (TemplateConfig::default(), Some(e)),
         };
         let template_value = serde_json::to_value(&template).unwrap_or(serde_json::json!({}));
+        let sandbox_status = load_sandbox_status_from_disk(profile);
         self.config_cache.insert(
             profile.clone(),
             CachedProfileConfig {
@@ -815,9 +937,114 @@ impl Supervisor {
                 hotconfig_value,
                 template,
                 template_value,
+                sandbox_status,
                 template_error,
             },
         );
+    }
+
+    fn spawn_sandbox_reconcile(&mut self, profile: &ContainerName, reason: &str) {
+        if !self
+            .ns_alive_status
+            .get(profile)
+            .map(|status| status.child_alive)
+            .unwrap_or(false)
+        {
+            push_up_log(
+                &mut self.up_logs,
+                profile,
+                plain_log_entry(
+                    "INFO",
+                    "supervisor",
+                    format!(
+                        "Skipping sandbox reconcile ({reason}): container is not running yet"
+                    ),
+                ),
+            );
+            return;
+        }
+
+        if !self.sandbox_in_flight.insert(profile.clone()) {
+            push_up_log(
+                &mut self.up_logs,
+                profile,
+                plain_log_entry(
+                    "INFO",
+                    "supervisor",
+                    format!("Sandbox reconcile already running ({reason})"),
+                ),
+            );
+            return;
+        }
+
+        push_up_log(
+            &mut self.up_logs,
+            profile,
+            plain_log_entry(
+                "INFO",
+                "supervisor",
+                format!("Running sp sandbox ({reason})"),
+            ),
+        );
+
+        let cli = Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: None,
+            cmd: MainCommand::Sandbox {
+                profile: profile.clone(),
+            },
+        };
+
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+            Ok(spawned) => {
+                spawn_child_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stdout,
+                    spawned.stdout_r,
+                    self.event_tx.clone(),
+                    |profile, stream, line| SupervisorEvent::SandboxProcessLog {
+                        profile,
+                        stream,
+                        line,
+                    },
+                );
+                spawn_child_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stderr,
+                    spawned.stderr_r,
+                    self.event_tx.clone(),
+                    |profile, stream, line| SupervisorEvent::SandboxProcessLog {
+                        profile,
+                        stream,
+                        line,
+                    },
+                );
+                spawn_child_waiter(
+                    profile.clone(),
+                    spawned.pid,
+                    self.event_tx.clone(),
+                    |profile, success, detail| SupervisorEvent::SandboxFinished {
+                        profile,
+                        success,
+                        detail,
+                    },
+                );
+            }
+            Err(err) => {
+                self.sandbox_in_flight.remove(profile);
+                push_up_log(
+                    &mut self.up_logs,
+                    profile,
+                    plain_log_entry(
+                        "WARN",
+                        "supervisor",
+                        format!("Failed to spawn sp sandbox: {err}"),
+                    ),
+                );
+            }
+        }
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -900,6 +1127,7 @@ impl Supervisor {
             SupervisorCommand::StartUp { profile } => {
                 info!(profile = profile.as_str(), "starting sp up flow");
                 self.set_container_lifecycle(&profile, ContainerLifecycleState::Starting);
+                self.pending_start_sandbox.insert(profile.clone());
                 // Fresh backoff — intentional start, connect immediately.
                 self.reset_backoff(&profile);
                 let cli = Cli {
@@ -916,8 +1144,12 @@ impl Supervisor {
                     },
                 };
                 {
-                    let buf = self.up_logs.entry(profile.clone()).or_default();
-                    buf.clear();
+                    let logs = self
+                        .up_logs
+                        .entry(profile.clone())
+                        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+                        .clone();
+                    logs.write().unwrap_or_else(|e| e.into_inner()).clear();
                 }
                 push_up_log(
                     &mut self.up_logs,
@@ -954,6 +1186,7 @@ impl Supervisor {
                         );
                     }
                     Err(err) => {
+                        self.pending_start_sandbox.remove(&profile);
                         self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
                         warn!("failed to start sp up for {}: {err:?}", profile);
                     }
@@ -1045,6 +1278,46 @@ impl Supervisor {
                     info!(profile = profile.as_str(), exec = ?args.exec, argc = args.args.len(), "sending Spawn request to up daemon");
                     let _ = tx.send(diag::DaemonRequest::Spawn { args });
                 }
+            }
+            SupervisorCommand::SaveHotconfigPrivileged { profile, content } => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::WriteFile {
+                        path: state_paths::hot_config(profile.as_str()),
+                        content: content.into_bytes(),
+                        create_parent: true,
+                    },
+                    PendingRootDaemonOp::SaveHotconfig { profile },
+                );
+            }
+            SupervisorCommand::SaveProfilePrivileged { profile, content } => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::WriteFile {
+                        path: state_paths::profile_config(profile.as_str()),
+                        content: content.into_bytes(),
+                        create_parent: true,
+                    },
+                    PendingRootDaemonOp::SaveProfile { profile },
+                );
+            }
+            SupervisorCommand::CreateProfilePrivileged {
+                name,
+                profile_content,
+                hot_content,
+            } => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::CreateProfile {
+                        name: name.clone(),
+                        profile_content,
+                        hot_content,
+                    },
+                    PendingRootDaemonOp::CreateProfile { name },
+                );
+            }
+            SupervisorCommand::RunSandbox { profile, reason } => {
+                info!(profile = profile.as_str(), reason, "running sandbox reconcile");
+                self.known_profiles.insert(profile.clone());
+                self.refresh_profile_status(&profile);
+                self.spawn_sandbox_reconcile(&profile, &reason);
             }
             SupervisorCommand::SpawnPty { profile, args } => {
                 info!(profile = profile.as_str(), exec = ?args.exec, cwd = ?args.cwd, argc = args.args.len(), "starting PTY-managed process");
@@ -1379,6 +1652,7 @@ impl Supervisor {
             }
             SupervisorCommand::Init => {
                 info!("initializing supervisor profiles from disk");
+                self.ensure_root_daemon_client();
                 if let Ok(profile_infos) = crate::profile_loader::list_profiles() {
                     let discovered: HashSet<_> = profile_infos
                         .iter()
@@ -1477,6 +1751,11 @@ impl Supervisor {
             .get(profile)
             .map(|status| status.state)
             .unwrap_or_default();
+        let had_child_alive = self
+            .ns_alive_status
+            .get(profile)
+            .map(|status| status.child_alive)
+            .unwrap_or(false);
         let ns_meta = state_paths::profile_ns_meta(profile.as_str());
         let (child_alive, child_pid, serve_alive, serve_pid, up_alive, up_pid) = if ns_meta.exists()
         {
@@ -1544,6 +1823,9 @@ impl Supervisor {
         self.reconcile_container_lifecycle(profile, child_alive, start_in_flight);
 
         if !child_alive {
+            if !start_in_flight {
+                self.pending_start_sandbox.remove(profile);
+            }
             self.process_list_snapshot.remove(profile);
             if start_in_flight {
                 // Container is in Starting state — sp up hasn't written ns_alive yet.
@@ -1583,6 +1865,9 @@ impl Supervisor {
         if rearm_clients && serve_alive {
             self.ensure_diag_client(profile);
         }
+        if child_alive && !had_child_alive && self.pending_start_sandbox.remove(profile) {
+            self.spawn_sandbox_reconcile(profile, "container startup");
+        }
     }
 
     fn handle_event(&mut self, ev: SupervisorEvent) {
@@ -1594,7 +1879,7 @@ impl Supervisor {
                     event = event_name,
                     "received diag event"
                 );
-                let state = self.diag_state.entry(profile).or_default();
+                let state = self.diag_state.entry(profile.clone()).or_default();
                 state.accumulator.ingest(&event);
                 // Update client-side connection-tracking state.
                 state.conns_state.apply_event(&event);
@@ -1616,15 +1901,15 @@ impl Supervisor {
                     }
                     DiagEvent::UplinkStatsSnapshot { stats, .. } => state.proxy_stats = stats,
                     DiagEvent::Log(entry) => {
-                        const MAX_LOGS: usize = 2048;
-                        state.serve_logs.push_back(entry);
-                        if state.serve_logs.len() > MAX_LOGS {
-                            state.serve_logs.pop_front();
-                        }
+                        push_profile_log(&mut self.up_logs, &profile, LogSource::Serve, entry);
                     }
                     DiagEvent::RecentLogs(entries) => {
-                        state.serve_logs.clear();
-                        state.serve_logs.extend(entries);
+                        replace_profile_logs_for_source(
+                            &mut self.up_logs,
+                            &profile,
+                            LogSource::Serve,
+                            entries,
+                        );
                     }
                     DiagEvent::RecentDiagEvents(entries) => {
                         // Historical backfill: only populate when our local log is empty
@@ -1702,16 +1987,18 @@ impl Supervisor {
                 if let diag::DaemonEvent::Log(entry) = event {
                     push_up_log(&mut self.up_logs, &profile, entry);
                 } else if let diag::DaemonEvent::RecentLogs(entries) = event {
-                    // Historical backfill from the up-daemon ring buffer.
-                    // Replace the local log buffer with the server's snapshot, then live
-                    // DaemonEvent::Log entries will be appended on top.
-                    let buf = self.up_logs.entry(profile.clone()).or_default();
-                    buf.clear();
-                    buf.extend(entries);
+                    replace_profile_logs_for_source(
+                        &mut self.up_logs,
+                        &profile,
+                        LogSource::Up,
+                        entries,
+                    );
                 } else if let diag::DaemonEvent::RawLogs { pid, logs } = event {
                     self.process_raw_logs
                         .entry(profile.clone())
-                        .or_default()
+                        .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(pid, logs);
                 } else if let diag::DaemonEvent::PtyScrollback { pid, data } = event {
                     {
@@ -1829,6 +2116,84 @@ impl Supervisor {
                     run_injected_diag_stream(profile_name, stream, cmd_rx, event_tx).await;
                 });
             }
+            SupervisorEvent::InjectRootDaemonStream { stream } => {
+                info!("control socket: root daemon connected, starting direct stream handler");
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<diag::RootDaemonRequest>();
+                self.root_daemon_cmd = Some(cmd_tx);
+                let event_tx = self.event_tx.clone();
+                let nsproxy_path = self.nsproxy_path.clone();
+                let control_sock_path = self.control_sock_path.clone();
+                tokio::spawn(async move {
+                    run_injected_root_daemon_stream(
+                        stream,
+                        cmd_rx,
+                        event_tx,
+                        nsproxy_path,
+                        control_sock_path,
+                    )
+                    .await;
+                });
+            }
+            SupervisorEvent::RootDaemonConnectionUpdate { state, error } => {
+                self.root_daemon_connection.state = state;
+                self.root_daemon_connection.last_error = error.clone();
+                if state != ConnectionState::Connected {
+                    let detail = error.unwrap_or_else(|| "root daemon disconnected".to_string());
+                    self.fail_inflight_root_daemon_ops(detail);
+                }
+            }
+            SupervisorEvent::RootDaemonEvent { event } => {
+                let pending = self.pending_root_daemon_ops.remove(&event.op_id);
+                match event.result {
+                    diag::RootDaemonResult::Pong { version } => {
+                        if let Some(op) = pending.as_ref() {
+                            self.publish_editor_status(
+                                op,
+                                true,
+                                event.op_id,
+                                format!("root daemon pong ({version})"),
+                            );
+                        }
+                    }
+                    diag::RootDaemonResult::Ok { message, profile, .. } => {
+                        if let Some(op) = pending.as_ref() {
+                            self.publish_editor_status(op, true, event.op_id, message.clone());
+                            match op {
+                                PendingRootDaemonOp::SaveHotconfig { profile } => {
+                                    self.refresh_config_cache(profile);
+                                    self.refresh_profile_status(profile);
+                                    self.spawn_sandbox_reconcile(profile, "hotconfig saved");
+                                }
+                                PendingRootDaemonOp::SaveProfile { profile } => {
+                                    self.refresh_config_cache(profile);
+                                    self.refresh_profile_status(profile);
+                                    self.spawn_sandbox_reconcile(profile, "profile saved");
+                                }
+                                PendingRootDaemonOp::CreateProfile { name } => {
+                                    self.known_profiles.insert(name.clone());
+                                    self.refresh_config_cache(name);
+                                    self.refresh_profile_status(name);
+                                }
+                            }
+                        }
+                    }
+                    diag::RootDaemonResult::Error { message, profile, .. } => {
+                        if let Some(op) = pending.as_ref() {
+                            self.publish_editor_status(op, false, event.op_id, message);
+                        }
+                    }
+                }
+            }
+            SupervisorEvent::RootDaemonLog { entry } => {
+                push_global_log(&self.root_daemon_logs, LogSource::RootDaemon, entry);
+            }
+            SupervisorEvent::RootDaemonRecentLogs { entries } => {
+                replace_global_logs_for_source(
+                    &self.root_daemon_logs,
+                    LogSource::RootDaemon,
+                    entries,
+                );
+            }
             SupervisorEvent::UpDaemonExited { profile } => {
                 let lc = self.container_lifecycle(&profile);
                 if !matches!(
@@ -1912,6 +2277,27 @@ impl Supervisor {
                     },
                 );
             }
+            SupervisorEvent::SandboxProcessLog {
+                profile,
+                stream,
+                line,
+            } => {
+                let level = match stream {
+                    BootstrapLogStream::Stdout => "INFO",
+                    BootstrapLogStream::Stderr => "WARN",
+                };
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    diag::LogEntry {
+                        ts: diag::Timestamp::now(),
+                        level: level.to_string(),
+                        target: "sp-sandbox".to_string(),
+                        message: line,
+                        fields: Vec::new(),
+                    },
+                );
+            }
             SupervisorEvent::DeleteContainerFinished {
                 profile,
                 success,
@@ -1948,6 +2334,28 @@ impl Supervisor {
                     self.refresh_profile_status(&profile);
                 }
             }
+            SupervisorEvent::SandboxFinished {
+                profile,
+                success,
+                detail,
+            } => {
+                self.sandbox_in_flight.remove(&profile);
+                self.refresh_config_cache(&profile);
+                self.refresh_profile_status(&profile);
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    plain_log_entry(
+                        if success { "INFO" } else { "WARN" },
+                        "supervisor",
+                        if success {
+                            format!("Sandbox reconcile finished successfully ({detail})")
+                        } else {
+                            format!("Sandbox reconcile failed ({detail})")
+                        },
+                    ),
+                );
+            }
         }
         self.ectx.request_repaint();
     }
@@ -1971,6 +2379,8 @@ impl Supervisor {
         self.profile_ns_cache.remove(profile);
         self.process_raw_logs.remove(profile);
         self.pending_auto_open_logs.remove(profile);
+        self.sandbox_in_flight.remove(profile);
+        self.pending_start_sandbox.remove(profile);
         self.up_start_time.remove(profile);
         self.spawned_daemons
             .retain(|key| !key.starts_with(&format!("{}:", profile)));
@@ -2217,6 +2627,79 @@ impl Supervisor {
         });
     }
 
+    fn start_root_daemon_process(&mut self) {
+        match try_start_root_daemon_process(&self.nsproxy_path, &self.control_sock_path) {
+            Ok(_) => {}
+            Err(err) => {
+                self.root_daemon_connection.state = ConnectionState::Disconnected;
+                self.root_daemon_connection.last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn ensure_root_daemon_client(&mut self) {
+        if self.root_daemon_cmd.is_some() {
+            return;
+        }
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        self.root_daemon_cmd = Some(cmd_tx);
+        let event_tx = self.event_tx.clone();
+        let backoff = self.root_daemon_attempt.clone();
+        let nsproxy_path = self.nsproxy_path.clone();
+        let control_sock_path = self.control_sock_path.clone();
+        tokio::spawn(async move {
+            root_daemon_client_loop(cmd_rx, event_tx, backoff, nsproxy_path, control_sock_path)
+                .await;
+        });
+
+        if !diag::root_daemon_sock_path().exists() {
+            self.start_root_daemon_process();
+        }
+    }
+
+    fn queue_root_daemon_op(&mut self, op: diag::RootDaemonOp, pending: PendingRootDaemonOp) {
+        self.ensure_root_daemon_client();
+        if self.root_daemon_connection.state != ConnectionState::Connected {
+            let detail = self
+                .root_daemon_connection
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "root daemon is not connected".to_string());
+            let token = self.next_editor_status_token();
+            self.publish_editor_status(&pending, false, token, detail);
+            return;
+        }
+        let op_id = self.next_root_daemon_op_id;
+        self.next_root_daemon_op_id = self.next_root_daemon_op_id.saturating_add(1);
+        let req = diag::RootDaemonRequest { op_id, op };
+        match self.root_daemon_cmd.as_ref() {
+            Some(tx) => {
+                if tx.send(req).is_err() {
+                    self.root_daemon_cmd = None;
+                    self.root_daemon_connection.state = ConnectionState::Disconnected;
+                    self.root_daemon_connection.last_error =
+                        Some("root daemon command channel dropped".to_string());
+                    let token = self.next_editor_status_token();
+                    self.publish_editor_status(
+                        &pending,
+                        false,
+                        token,
+                        "root daemon command channel dropped",
+                    );
+                } else {
+                    self.pending_root_daemon_ops.insert(op_id, pending);
+                }
+            }
+            None => {
+                self.root_daemon_connection.state = ConnectionState::Disconnected;
+                self.root_daemon_connection.last_error =
+                    Some("root daemon channel unavailable".to_string());
+                let token = self.next_editor_status_token();
+                self.publish_editor_status(&pending, false, token, "root daemon channel unavailable");
+            }
+        }
+    }
+
     fn spawn_hotconfig_daemons(&mut self, profile: &ContainerName) {
         let list = self
             .daemon_catalog
@@ -2264,13 +2747,14 @@ impl Supervisor {
             // Use cached config to avoid per-event disk reads.
             // A default is produced inline when the cache entry is absent (first frame
             // before an explicit Load command populates it).
-            let (hotconfig, hotconfig_value, template, template_value, template_error) =
+            let (hotconfig, hotconfig_value, template, template_value, sandbox_status, template_error) =
                 if let Some(c) = self.config_cache.get(profile) {
                     (
                         c.hotconfig.clone(),
                         c.hotconfig_value.clone(),
                         c.template.clone(),
                         c.template_value.clone(),
+                        c.sandbox_status.clone(),
                         c.template_error.clone(),
                     )
                 } else {
@@ -2278,7 +2762,7 @@ impl Supervisor {
                     let hv = serde_json::json!({});
                     let tc = TemplateConfig::default();
                     let tv = serde_json::json!({});
-                    (hc, hv, tc, tv, None)
+                    (hc, hv, tc, tv, None, None)
                 };
 
             let ns_status = self
@@ -2318,6 +2802,7 @@ impl Supervisor {
                     diag_error: diag_connection.last_error,
                     hotconfig,
                     template,
+                    sandbox_status,
                     template_error,
                     routing_state: diag.and_then(|d| d.routing_state.clone()),
                     dns_state: diag.and_then(|d| d.dns_state.clone()),
@@ -2336,29 +2821,20 @@ impl Supervisor {
                         .profile_ns_cache
                         .get(profile)
                         .and_then(|v| v.keeper.clone()),
-                    up_logs: self
+                    logs_by_level: self
                         .up_logs
                         .get(profile)
-                        .map(|q| q.iter().cloned().collect())
-                        .unwrap_or_default(),
-                    serve_logs: diag
-                        .map(|d| d.serve_logs.iter().cloned().collect())
-                        .unwrap_or_default(),
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(RwLock::new(BTreeMap::new()))),
                     diag_event_log: diag
                         .map(|d| d.diag_event_log.iter().cloned().collect())
                         .unwrap_or_default(),
                     conns_state: diag.map(|d| d.conns_state.clone()).unwrap_or_default(),
-                    merged_logs: {
-                        let empty_vd = VecDeque::new();
-                        let ul = self.up_logs.get(profile).unwrap_or(&empty_vd);
-                        let sl = diag.map(|d| &d.serve_logs).unwrap_or(&empty_vd);
-                        build_merged_logs(ul, sl)
-                    },
                     process_raw_logs: self
                         .process_raw_logs
                         .get(profile)
                         .cloned()
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
                     pty_streams: HashMap::new(),
                 },
             );
@@ -2367,6 +2843,11 @@ impl Supervisor {
         let _ = self.snapshot_tx.send(SupervisorSnapshot {
             profiles,
             ui_ns: self.ui_ns_cache.clone(),
+            root_daemon_connection: self.root_daemon_connection.state,
+            root_daemon_error: self.root_daemon_connection.last_error.clone(),
+            hotconfig_editor_status: self.hotconfig_editor_status.clone(),
+            profile_editor_status: self.profile_editor_status.clone(),
+            root_daemon_logs: self.root_daemon_logs.clone(),
             auto_open_logs_target: self.auto_open_logs_target.clone(),
             generated_at: SystemTime::now(),
         });
@@ -2419,6 +2900,22 @@ enum SupervisorEvent {
         profile: ContainerName,
         stream: diag::DiagEventStream,
     },
+    InjectRootDaemonStream {
+        stream: diag::RootDaemonStream,
+    },
+    RootDaemonConnectionUpdate {
+        state: ConnectionState,
+        error: Option<String>,
+    },
+    RootDaemonEvent {
+        event: diag::RootDaemonEvent,
+    },
+    RootDaemonLog {
+        entry: diag::LogEntry,
+    },
+    RootDaemonRecentLogs {
+        entries: Vec<diag::LogEntry>,
+    },
     /// `sp up` process has been confirmed dead by `kill(0)`; lifecycle transitions to Stopped.
     /// Sub-processes (sp serve, sandbox child) are owned by sp up and need no separate tracking.
     UpDaemonExited { profile: ContainerName },
@@ -2434,7 +2931,17 @@ enum SupervisorEvent {
         stream: BootstrapLogStream,
         line: String,
     },
+    SandboxProcessLog {
+        profile: ContainerName,
+        stream: BootstrapLogStream,
+        line: String,
+    },
     DeleteContainerFinished {
+        profile: ContainerName,
+        success: bool,
+        detail: String,
+    },
+    SandboxFinished {
         profile: ContainerName,
         success: bool,
         detail: String,
@@ -2463,6 +2970,8 @@ struct ConnectionBackoff {
 
 /// A connection lasting longer than this is considered stable; urgency resets to 0.
 const STABLE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+static ROOT_DAEMON_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 impl ConnectionBackoff {
     /// Return the delay that should be observed before the next connect attempt.
@@ -2609,6 +3118,47 @@ async fn sleep_or_cancelled<T>(
     }
 }
 
+enum RootDaemonConnectOutcome {
+    Ready(diag::RootDaemonStream),
+    RestartRequired { message: String },
+}
+
+async fn verify_root_daemon_stream(
+    mut stream: diag::RootDaemonStream,
+) -> Result<RootDaemonConnectOutcome> {
+    stream
+        .send_stable_request(&diag::StableRequest::Upgrade {
+            build_tree_hash: diag::protocol_version().to_string(),
+        })
+        .await
+        .context("request root daemon protocol upgrade")?;
+
+    let Some(event) = stream
+        .next_wire_event()
+        .await
+        .context("read root daemon upgrade response")?
+    else {
+        anyhow::bail!("root daemon closed during protocol upgrade");
+    };
+
+    match event {
+        diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted { .. }) => {
+            Ok(RootDaemonConnectOutcome::Ready(stream))
+        }
+        diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeRejected { msg }) => {
+            let message = format!("sp daemon version mismatch: {msg}; restarting");
+            let _ = stream
+                .send_stable_request(&diag::StableRequest::GracefulShutdown)
+                .await;
+            Ok(RootDaemonConnectOutcome::RestartRequired { message })
+        }
+        diag::RootDaemonWireEvent::Stable(diag::StableEvent::Error { msg }) => {
+            anyhow::bail!("root daemon stable protocol error: {msg}")
+        }
+        other => anyhow::bail!("unexpected root daemon upgrade response: {other:?}"),
+    }
+}
+
 /// Accept loop for the UI-side control socket.
 /// Spawned processes (sp up, sp serve) connect here, write a `ControlSocketGreeting`,
 /// and then the normal wire protocol takes over in the supervisor's client loops
@@ -2651,6 +3201,13 @@ async fn control_socket_accept_loop(
                             let _ = event_tx.send(SupervisorEvent::InjectDiagStream {
                                 profile: name.into(),
                                 stream: diag_stream,
+                            });
+                        }
+                        Ok(Some(diag::ControlSocketGreeting::RootDaemon)) => {
+                            info!("control socket: received RootDaemon greeting");
+                            let daemon_stream = diag::RootDaemonStream::from_stream(stream);
+                            let _ = event_tx.send(SupervisorEvent::InjectRootDaemonStream {
+                                stream: daemon_stream,
                             });
                         }
                         Ok(None) => {
@@ -2749,6 +3306,254 @@ async fn run_injected_diag_stream(
                 ConnectionState::Disconnected,
                 Some(err.to_string()),
             );
+        }
+    }
+}
+
+async fn root_daemon_stream_loop(
+    stream: diag::RootDaemonStream,
+    cmd_rx: &mut mpsc::UnboundedReceiver<diag::RootDaemonRequest>,
+    event_tx: &mpsc::UnboundedSender<SupervisorEvent>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.split();
+
+    writer
+        .send_query_recent_logs(diag::LOG_RING_CAP)
+        .await
+        .context("request root daemon recent logs")?;
+
+    loop {
+        tokio::select! {
+            res = reader.next_wire_event() => {
+                match res.context("read root daemon wire event")? {
+                    Some(diag::RootDaemonWireEvent::Unstable(event)) => {
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonEvent { event });
+                    }
+                    Some(diag::RootDaemonWireEvent::Log(entry)) => {
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonLog { entry });
+                    }
+                    Some(diag::RootDaemonWireEvent::RecentLogs(entries)) => {
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonRecentLogs { entries });
+                    }
+                    Some(diag::RootDaemonWireEvent::Stable(diag::StableEvent::Error { msg })) => {
+                        anyhow::bail!("root daemon stable protocol error: {msg}")
+                    }
+                    Some(other) => anyhow::bail!("unexpected root daemon wire event: {other:?}"),
+                    None => anyhow::bail!("root daemon closed connection"),
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(cmd) => {
+                        if let Err(err) = writer.send_request(&cmd).await {
+                            return Err(err).context("send root daemon request");
+                        }
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+async fn run_injected_root_daemon_stream(
+    stream: diag::RootDaemonStream,
+    mut cmd_rx: mpsc::UnboundedReceiver<diag::RootDaemonRequest>,
+    event_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    nsproxy_path: PathBuf,
+    control_sock_path: PathBuf,
+) {
+    let stream = match verify_root_daemon_stream(stream).await {
+        Ok(RootDaemonConnectOutcome::Ready(stream)) => stream,
+        Ok(RootDaemonConnectOutcome::RestartRequired { message }) => {
+            let restart_message = message.clone();
+            let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                state: ConnectionState::Connecting,
+                error: Some(restart_message),
+            });
+            match try_start_root_daemon_process(&nsproxy_path, &control_sock_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                        state: ConnectionState::NoRetry,
+                        error: Some(message),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                        state: ConnectionState::NoRetry,
+                        error: Some(format!("failed to restart sp daemon: {err}")),
+                    });
+                }
+            }
+            return;
+        }
+        Err(err) => {
+            let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                state: ConnectionState::Disconnected,
+                error: Some(err.to_string()),
+            });
+            return;
+        }
+    };
+
+    let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+        state: ConnectionState::Connected,
+        error: None,
+    });
+    if let Err(err) = root_daemon_stream_loop(stream, &mut cmd_rx, &event_tx).await {
+        let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+            state: ConnectionState::Disconnected,
+            error: Some(err.to_string()),
+        });
+    }
+}
+
+async fn root_daemon_client_loop(
+    mut cmd_rx: mpsc::UnboundedReceiver<diag::RootDaemonRequest>,
+    event_tx: mpsc::UnboundedSender<SupervisorEvent>,
+    backoff: Arc<Mutex<ConnectionBackoff>>,
+    nsproxy_path: PathBuf,
+    control_sock_path: PathBuf,
+) {
+    let sock = diag::root_daemon_sock_path();
+    let mut restart_note: Option<String> = None;
+
+    loop {
+        let delay = backoff.lock().unwrap().next_delay();
+        if !delay.is_zero() {
+            if sleep_or_cancelled(delay, &mut cmd_rx).await {
+                return;
+            }
+        }
+
+        let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+            state: ConnectionState::Connecting,
+            error: None,
+        });
+
+        match diag::connect_root_daemon(&sock).await {
+            Ok(stream) => {
+                let stream = match verify_root_daemon_stream(stream).await {
+                    Ok(RootDaemonConnectOutcome::Ready(stream)) => stream,
+                    Ok(RootDaemonConnectOutcome::RestartRequired { message }) => {
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                            state: ConnectionState::Connecting,
+                            error: Some(message.clone()),
+                        });
+                        match try_start_root_daemon_process(&nsproxy_path, &control_sock_path) {
+                            Ok(true) => {
+                                backoff.lock().unwrap().reset();
+                                restart_note = Some(message);
+                            }
+                            Ok(false) => {
+                                backoff.lock().unwrap().record_disconnect();
+                                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                    state: ConnectionState::NoRetry,
+                                    error: Some(message),
+                                });
+                                return;
+                            }
+                            Err(err) => {
+                                backoff.lock().unwrap().record_disconnect();
+                                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                    state: ConnectionState::NoRetry,
+                                    error: Some(format!("failed to restart sp daemon: {err}")),
+                                });
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        let err_text = err.to_string();
+                        if !ROOT_DAEMON_START_ATTEMPTED.load(Ordering::Relaxed) {
+                            let restart_message =
+                                format!("root daemon initial handshake failed: {err_text}; restarting once");
+                            let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                state: ConnectionState::Connecting,
+                                error: Some(restart_message),
+                            });
+                            match try_start_root_daemon_process(&nsproxy_path, &control_sock_path) {
+                                Ok(true) => {
+                                    backoff.lock().unwrap().reset();
+                                    continue;
+                                }
+                                Ok(false) => {
+                                    backoff.lock().unwrap().reset();
+                                    continue;
+                                }
+                                Err(restart_err) => {
+                                    backoff.lock().unwrap().record_disconnect();
+                                    let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                        state: ConnectionState::Disconnected,
+                                        error: Some(format!(
+                                            "failed to restart sp daemon after initial handshake error: {restart_err}"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        backoff.lock().unwrap().record_disconnect();
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                            state: ConnectionState::Disconnected,
+                            error: Some(err_text),
+                        });
+                        continue;
+                    }
+                };
+
+                backoff.lock().unwrap().record_connected();
+                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                    state: ConnectionState::Connected,
+                    error: restart_note.take(),
+                });
+                match root_daemon_stream_loop(stream, &mut cmd_rx, &event_tx).await {
+                    Ok(()) => return,
+                    Err(err) => {
+                        backoff.lock().unwrap().record_disconnect();
+                        let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                            state: ConnectionState::Disconnected,
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                let err_text = format!("failed to connect to {}: {err}", sock.display());
+                if !ROOT_DAEMON_START_ATTEMPTED.load(Ordering::Relaxed) {
+                    let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                        state: ConnectionState::Connecting,
+                        error: Some(format!("{err_text}; restarting once")),
+                    });
+                    match try_start_root_daemon_process(&nsproxy_path, &control_sock_path) {
+                        Ok(true) => {
+                            backoff.lock().unwrap().reset();
+                            continue;
+                        }
+                        Ok(false) => {
+                            backoff.lock().unwrap().reset();
+                            continue;
+                        }
+                        Err(restart_err) => {
+                            backoff.lock().unwrap().record_disconnect();
+                            let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                state: ConnectionState::Disconnected,
+                                error: Some(format!(
+                                    "failed to restart sp daemon after initial connect error: {restart_err}"
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                backoff.lock().unwrap().record_disconnect();
+                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                    state: ConnectionState::Disconnected,
+                    error: Some(err_text),
+                });
+            }
         }
     }
 }
@@ -3090,27 +3895,6 @@ fn build_traffic_snapshot(state: &DiagState) -> TrafficSnapshot {
     }
 }
 
-fn build_merged_logs(
-    up_logs: &VecDeque<LogEntry>,
-    serve_logs: &VecDeque<LogEntry>,
-) -> Vec<Arc<LogEntryOf>> {
-    let mut v: Vec<Arc<LogEntryOf>> = Vec::with_capacity(up_logs.len() + serve_logs.len());
-    for e in up_logs {
-        v.push(Arc::new(LogEntryOf {
-            log: e.clone(),
-            src: LogSource::Up,
-        }));
-    }
-    for e in serve_logs {
-        v.push(Arc::new(LogEntryOf {
-            log: e.clone(),
-            src: LogSource::Serve,
-        }));
-    }
-    v.sort_by_key(|e| e.log.ts);
-    v
-}
-
 fn default_nsproxy_path() -> PathBuf {
     if let Ok(current) = std::env::current_exe() {
         if let Some(parent) = current.parent() {
@@ -3173,6 +3957,51 @@ fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<SpawnedCli> {
                 libc::close(stdout_pipe[1]);
                 libc::close(stderr_pipe[1]);
             }
+            let fd_str = fd.to_string();
+            let argv = [to_cstr(path.to_string_lossy().as_ref()), to_cstr(&fd_str)];
+            let envs: Vec<_> = std::env::vars()
+                .map(|(k, v)| {
+                    let mut s = k;
+                    s.push('=');
+                    s.push_str(&v);
+                    to_cstr(&s)
+                })
+                .collect();
+            let _ = execve(&to_cstr(path.to_string_lossy().as_ref()), &argv, &envs);
+            std::process::exit(127);
+        }
+    }
+}
+
+fn spawn_root_daemon_process(nsproxy_path: &Path, control_sock_path: &Path) -> Result<()> {
+    let cli = Cli {
+        conf: None,
+        root: None,
+        no_wrap_check: false,
+        control_socket: Some(control_sock_path.to_path_buf()),
+        cmd: MainCommand::Daemon { cmd: None },
+    };
+    let _ = spawn_nsproxy_cli_detached(nsproxy_path, &cli)?;
+    Ok(())
+}
+
+fn try_start_root_daemon_process(nsproxy_path: &Path, control_sock_path: &Path) -> Result<bool> {
+    if ROOT_DAEMON_START_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return Ok(false);
+    }
+    spawn_root_daemon_process(nsproxy_path, control_sock_path)?;
+    Ok(true)
+}
+
+fn spawn_nsproxy_cli_detached(path: &Path, cli: &Cli) -> Result<Pid> {
+    let fd_file = cli_to_inheritable_fd(cli)?;
+    let fd = fd_file.as_raw_fd();
+
+    match unsafe { fork()? } {
+        ForkResult::Parent { child } => Ok(child),
+        ForkResult::Child => {
+            let _ = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            let _ = unsafe { libc::setsid() };
             let fd_str = fd.to_string();
             let argv = [to_cstr(path.to_string_lossy().as_ref()), to_cstr(&fd_str)];
             let envs: Vec<_> = std::env::vars()
@@ -3297,6 +4126,25 @@ fn load_hotconfig_from_disk(profile: &ContainerName) -> Option<HotConfig> {
         Err(err) => {
             warn!("invalid hotconfig JSON on disk for {}: {err}", profile);
             Some(HotConfig::default())
+        }
+    }
+}
+
+fn load_sandbox_status_from_disk(profile: &ContainerName) -> Option<SandboxStatus> {
+    let path = state_paths::sandbox_status(profile.as_str());
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn!("failed to read sandbox status for {}: {err}", profile);
+            return None;
+        }
+    };
+    match serde_json::from_str::<SandboxStatus>(&content) {
+        Ok(status) => Some(status),
+        Err(err) => {
+            warn!("invalid sandbox status JSON on disk for {}: {err}", profile);
+            None
         }
     }
 }
@@ -3500,7 +4348,7 @@ async fn watch_up_pid_exit(
 
 fn fallback_stop_profile_from_metadata(
     profile: &ContainerName,
-    up_logs: &mut HashMap<ContainerName, VecDeque<LogEntry>>,
+    up_logs: &mut HashMap<ContainerName, SharedLevelLogRings>,
 ) {
     info!(
         profile = profile.as_str(),
@@ -3574,15 +4422,107 @@ fn plain_log_entry(level: &str, target: &str, message: impl Into<String>) -> Log
 }
 
 fn push_up_log(
-    up_logs: &mut HashMap<ContainerName, VecDeque<LogEntry>>,
+    up_logs: &mut HashMap<ContainerName, SharedLevelLogRings>,
     profile: &ContainerName,
     entry: LogEntry,
 ) {
-    const MAX_LOGS: usize = 2048;
-    let buf = up_logs.entry(profile.clone()).or_default();
-    buf.push_back(entry);
-    if buf.len() > MAX_LOGS {
+    push_profile_log(up_logs, profile, LogSource::Up, entry);
+}
+
+fn push_global_log(logs: &SharedLevelLogRings, src: LogSource, entry: LogEntry) {
+    const MAX_LOGS_PER_LEVEL: usize = 2048;
+    let level = normalized_log_level(&entry.level);
+    let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
+    let buf = guard.entry(level).or_default();
+    buf.push_back(Arc::new(LogEntryOf {
+        hash: fast_hash_log_entry(&entry),
+        log: entry,
+        src,
+    }));
+    if buf.len() > MAX_LOGS_PER_LEVEL {
         buf.pop_front();
+    }
+}
+
+fn replace_global_logs_for_source<I>(logs: &SharedLevelLogRings, src: LogSource, entries: I)
+where
+    I: IntoIterator<Item = LogEntry>,
+{
+    const MAX_LOGS_PER_LEVEL: usize = 2048;
+    let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
+    for buf in guard.values_mut() {
+        buf.retain(|entry| entry.src != src);
+    }
+    guard.retain(|_, buf| !buf.is_empty());
+    for entry in entries {
+        let level = normalized_log_level(&entry.level);
+        let buf = guard.entry(level).or_default();
+        buf.push_back(Arc::new(LogEntryOf {
+            hash: fast_hash_log_entry(&entry),
+            log: entry,
+            src: src.clone(),
+        }));
+        if buf.len() > MAX_LOGS_PER_LEVEL {
+            buf.pop_front();
+        }
+    }
+}
+
+fn push_profile_log(
+    up_logs: &mut HashMap<ContainerName, SharedLevelLogRings>,
+    profile: &ContainerName,
+    src: LogSource,
+    entry: LogEntry,
+) {
+    const MAX_LOGS_PER_LEVEL: usize = 2048;
+    let level = normalized_log_level(&entry.level);
+    let logs = up_logs
+        .entry(profile.clone())
+        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+        .clone();
+    let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
+    let buf = guard
+        .entry(level)
+        .or_default();
+    buf.push_back(Arc::new(LogEntryOf {
+        hash: fast_hash_log_entry(&entry),
+        log: entry,
+        src,
+    }));
+    if buf.len() > MAX_LOGS_PER_LEVEL {
+        buf.pop_front();
+    }
+}
+
+fn replace_profile_logs_for_source<I>(
+    up_logs: &mut HashMap<ContainerName, SharedLevelLogRings>,
+    profile: &ContainerName,
+    src: LogSource,
+    entries: I,
+) where
+    I: IntoIterator<Item = LogEntry>,
+{
+    let logs = up_logs
+        .entry(profile.clone())
+        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+        .clone();
+    let mut profile_logs = logs.write().unwrap_or_else(|e| e.into_inner());
+    for buf in profile_logs.values_mut() {
+        buf.retain(|entry| entry.src != src);
+    }
+    profile_logs.retain(|_, buf| !buf.is_empty());
+    drop(profile_logs);
+    for entry in entries {
+        push_profile_log(up_logs, profile, src.clone(), entry);
+    }
+}
+
+fn normalized_log_level(level: &str) -> String {
+    let trimmed = level.trim();
+    if trimmed.is_empty() {
+        "INFO".to_string()
+    } else {
+        trimmed.to_ascii_uppercase()
     }
 }
 

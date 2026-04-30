@@ -1,7 +1,7 @@
 //! Profile discovery utilities for the nsproxy UI.
-//! 
-//! This module scans the persist root to discover available container profiles.
-//! Profiles are directories under /nsp3/{name}, and are considered "instantiated"
+//!
+//! This module scans the persistent config root to discover available container profiles.
+//! Profiles are directories under /nsp3/config/{name}, and are considered "instantiated"
 //! if they have a valid ns_alive.json file indicating an active namespace.
 
 use std::fs;
@@ -11,7 +11,7 @@ use anyhow::Result;
 use nsproxy_core::{NsAlive, state_paths};
 use serde::{Deserialize, Serialize};
 
-/// Runtime profile information loaded from the persist root
+/// Runtime profile information loaded from the persistent config root
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProfileInfo {
     pub name: String,
@@ -19,11 +19,11 @@ pub struct ProfileInfo {
     pub ns_alive: Option<NsAlive>,
 }
 
-/// Scan the persist root and discover all profiles.
-/// A profile is considered to exist if it has a directory under /nsp3/{name}.
+/// Scan the persistent config root and discover all profiles.
+/// A profile is considered to exist if it has a directory under /nsp3/config/{name}.
 /// A profile is instantiated if ns_alive.json exists and is valid.
 pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
-    let root = state_paths::persist_root();
+    let root = state_paths::config_root();
     let mut profiles = Vec::new();
 
     if !root.exists() {

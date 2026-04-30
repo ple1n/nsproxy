@@ -10,6 +10,7 @@ use nsproxy_common::crdt::CRDT;
 use nsproxy_common::normalize_domain;
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::stats::ProxyStats;
+use nsproxy_core::sandbox::SandboxStatus;
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::state_blueprint::PersistentState as _;
 use nsproxy_core::uplink::clash::{ClashState, GroupId};
@@ -21,25 +22,31 @@ use nsproxy_core::{
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use twox_hash::XxHash3_64;
 use which;
 
+mod alacritty_window;
 mod profile_loader;
 mod supervisor;
-mod alacritty_window;
 
-use alacritty_window::{ExternalTermWindowClient, parse_term_window_fd_arg, run_term_window_process};
+use alacritty_window::{
+    parse_term_window_fd_arg, run_term_window_process, ExternalTermWindowClient,
+};
 use profile_loader::ProfileInfo;
-use supervisor::{ContainerName, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle};
-use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
+use supervisor::{
+    ContainerName, EditorStatus, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle,
+};
+use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
 /// `PtyIpc` implementation that routes through the supervisor for a specific
 /// (profile, pid) combination.  Lives in `nsproxy-ui` (debug build) but is
@@ -156,6 +163,7 @@ impl ProxyType {
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum RightTab {
     Proxies,
+    Daemon,
     Processes,
     Traffic,
     Hotconfig,
@@ -168,6 +176,60 @@ enum TrafficSubview {
     #[default]
     Connections,
     Logs,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+enum LogMinLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogMinLevel {
+    const ALL: [Self; 5] = [
+        Self::Trace,
+        Self::Debug,
+        Self::Info,
+        Self::Warn,
+        Self::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    fn matches(self, level: &str) -> bool {
+        Self::rank(level) >= self.rank_value()
+    }
+
+    fn rank_value(self) -> u8 {
+        match self {
+            Self::Trace => 0,
+            Self::Debug => 1,
+            Self::Info => 2,
+            Self::Warn => 3,
+            Self::Error => 4,
+        }
+    }
+
+    fn rank(level: &str) -> u8 {
+        match level.trim().to_ascii_uppercase().as_str() {
+            "TRACE" => Self::Trace.rank_value(),
+            "DEBUG" => Self::Debug.rank_value(),
+            "WARN" => Self::Warn.rank_value(),
+            "ERROR" => Self::Error.rank_value(),
+            _ => Self::Info.rank_value(),
+        }
+    }
 }
 
 // ── Viewer (ported from nsp-diag viewer.rs) ──────────────────────────────────
@@ -462,9 +524,10 @@ impl IntInput {
         let cache_key = (id, value_addr);
         let mut changed = false;
 
-        let input = self.texts.entry(cache_key).or_insert_with(|| {
-            value.map(|parsed| parsed.to_string()).unwrap_or_default()
-        });
+        let input = self
+            .texts
+            .entry(cache_key)
+            .or_insert_with(|| value.map(|parsed| parsed.to_string()).unwrap_or_default());
 
         let parsed = input.parse::<u32>().ok();
         let is_valid = parsed.is_some_and(&validate);
@@ -481,10 +544,12 @@ impl IntInput {
         let visuals = ui.visuals_mut();
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
-        let resp = ui.horizontal(|ui| {
-            let resp = ui.add(egui::TextEdit::singleline(input).id_source(text_edit_id));
-            resp
-        }).inner;
+        let resp = ui
+            .horizontal(|ui| {
+                let resp = ui.add(egui::TextEdit::singleline(input).id_source(text_edit_id));
+                resp
+            })
+            .inner;
         ui.visuals_mut().extreme_bg_color = old_bg;
 
         let next_value = if input.is_empty() {
@@ -579,8 +644,15 @@ struct App {
     fps_window_start: Instant,
     fps_window_count: u32,
     last_fps: f32,
-    /// ANSI-render cache keyed by raw log message string.
-    cached_log: HashMap<String, Vec<egui::RichText>>,
+    /// ANSI-render cache keyed by a fast collision-tolerant hash.
+    cached_log: HashMap<u64, Vec<egui::RichText>>,
+    log_panel_min_level: LogMinLevel,
+}
+
+fn fast_hash_value<T: Hash>(value: &T) -> u64 {
+    let mut hasher = XxHash3_64::default();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn load_proxies_from_persisted() -> ProxySnapshot {
@@ -723,7 +795,11 @@ fn default_spawn_shell_command_line() -> String {
     nsproxy_core::sys::your_shell(None, nix::unistd::getuid().as_raw().into())
         .ok()
         .flatten()
-        .or_else(|| std::env::var("SHELL").ok().filter(|shell| !shell.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("SHELL")
+                .ok()
+                .filter(|shell| !shell.trim().is_empty())
+        })
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
@@ -1020,6 +1096,11 @@ impl App {
             snapshot: supervisor::SupervisorSnapshot {
                 profiles: BTreeMap::new(),
                 ui_ns: supervisor::NamespaceIndicator::default(),
+                root_daemon_connection: supervisor::ConnectionState::Disconnected,
+                root_daemon_error: None,
+                hotconfig_editor_status: None,
+                profile_editor_status: None,
+                root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
                 auto_open_logs_target: None,
                 generated_at: SystemTime::now(),
             },
@@ -1068,12 +1149,14 @@ impl App {
             fps_window_count: 0,
             last_fps: 0.0,
             cached_log: HashMap::new(),
+            log_panel_min_level: LogMinLevel::default(),
         }
     }
 
     fn right_tab_label(&self) -> &'static str {
         match self.right_tab {
             RightTab::Proxies => "Proxies",
+            RightTab::Daemon => "Daemon",
             RightTab::Processes => "Processes",
             RightTab::Traffic => "Traffic",
             RightTab::Hotconfig => "Hotconfig",
@@ -1268,42 +1351,12 @@ impl App {
             }
         };
 
-        self.apply_hotconfig_live(
-            profile_name,
-            self.hotconfig_editor_value.clone(),
-            content,
-            "Saved hotconfig".to_string(),
-        );
-    }
-
-    fn update_local_hotconfig_state(&mut self, profile_name: &str, hot: &HotConfig) {
-        if let Some(state) = self.snapshot.profiles.get_mut(profile_name) {
-            state.hotconfig = hot.clone();
-            state.hotconfig_value =
-                serde_json::to_value(hot).unwrap_or_else(|_| serde_json::json!({}));
-        }
-
-        if self.selected_profile.as_deref() == Some(profile_name) {
-            self.hotconfig_editor_value = hot.clone();
-            self.hotconfig_editor_json =
-                serde_json::to_string_pretty(hot).unwrap_or_else(|_| "{}".to_string());
-            self.hotconfig_editor_error = None;
-        }
-    }
-
-    fn apply_hotconfig_live(
-        &mut self,
-        profile_name: ContainerName,
-        hot: HotConfig,
-        content: String,
-        status: String,
-    ) {
-        self.update_local_hotconfig_state(&profile_name, &hot);
-        self.supervisor.send(SupervisorCommand::Ctrl {
-            profile: profile_name,
-            cmd: diag::ControlCommand::ApplyHotConfig { content },
-        });
-        self.hotconfig_editor_status = Some(status);
+        self.hotconfig_editor_status = Some("Saving hotconfig via sp daemon...".to_string());
+        self.supervisor
+            .send(SupervisorCommand::SaveHotconfigPrivileged {
+                profile: profile_name,
+                content,
+            });
     }
 
     fn refresh_profile_editor_target(&mut self) {
@@ -1356,14 +1409,6 @@ impl App {
             return;
         }
 
-        let path = state_paths::profile_config(profile_name.as_str());
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                self.profile_editor_status = Some(format!("Create dir failed: {err}"));
-                return;
-            }
-        }
-
         let content = match serde_json::to_string_pretty(&self.profile_editor_template) {
             Ok(content) => content,
             Err(err) => {
@@ -1372,16 +1417,12 @@ impl App {
             }
         };
 
-        if let Err(err) = std::fs::write(&path, content) {
-            self.profile_editor_status = Some(format!("Save failed: {err}"));
-            return;
-        }
-
+        self.profile_editor_status = Some("Saving profile via sp daemon...".to_string());
         self.supervisor
-            .send(SupervisorCommand::ReloadProfile(profile_name.clone()));
-        self.supervisor
-            .send(SupervisorCommand::LoadProfile(profile_name.clone()));
-        self.profile_editor_status = Some(format!("Saved {}", profile_name));
+            .send(SupervisorCommand::SaveProfilePrivileged {
+                profile: profile_name,
+                content,
+            });
     }
 
     fn create_profile_from_editor(&mut self) {
@@ -1400,18 +1441,6 @@ impl App {
             return;
         }
 
-        let profile_dir = state_paths::profile_dir(name.as_str());
-        if profile_dir.exists() {
-            self.profile_editor_status = Some(format!("Profile '{}' already exists.", name));
-            return;
-        }
-
-        if let Err(err) = std::fs::create_dir_all(&profile_dir) {
-            self.profile_editor_status = Some(format!("Create profile dir failed: {err}"));
-            return;
-        }
-
-        let profile_path = state_paths::profile_config(name.as_str());
         let profile_content = match serde_json::to_string_pretty(&self.profile_editor_template) {
             Ok(content) => content,
             Err(err) => {
@@ -1419,26 +1448,19 @@ impl App {
                 return;
             }
         };
-        if let Err(err) = std::fs::write(&profile_path, profile_content) {
-            self.profile_editor_status = Some(format!("Write profile.json failed: {err}"));
-            return;
-        }
+        let hot_content = self
+            .profile_editor_template
+            .hot_init
+            .as_ref()
+            .and_then(|hot| serde_json::to_string_pretty(hot).ok());
 
-        if let Some(hot) = self.profile_editor_template.hot_init.as_ref() {
-            let hot_path = state_paths::hot_config(name.as_str());
-            if !hot_path.exists() {
-                if let Ok(hot_content) = serde_json::to_string_pretty(hot) {
-                    let _ = std::fs::write(hot_path, hot_content);
-                }
-            }
-        }
-
-        self.selected_profile = Some(name.clone());
-        self.profile_editor_target = None;
-        self.supervisor.send(SupervisorCommand::Init);
+        self.profile_editor_status = Some("Creating profile via sp daemon...".to_string());
         self.supervisor
-            .send(SupervisorCommand::LoadProfile(name.clone()));
-        self.profile_editor_status = Some(format!("Created profile '{}'", name));
+            .send(SupervisorCommand::CreateProfilePrivileged {
+                name,
+                profile_content,
+                hot_content,
+            });
     }
 
     fn render_optional_u32(
@@ -1448,14 +1470,7 @@ impl App {
         value: &mut Option<u32>,
         value_changed: bool,
     ) -> bool {
-        Self::render_optional_u32_with_default(
-            ui,
-            int_input,
-            label,
-            value,
-            value_changed,
-            0,
-        )
+        Self::render_optional_u32_with_default(ui, int_input, label, value, value_changed, 0)
     }
 
     fn render_optional_u32_with_default(
@@ -1561,6 +1576,7 @@ impl App {
                         target: "/".into(),
                         read_only: false,
                         recursive: true,
+                        skip_missing: false,
                     });
                     changed = true;
                 }
@@ -2098,33 +2114,36 @@ impl App {
             changed = true;
         }
 
-
         ui.group(|ui| {
             ui.strong("dns runtime");
             let captured_resolv_conf_dns = "100.68.0.1";
+            let mut use_internal_dns = hot.resolv_conf_dns
+                == nsproxy_core::INTERNAL_RESOLV_CONF_DNS
+                && !hot.dns_capture_enabled();
+            let mut dns_capture_enabled = hot.dns_capture_enabled();
+            let dns_capture_label = if dns_capture_enabled {
+                "capture all dns"
+            } else {
+                "no dns capture"
+            };
             ui.horizontal(|ui| {
-                let mut use_internal_dns =
-                    hot.resolv_conf_dns == nsproxy_core::INTERNAL_RESOLV_CONF_DNS
-                        && !hot.dns_capture_enabled();
-                if ui.checkbox(&mut use_internal_dns, "route to local dns").changed() {
+                if ui
+                    .checkbox(&mut use_internal_dns, "route to local dns")
+                    .changed()
+                {
                     if use_internal_dns {
                         hot.resolv_conf_dns = nsproxy_core::INTERNAL_RESOLV_CONF_DNS.to_string();
                         hot.set_dns_capture_enabled(false);
                     } else {
                         if hot.resolv_conf_dns == nsproxy_core::INTERNAL_RESOLV_CONF_DNS {
-                            hot.resolv_conf_dns = nsproxy_core::CAPTURED_RESOLV_CONF_DNS.to_string();
+                            hot.resolv_conf_dns =
+                                nsproxy_core::CAPTURED_RESOLV_CONF_DNS.to_string();
                         }
                         hot.set_dns_capture_enabled(true);
                     }
                     changed = true;
                 }
 
-                let mut dns_capture_enabled = hot.dns_capture_enabled();
-                let dns_capture_label = if dns_capture_enabled {
-                    "capture all dns"
-                } else {
-                    "no dns capture"
-                };
                 if ui
                     .toggle_value(&mut dns_capture_enabled, dns_capture_label)
                     .changed()
@@ -2144,6 +2163,9 @@ impl App {
                     hot.resolv_conf_dns = resolv_conf_dns;
                     changed = true;
                 }
+            });
+
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("127.0.0.1").clicked() {
                     hot.resolv_conf_dns = "127.0.0.1".to_string();
                     changed = true;
@@ -2337,10 +2359,12 @@ impl App {
                 }
             });
 
-            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid, uid_gid_value_changed) {
+            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid, uid_gid_value_changed)
+            {
                 changed = true;
             }
-            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid, uid_gid_value_changed) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid, uid_gid_value_changed)
+            {
                 changed = true;
             }
             if Self::render_optional_text(ui, "exec", &mut args.exec) {
@@ -2488,7 +2512,11 @@ impl App {
         if Self::render_mount_list(ui, &mut self.profile_editor_template.mounts, "mounts") {
             changed = true;
         }
-        if Self::render_chmod_list(ui, &mut self.int_input, &mut self.profile_editor_template.chmod) {
+        if Self::render_chmod_list(
+            ui,
+            &mut self.int_input,
+            &mut self.profile_editor_template.chmod,
+        ) {
             changed = true;
         }
         if Self::render_env_map(ui, &mut self.profile_editor_template.env) {
@@ -2553,7 +2581,12 @@ impl App {
             self.refresh_hot_init_json_from_template();
         }
 
-        if Self::render_shell_args(ui, &mut self.int_input, &mut self.profile_editor_template.sargs, "sargs") {
+        if Self::render_shell_args(
+            ui,
+            &mut self.int_input,
+            &mut self.profile_editor_template.sargs,
+            "sargs",
+        ) {
             changed = true;
         }
         if Self::render_optional_text(
@@ -2877,9 +2910,13 @@ impl eframe::App for App {
             && ctx.input_mut(|i| i.consume_shortcut(&delete_shortcut));
         if delete_requested {
             if let Some(profile_name) = self.selected_profile.clone() {
-                info!(profile = profile_name.as_str(), "ui shortcut requested container delete");
-                self.supervisor
-                    .send(SupervisorCommand::DeleteContainer { profile: profile_name });
+                info!(
+                    profile = profile_name.as_str(),
+                    "ui shortcut requested container delete"
+                );
+                self.supervisor.send(SupervisorCommand::DeleteContainer {
+                    profile: profile_name,
+                });
             }
         }
 
@@ -2915,6 +2952,7 @@ impl eframe::App for App {
                     self.selected_profile = None;
                 }
 
+                ui.add_space(6.0);
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -2979,8 +3017,7 @@ impl eframe::App for App {
                         .on_hover_text("Refresh namespace view")
                         .clicked()
                     {
-                        self.supervisor
-                            .send(SupervisorCommand::RefreshNamespaces);
+                        self.supervisor.send(SupervisorCommand::RefreshNamespaces);
                     }
                 });
 
@@ -3041,9 +3078,12 @@ impl eframe::App for App {
 
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("frame: {}ms  {:.1}fps", self.last_frame_elapsed_ms, self.last_fps))
-                        .color(egui::Color32::GRAY)
-                        .small(),
+                    egui::RichText::new(format!(
+                        "frame: {}ms  {:.1}fps",
+                        self.last_frame_elapsed_ms, self.last_fps
+                    ))
+                    .color(egui::Color32::GRAY)
+                    .small(),
                 );
             });
 
@@ -3062,6 +3102,12 @@ impl eframe::App for App {
                                 tab: supervisor::TabKind::Proxies,
                             });
                     }
+                }
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Daemon, "Daemon")
+                    .clicked()
+                {
+                    self.right_tab = RightTab::Daemon;
                 }
                 if ui
                     .selectable_label(self.right_tab == RightTab::Processes, "Processes")
@@ -3152,6 +3198,7 @@ impl eframe::App for App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.right_tab {
                     RightTab::Proxies => self.render_proxies_tab(ui),
+                    RightTab::Daemon => self.render_daemon_tab(ui),
                     RightTab::Processes => self.render_processes_tab(ui),
                     RightTab::Traffic => self.render_traffic_tab(ui),
                     RightTab::Hotconfig => self.render_hotconfig_tab(ui),
@@ -3721,6 +3768,238 @@ impl App {
         }
     }
 
+    fn render_structured_log_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        panel_id: &str,
+        empty_message: &str,
+        no_level_message: String,
+        entries: Vec<Arc<LogEntryOf>>,
+        total_entries: usize,
+    ) {
+        let cached_log = &mut self.cached_log;
+
+        egui::Frame::none()
+            .fill(Color32::from_gray(18))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
+                let total = entries.len();
+
+                ui.horizontal(|ui| {
+                    ui.label("Min level");
+                    egui::ComboBox::from_id_salt(("log_panel_min_level", panel_id))
+                        .selected_text(self.log_panel_min_level.label())
+                        .show_ui(ui, |ui| {
+                            for level in LogMinLevel::ALL {
+                                ui.selectable_value(
+                                    &mut self.log_panel_min_level,
+                                    level,
+                                    level.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        Color32::from_gray(130),
+                        format!("showing {} / {}", total, total_entries),
+                    );
+                });
+
+                ui.add_space(6.0);
+
+                egui::ScrollArea::both()
+                    .id_salt(format!("log_panel_{}", panel_id))
+                    .max_height(500.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if total_entries == 0 {
+                            ui.colored_label(Color32::from_gray(110), empty_message);
+                            return;
+                        }
+
+                        if entries.is_empty() {
+                            ui.colored_label(Color32::from_gray(110), no_level_message);
+                            return;
+                        }
+
+                        for entry in &entries {
+                            let (badge_text, badge_color) = match entry.src {
+                                LogSource::Serve => ("serve", Color32::from_rgb(100, 180, 130)),
+                                LogSource::Up => ("up", Color32::from_rgb(100, 150, 210)),
+                                LogSource::RootDaemon => {
+                                    ("daemon", Color32::from_rgb(210, 140, 90))
+                                }
+                                LogSource::Pid(_) => ("pid", Color32::from_rgb(140, 140, 220)),
+                            };
+                            cached_log
+                                .entry(entry.hash)
+                                .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.log.message));
+                            ui.horizontal(|ui| {
+                                ui.colored_label(badge_color, badge_text);
+
+                                let level_color = match entry.log.level.as_str() {
+                                    "ERROR" => Color32::from_rgb(220, 80, 80),
+                                    "WARN" => Color32::from_rgb(210, 160, 60),
+                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                    _ => Color32::from_gray(200),
+                                };
+                                ui.colored_label(level_color, &entry.log.level);
+
+                                ui.colored_label(
+                                    Color32::from_gray(100),
+                                    format!("[{}]", entry.log.target),
+                                );
+
+                                if let Some(ansi_parts) = cached_log.get(&entry.hash) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for part in ansi_parts {
+                                            ui.label(part.clone());
+                                        }
+                                        for field in &entry.log.fields {
+                                            ui.add_space(6.0);
+                                            ui.colored_label(
+                                                Color32::from_gray(110),
+                                                format!("{}=", field.name),
+                                            );
+                                            ui.monospace(&field.value);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+            });
+    }
+
+    fn render_daemon_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("sp daemon");
+        ui.add_space(6.0);
+
+        let (entries, total_entries) = {
+            let guard = self
+                .snapshot
+                .root_daemon_logs
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut entries: Vec<Arc<LogEntryOf>> = guard
+                .iter()
+                .filter(|(level, _)| self.log_panel_min_level.matches(level))
+                .flat_map(|(_, ring)| ring.iter().cloned())
+                .collect();
+            entries.sort_by_key(|entry| entry.log.ts);
+            let total_entries = guard.values().map(|ring| ring.len()).sum();
+            (entries, total_entries)
+        };
+
+        self.render_structured_log_panel(
+            ui,
+            "root_daemon",
+            "no daemon logs yet",
+            format!(
+                "no daemon logs at or above {}",
+                self.log_panel_min_level.label()
+            ),
+            entries,
+            total_entries,
+        );
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        let daemon_error = self.snapshot.root_daemon_error.as_deref();
+        let version_mismatch =
+            daemon_error.is_some_and(|err| err.to_ascii_lowercase().contains("version mismatch"));
+        let (status_text, detail_text, detail_color) = if version_mismatch {
+            (
+                "version mismatch",
+                daemon_error.unwrap_or("sp daemon version mismatch"),
+                Color32::from_rgb(220, 120, 90),
+            )
+        } else if let Some(error) = daemon_error {
+            let status = if error
+                .to_ascii_lowercase()
+                .contains("failed to restart sp daemon")
+                || error
+                    .to_ascii_lowercase()
+                    .contains("root daemon channel unavailable")
+                || error
+                    .to_ascii_lowercase()
+                    .contains("root daemon command channel dropped")
+            {
+                "error starting daemon"
+            } else if self.snapshot.root_daemon_connection
+                == supervisor::ConnectionState::Connecting
+            {
+                "connecting"
+            } else {
+                "error"
+            };
+            (status, error, Color32::from_rgb(220, 120, 90))
+        } else {
+            match self.snapshot.root_daemon_connection {
+                supervisor::ConnectionState::Connected => (
+                    "running",
+                    "UI is connected to the sp daemon socket.",
+                    Color32::from_rgb(120, 200, 140),
+                ),
+                supervisor::ConnectionState::Connecting => (
+                    "connecting",
+                    "UI is connecting to the sp daemon socket.",
+                    Color32::from_rgb(220, 180, 90),
+                ),
+                supervisor::ConnectionState::Disconnected => (
+                    "stopped",
+                    "sp daemon socket is not connected.",
+                    Color32::from_gray(140),
+                ),
+                supervisor::ConnectionState::NoRetry => (
+                    "error",
+                    "sp daemon is in a terminal error state.",
+                    Color32::from_rgb(220, 120, 90),
+                ),
+            }
+        };
+
+        ui.label(RichText::new(format!("status: {status_text}")).strong());
+        ui.colored_label(detail_color, detail_text);
+    }
+
+    fn effective_hotconfig_status<'a>(&'a self, profile_name: &ContainerName) -> Option<&'a str> {
+        if let Some(status) = &self.hotconfig_editor_status {
+            if status != "Saving hotconfig via sp daemon..." {
+                return Some(status.as_str());
+            }
+        }
+        if let Some(EditorStatus {
+            profile: Some(status_profile),
+            message,
+            ..
+        }) = self.snapshot.hotconfig_editor_status.as_ref()
+        {
+            if status_profile == profile_name {
+                return Some(message.as_str());
+            }
+        }
+        self.hotconfig_editor_status.as_deref()
+    }
+
+    fn effective_profile_editor_status(&self) -> Option<&str> {
+        if let Some(status) = &self.profile_editor_status {
+            if status != "Saving profile via sp daemon..."
+                && status != "Creating profile via sp daemon..."
+            {
+                return Some(status.as_str());
+            }
+        }
+        if let Some(status) = self.snapshot.profile_editor_status.as_ref() {
+            return Some(status.message.as_str());
+        }
+        self.profile_editor_status.as_deref()
+    }
+
     fn render_process_controls(&mut self, ui: &mut egui::Ui, profile_name: &ContainerName) {
         let (
             container_lifecycle,
@@ -3898,14 +4177,14 @@ impl App {
             let serve_subtitle = if !serve_enabled {
                 "requires container up"
             } else if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
-                    "connecting"
-                } else if serve_running && serve_diag_connected {
-                    "connected"
-                } else if serve_running {
-                    "disconnected"
-                } else {
-                    "down"
-                };
+                "connecting"
+            } else if serve_running && serve_diag_connected {
+                "connected"
+            } else if serve_running {
+                "disconnected"
+            } else {
+                "down"
+            };
             let serve_title = if serve_running {
                 "Stop TUN"
             } else {
@@ -3914,14 +4193,14 @@ impl App {
             let serve_color = if !serve_enabled {
                 egui::Color32::from_rgb(160, 80, 80)
             } else if serve_running && diag_connection == supervisor::ConnectionState::Connecting {
-                    egui::Color32::from_rgb(200, 165, 90)
-                } else if serve_running && serve_diag_connected {
-                    egui::Color32::from_rgb(120, 200, 140)
-                } else if serve_running {
-                    egui::Color32::from_rgb(190, 110, 90)
-                } else {
-                    egui::Color32::from_rgb(180, 180, 180)
-                };
+                egui::Color32::from_rgb(200, 165, 90)
+            } else if serve_running && serve_diag_connected {
+                egui::Color32::from_rgb(120, 200, 140)
+            } else if serve_running {
+                egui::Color32::from_rgb(190, 110, 90)
+            } else {
+                egui::Color32::from_rgb(180, 180, 180)
+            };
 
             let mut serve_resp = sidebar_box_width(
                 ui,
@@ -3952,14 +4231,19 @@ impl App {
         });
 
         ui.add_space(6.0);
-        let entries: &[Arc<LogEntryOf>] = self
-            .snapshot
-            .profiles
-            .get(profile_name)
-            .map(|p| p.merged_logs.as_slice())
-            .unwrap_or(&[]);
-
+        let snapshot = &self.snapshot;
         let cached_log = &mut self.cached_log;
+        let mut log_panel_min_level = self.log_panel_min_level;
+        let profile = snapshot.profiles.get(profile_name);
+        let logs_guard = match profile {
+            Some(profile) => Some(
+                profile
+                    .logs_by_level
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            None => None,
+        };
 
         egui::Frame::none()
             .fill(Color32::from_gray(18))
@@ -3967,66 +4251,135 @@ impl App {
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
-                let total = entries.len();
+                ui.horizontal(|ui| {
+                    ui.label("Min level");
+                    egui::ComboBox::from_id_salt(("log_panel_min_level", profile_name))
+                        .selected_text(log_panel_min_level.label())
+                        .show_ui(ui, |ui| {
+                            for level in LogMinLevel::ALL {
+                                ui.selectable_value(&mut log_panel_min_level, level, level.label());
+                            }
+                        });
+                });
+
+                ui.add_space(6.0);
 
                 egui::ScrollArea::both()
                     .id_salt(format!("log_panel_{}", profile_name))
                     .max_height(500.0)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if total == 0 {
-                            ui.colored_label(
-                                Color32::from_gray(110),
-                                "no logs yet — start the container to see output",
-                            );
-                            return;
-                        }
-
-                        for entry in entries {
-                            let is_serve = matches!(entry.src, LogSource::Serve);
-                            cached_log
-                                .entry(entry.log.message.clone())
-                                .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.log.message));
-                            ui.horizontal(|ui| {
-                                let (badge_text, badge_color) = if is_serve {
-                                    ("serve", Color32::from_rgb(100, 180, 130))
-                                } else {
-                                    ("up", Color32::from_rgb(100, 150, 210))
-                                };
-                                ui.colored_label(badge_color, badge_text);
-
-                                let level_color = match entry.log.level.as_str() {
-                                    "ERROR" => Color32::from_rgb(220, 80, 80),
-                                    "WARN" => Color32::from_rgb(210, 160, 60),
-                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                    _ => Color32::from_gray(200),
-                                };
-                                ui.colored_label(level_color, &entry.log.level);
-
+                    .show_rows(
+                        ui,
+                        ui.text_style_height(&egui::TextStyle::Body),
+                        logs_guard
+                            .as_ref()
+                            .map(|guard| {
+                                guard
+                                    .iter()
+                                    .filter(|(level, _)| log_panel_min_level.matches(level))
+                                    .map(|(_, ring)| ring.len())
+                                    .sum()
+                            })
+                            .unwrap_or(0),
+                        |ui, row_range| {
+                            let Some(guard) = logs_guard.as_ref() else {
                                 ui.colored_label(
-                                    Color32::from_gray(100),
-                                    format!("[{}]", entry.log.target),
+                                    Color32::from_gray(110),
+                                    "no logs yet — start the container to see output",
                                 );
+                                return;
+                            };
 
-                                if let Some(ansi_parts) = cached_log.get(&entry.log.message) {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for part in ansi_parts {
-                                            ui.label(part.clone());
-                                        }
-                                        for field in &entry.log.fields {
-                                            ui.add_space(6.0);
-                                            ui.colored_label(
-                                                Color32::from_gray(110),
-                                                format!("{}=", field.name),
-                                            );
-                                            ui.monospace(&field.value);
-                                        }
-                                    });
+                            if guard.is_empty() {
+                                ui.colored_label(
+                                    Color32::from_gray(110),
+                                    "no logs yet — start the container to see output",
+                                );
+                                return;
+                            }
+
+                            let visible_start = row_range.start;
+                            let visible_end = row_range.end;
+                            let mut matched_index = 0usize;
+                            let mut rendered_any = false;
+
+                            for (level, ring) in guard.iter() {
+                                if !log_panel_min_level.matches(level) {
+                                    continue;
                                 }
-                            });
-                        }
-                    });
+
+                                for entry in ring.iter() {
+                                    if matched_index >= visible_end {
+                                        break;
+                                    }
+
+                                    if matched_index >= visible_start {
+                                        rendered_any = true;
+                                        let is_serve = matches!(entry.src, LogSource::Serve);
+                                        cached_log.entry(entry.hash).or_insert_with(|| {
+                                            egui_sgr::ansi_to_rich_text(&entry.log.message)
+                                        });
+                                        ui.horizontal(|ui| {
+                                            let (badge_text, badge_color) = if is_serve {
+                                                ("serve", Color32::from_rgb(100, 180, 130))
+                                            } else {
+                                                ("up", Color32::from_rgb(100, 150, 210))
+                                            };
+                                            ui.colored_label(badge_color, badge_text);
+
+                                            let level_color = match entry.log.level.as_str() {
+                                                "ERROR" => Color32::from_rgb(220, 80, 80),
+                                                "WARN" => Color32::from_rgb(210, 160, 60),
+                                                "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                                _ => Color32::from_gray(200),
+                                            };
+                                            ui.colored_label(level_color, &entry.log.level);
+
+                                            ui.colored_label(
+                                                Color32::from_gray(100),
+                                                format!("[{}]", entry.log.target),
+                                            );
+
+                                            if let Some(ansi_parts) = cached_log.get(&entry.hash) {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for part in ansi_parts {
+                                                        ui.label(part.clone());
+                                                    }
+                                                    for field in &entry.log.fields {
+                                                        ui.add_space(6.0);
+                                                        ui.colored_label(
+                                                            Color32::from_gray(110),
+                                                            format!("{}=", field.name),
+                                                        );
+                                                        ui.monospace(&field.value);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+
+                                    matched_index += 1;
+                                }
+
+                                if matched_index >= visible_end {
+                                    break;
+                                }
+                            }
+
+                            if !rendered_any && visible_start == 0 {
+                                ui.colored_label(
+                                    Color32::from_gray(110),
+                                    format!(
+                                        "no logs at or above {} for this profile",
+                                        log_panel_min_level.label()
+                                    ),
+                                );
+                            }
+                        },
+                    );
             });
+
+        self.log_panel_min_level = log_panel_min_level;
     }
 
     fn render_process_spawn_args_panel(&mut self, ui: &mut egui::Ui) {
@@ -4258,7 +4611,8 @@ impl App {
                             ui.label(&uid_str);
                         });
 
-                        let external_title = Self::format_external_terminal_title(row_profile, entry);
+                        let external_title =
+                            Self::format_external_terminal_title(row_profile, entry);
                         let swap_title = Self::format_swap_terminal_title(row_profile, entry);
                         let is_swap_target = self.is_same_swap_pty(row_profile, *slot_pid);
                         let is_dedicated_open = self.is_dedicated_pty_open(row_profile, *slot_pid);
@@ -4330,14 +4684,13 @@ impl App {
                                         !is_dedicated_open && !is_swap_target,
                                         egui::Button::new("swap").small(),
                                     )
-                                    .on_hover_text("Swap this PTY into the special second terminal window")
+                                    .on_hover_text(
+                                        "Swap this PTY into the special second terminal window",
+                                    )
                                     .clicked()
                                 {
-                                    swap_external_pty_request = Some((
-                                        row_profile.clone(),
-                                        *slot_pid,
-                                        swap_title.clone(),
-                                    ));
+                                    swap_external_pty_request =
+                                        Some((row_profile.clone(), *slot_pid, swap_title.clone()));
                                 }
                             }
                         });
@@ -4360,14 +4713,13 @@ impl App {
                                             !is_swap_target,
                                             egui::Button::new("open").small(),
                                         )
-                                        .on_hover_text("Open a dedicated terminal window for this PTY")
+                                        .on_hover_text(
+                                            "Open a dedicated terminal window for this PTY",
+                                        )
                                         .clicked()
                                     {
-                                        open_dedicated_pty_request = Some((
-                                            row_profile.clone(),
-                                            *slot_pid,
-                                            external_title,
-                                        ));
+                                        open_dedicated_pty_request =
+                                            Some((row_profile.clone(), *slot_pid, external_title));
                                     }
                                 }
                             }
@@ -4436,7 +4788,11 @@ impl App {
             }
         };
 
-        Self::join_title_parts([Some(profile.as_str()), Some(program.as_str()), Some(uid.as_str())])
+        Self::join_title_parts([
+            Some(profile.as_str()),
+            Some(program.as_str()),
+            Some(uid.as_str()),
+        ])
     }
 
     fn format_swap_terminal_title(profile: &ContainerName, entry: &diag::ProcessEntry) -> String {
@@ -4544,10 +4900,7 @@ impl App {
             return;
         };
         let key = (profile.clone(), pid);
-        let window = self
-            .dedicated_term_windows
-            .entry(key)
-            .or_default();
+        let window = self.dedicated_term_windows.entry(key).or_default();
         if let Err(err) = window.attach(rt, profile, pid, title) {
             tracing::warn!(%err, "failed to attach dedicated terminal child window");
         }
@@ -4574,7 +4927,8 @@ impl App {
     }
 
     fn render_process_pty_panel(&mut self, ui: &mut egui::Ui) {
-        let Some((selected_profile, selected_slot_pid)) = self.selected_process_logs.as_ref() else {
+        let Some((selected_profile, selected_slot_pid)) = self.selected_process_logs.as_ref()
+        else {
             return;
         };
         let profile = selected_profile.clone();
@@ -4603,7 +4957,12 @@ impl App {
         self.render_process_pty_terminal(ui, &profile, slot_pid);
     }
 
-    fn render_process_pty_terminal(&mut self, ui: &mut egui::Ui, profile: &ContainerName, slot_pid: u32) {
+    fn render_process_pty_terminal(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ContainerName,
+        slot_pid: u32,
+    ) {
         let key = (profile.clone(), slot_pid);
 
         let ipc = SupervisorPtyIpc {
@@ -4666,12 +5025,11 @@ impl App {
         });
 
         let show_details = self.raw_log_show_details;
-        let logs: &[diag::RawLog] = self
+        let logs_guard = self
             .snapshot
             .profiles
             .get(&profile)
-            .and_then(|p| p.process_raw_logs.get(&slot_pid).map(Vec::as_slice))
-            .unwrap_or(&[]);
+            .map(|p| p.process_raw_logs.read().unwrap_or_else(|e| e.into_inner()));
         let cached_log = &mut self.cached_log;
 
         egui::Frame::none()
@@ -4681,7 +5039,10 @@ impl App {
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 200.0));
                 let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-                let total = logs.len();
+                let total = logs_guard
+                    .as_ref()
+                    .and_then(|logs| logs.get(&slot_pid).map(Vec::len))
+                    .unwrap_or(0);
                 egui::ScrollArea::vertical()
                     .id_salt(format!("raw_logs_{}_{}", profile, slot_pid))
                     .max_height(400.0)
@@ -4696,7 +5057,13 @@ impl App {
                             return;
                         }
                         for i in row_range {
-                            let entry = &logs[i];
+                            let Some(entry) = logs_guard
+                                .as_ref()
+                                .and_then(|logs| logs.get(&slot_pid))
+                                .and_then(|logs| logs.get(i))
+                            else {
+                                continue;
+                            };
                             ui.horizontal(|ui| {
                                 if show_details {
                                     ui.colored_label(
@@ -4715,14 +5082,14 @@ impl App {
                                     ui.colored_label(badge_color, badge);
                                 };
                                 cached_log
-                                    .entry(entry.content.clone())
+                                    .entry(fast_hash_value(&entry.content))
                                     .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.content));
-                                if let Some(ansi_parts) = cached_log.get(&entry.content) {
+                                if let Some(ansi_parts) = cached_log.get(&fast_hash_value(&entry.content)) {
                                     for part in ansi_parts {
                                         ui.label(part.clone());
                                     }
                                 }
-            });
+                            });
                         }
                     });
             });
@@ -4749,7 +5116,8 @@ impl App {
                             profile: profile.clone(),
                             args,
                         });
-                        self.run_command.status = Some("Output-mode spawn request sent".to_string());
+                        self.run_command.status =
+                            Some("Output-mode spawn request sent".to_string());
                     }
                     self.run_command.parse_error = None;
                 } else {
@@ -5533,6 +5901,18 @@ impl App {
         }
 
         let profile_name = self.selected_profile.clone().unwrap_or_default();
+        let (dns_state, sandbox_status, child_alive) = self
+            .snapshot
+            .profiles
+            .get(&profile_name)
+            .map(|profile| {
+                (
+                    profile.dns_state.clone(),
+                    profile.sandbox_status.clone(),
+                    profile.child_alive,
+                )
+            })
+            .unwrap_or((None, None, false));
         ui.horizontal(|ui| {
             ui.heading(format!("Hotconfig - {}", profile_name));
             if ui.button("Reload").clicked() {
@@ -5545,22 +5925,49 @@ impl App {
             if ui.button("Save").clicked() {
                 self.save_hotconfig_editor();
             }
+            if ui.button("Apply Sandbox").clicked() {
+                self.supervisor.send(SupervisorCommand::RunSandbox {
+                    profile: profile_name.clone(),
+                    reason: "manual hotconfig action".to_string(),
+                });
+            }
         });
-        if let Some(status) = &self.hotconfig_editor_status {
+        if let Some(status) = self.effective_hotconfig_status(&profile_name) {
             ui.label(status);
         }
-        if let Some(profile) = self.snapshot.profiles.get(&profile_name) {
-            if let Some(dns_state) = &profile.dns_state {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "DNS: {} domains, {} IPv4, {} IPv6",
-                        dns_state.domain_count, dns_state.ip4_count, dns_state.ip6_count
-                    ));
-                    if dns_state.aaaa_only {
-                        ui.label(RichText::new("AAAA stripped").color(Color32::LIGHT_BLUE));
-                    }
-                });
+        if let Some(dns_state) = &dns_state {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "DNS: {} domains, {} IPv4, {} IPv6",
+                    dns_state.domain_count, dns_state.ip4_count, dns_state.ip6_count
+                ));
+                if dns_state.aaaa_only {
+                    ui.label(RichText::new("AAAA stripped").color(Color32::LIGHT_BLUE));
+                }
+            });
+        }
+        ui.add_space(8.0);
+        match sandbox_status.as_ref() {
+            Some(status) => Self::render_sandbox_status_panel(ui, status),
+            None => {
+                egui::Frame::none()
+                    .fill(Color32::from_gray(18))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.heading("Sandbox State");
+                            ui.colored_label(
+                                Color32::from_gray(130),
+                                if child_alive {
+                                    "No sandbox snapshot yet. Use Save or Apply Sandbox to run sp sandbox."
+                                } else {
+                                    "Container is not running yet. The first startup will trigger sp sandbox."
+                                },
+                            );
+                        });
+                    });
             }
         }
         ui.add_space(6.0);
@@ -5576,6 +5983,153 @@ impl App {
         if changed {
             self.hotconfig_editor_status = None;
         }
+    }
+
+    fn render_sandbox_status_panel(ui: &mut egui::Ui, status: &SandboxStatus) {
+        egui::Frame::none()
+            .fill(Color32::from_gray(18))
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading("Sandbox State");
+                    ui.label(
+                        RichText::new(format!("mode {:?}", status.configured_mode))
+                            .color(Color32::LIGHT_BLUE),
+                    );
+                    let detected_color = if matches!(
+                        status.detected_state,
+                        nsproxy_core::sandbox::SandboxState::Pivoted
+                    ) {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::from_rgb(236, 198, 92)
+                    };
+                    ui.label(
+                        RichText::new(format!("detected {:?}", status.detected_state))
+                            .color(detected_color),
+                    );
+                    ui.colored_label(
+                        Color32::from_gray(130),
+                        format!("updated {}", status.updated_at_secs),
+                    );
+                });
+
+                if let Some(err) = &status.last_error {
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Mount Points").strong());
+                if status.mounts.is_empty() {
+                    ui.colored_label(Color32::from_gray(120), "No configured sandbox mounts");
+                    return;
+                }
+
+                egui::ScrollArea::horizontal()
+                    .id_salt("sandbox-status-mounts")
+                    .show(ui, |ui| {
+                        TableBuilder::new(ui)
+                            .id_salt("sandbox-status-mounts-table")
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::remainder().at_least(180.0))
+                            .column(Column::remainder().at_least(180.0))
+                            .column(Column::auto().at_least(90.0))
+                            .column(Column::auto().at_least(110.0))
+                            .column(Column::remainder().at_least(150.0))
+                            .header(20.0, |mut header| {
+                                header.col(|ui| {
+                                    ui.strong("Target");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Source");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Flags");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("State");
+                                });
+                                header.col(|ui| {
+                                    ui.strong("Meta");
+                                });
+                            })
+                            .body(|mut body| {
+                                body.rows(24.0, status.mounts.len(), |mut row| {
+                                    let mount = &status.mounts[row.index()];
+                                    row.col(|ui| {
+                                        ui.label(
+                                            RichText::new(mount.target.display().to_string())
+                                                .monospace(),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            RichText::new(mount.source.display().to_string())
+                                                .monospace(),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        let mut flags =
+                                            if mount.read_only { "ro" } else { "rw" }.to_string();
+                                        if mount.recursive {
+                                            flags.push_str(" rec");
+                                        }
+                                        ui.label(flags);
+                                    });
+                                    row.col(|ui| {
+                                        let mounted_color = if mount.mounted {
+                                            Color32::LIGHT_GREEN
+                                        } else {
+                                            Color32::LIGHT_RED
+                                        };
+                                        ui.label(
+                                            RichText::new(if mount.mounted {
+                                                "mounted"
+                                            } else {
+                                                "missing"
+                                            })
+                                            .color(mounted_color),
+                                        );
+                                        if mount.mounted {
+                                            let match_color = if mount.target_matches_source {
+                                                Color32::LIGHT_GREEN
+                                            } else {
+                                                Color32::from_rgb(236, 198, 92)
+                                            };
+                                            ui.colored_label(
+                                                match_color,
+                                                if mount.target_matches_source {
+                                                    "source-ok"
+                                                } else {
+                                                    "source-drift"
+                                                },
+                                            );
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "{} • {} • {}",
+                                            mount.target_status.kind.as_deref().unwrap_or("-"),
+                                            format_mode_bits(mount.target_status.mode),
+                                            format_uid_gid(
+                                                mount.target_status.uid,
+                                                mount.target_status.gid,
+                                            ),
+                                        ));
+                                        ui.colored_label(
+                                            Color32::from_gray(120),
+                                            format_optional_size(mount.target_status.size),
+                                        );
+                                        if let Some(err) = &mount.target_status.error {
+                                            ui.colored_label(Color32::LIGHT_RED, err);
+                                        }
+                                    });
+                                });
+                            });
+                    });
+            });
     }
 
     fn render_profile_editor_tab(&mut self, ui: &mut egui::Ui) {
@@ -5612,7 +6166,7 @@ impl App {
             }
         });
 
-        if let Some(status) = &self.profile_editor_status {
+        if let Some(status) = self.effective_profile_editor_status() {
             ui.label(status);
         }
         ui.add_space(6.0);
@@ -6592,6 +7146,35 @@ fn format_bytes(bytes: u128) -> String {
     } else {
         format!("{:.2}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+fn format_mode_bits(mode: Option<u32>) -> String {
+    let Some(mode) = mode else {
+        return "-".to_string();
+    };
+    let perms = mode & 0o777;
+    let mut text = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let chunk = (perms >> shift) & 0o7;
+        text.push(if chunk & 0o4 != 0 { 'r' } else { '-' });
+        text.push(if chunk & 0o2 != 0 { 'w' } else { '-' });
+        text.push(if chunk & 0o1 != 0 { 'x' } else { '-' });
+    }
+    format!("{} ({:03o})", text, perms)
+}
+
+fn format_uid_gid(uid: Option<u32>, gid: Option<u32>) -> String {
+    match (uid, gid) {
+        (Some(uid), Some(gid)) => format!("{}:{}", uid, gid),
+        (Some(uid), None) => format!("{}:-", uid),
+        (None, Some(gid)) => format!("-:{}", gid),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn format_optional_size(size: Option<u64>) -> String {
+    size.map(|bytes| format_bytes(bytes as u128))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn determine_byte_unit(max_bytes: f64) -> (f64, &'static str) {

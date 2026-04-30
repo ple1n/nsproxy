@@ -59,9 +59,24 @@ pub mod state_paths {
             .expect("persist root lock poisoned") = root.into();
     }
 
-    /// Get profile directory for a named profile
+    /// Root directory for persistent profile configuration.
+    pub fn config_root() -> PathBuf {
+        persist_root().join("config")
+    }
+
+    /// Root directory for container rootfs trees used by pivot_root.
+    pub fn rootfs_root() -> PathBuf {
+        persist_root().join("rootfs")
+    }
+
+    /// Get persistent config directory for a named profile.
     pub fn profile_dir(name: &str) -> PathBuf {
-        persist_root().join(name)
+        config_root().join(name)
+    }
+
+    /// Get rootfs directory for a named profile.
+    pub fn profile_rootfs_dir(name: &str) -> PathBuf {
+        rootfs_root().join(name)
     }
 
     /// Get profile.json path for a named profile
@@ -74,14 +89,19 @@ pub mod state_paths {
         profile_dir(name).join("hot.json")
     }
 
+    /// Get sandbox status snapshot path for a named profile.
+    pub fn sandbox_status(name: &str) -> PathBuf {
+        profile_dir(name).join("sandbox_status.json")
+    }
+
     /// Get namespace bind mount path inside profile instance dir
-    /// Returns /nsp3/{name}/net
+    /// Returns /nsp3/config/{name}/net
     pub fn profile_netns_bind(name: &str) -> PathBuf {
         profile_dir(name).join("net")
     }
 
     /// Get namespace metadata JSON path inside profile instance dir
-    /// Returns /nsp3/{name}/ns_alive.json
+    /// Returns /nsp3/config/{name}/ns_alive.json
     pub fn profile_ns_meta(name: &str) -> PathBuf {
         profile_dir(name).join("ns_alive.json")
     }
@@ -135,8 +155,13 @@ pub mod state_paths {
 
     /// Pivot-root staging directory for a named profile.
     /// Returns /tmp/nsproxy_{name}
-    pub fn pivot_root_dir(name: &str) -> PathBuf {
+    pub fn pivot_root_mem(name: &str) -> PathBuf {
         PathBuf::from(format!("/tmp/nsproxy_{}", name))
+    }
+
+    /// This is the default pattern, because many docker images use / for state store
+    pub fn pivot_root(name: &str) -> PathBuf {
+        profile_rootfs_dir(name)
     }
 
     /// Global namespace registry path.
@@ -146,8 +171,23 @@ pub mod state_paths {
     }
 }
 
+pub fn current_boot_time_secs() -> Result<u64> {
+    let content = std::fs::read_to_string("/proc/stat")?;
+    let line = content
+        .lines()
+        .find(|line| line.starts_with("btime "))
+        .ok_or_else(|| anyhow::anyhow!("missing btime entry in /proc/stat"))?;
+    let value = line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("malformed btime entry in /proc/stat"))?;
+    Ok(value.parse()?)
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct NsAlive {
+    #[serde(default)]
+    pub boot_time_secs: Option<u64>,
     #[serde(default)]
     pub profile_name: Option<String>,
     pub browser_profile: Option<String>,
@@ -159,6 +199,9 @@ pub struct NsAlive {
     /// sp up daemon, socket server
     #[serde(default)]
     pub up_pid: Option<u32>,
+    /// Uniquely identifies a rootfs created at runtime
+    #[serde(default)]
+    pub rootfs: Option<UniqueFile>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
