@@ -688,13 +688,64 @@ pub fn mount_resolv_conf(nameserver: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn replace_mount_resolv_conf(nameserver: &str) -> Result<()> {
-    let p  = Path::new("/etc/resolv.conf");
+pub fn write_resolv_conf_explicit(target: &Path, nameserver: &str) -> Result<()> {
     let content = format!("nameserver {}\n", nameserver);
-    let _ = rm_mount(p);
-    mount_file_content(content.as_bytes(), p)?;
+    if let Some(parent) = target.parent() {
+        create_dir_all(parent)?;
+    }
+    std::fs::write(target, content.as_bytes())?;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o644))?;
+    info!("wrote resolv.conf at {:?} with nameserver: {}", target, nameserver);
+    Ok(())
+}
+
+pub fn replace_mount_resolv_conf(nameserver: &str, direct_write: bool) -> Result<()> {
+    let target = Path::new("/etc/resolv.conf");
+    if direct_write {
+        write_resolv_conf_explicit(target, nameserver)?;
+        return Ok(());
+    }
+
+    let content = format!("nameserver {}\n", nameserver);
+    let _ = rm_mount(target);
+    mount_file_content(content.as_bytes(), target)?;
     info!("mounted resolv.conf with nameserver: {}", nameserver);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_resolv_conf_explicit_writes_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "nsproxy-resolv-conf-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        let resolv_conf = path.join("etc/resolv.conf");
+
+        write_resolv_conf_explicit(&resolv_conf, "8.8.8.8")
+            .expect("write_resolv_conf_explicit should succeed");
+
+        let content = std::fs::read_to_string(&resolv_conf)
+            .expect("resolv.conf should be readable after write");
+        assert_eq!(content, "nameserver 8.8.8.8\n");
+
+        let mode = std::fs::metadata(&resolv_conf)
+            .expect("resolv.conf metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 /// Mount nsswitch.conf for DNS resolution via glibc's libnss_dns

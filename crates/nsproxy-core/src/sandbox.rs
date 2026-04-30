@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::BufRead;
+use std::os::unix::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use crate::{
     PathExpansionState, ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig,
     sys::{
         MountInfo, ensure_mountpoint, mount_bind_ro_explicit, mount_bind_rw_explicit,
-        mount_tmpfs, pivot_root_into,
+        mount_tmpfs, pivot_root_into, write_resolv_conf_explicit,
     },
 };
 
@@ -144,10 +145,53 @@ pub fn apply_chmod(vars: &PathExpansionState, chmods: &[ProfileChmod]) -> Result
     Ok(())
 }
 
+fn populate_writable_etc(new_root: &Path) -> Result<()> {
+    let sandbox_etc = new_root.join("etc");
+    let managed_etc_files: HashSet<&str> = ["resolv.conf"].into_iter().collect();
+    info!("read_dir(/etc)");
+    for entry in std::fs::read_dir("/etc")? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if managed_etc_files.contains(file_name.to_string_lossy().as_ref()) {
+            continue;
+        }
+
+        let source = entry.path();
+        let target = sandbox_etc.join(&file_name);
+        info!("symlink_metadata({:?})", source);
+        let meta = std::fs::symlink_metadata(&source)?;
+        if meta.file_type().is_symlink() {
+            info!("read_link({:?})", source);
+            let link_target = std::fs::read_link(&source)?;
+            if !target.exists() {
+                info!("symlink({:?} -> {:?})", link_target, target);
+                fs::symlink(&link_target, &target)?;
+            }
+            continue;
+        }
+
+        info!(
+            "mount_bind_ro_explicit(source={:?}, target={:?}, recursive={})",
+            source,
+            target,
+            meta.is_dir()
+        );
+        mount_bind_ro_explicit(&source, &target, meta.is_dir())?;
+    }
+
+    write_resolv_conf_explicit(
+        &sandbox_etc.join("resolv.conf"),
+        crate::INTERNAL_RESOLV_CONF_DNS,
+    )?;
+
+    Ok(())
+}
+
 /// Build the minimal filesystem skeleton inside `new_root`.
 ///
-/// This creates stub directories, bind-mounts /usr and /etc read-only,
-/// recreates merged-usr symlinks (or bind-mounts them for non-merged distros),
+/// This creates stub directories, bind-mounts /usr read-only, mirrors host /etc
+/// into a writable sandbox /etc with managed files left local, recreates
+/// merged-usr symlinks (or bind-mounts them for non-merged distros),
 /// bind-mounts /nsp3/config and /dev read-write, and mounts fresh proc/sys/tmp/run.
 pub fn build_skeleton(new_root: &Path) -> Result<()> {
     for d in &["usr", "etc", "dev", "proc", "sys", "tmp", "run", "home", "root"] {
@@ -155,18 +199,19 @@ pub fn build_skeleton(new_root: &Path) -> Result<()> {
         std::fs::create_dir_all(new_root.join(d))?;
     }
 
-    // Bind-mount /usr and /etc read-only (recursive).
-    for dir in &["usr", "etc"] {
-        let src = PathBuf::from(format!("/{}", dir));
-        if src.exists() {
-            info!(
-                "mount_bind_ro_explicit(source={:?}, target={:?}, recursive=true)",
-                src,
-                new_root.join(dir)
-            );
-            mount_bind_ro_explicit(&src, &new_root.join(dir), true)?;
-        }
+    // Bind-mount /usr read-only (recursive).
+    let usr = PathBuf::from("/usr");
+    if usr.exists() {
+        info!(
+            "mount_bind_ro_explicit(source={:?}, target={:?}, recursive=true)",
+            usr,
+            new_root.join("usr")
+        );
+        mount_bind_ro_explicit(&usr, &new_root.join("usr"), true)?;
     }
+
+    // Build a writable /etc while keeping host entries visible as read-only binds.
+    populate_writable_etc(new_root)?;
 
     // Recreate merged-usr symlinks (/bin /lib /lib64 /sbin -> usr/…)
     // if the host uses usr-merge, otherwise bind-mount them.

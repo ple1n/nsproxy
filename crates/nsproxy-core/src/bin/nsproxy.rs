@@ -1873,7 +1873,7 @@ fn cmd_serve(
     })?;
     let profile_path = state_paths::profile_config(&profile);
     let profile_conf = TemplateConfig::load(&profile_path)?;
-    let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
+    let write_resolv_conf_directly = ns_alive.rootfs.is_some();
 
     let child_pid = ns_alive
         .child_pid
@@ -1912,7 +1912,7 @@ fn cmd_serve(
                 drop(child_log_parent);
                 diag::install_child_log_forward(child_log_child);
                 let hot_conf = hot_conf.clone();
-                let is_pivot_mode = is_pivot_mode;
+                let write_resolv_conf_directly = write_resolv_conf_directly;
                 let expected_mnt = profile_namespaces.mnt.clone();
                 let ns_source = NSSource::Pid(child_pid as i32);
                 ns_source.enter(CloneFlags::CLONE_NEWNS)?;
@@ -1924,7 +1924,10 @@ fn cmd_serve(
                     no_dns_capture,
                     internal_dns_server,
                 );
-                replace_mount_resolv_conf(&initial_hot.resolv_conf_dns)?;
+                replace_mount_resolv_conf(
+                    &initial_hot.resolv_conf_dns,
+                    write_resolv_conf_directly,
+                )?;
 
                 let mut tun = TunMaker::default();
                 tun.name = tun_name.clone();
@@ -2033,7 +2036,10 @@ fn cmd_serve(
                                 match serde_json::from_slice::<nsproxy_core::hot_reload::ChildHotReloadRequest>(&payload) {
                                     Ok(request) => {
                                         let mut newconf = request.config;
-                                        replace_mount_resolv_conf(&newconf.resolv_conf_dns)?;
+                                        replace_mount_resolv_conf(
+                                            &newconf.resolv_conf_dns,
+                                            write_resolv_conf_directly,
+                                        )?;
                                         if let Err(err) = newconf.merged_mounts() {
                                             warn!("failed to merge hot mounts during sandbox handoff: {}", err);
                                         } else {
