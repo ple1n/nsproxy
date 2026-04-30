@@ -2,6 +2,7 @@
 name = "term-view"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 build = "src/alacritty_port/build.rs"
 
 [features]

@@ -2,6 +2,7 @@
 name = "nsproxy-core"
 version.workspace = true
 edition = "2024"
+license.workspace = true
 build = "build.rs"
 
 [build-dependencies]
