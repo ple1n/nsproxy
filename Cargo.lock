@@ -4378,6 +4378,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bincode",
+ "clap",
  "diag",
  "eframe 0.33.3",
  "egui 0.33.3",
