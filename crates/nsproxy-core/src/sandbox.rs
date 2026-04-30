@@ -121,6 +121,11 @@ pub fn apply_chmod(vars: &PathExpansionState, chmods: &[ProfileChmod]) -> Result
     for c in chmods {
         let target = vars.expand_target(&c.path);
 
+        if c.mkdir && !target.try_exists()? {
+            info!("create_dir_all({:?})", target);
+            std::fs::create_dir_all(&target)?;
+        }
+
         if let Some(mode) = c.mode {
             info!("syscall: metadata({:?})", target);
             let mut perms = std::fs::metadata(&target)?.permissions();
@@ -406,6 +411,45 @@ pub fn inspect_path(path: &Path) -> SandboxPathStatus {
             size: None,
             error: Some(err.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        path.push(format!("nsproxy-sandbox-test-{nanos}-{}", std::process::id()));
+        path
+    }
+
+    #[test]
+    fn apply_chmod_creates_missing_directory_when_mkdir_is_true() {
+        let root = unique_temp_dir();
+        let target = root.join("nested/dir");
+        let vars = PathExpansionState::without_instance().with_dst_chroot(&root);
+
+        let result = apply_chmod(
+            &vars,
+            &[ProfileChmod {
+                path: PathBuf::from("/nested/dir"),
+                mode: Some(0o755),
+                uid: None,
+                gid: None,
+                mkdir: true,
+            }],
+        );
+
+        result.expect("apply_chmod should succeed");
+        let meta = std::fs::metadata(&target).expect("target directory should exist");
+        assert!(meta.is_dir(), "target should be created as a directory");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -1631,6 +1631,7 @@ impl App {
                         mode: None,
                         uid: None,
                         gid: None,
+                        mkdir: false
                     });
                     changed = true;
                 }
