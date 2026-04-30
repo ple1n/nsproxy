@@ -42,7 +42,8 @@ use nsproxy_common::{
     ExactNS, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile, forever,
 };
 use nsproxy_core::{
-    BasisCommand, Cli, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths, PathsBinds,
+    BasisCommand, Cli, DaemonCliRequest, HotConfig, MainCommand, NetlinkOps, NsproxyConfig,
+    Paths, PathsBinds,
     SandboxMode, TemplateConfig, TunMaker,
     cmd_common::{
         apply_ns_env, check_proxy_mode, enter_ns, read_ns_alive, read_ns_alive_opt,
@@ -50,14 +51,16 @@ use nsproxy_core::{
     },
     env::{ENV_NS, args_deduce_mount, name_to_mount_path},
     hot_reload::{VethIps, sync_links, watch_hot},
-    sandbox::{apply_chmod, apply_mounts},
+    sandbox::{
+        apply_chmod, apply_mounts, collect_sandbox_status, write_sandbox_status,
+    },
     shell::{ShellArgs, ShellPrefs},
     state_paths,
     sys::{
         Clone3Result, NSEnter, check_capsys, check_selfns, enable_ping_all, mount_bind,
         mount_bind_ro_explicit, mount_bind_root, mount_bind_rw_explicit, mount_ns,
         mount_nsswitch_conf, mount_resolv_conf, mount_tmpfs, pivot_root_into,
-        replace_mount_resolv_conf, rm_mount,
+        replace_mount_resolv_conf, rm_mount, umount_detach_targets,
     },
     tokio_netlink_conn,
     utils::ToExactNs,
@@ -92,7 +95,7 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     process::exit,
     str::FromStr,
@@ -799,12 +802,13 @@ fn main() -> anyhow::Result<()> {
             info!("Profile name: {}", clean_name);
             info!("Template config: {:?}", path);
 
-            // Create target directory at /nsp3/{clean_name}
-            let target_dir = state_paths::profile_dir(&clean_name);
-            info!("Target directory: {:?}", target_dir);
+            // Create target config directory at /nsp3/config/{clean_name}
+            let profile_config_dir = state_paths::profile_dir(&clean_name);
+            let rootfs_dir = state_paths::profile_rootfs_dir(&clean_name);
+            info!("Target config directory: {:?}", profile_config_dir);
 
-            let profile_path = target_dir.join("profile.json");
-            let hot_path = target_dir.join("hot.json");
+            let profile_path = profile_config_dir.join("profile.json");
+            let hot_path = profile_config_dir.join("hot.json");
 
             if update {
                 // Update mode: check that profile exists
@@ -823,8 +827,8 @@ fn main() -> anyhow::Result<()> {
                 info!("Template loaded successfully");
 
                 // Expand @ placeholders
-                info!("Expanding @ placeholders to: {:?}", target_dir);
-                profile.expand_placeholders(&target_dir);
+                info!("Expanding @ placeholders to: {:?}", profile_config_dir);
+                profile.expand_placeholders(&profile_config_dir);
 
                 // Wellness checks
                 info!("Running wellness checks...");
@@ -887,8 +891,9 @@ fn main() -> anyhow::Result<()> {
                 // Create mode (original logic)
 
                 // If reset flag is set, remove the entire directory first
-                if reset && target_dir.exists() {
-                    warn!("Reset flag enabled - removing existing profile directory");
+                if reset && (profile_config_dir.exists() || rootfs_dir.exists()) {
+                    // TODO: this profile reset path should reuse `sp down`
+                    warn!("Reset flag enabled - removing existing profile state");
 
                     // Remove namespace bind mount if it exists
                     let ns_bind = state_paths::profile_netns_bind(&clean_name);
@@ -904,12 +909,14 @@ fn main() -> anyhow::Result<()> {
                         std::fs::remove_file(&ns_meta)?;
                     }
 
-                    std::fs::remove_dir_all(&target_dir)?;
-                    info!("Removed existing directory");
+                    if profile_config_dir.exists() {
+                        std::fs::remove_dir_all(&profile_config_dir)?;
+                        info!("Removed existing config directory");
+                    }
                 }
 
                 info!("Creating profile directory structure...");
-                std::fs::create_dir_all(&target_dir)?;
+                std::fs::create_dir_all(&profile_config_dir)?;
 
                 if profile_path.exists() && !reset {
                     bail!(
@@ -924,8 +931,8 @@ fn main() -> anyhow::Result<()> {
                 info!("Template loaded successfully");
 
                 // Expand @ placeholders for directory creation
-                info!("Expanding @ placeholders to: {:?}", target_dir);
-                profile.expand_placeholders(&target_dir);
+                info!("Expanding @ placeholders to: {:?}", profile_config_dir);
+                profile.expand_placeholders(&profile_config_dir);
 
                 // Create all referenced directories
                 if let Some(ref cwd) = profile.sargs.cwd {
@@ -1009,7 +1016,7 @@ fn main() -> anyhow::Result<()> {
 
                 info!("");
                 info!("✓ Profile created successfully");
-                info!("Location: {:?}", target_dir);
+                info!("Location: {:?}", profile_config_dir);
                 info!("Config: {:?}", profile_path);
                 info!("Hot config: {:?}", new_profile.hot);
             }
@@ -1284,6 +1291,9 @@ fn main() -> anyhow::Result<()> {
                             ns_alive.bind_mount = bind_mount.clone();
                             ns_alive.child_pid = Some(child_pid as u32);
                             ns_alive.up_pid = Some(up_pid);
+                            if upkeeper_pid.is_none() {
+                                ns_alive.rootfs = None;
+                            }
                         })?;
                         warn!("Auxiliary data written to {:?}", &ns_meta);
 
@@ -1351,11 +1361,30 @@ fn main() -> anyhow::Result<()> {
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let bind_mount = state_paths::profile_netns_bind(&profile);
             let profile_dir = state_paths::profile_dir(&profile);
+            let sandbox_root = configured_sandbox_root(&profile)?;
+            let mut sandbox_mounts_removed = !sandbox_root.exists();
 
             // Kill the keeper process if we know its PID.
             if ns_meta.exists() {
                 if let Ok(content) = std::fs::read_to_string(&ns_meta) {
                     if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
+                        if rm {
+                            match cleanup_sandbox_mounts(&ns_alive, &sandbox_root) {
+                                Ok(()) => {
+                                    sandbox_mounts_removed = true;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "failed to detach sandbox-owned mounts for {:?}: {}",
+                                        profile,
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                        if ns_alive.up_pid.filter(|pid| pid_is_alive(*pid)).is_some() {
+                            request_graceful_up_shutdown(&profile);
+                        }
                         if let Some(pid) = ns_alive.child_pid {
                             let proc_path = PathBuf::from("/proc").join(pid.to_string());
                             if proc_path.exists() {
@@ -1380,34 +1409,43 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             })?;
 
-            // Unmount and remove the bind-mount file.
-            let mut bind_mount_removed = !bind_mount.exists();
-            if bind_mount.exists() {
-                if let Err(e) = rm_mount(&bind_mount) {
-                    warn!("failed to remove bind mount {:?}: {:?}", bind_mount, e);
-                } else {
-                    info!("removed bind mount {:?}", bind_mount);
-                    bind_mount_removed = true;
-                }
-            } else {
-                warn!(
-                    "bind mount {:?} does not exist, nothing to unmount",
-                    bind_mount
-                );
-            }
-
             if rm {
-                if bind_mount_removed {
-                    if profile_dir.exists() {
-                        std::fs::remove_dir_all(&profile_dir)?;
-                        info!("removed profile directory {:?}", profile_dir);
+                // Unmount and remove the bind-mount file.
+                let mut bind_mount_removed = !bind_mount.exists();
+                if bind_mount.exists() {
+                    if let Err(e) = rm_mount(&bind_mount) {
+                        warn!("failed to remove bind mount {:?}: {:?}", bind_mount, e);
                     } else {
-                        warn!("profile directory {:?} does not exist", profile_dir);
+                        info!("removed bind mount {:?}", bind_mount);
+                        bind_mount_removed = true;
                     }
                 } else {
                     warn!(
-                        "skipping profile directory removal for {:?} because bind mount cleanup failed",
-                        profile_dir
+                        "bind mount {:?} does not exist, nothing to unmount",
+                        bind_mount
+                    );
+                }
+
+                if bind_mount_removed && sandbox_mounts_removed {
+                    if sandbox_root.exists() {
+                        std::fs::remove_dir_all(&sandbox_root)?;
+                        info!("removed profile rootfs directory {:?}", sandbox_root);
+                    } else {
+                        warn!("profile rootfs directory {:?} does not exist", sandbox_root);
+                    }
+                    if profile_dir.exists() {
+                        std::fs::remove_dir_all(&profile_dir)?;
+                        info!("removed profile config directory {:?}", profile_dir);
+                    } else {
+                        warn!("profile config directory {:?} does not exist", profile_dir);
+                    }
+                } else {
+                    warn!(
+                        "skipping profile state removal for config {:?} and rootfs {:?} because mount cleanup failed (bind_mount_removed={}, sandbox_mounts_removed={})",
+                        profile_dir,
+                        sandbox_root,
+                        bind_mount_removed,
+                        sandbox_mounts_removed
                     );
                 }
             }
@@ -1633,23 +1671,29 @@ fn main() -> anyhow::Result<()> {
             nsproxy_core::sandbox::assert_mount_ns_matches(&profile_namespaces.mnt)?;
 
             // Check if a previous sandbox is already in place (restart case).
-            let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state()?;
+            let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state(ns_alive.rootfs)?;
 
             // Determine before consuming sandbox_state whether a pivot root will be/was applied.
             // Hot mounts applied after a pivot must resolve source paths through /pivot (the old root).
             let is_pivot_mode = profile_conf.sandbox_mode == SandboxMode::Pivot;
 
             match sandbox_state {
-                nsproxy_core::sandbox::SandboxState::AlreadyPivoted => {
+                nsproxy_core::sandbox::SandboxState::Pivoted => {
                     info!("sandbox already applied, skipping pivot");
                 }
-                nsproxy_core::sandbox::SandboxState::Virgin => {
+                nsproxy_core::sandbox::SandboxState::NoPivot => {
                     if is_pivot_mode {
                         // Build and pivot into the sandbox root.
                         nsproxy_core::sandbox::apply_pivot(&profile_conf, &profile)?;
+                        let rootfs = nsproxy_core::sandbox::current_rootfs_id()?;
+                        update_ns_alive(&ns_meta, |ns_alive| {
+                            ns_alive.rootfs = Some(rootfs);
+                        })?;
                     }
                 }
             }
+
+            let mut status_mounts = profile_conf.mounts.clone();
 
             // Resolve the hot config path (already expanded).
             let hot_path = profile_conf.hot.clone();
@@ -1672,9 +1716,82 @@ fn main() -> anyhow::Result<()> {
                     if let Ok(mounts) = hot.merged_mounts() {
                         if !mounts.is_empty() {
                             nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
+                            status_mounts.extend(mounts);
                         }
                     }
                 }
+            }
+
+            let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state(read_ns_alive_opt(&ns_meta).and_then(|ns_alive| ns_alive.rootfs))?;
+            let sandbox_status = collect_sandbox_status(
+                profile_conf.sandbox_mode.clone(),
+                sandbox_state,
+                &status_mounts,
+                None,
+            )?;
+            write_sandbox_status(&profile, &sandbox_status)?;
+        }
+        MainCommand::Daemon { cmd } => {
+            check_capsys()?;
+
+            if let Some(cmd) = cmd {
+                let request = match cmd {
+                    DaemonCliRequest::Ping => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::Ping,
+                    },
+                    DaemonCliRequest::Stop => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::Stop,
+                    },
+                    DaemonCliRequest::CreateDirAll { path } => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::CreateDirAll { path },
+                    },
+                    DaemonCliRequest::WriteFile {
+                        path,
+                        content,
+                        create_parent,
+                    } => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::WriteFile {
+                            path,
+                            content,
+                            create_parent,
+                        },
+                    },
+                    DaemonCliRequest::CreateProfile {
+                        name,
+                        profile_content,
+                        hot_content,
+                    } => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::CreateProfile {
+                            name,
+                            profile_content,
+                            hot_content,
+                        },
+                    },
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let mut stream = diag::connect_root_daemon(&diag::root_daemon_sock_path()).await?;
+                    stream.send_request(&request).await?;
+                    match stream.next_event().await? {
+                        Some(evt) => {
+                            println!("{:?}", evt);
+                            Ok::<(), anyhow::Error>(())
+                        }
+                        None => bail!("root daemon closed connection without a response"),
+                    }
+                })?;
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(run_root_daemon(cli.control_socket.clone()))?;
             }
         }
         _ => unimplemented!(),
@@ -1893,11 +2010,8 @@ fn cmd_serve(
                     tokio::spawn(nsproxy_common::trace_spawn_result(
                         "serve child hot reload watcher",
                         async move {
-                        use std::collections::HashSet;
-
                         let conf = Some(hot_conf);
                         if let Some(conf) = conf {
-                            let mut mounted_targets: HashSet<PathBuf> = HashSet::new();
                             let mut read = [0u8; 1];
                             let mut len_buf = [0u8; 4];
                             loop {
@@ -1919,50 +2033,13 @@ fn cmd_serve(
                                 match serde_json::from_slice::<nsproxy_core::hot_reload::ChildHotReloadRequest>(&payload) {
                                     Ok(request) => {
                                         let mut newconf = request.config;
-                                        let instance_root = conf.parent().unwrap_or(std::path::Path::new("/"));
-                                        let base_hot_vars = nsproxy_core::PathExpansionState::for_instance(instance_root);
-                                        let sandbox_state = nsproxy_core::sandbox::detect_sandbox_state()?;
                                         replace_mount_resolv_conf(&newconf.resolv_conf_dns)?;
-
-                                        if is_pivot_mode
-                                            && matches!(sandbox_state, nsproxy_core::sandbox::SandboxState::Virgin)
-                                        {
-                                            warn!(
-                                                "skipping live hot bind-mount reconcile: profile expects pivot sandbox but namespace root is not pivoted"
-                                            );
+                                        if let Err(err) = newconf.merged_mounts() {
+                                            warn!("failed to merge hot mounts during sandbox handoff: {}", err);
                                         } else {
-                                            let hot_vars = match sandbox_state {
-                                                nsproxy_core::sandbox::SandboxState::AlreadyPivoted => {
-                                                    if is_pivot_mode {
-                                                        base_hot_vars.with_src_chroot(std::path::Path::new("/pivot"))
-                                                    } else {
-                                                        base_hot_vars
-                                                    }
-                                                }
-                                                nsproxy_core::sandbox::SandboxState::Virgin => {
-                                                    base_hot_vars
-                                                }
-                                            };
-                                            newconf.expand_with(&hot_vars);
-
-                                            match newconf.merged_mounts() {
-                                                Ok(mounts) => {
-                                                    let desired_targets: HashSet<PathBuf> = mounts
-                                                        .iter()
-                                                        .map(|mount| hot_vars.expand_target(&mount.target))
-                                                        .collect();
-                                                    for removed in mounted_targets.difference(&desired_targets) {
-                                                        if let Err(err) = rm_mount(removed) {
-                                                            warn!("failed to detach removed hot mount {:?}: {}", removed, err);
-                                                        }
-                                                    }
-                                                    if !mounts.is_empty() {
-                                                        nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
-                                                    }
-                                                    mounted_targets = desired_targets;
-                                                }
-                                                Err(err) => warn!("failed to merge hot mounts during live apply: {}", err),
-                                            }
+                                            info!(
+                                                "skipping live sandbox mount reconcile in serve child; waiting for dedicated sp sandbox run"
+                                            );
                                         }
 
                                         tx.write(&[0, 0, 0, 0]).await?;
@@ -3546,6 +3623,369 @@ async fn connect_and_greet_serve(
     Ok(stream)
 }
 
+async fn connect_and_greet_root_daemon(ctrl_path: &Path) -> Result<tokio::net::UnixStream> {
+    let mut stream = tokio::net::UnixStream::connect(ctrl_path).await?;
+    diag::control_handshake_client(&mut stream).await?;
+    let frame = diag::encode_control_greeting(&diag::ControlSocketGreeting::RootDaemon)?;
+    use tokio::io::AsyncWriteExt as _;
+    stream.write_all(&frame).await?;
+    Ok(stream)
+}
+
+fn ensure_daemon_path_allowed(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("daemon path must be absolute: {:?}", path);
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("daemon path must not contain '..': {:?}", path);
+    }
+    let root = state_paths::persist_root();
+    if !path.starts_with(&root) {
+        bail!(
+            "daemon path {:?} escapes persist root {:?}",
+            path,
+            root
+        );
+    }
+    Ok(())
+}
+
+fn daemon_ok(
+    op_id: u64,
+    message: String,
+    profile: Option<String>,
+    path: Option<PathBuf>,
+) -> diag::RootDaemonEvent {
+    diag::RootDaemonEvent {
+        op_id,
+        result: diag::RootDaemonResult::Ok {
+            message,
+            profile,
+            path,
+        },
+    }
+}
+
+fn daemon_err(
+    op_id: u64,
+    message: String,
+    profile: Option<String>,
+    path: Option<PathBuf>,
+) -> diag::RootDaemonEvent {
+    diag::RootDaemonEvent {
+        op_id,
+        result: diag::RootDaemonResult::Error {
+            message,
+            profile,
+            path,
+        },
+    }
+}
+
+enum RootDaemonAction {
+    Reply(diag::RootDaemonEvent),
+    ReplyAndStop(diag::RootDaemonEvent),
+}
+
+fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
+    match op {
+        diag::RootDaemonOp::Ping => "ping",
+        diag::RootDaemonOp::Stop => "stop",
+        diag::RootDaemonOp::CreateDirAll { .. } => "create_dir_all",
+        diag::RootDaemonOp::WriteFile { .. } => "write_file",
+        diag::RootDaemonOp::CreateProfile { .. } => "create_profile",
+    }
+}
+
+fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction {
+    let op_id = req.op_id;
+    let op_name = root_daemon_op_name(&req.op);
+    match &req.op {
+        diag::RootDaemonOp::Ping => {
+            info!(op_id, op = op_name, "root daemon op received");
+        }
+        diag::RootDaemonOp::Stop => {
+            info!(op_id, op = op_name, "root daemon op received");
+        }
+        diag::RootDaemonOp::CreateDirAll { path } => {
+            info!(op_id, op = op_name, path = %path.display(), "root daemon op received");
+        }
+        diag::RootDaemonOp::WriteFile {
+            path,
+            create_parent,
+            ..
+        } => {
+            info!(
+                op_id,
+                op = op_name,
+                path = %path.display(),
+                create_parent,
+                "root daemon op received"
+            );
+        }
+        diag::RootDaemonOp::CreateProfile { name, .. } => {
+            info!(op_id, op = op_name, profile = %name, "root daemon op received");
+        }
+    }
+    match req.op {
+        diag::RootDaemonOp::Ping => {
+            info!(op_id, op = op_name, build_tree_hash = nsproxy_core::build_tree_hash(), "root daemon op completed");
+            RootDaemonAction::Reply(diag::RootDaemonEvent {
+                op_id,
+                result: diag::RootDaemonResult::Pong {
+                    version: nsproxy_core::build_tree_hash().to_string(),
+                },
+            })
+        }
+        diag::RootDaemonOp::Stop => {
+            info!(op_id, op = op_name, build_tree_hash = nsproxy_core::build_tree_hash(), "root daemon op completed");
+            RootDaemonAction::ReplyAndStop(daemon_ok(
+                op_id,
+                format!("stopping sp daemon {}", nsproxy_core::build_tree_hash()),
+                None,
+                None,
+            ))
+        }
+        diag::RootDaemonOp::CreateDirAll { path } => RootDaemonAction::Reply(match ensure_daemon_path_allowed(&path)
+            .and_then(|_| std::fs::create_dir_all(&path).map_err(anyhow::Error::from))
+        {
+            Ok(()) => {
+                info!(op_id, op = op_name, path = %path.display(), "root daemon op completed");
+                daemon_ok(op_id, format!("created {}", path.display()), None, Some(path))
+            }
+            Err(err) => {
+                warn!(op_id, op = op_name, path = %path.display(), error = %err, "root daemon op failed");
+                daemon_err(op_id, err.to_string(), None, Some(path))
+            }
+        }),
+        diag::RootDaemonOp::WriteFile {
+            path,
+            content,
+            create_parent,
+        } => {
+            let result = (|| -> Result<()> {
+                ensure_daemon_path_allowed(&path)?;
+                if create_parent {
+                    if let Some(parent) = path.parent() {
+                        ensure_daemon_path_allowed(parent)?;
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&path, content)?;
+                Ok(())
+            })();
+            RootDaemonAction::Reply(match result {
+                Ok(()) => {
+                    info!(op_id, op = op_name, path = %path.display(), "root daemon op completed");
+                    daemon_ok(op_id, format!("wrote {}", path.display()), None, Some(path))
+                }
+                Err(err) => {
+                    warn!(op_id, op = op_name, path = %path.display(), error = %err, "root daemon op failed");
+                    daemon_err(op_id, err.to_string(), None, Some(path))
+                }
+            })
+        }
+        diag::RootDaemonOp::CreateProfile {
+            name,
+            profile_content,
+            hot_content,
+        } => {
+            let profile = name.clone();
+            let result = (|| -> Result<()> {
+                if profile.is_empty() || profile.contains('/') {
+                    bail!("invalid profile name: {}", profile);
+                }
+                let profile_dir = state_paths::profile_dir(&profile);
+                let profile_path = state_paths::profile_config(&profile);
+                let hot_path = state_paths::hot_config(&profile);
+                ensure_daemon_path_allowed(&profile_dir)?;
+                ensure_daemon_path_allowed(&profile_path)?;
+                ensure_daemon_path_allowed(&hot_path)?;
+                if profile_dir.exists() {
+                    bail!("profile '{}' already exists", profile);
+                }
+                std::fs::create_dir_all(&profile_dir)?;
+                std::fs::write(&profile_path, profile_content.as_bytes())?;
+                if let Some(hot_content) = hot_content {
+                    std::fs::write(&hot_path, hot_content.as_bytes())?;
+                }
+                Ok(())
+            })();
+            RootDaemonAction::Reply(match result {
+                Ok(()) => {
+                    info!(op_id, op = op_name, profile = %profile, "root daemon op completed");
+                    daemon_ok(
+                        op_id,
+                        format!("created profile {}", profile),
+                        Some(profile),
+                        None,
+                    )
+                }
+                Err(err) => {
+                    warn!(op_id, op = op_name, profile = %profile, error = %err, "root daemon op failed");
+                    daemon_err(op_id, err.to_string(), Some(profile), None)
+                }
+            })
+        }
+    }
+}
+
+async fn handle_root_daemon_client(
+    stream: tokio::net::UnixStream,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    mut log_rx: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
+) -> Result<()> {
+    let (mut read_half, mut write_half) = stream.into_split();
+    let mut upgraded = false;
+    loop {
+        tokio::select! {
+            req = read_bincode_frame_async::<diag::RootDaemonWireRequest, _>(&mut read_half) => {
+                let Some(req) = req? else {
+                    break;
+                };
+                match req {
+                    diag::RootDaemonWireRequest::Stable(stable_req) => {
+                        match stable_req {
+                            diag::StableRequest::Ping => {
+                                let stable_evt = diag::RootDaemonWireEvent::Stable(diag::StableEvent::Pong);
+                                write_bincode_frame_async(&mut write_half, &stable_evt).await?;
+                            }
+                            diag::StableRequest::GracefulShutdown => {
+                                let stable_evt = diag::RootDaemonWireEvent::Stable(diag::StableEvent::ShuttingDown);
+                                write_bincode_frame_async(&mut write_half, &stable_evt).await?;
+                                let _ = shutdown_tx.send(true);
+                                break;
+                            }
+                            diag::StableRequest::Upgrade { build_tree_hash } => {
+                                let local_hash = nsproxy_core::build_tree_hash();
+                                let stable_evt = if build_tree_hash == local_hash {
+                                    upgraded = true;
+                                    diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted {
+                                        build_tree_hash: local_hash.to_string(),
+                                    })
+                                } else {
+                                    diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeRejected {
+                                        msg: format!(
+                                            "build hash mismatch: local={}, remote={}",
+                                            local_hash, build_tree_hash
+                                        ),
+                                    })
+                                };
+                                write_bincode_frame_async(&mut write_half, &stable_evt).await?;
+                            }
+                        }
+                    }
+                    diag::RootDaemonWireRequest::Unstable(req) => {
+                        if !upgraded {
+                            let stable_evt = diag::RootDaemonWireEvent::Stable(diag::StableEvent::Error {
+                                msg: "root daemon protocol upgrade required before requests".to_string(),
+                            });
+                            write_bincode_frame_async(&mut write_half, &stable_evt).await?;
+                            continue;
+                        }
+                        match handle_root_daemon_request(req) {
+                            RootDaemonAction::Reply(event) => {
+                                write_bincode_frame_async(&mut write_half, &diag::RootDaemonWireEvent::Unstable(event)).await?;
+                            }
+                            RootDaemonAction::ReplyAndStop(event) => {
+                                write_bincode_frame_async(&mut write_half, &diag::RootDaemonWireEvent::Unstable(event)).await?;
+                                let _ = shutdown_tx.send(true);
+                                break;
+                            }
+                        }
+                    }
+                    diag::RootDaemonWireRequest::QueryRecentLogs { limit } => {
+                        if !upgraded {
+                            let stable_evt = diag::RootDaemonWireEvent::Stable(diag::StableEvent::Error {
+                                msg: "root daemon protocol upgrade required before log queries".to_string(),
+                            });
+                            write_bincode_frame_async(&mut write_half, &stable_evt).await?;
+                            continue;
+                        }
+                        let evt = diag::RootDaemonWireEvent::RecentLogs(diag::query_recent_logs(limit));
+                        write_bincode_frame_async(&mut write_half, &evt).await?;
+                    }
+                }
+            }
+            frame = log_rx.recv(), if upgraded => {
+                match frame {
+                    Ok(frame) => write_half.write_all(&frame).await?,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "root daemon log client lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_root_daemon(control_socket: Option<PathBuf>) -> Result<()> {
+    diag::init_root_daemon_log_broadcast();
+    let sock_path = diag::root_daemon_sock_path();
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    std::fs::set_permissions(&sock_path, Permissions::from_mode(0o666))?;
+    info!(sock = %sock_path.display(), "root daemon listening");
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    if let Some(ctrl_path) = control_socket {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            match connect_and_greet_root_daemon(&ctrl_path).await {
+                Ok(stream) => {
+                    let log_rx = diag::subscribe_root_daemon_logs()
+                        .expect("root daemon log broadcast must be initialised before control socket connect");
+                    if let Err(err) = handle_root_daemon_client(stream, shutdown_tx, log_rx).await {
+                        warn!(error = %err, "root daemon reversed client error");
+                    }
+                }
+                Err(err) => warn!(path = %ctrl_path.display(), error = %err, "root daemon failed to connect to UI control socket"),
+            }
+        });
+    }
+
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                let (mut stream, _) = res?;
+                if let Err(err) = diag::handshake_server(&mut stream, diag::ProtocolChannel::Daemon).await {
+                    warn!(error = %err, "root daemon handshake failed");
+                    continue;
+                }
+                let shutdown_tx = shutdown_tx.clone();
+                let log_rx = diag::subscribe_root_daemon_logs()
+                    .expect("root daemon log broadcast must be initialised before accept loop");
+                tokio::spawn(async move {
+                    if let Err(err) = handle_root_daemon_client(stream, shutdown_tx, log_rx).await {
+                        warn!(error = %err, "root daemon client error");
+                    }
+                });
+            }
+            changed = shutdown_rx.changed() => {
+                match changed {
+                    Ok(()) if *shutdown_rx.borrow() => {
+                        info!(sock = %sock_path.display(), "root daemon stopping cooperatively");
+                        break;
+                    }
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&sock_path);
+    Ok(())
+}
+
 fn spawn_daemon_process(
     args: &diag::SpawnArgs,
     ns_alive: &nsproxy_core::NsAlive,
@@ -3820,6 +4260,126 @@ fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
     }
 
     false
+}
+
+fn configured_sandbox_root(profile: &str) -> Result<PathBuf> {
+    let profile_path = state_paths::profile_config(profile);
+    if !profile_path.exists() {
+        return Ok(state_paths::pivot_root(profile));
+    }
+
+    let profile_conf = TemplateConfig::load(&profile_path)?;
+    Ok(match profile_conf.rootfs {
+        Rootfs::Default => state_paths::pivot_root(profile),
+        Rootfs::Tempfs => state_paths::pivot_root_mem(profile),
+        Rootfs::Path(path) => path,
+    })
+}
+
+fn request_graceful_up_shutdown(profile: &str) {
+    let sock_path = diag::up_sock_path(profile);
+    if !sock_path.exists() {
+        return;
+    }
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            warn!(
+                profile,
+                "failed to create runtime for up-daemon shutdown request: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = rt.block_on(async {
+        let mut stream = diag::connect_up_daemon_stable(&sock_path).await?;
+        stream
+            .send_stable_request(&diag::StableRequest::GracefulShutdown)
+            .await?;
+        match tokio::time::timeout(Duration::from_secs(5), stream.next_event()).await {
+            Ok(Ok(Some(diag::UpWireEvent::Stable(diag::StableEvent::ShuttingDown))))
+            | Ok(Ok(Some(diag::UpWireEvent::Unstable(diag::DaemonEvent::Stopping))))
+            | Ok(Ok(None)) => Ok::<(), anyhow::Error>(()),
+            Ok(Ok(Some(diag::UpWireEvent::Stable(diag::StableEvent::Error { msg })))) => {
+                bail!("up daemon returned error on graceful shutdown: {}", msg)
+            }
+            Ok(Ok(Some(diag::UpWireEvent::Unstable(diag::DaemonEvent::Error { msg })))) => {
+                bail!("up daemon returned error on graceful shutdown: {}", msg)
+            }
+            Ok(Ok(Some(other))) => {
+                bail!("unexpected response from up daemon: {:?}", other)
+            }
+            Ok(Err(err)) => Err(err.into()),
+            Err(_) => bail!("timed out waiting for graceful shutdown acknowledgement"),
+        }
+    }) {
+        warn!(
+            profile,
+            "failed to request graceful up-daemon shutdown: {}",
+            err
+        );
+    }
+}
+
+/// Detach the sandbox-owned mount targets created by [crate::sandbox::build_skeleton].
+///
+/// This intentionally targets only the top-level skeleton mounts (`/pivot`, `/proc`,
+/// `/sys`, `/tmp`, `/run`) and does not recurse into mount targets under `/pivot`,
+/// which belong to the old root after `pivot_root`.
+fn cleanup_sandbox_mounts(ns_alive: &nsproxy_core::NsAlive, sandbox_root: &Path) -> Result<()> {
+    let Some(child_pid) = ns_alive.child_pid else {
+        return Ok(());
+    };
+
+    if !pid_is_alive(child_pid) || !sandbox_root.exists() {
+        return Ok(());
+    }
+
+    match unsafe { fork()? } {
+        ForkResult::Parent { child } => match nix::sys::wait::waitpid(child, None)? {
+            nix::sys::wait::WaitStatus::Exited(_, 0) => Ok(()),
+            nix::sys::wait::WaitStatus::Exited(_, code) => {
+                bail!("sandbox cleanup helper exited with status {}", code)
+            }
+            nix::sys::wait::WaitStatus::Signaled(_, signal, _) => {
+                bail!("sandbox cleanup helper terminated by signal {:?}", signal)
+            }
+            status => bail!("sandbox cleanup helper ended unexpectedly: {:?}", status),
+        },
+        ForkResult::Child => {
+            let cleanup_targets = [
+                Path::new("/pivot"),
+                Path::new("/proc"),
+                Path::new("/sys"),
+                Path::new("/tmp"),
+                Path::new("/run"),
+            ];
+            let exit_code = match enter_ns(ns_alive, &ns_alive.bind_mount).and_then(|_| {
+                if sandbox_root.exists() {
+                    umount_detach_targets(&cleanup_targets)
+                } else {
+                    Ok(())
+                }
+            }) {
+                Ok(()) => 0,
+                Err(err) => {
+                    warn!(
+                        "failed to clean sandbox-owned mounts for {:?}: {}",
+                        sandbox_root,
+                        err
+                    );
+                    1
+                }
+            };
+            std::process::exit(exit_code);
+        }
+    }
 }
 
 fn pid_is_alive(pid: u32) -> bool {

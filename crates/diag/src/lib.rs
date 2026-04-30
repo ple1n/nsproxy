@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use nsproxy_common::routing::{ProxyID, RoutingResovled};
+use nsproxy_common::{routing::{ProxyID, RoutingResovled}, state_paths};
 use socks5_impl::protocol::WireAddress;
 pub use nsproxy_common::stats::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,74 @@ pub enum ControlCommand {
     QueryConnsState,
 }
 
+/// Request sent to the global privileged `sp daemon` service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootDaemonRequest {
+    pub op_id: u64,
+    pub op: RootDaemonOp,
+}
+
+/// Supported privileged maintenance operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RootDaemonOp {
+    Ping,
+    Stop,
+    CreateDirAll {
+        path: PathBuf,
+    },
+    WriteFile {
+        path: PathBuf,
+        content: Vec<u8>,
+        create_parent: bool,
+    },
+    CreateProfile {
+        name: String,
+        profile_content: String,
+        hot_content: Option<String>,
+    },
+}
+
+/// Response emitted by the global privileged `sp daemon` service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootDaemonEvent {
+    pub op_id: u64,
+    pub result: RootDaemonResult,
+}
+
+/// Root-daemon wire request envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RootDaemonWireRequest {
+    Stable(StableRequest),
+    Unstable(RootDaemonRequest),
+    QueryRecentLogs { limit: usize },
+}
+
+/// Root-daemon wire event envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RootDaemonWireEvent {
+    Stable(StableEvent),
+    Unstable(RootDaemonEvent),
+    Log(LogEntry),
+    RecentLogs(Vec<LogEntry>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RootDaemonResult {
+    Pong {
+        version: String,
+    },
+    Ok {
+        message: String,
+        profile: Option<String>,
+        path: Option<PathBuf>,
+    },
+    Error {
+        message: String,
+        profile: Option<String>,
+        path: Option<PathBuf>,
+    },
+}
+
 /// Snapshot of DNS state derived from the VirtDNS handle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsState {
@@ -220,6 +288,7 @@ pub struct RoutingState {
 pub enum ProtocolChannel {
     Diag,
     Up,
+    Daemon,
     Control,
 }
 
@@ -300,6 +369,9 @@ pub enum ControlSocketGreeting {
     UpDaemon { name: String },
     /// The `sp serve` process is connecting; subsequent frames are `DiagEvent` / `ControlCommand`.
     ServeDaemon { name: String },
+    /// The global privileged `sp daemon` is connecting; subsequent frames are
+    /// `RootDaemonEvent` / `RootDaemonRequest`.
+    RootDaemon,
 }
 
 /// Encode a [`ControlSocketGreeting`] as a length-prefixed bincode frame ready to write.
@@ -940,6 +1012,11 @@ pub fn up_sock_path(instance_name: &str) -> PathBuf {
     PathBuf::from("/nsp3").join(instance_name).join("up.sock")
 }
 
+/// Derive the canonical global privileged daemon socket path.
+pub fn root_daemon_sock_path() -> PathBuf {
+    state_paths::persist_root().join("daemon.sock")
+}
+
 // ── Task-local diag sender + tracing layer ────────────────────────────
 
 tokio::task_local! {
@@ -953,6 +1030,11 @@ tokio::task_local! {
 /// Initialised once by [`init_up_log_broadcast`] when the up daemon starts.
 /// [`DiagTracingLayer`] forwards log records here whenever no per-task diag scope is active.
 static UP_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sync::OnceLock::new();
+
+/// Global broadcast channel for the `sp daemon` log forwarding.
+/// Initialised once by [`init_root_daemon_log_broadcast`] when the privileged daemon starts.
+static ROOT_DAEMON_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> =
+    std::sync::OnceLock::new();
 
 /// Global broadcast channel for the `sp serve` diag log forwarding.
 /// Installed once via [`DiagServer::install_as_global`] after the diag server is created.
@@ -973,6 +1055,13 @@ pub fn init_up_log_broadcast() {
     let _ = UP_LOG_TX.set(tx);
 }
 
+/// Initialise the global root-daemon log broadcast channel.
+/// Safe to call multiple times; only the first call takes effect.
+pub fn init_root_daemon_log_broadcast() {
+    let (tx, _) = broadcast::channel(1024);
+    let _ = ROOT_DAEMON_LOG_TX.set(tx);
+}
+
 /// Install a child-process log forward stream.
 ///
 /// Intended for forked serve children: the child writes framed [`LogEntry`] payloads to this
@@ -985,6 +1074,12 @@ pub fn install_child_log_forward(stream: StdUnixStream) {
 /// Returns `None` if [`init_up_log_broadcast`] has not been called yet.
 pub fn subscribe_up_logs() -> Option<broadcast::Receiver<Arc<Vec<u8>>>> {
     UP_LOG_TX.get().map(|tx| tx.subscribe())
+}
+
+/// Subscribe to the root-daemon log broadcast, receiving pre-encoded
+/// [`RootDaemonWireEvent::Log`] frames.
+pub fn subscribe_root_daemon_logs() -> Option<broadcast::Receiver<Arc<Vec<u8>>>> {
+    ROOT_DAEMON_LOG_TX.get().map(|tx| tx.subscribe())
 }
 
 // ── In-process log ring buffer ────────────────────────────────────────
@@ -1082,10 +1177,14 @@ where
             .unwrap_or(false);
 
         // Outside a diag scope, forward to the serve-global channel when in a serve process,
-        // otherwise fall back to the up daemon broadcast channel.
+        // otherwise fall back to the root daemon or up daemon broadcast channels.
         if !sent_to_diag {
             if let Some(tx) = SERVE_LOG_TX.get() {
                 if let Ok(frame) = encode_frame(&DiagEvent::Log(entry)) {
+                    let _ = tx.send(Arc::new(frame));
+                }
+            } else if let Some(tx) = ROOT_DAEMON_LOG_TX.get() {
+                if let Ok(frame) = encode_frame(&RootDaemonWireEvent::Log(entry)) {
                     let _ = tx.send(Arc::new(frame));
                 }
             } else if let Some(tx) = UP_LOG_TX.get() {
@@ -1412,6 +1511,122 @@ pub struct ProcessList {
 pub struct UpDaemonStream {
     read_half: tokio::net::unix::OwnedReadHalf,
     write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+pub struct RootDaemonStream {
+    read_half: tokio::net::unix::OwnedReadHalf,
+    write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl std::fmt::Debug for RootDaemonStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootDaemonStream").finish_non_exhaustive()
+    }
+}
+
+pub struct RootDaemonReader {
+    read_half: tokio::net::unix::OwnedReadHalf,
+}
+
+impl RootDaemonReader {
+    pub async fn next_event(&mut self) -> Result<Option<RootDaemonEvent>> {
+        match read_frame::<RootDaemonWireEvent, _>(&mut self.read_half).await? {
+            Some(RootDaemonWireEvent::Unstable(event)) => Ok(Some(event)),
+            Some(RootDaemonWireEvent::Stable(StableEvent::Error { msg })) => {
+                bail!("root daemon stable protocol error: {}", msg)
+            }
+            Some(other) => bail!("unexpected root daemon wire event: {:?}", other),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn next_wire_event(&mut self) -> Result<Option<RootDaemonWireEvent>> {
+        read_frame(&mut self.read_half).await
+    }
+}
+
+pub struct RootDaemonWriter {
+    write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl RootDaemonWriter {
+    pub async fn send_request(&mut self, req: &RootDaemonRequest) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::Unstable(req.clone()))?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn send_stable_request(&mut self, req: &StableRequest) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::Stable(req.clone()))?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn send_query_recent_logs(&mut self, limit: usize) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::QueryRecentLogs { limit })?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+}
+
+pub async fn connect_root_daemon(sock_path: &Path) -> Result<RootDaemonStream> {
+    let mut stream = UnixStream::connect(sock_path).await?;
+    handshake_client(&mut stream, ProtocolChannel::Daemon).await?;
+    Ok(RootDaemonStream::from_stream(stream))
+}
+
+impl RootDaemonStream {
+    pub fn from_stream(stream: UnixStream) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        RootDaemonStream {
+            read_half,
+            write_half,
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Result<Option<RootDaemonEvent>> {
+        match read_frame::<RootDaemonWireEvent, _>(&mut self.read_half).await? {
+            Some(RootDaemonWireEvent::Unstable(event)) => Ok(Some(event)),
+            Some(RootDaemonWireEvent::Stable(StableEvent::Error { msg })) => {
+                bail!("root daemon stable protocol error: {}", msg)
+            }
+            Some(other) => bail!("unexpected root daemon wire event: {:?}", other),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn send_request(&mut self, req: &RootDaemonRequest) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::Unstable(req.clone()))?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn next_wire_event(&mut self) -> Result<Option<RootDaemonWireEvent>> {
+        read_frame(&mut self.read_half).await
+    }
+
+    pub async fn send_stable_request(&mut self, req: &StableRequest) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::Stable(req.clone()))?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn send_query_recent_logs(&mut self, limit: usize) -> Result<()> {
+        let frame = encode_frame(&RootDaemonWireRequest::QueryRecentLogs { limit })?;
+        self.write_half.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub fn split(self) -> (RootDaemonReader, RootDaemonWriter) {
+        (
+            RootDaemonReader {
+                read_half: self.read_half,
+            },
+            RootDaemonWriter {
+                write_half: self.write_half,
+            },
+        )
+    }
 }
 
 impl std::fmt::Debug for UpDaemonStream {

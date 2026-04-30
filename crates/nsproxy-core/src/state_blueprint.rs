@@ -120,23 +120,42 @@ pub fn global_state_tree() -> StateNode {
                 state_paths::wrapped_binaries_config(),
             ),
             StateNode::branch(
-                "profile (template)",
-                state_paths::profile_dir("{profile}"),
+                "config",
+                state_paths::config_root(),
                 vec![
-                    StateNode::leaf(
-                        "profile_config",
-                        state_paths::profile_config("{profile}"),
-                    ),
-                    StateNode::leaf("hot_config", state_paths::hot_config("{profile}")),
-                    StateNode::leaf(
-                        "profile_netns_bind",
-                        state_paths::profile_netns_bind("{profile}"),
-                    ),
-                    StateNode::leaf(
-                        "profile_ns_meta",
-                        state_paths::profile_ns_meta("{profile}"),
+                    StateNode::branch(
+                        "profile (template)",
+                        state_paths::profile_dir("{profile}"),
+                        vec![
+                            StateNode::leaf(
+                                "profile_config",
+                                state_paths::profile_config("{profile}"),
+                            ),
+                            StateNode::leaf("hot_config", state_paths::hot_config("{profile}")),
+                            StateNode::leaf(
+                                "profile_netns_bind",
+                                state_paths::profile_netns_bind("{profile}"),
+                            ),
+                            StateNode::leaf(
+                                "profile_ns_meta",
+                                state_paths::profile_ns_meta("{profile}"),
+                            ),
+                            StateNode::leaf(
+                                "sandbox_status",
+                                state_paths::sandbox_status("{profile}"),
+                            ),
+                        ],
                     ),
                 ],
+            ),
+            StateNode::branch(
+                "rootfs",
+                state_paths::rootfs_root(),
+                vec![StateNode::branch(
+                    "profile rootfs",
+                    state_paths::profile_rootfs_dir("{profile}"),
+                    vec![StateNode::leaf("pivot_root", state_paths::pivot_root("{profile}"))],
+                )],
             ),
             StateNode::branch(
                 "uplink",
