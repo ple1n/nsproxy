@@ -6,7 +6,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,8 +17,6 @@ use term_view::{PtyIpc, run_standalone_window};
 use tracing::{error, info, warn};
 
 use crate::supervisor::ContainerName;
-
-const TERMINAL_RESET_SEQUENCE: &[u8] = b"\x1bc";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermWindowTarget {
@@ -240,7 +238,10 @@ impl Drop for ExternalTermWindowClient {
 }
 
 struct SharedPtyState {
-    incoming: Mutex<Vec<u8>>,
+    incoming: Mutex<(u64, Vec<u8>)>,
+    reset_requested: AtomicBool,
+    reset_generation: AtomicU64,
+    session_id: AtomicU64,
     generation: Mutex<u64>,
     condvar: Condvar,
     title_prefix: Mutex<String>,
@@ -251,7 +252,10 @@ struct SharedPtyState {
 impl SharedPtyState {
     fn new() -> Self {
         Self {
-            incoming: Mutex::new(Vec::new()),
+            incoming: Mutex::new((1, Vec::new())),
+            reset_requested: AtomicBool::new(false),
+            reset_generation: AtomicU64::new(0),
+            session_id: AtomicU64::new(1),
             generation: Mutex::new(0),
             condvar: Condvar::new(),
             title_prefix: Mutex::new("Terminal".to_string()),
@@ -261,8 +265,13 @@ impl SharedPtyState {
     }
 
     fn append_incoming(&self, data: &[u8]) {
+        let session_id = self.session_id();
         let mut guard = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
-        guard.extend_from_slice(data);
+        if guard.0 != session_id {
+            guard.0 = session_id;
+            guard.1.clear();
+        }
+        guard.1.extend_from_slice(data);
         drop(guard);
         self.bump_generation();
     }
@@ -272,19 +281,37 @@ impl SharedPtyState {
         *title_guard = title.to_string();
         drop(title_guard);
 
+        let next_session_id = self.session_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut guard = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clear();
-        guard.extend_from_slice(TERMINAL_RESET_SEQUENCE);
-        guard.extend_from_slice(b"\x1b]0;");
-        guard.extend_from_slice(title.as_bytes());
-        guard.push(0x07);
+        guard.0 = next_session_id;
+        guard.1.clear();
         drop(guard);
+
+        self.reset_requested.store(true, Ordering::Relaxed);
+        self.reset_generation.fetch_add(1, Ordering::Relaxed);
         self.bump_generation();
     }
 
     fn drain_incoming(&self) -> Vec<u8> {
         let mut guard = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *guard)
+        std::mem::take(&mut guard.1)
+    }
+
+    fn drain_incoming_tagged(&self) -> (u64, Vec<u8>) {
+        let mut guard = self.incoming.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.0, std::mem::take(&mut guard.1))
+    }
+
+    fn drain_reset_request(&self) -> bool {
+        self.reset_requested.swap(false, Ordering::Relaxed)
+    }
+
+    fn reset_generation(&self) -> u64 {
+        self.reset_generation.load(Ordering::Relaxed)
+    }
+
+    fn session_id(&self) -> u64 {
+        self.session_id.load(Ordering::Relaxed)
     }
 
     fn wait_for_change(&self, observed_generation: u64) -> u64 {
@@ -339,6 +366,23 @@ struct AlacrittyWindowIpc {
 impl PtyIpc for AlacrittyWindowIpc {
     fn drain_incoming(&self) -> Vec<u8> {
         self.shared.drain_incoming()
+    }
+
+    fn drain_incoming_tagged(&self) -> term_view::PtyIncomingChunk {
+        let (session_id, data) = self.shared.drain_incoming_tagged();
+        term_view::PtyIncomingChunk { session_id, data }
+    }
+
+    fn drain_reset_request(&self) -> bool {
+        self.shared.drain_reset_request()
+    }
+
+    fn session_id(&self) -> u64 {
+        self.shared.session_id()
+    }
+
+    fn reset_generation(&self) -> u64 {
+        self.shared.reset_generation()
     }
 
     fn wait_for_incoming(&self, observed_generation: u64) -> u64 {
@@ -641,6 +685,7 @@ async fn spawn_terminal_window_process(
     let child = Command::new(exe)
         .arg("--build-hash")
         .arg(build_hash)
+        .args(diag::protocol_lenient().then_some("--lenient"))
         .arg("--term-window-fd")
         .arg(fd_arg)
         .stdin(Stdio::null())

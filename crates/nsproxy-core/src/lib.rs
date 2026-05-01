@@ -558,7 +558,7 @@ impl NetlinkOps for Handle {
     async fn remove_link_if_exists(&self, name: &str) -> Result<()> {
         warn!("removed obsolete device {}", name);
         let mut links = self.link().get().match_name(name.to_owned()).execute();
-        if let Some(link) = links.try_next().await? {
+        if let Some(Some(link)) = links.try_next().await.ok() {
             self.link().del(link.header.index).execute().await?;
         }
         Ok(())
@@ -1771,6 +1771,28 @@ pub enum NsInput {
     New,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum NsArg {
+    Container(String),
+    This
+}
+
+impl std::str::FromStr for NsArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("namespace argument must not be empty".to_string());
+        }
+        if trimmed.eq_ignore_ascii_case("this") {
+            Ok(NsArg::This)
+        } else {
+            Ok(NsArg::Container(trimmed.to_string()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum MainCommand {
     #[command(alias = "e")]
@@ -1904,10 +1926,13 @@ pub enum MainCommand {
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {
-        /// Profile name (must have been brought up with `up` first)
+        /// Source namespace endpoint (`this` or a profile name)
         #[arg(long)]
-        profile: String,
-        /// Veth pair base name (produces {name}_in and {name}_out)
+        src: NsArg,
+        /// Destination namespace endpoint (`this` or a profile name)
+        #[arg(long)]
+        dst: NsArg,
+        /// Veth pair base name (produces {name}_src and {name}_dst)
         #[arg(long)]
         veth_name: Option<String>,
         #[arg(short, long)]
@@ -2230,7 +2255,8 @@ mod cli_fd_tests {
             no_wrap_check: false,
             control_socket: None,
             cmd: MainCommand::Veth {
-                profile: "p1".into(),
+                src: NsArg::This,
+                dst: NsArg::Container("p1".into()),
                 veth_name: None,
                 log: None,
             },
@@ -2245,11 +2271,21 @@ mod cli_fd_tests {
             no_wrap_check: false,
             control_socket: None,
             cmd: MainCommand::Veth {
-                profile: "p2".into(),
+                src: NsArg::Container("p2".into()),
+                dst: NsArg::Container("p3".into()),
                 veth_name: Some("v_custom".into()),
                 log: Some(LevelFilter::WARN),
             },
         });
+    }
+
+    #[test]
+    fn parse_ns_arg_this_and_container() {
+        assert_eq!("this".parse::<NsArg>().unwrap(), NsArg::This);
+        assert_eq!(
+            "demo".parse::<NsArg>().unwrap(),
+            NsArg::Container("demo".to_string())
+        );
     }
 
     #[test]

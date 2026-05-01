@@ -300,10 +300,16 @@ pub struct ProtocolHandshake {
 }
 
 static PROTOCOL_VERSION: OnceLock<String> = OnceLock::new();
+static PROTOCOL_LENIENT: AtomicBool = AtomicBool::new(false);
 
 /// Set this process' protocol build identity. Must be called before opening any protocol sockets.
 pub fn set_protocol_version(version: impl Into<String>) {
     let _ = PROTOCOL_VERSION.set(version.into());
+}
+
+/// Control whether protocol build-hash mismatches are advisory instead of fatal.
+pub fn set_protocol_lenient(lenient: bool) {
+    PROTOCOL_LENIENT.store(lenient, Ordering::Relaxed);
 }
 
 /// Current process protocol build identity used during handshakes.
@@ -312,6 +318,15 @@ pub fn protocol_version() -> &'static str {
         .get()
         .map(String::as_str)
         .unwrap_or("unknown:0")
+}
+
+/// Whether version mismatches should be tolerated by this process' clients.
+pub fn protocol_lenient() -> bool {
+    PROTOCOL_LENIENT.load(Ordering::Relaxed)
+}
+
+pub fn protocol_mismatch_message(local: &str, remote: &str) -> String {
+    format!("build hash mismatch: local={}, remote={}", local, remote)
 }
 
 fn local_handshake(channel: ProtocolChannel) -> ProtocolHandshake {
@@ -1390,7 +1405,7 @@ pub enum StableRequest {
     Ping,
     /// Ask the target up daemon to stop gracefully.
     GracefulShutdown,
-    /// Request upgrade to version-specific protocol when build identity matches.
+    /// Request access to the version-specific protocol and advertise the caller build identity.
     Upgrade { build_tree_hash: String },
 }
 
@@ -1444,7 +1459,9 @@ pub enum DaemonEvent {
 pub enum StableEvent {
     Pong,
     ShuttingDown,
+    /// Version-specific protocol is available; `build_tree_hash` reports the responder identity.
     UpgradeAccepted { build_tree_hash: String },
+    /// Version-specific protocol is unavailable for reasons other than a build-hash mismatch.
     UpgradeRejected { msg: String },
     Error { msg: String },
 }
@@ -1669,13 +1686,30 @@ impl UpDaemonWriter {
 
 pub async fn connect_up_daemon(sock_path: &Path) -> Result<UpDaemonStream> {
     let mut stream = connect_up_daemon_stable(sock_path).await?;
+    let local_hash = protocol_version().to_string();
     stream
         .send_request(&UpWireRequest::Stable(StableRequest::Upgrade {
-            build_tree_hash: protocol_version().to_string(),
+            build_tree_hash: local_hash.clone(),
         }))
         .await?;
     match stream.next_event().await? {
-        Some(UpWireEvent::Stable(StableEvent::UpgradeAccepted { .. })) => Ok(stream),
+        Some(UpWireEvent::Stable(StableEvent::UpgradeAccepted { build_tree_hash })) => {
+            if build_tree_hash == local_hash {
+                Ok(stream)
+            } else if protocol_lenient() {
+                warn!(
+                    local_hash = %local_hash,
+                    remote_hash = %build_tree_hash,
+                    "continuing after up-daemon protocol version mismatch"
+                );
+                Ok(stream)
+            } else {
+                bail!(
+                    "up daemon protocol version mismatch: {}",
+                    protocol_mismatch_message(&local_hash, &build_tree_hash)
+                )
+            }
+        }
         Some(UpWireEvent::Stable(StableEvent::UpgradeRejected { msg })) => {
             bail!("up daemon protocol upgrade rejected: {}", msg)
         }

@@ -28,6 +28,7 @@ use crate::scheduler::Scheduler;
 use crate::window_context::WindowContext;
 
 const PTY_READ_WRITE_TOKEN: usize = 0;
+const SESSION_RESET_SEQUENCE: &[u8] = b"\x1bc";
 
 struct PendingWindow<I: PtyIpc + Send + Sync + 'static> {
     ipc: Arc<I>,
@@ -80,6 +81,7 @@ impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
             self.config.clone(),
             Default::default(),
             SocketEventedPty::new(pending.ipc, pending.pid, pending.closed)?,
+            true,
             Some(title_prefix_provider),
         )?;
 
@@ -266,15 +268,20 @@ pub struct SocketPtyReader<I: PtyIpc + Send + Sync + 'static> {
     wake_reader: UnixStream,
     pending: Vec<u8>,
     pending_offset: usize,
+    observed_session_id: u64,
+    reset_pending: bool,
 }
 
 impl<I: PtyIpc + Send + Sync + 'static> SocketPtyReader<I> {
     fn new(ipc: Arc<I>, wake_reader: UnixStream) -> Self {
+        let observed_session_id = ipc.session_id();
         Self {
             ipc,
             wake_reader,
             pending: Vec::new(),
             pending_offset: 0,
+            observed_session_id,
+            reset_pending: false,
         }
     }
 
@@ -283,8 +290,30 @@ impl<I: PtyIpc + Send + Sync + 'static> SocketPtyReader<I> {
             return;
         }
 
-        self.pending = self.ipc.drain_incoming();
+        let chunk = self.ipc.drain_incoming_tagged();
+        if chunk.session_id != self.observed_session_id {
+            self.observed_session_id = chunk.session_id;
+            self.reset_pending = true;
+        }
+
+        self.pending.clear();
+        if self.reset_pending {
+            self.pending.extend_from_slice(SESSION_RESET_SEQUENCE);
+            self.reset_pending = false;
+        }
+        self.pending.extend_from_slice(&chunk.data);
         self.pending_offset = 0;
+    }
+
+    fn discard_pending_on_session_change(&mut self) {
+        let session_id = self.ipc.session_id();
+        if session_id == self.observed_session_id {
+            return;
+        }
+
+        self.pending.clear();
+        self.pending_offset = 0;
+        self.reset_pending = true;
     }
 
     fn drain_wake_bytes(&mut self) -> io::Result<()> {
@@ -305,6 +334,7 @@ impl<I: PtyIpc + Send + Sync + 'static> SocketPtyReader<I> {
 impl<I: PtyIpc + Send + Sync + 'static> io::Read for SocketPtyReader<I> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.drain_wake_bytes()?;
+        self.discard_pending_on_session_change();
         self.refill_pending();
 
         if self.pending_offset >= self.pending.len() {

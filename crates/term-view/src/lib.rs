@@ -75,11 +75,36 @@ pub use config::monitor::ConfigMonitor;
 const BG_DEFAULT: Color32 = Color32::from_rgb(10, 12, 16);
 const FG_DEFAULT: Color32 = Color32::from_rgb(200, 200, 200);
 
+pub struct PtyIncomingChunk {
+    pub session_id: u64,
+    pub data: Vec<u8>,
+}
+
 /// IPC interface shared by the inline egui terminal and the standalone
 /// Alacritty/OpenGL child window.
 pub trait PtyIpc: Send + Sync + 'static {
     /// Drain any PTY bytes the daemon has sent since the last call.
     fn drain_incoming(&self) -> Vec<u8>;
+    /// Drain PTY bytes along with the authoritative session id they belong to.
+    fn drain_incoming_tagged(&self) -> PtyIncomingChunk {
+        PtyIncomingChunk {
+            session_id: self.session_id(),
+            data: self.drain_incoming(),
+        }
+    }
+    /// Drain a pending terminal reset request, if one was queued by the UI.
+    fn drain_reset_request(&self) -> bool {
+        false
+    }
+    /// Authoritative current PTY session id for swap-like transports.
+    fn session_id(&self) -> u64 {
+        0
+    }
+    /// Monotonic reset generation for transports where multiple consumers may
+    /// need to observe the same reset boundary.
+    fn reset_generation(&self) -> u64 {
+        0
+    }
     /// Block until new PTY bytes are available after `observed_generation`.
     /// Returns the latest generation number.
     fn wait_for_incoming(&self, observed_generation: u64) -> u64;
@@ -102,6 +127,10 @@ pub trait PtyIpc: Send + Sync + 'static {
 /// Drive one PTY IO cycle: pull bytes from backend, feed terminal parser,
 /// and flush alacritty-generated device responses back to backend.
 pub fn pump_pty_io<I: PtyIpc>(ipc: &I, session: &mut TermSession) {
+    if ipc.drain_reset_request() {
+        session.reset();
+    }
+
     let incoming = ipc.drain_incoming();
     if !incoming.is_empty() {
         session.feed(&incoming);
@@ -252,6 +281,13 @@ impl TermSession {
         }
         self.dirty_row_cells.resize_with(r, Vec::new);
         self.cell_buf.resize(c, (' ', FG_DEFAULT));
+        self.force_full_rebuild = true;
+    }
+
+    pub fn reset(&mut self) {
+        self.term.grid_mut().reset::<Color>();
+        self.term.reset_damage();
+        self.row_cache.fill(None);
         self.force_full_rebuild = true;
     }
 

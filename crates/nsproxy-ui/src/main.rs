@@ -53,6 +53,9 @@ struct UiCli {
     /// Override the advertised build hash for protocol/version handshakes.
     #[arg(long)]
     build_hash: Option<String>,
+    /// Allow UI clients to keep running when daemon build hashes differ.
+    #[arg(long)]
+    lenient: bool,
     #[arg(long, hide = true)]
     term_window_fd: Option<std::os::fd::RawFd>,
 }
@@ -1574,6 +1577,28 @@ impl App {
         changed
     }
 
+    fn refresh_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+        // small clickable area with 1px padding around the glyph
+        let size = egui::vec2(16.0, 16.0);
+        let id = ui.make_persistent_id(("refresh_button", tooltip));
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        let base = egui::Color32::from_rgba_unmultiplied(200, 200, 200, 140);
+        let hover_col = egui::Color32::from_rgba_unmultiplied(240, 240, 240, 200);
+        let col = if resp.hovered() { hover_col } else { base };
+
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⟳",
+            egui::FontId::proportional(14.0),
+            col,
+        );
+
+        // keep usual tooltip/response behavior
+        resp.on_hover_text(tooltip)
+    }
+
     fn render_mount_list(ui: &mut egui::Ui, mounts: &mut Vec<ProfileMount>, title: &str) -> bool {
         let mut changed = false;
         ui.group(|ui| {
@@ -2934,20 +2959,17 @@ impl eframe::App for App {
             .resizable(false)
             .default_width(280.0)
             .show(ctx, |ui| {
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.heading("Containers");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("🔄")
-                            .on_hover_text("Reload all container status")
-                            .clicked()
-                        {
+                        if Self::refresh_button(ui, "Reload all container status").clicked() {
                             self.reload_all_ns_alive();
                         }
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.remove_containers_armed, "remove containers")
                         .on_hover_text("Enable Ctrl+D to remove the selected container");
@@ -3009,8 +3031,6 @@ impl eframe::App for App {
                     }
                 }
 
-                ui.add_space(2.0);
-                ui.separator();
                 ui.add_space(6.0);
 
                 ui.group(|ui| {
@@ -3023,11 +3043,7 @@ impl eframe::App for App {
                                 .color(egui::Color32::GRAY),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("⟳")
-                                .on_hover_text("Refresh namespace view")
-                                .clicked()
-                            {
+                            if Self::refresh_button(ui, "Refresh namespace view").clicked() {
                                 self.supervisor.send(SupervisorCommand::RefreshNamespaces);
                             }
                         });
@@ -3093,16 +3109,7 @@ impl eframe::App for App {
                     }
                 });
 
-                ui.add_space(6.0);
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "frame: {}ms  {:.1}fps",
-                        self.last_frame_elapsed_ms, self.last_fps
-                    ))
-                    .color(egui::Color32::GRAY)
-                    .small(),
-                );
+                // minimal dev-only frame info intentionally omitted here
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3226,6 +3233,35 @@ impl eframe::App for App {
 
         self.render_external_pty_window(ctx);
         self.render_proxy_detail_window(ctx);
+
+        // Minimal dev-only watermark at bottom-left: non-intrusive, low-contrast
+        egui::Area::new(egui::Id::new("dev_frame_watermark"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::Vec2::new(8.0, -8.0))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let ms = self.last_frame_elapsed_ms as f32;
+                    let fps = self.last_fps;
+
+                    let indicator_color = if ms <= 16.0 {
+                        Color32::from_rgba_unmultiplied(120, 220, 120, 120)
+                    } else if ms <= 33.0 {
+                        Color32::from_rgba_unmultiplied(240, 200, 120, 120)
+                    } else {
+                        Color32::from_rgba_unmultiplied(220, 100, 100, 120)
+                    };
+
+                    ui.colored_label(indicator_color, "●");
+
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        egui::RichText::new(format!("{}ms  {:.1}fps", self.last_frame_elapsed_ms, fps))
+                            .small()
+                            .color(Color32::from_rgba_unmultiplied(200, 200, 200, 120)),
+                    );
+                });
+            });
 
         let frame_elapsed = frame_started.elapsed();
         self.last_frame_elapsed_ms = frame_elapsed.as_millis();
@@ -3827,11 +3863,13 @@ impl App {
 
                 ui.add_space(6.0);
 
+                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+
                 egui::ScrollArea::both()
                     .id_salt(format!("log_panel_{}", panel_id))
                     .max_height(500.0)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .show_rows(ui, row_h, total, |ui, row_range| {
                         if total_entries == 0 {
                             ui.colored_label(Color32::from_gray(110), empty_message);
                             return;
@@ -3842,7 +3880,11 @@ impl App {
                             return;
                         }
 
-                        for entry in &entries {
+                        for entry in entries
+                            .iter()
+                            .skip(row_range.start)
+                            .take(row_range.end.saturating_sub(row_range.start))
+                        {
                             let (badge_text, badge_color) = match entry.src {
                                 LogSource::Serve => ("serve", Color32::from_rgb(100, 180, 130)),
                                 LogSource::Up => ("up", Color32::from_rgb(100, 150, 210)),
@@ -3871,19 +3913,17 @@ impl App {
                                 );
 
                                 if let Some(ansi_parts) = cached_log.get(&entry.hash) {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for part in ansi_parts {
-                                            ui.label(part.clone());
-                                        }
-                                        for field in &entry.log.fields {
-                                            ui.add_space(6.0);
-                                            ui.colored_label(
-                                                Color32::from_gray(110),
-                                                format!("{}=", field.name),
-                                            );
-                                            ui.monospace(&field.value);
-                                        }
-                                    });
+                                    for part in ansi_parts {
+                                        ui.label(part.clone());
+                                    }
+                                    for field in &entry.log.fields {
+                                        ui.add_space(6.0);
+                                        ui.colored_label(
+                                            Color32::from_gray(110),
+                                            format!("{}=", field.name),
+                                        );
+                                        ui.monospace(&field.value);
+                                    }
                                 }
                             });
                         }
@@ -4286,115 +4326,86 @@ impl App {
                     .id_salt(format!("log_panel_{}", profile_name))
                     .max_height(500.0)
                     .auto_shrink([false, false])
-                    .show_rows(
-                        ui,
-                        ui.text_style_height(&egui::TextStyle::Body),
-                        logs_guard
-                            .as_ref()
-                            .map(|guard| {
-                                guard
-                                    .iter()
-                                    .filter(|(level, _)| log_panel_min_level.matches(level))
-                                    .map(|(_, ring)| ring.len())
-                                    .sum()
-                            })
-                            .unwrap_or(0),
-                        |ui, row_range| {
-                            let Some(guard) = logs_guard.as_ref() else {
-                                ui.colored_label(
-                                    Color32::from_gray(110),
-                                    "no logs yet — start the container to see output",
-                                );
-                                return;
-                            };
+                    .show(ui, |ui| {
+                        let Some(guard) = logs_guard.as_ref() else {
+                            ui.colored_label(
+                                Color32::from_gray(110),
+                                "no logs yet — start the container to see output",
+                            );
+                            return;
+                        };
 
-                            if guard.is_empty() {
-                                ui.colored_label(
-                                    Color32::from_gray(110),
-                                    "no logs yet — start the container to see output",
-                                );
-                                return;
+                        if guard.is_empty() {
+                            ui.colored_label(
+                                Color32::from_gray(110),
+                                "no logs yet — start the container to see output",
+                            );
+                            return;
+                        }
+
+                        let mut rendered_any = false;
+
+                        for (level, ring) in guard.iter() {
+                            if !log_panel_min_level.matches(level) {
+                                continue;
                             }
 
-                            let visible_start = row_range.start;
-                            let visible_end = row_range.end;
-                            let mut matched_index = 0usize;
-                            let mut rendered_any = false;
+                            for entry in ring.iter() {
+                                rendered_any = true;
+                                let is_serve = matches!(entry.src, LogSource::Serve);
+                                cached_log.entry(entry.hash).or_insert_with(|| {
+                                    egui_sgr::ansi_to_rich_text(&entry.log.message)
+                                });
+                                ui.horizontal(|ui| {
+                                    let (badge_text, badge_color) = if is_serve {
+                                        ("serve", Color32::from_rgb(100, 180, 130))
+                                    } else {
+                                        ("up", Color32::from_rgb(100, 150, 210))
+                                    };
+                                    ui.colored_label(badge_color, badge_text);
 
-                            for (level, ring) in guard.iter() {
-                                if !log_panel_min_level.matches(level) {
-                                    continue;
-                                }
+                                    let level_color = match entry.log.level.as_str() {
+                                        "ERROR" => Color32::from_rgb(220, 80, 80),
+                                        "WARN" => Color32::from_rgb(210, 160, 60),
+                                        "DEBUG" | "TRACE" => Color32::from_gray(120),
+                                        _ => Color32::from_gray(200),
+                                    };
+                                    ui.colored_label(level_color, &entry.log.level);
 
-                                for entry in ring.iter() {
-                                    if matched_index >= visible_end {
-                                        break;
-                                    }
+                                    ui.colored_label(
+                                        Color32::from_gray(100),
+                                        format!("[{}]", entry.log.target),
+                                    );
 
-                                    if matched_index >= visible_start {
-                                        rendered_any = true;
-                                        let is_serve = matches!(entry.src, LogSource::Serve);
-                                        cached_log.entry(entry.hash).or_insert_with(|| {
-                                            egui_sgr::ansi_to_rich_text(&entry.log.message)
-                                        });
-                                        ui.horizontal(|ui| {
-                                            let (badge_text, badge_color) = if is_serve {
-                                                ("serve", Color32::from_rgb(100, 180, 130))
-                                            } else {
-                                                ("up", Color32::from_rgb(100, 150, 210))
-                                            };
-                                            ui.colored_label(badge_color, badge_text);
-
-                                            let level_color = match entry.log.level.as_str() {
-                                                "ERROR" => Color32::from_rgb(220, 80, 80),
-                                                "WARN" => Color32::from_rgb(210, 160, 60),
-                                                "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                                _ => Color32::from_gray(200),
-                                            };
-                                            ui.colored_label(level_color, &entry.log.level);
-
-                                            ui.colored_label(
-                                                Color32::from_gray(100),
-                                                format!("[{}]", entry.log.target),
-                                            );
-
-                                            if let Some(ansi_parts) = cached_log.get(&entry.hash) {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    for part in ansi_parts {
-                                                        ui.label(part.clone());
-                                                    }
-                                                    for field in &entry.log.fields {
-                                                        ui.add_space(6.0);
-                                                        ui.colored_label(
-                                                            Color32::from_gray(110),
-                                                            format!("{}=", field.name),
-                                                        );
-                                                        ui.monospace(&field.value);
-                                                    }
-                                                });
+                                    if let Some(ansi_parts) = cached_log.get(&entry.hash) {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for part in ansi_parts {
+                                                ui.label(part.clone());
+                                            }
+                                            for field in &entry.log.fields {
+                                                ui.add_space(6.0);
+                                                ui.colored_label(
+                                                    Color32::from_gray(110),
+                                                    format!("{}=", field.name),
+                                                );
+                                                ui.monospace(&field.value);
                                             }
                                         });
                                     }
-
-                                    matched_index += 1;
-                                }
-
-                                if matched_index >= visible_end {
-                                    break;
-                                }
+                                });
                             }
+                        }
 
-                            if !rendered_any && visible_start == 0 {
-                                ui.colored_label(
-                                    Color32::from_gray(110),
-                                    format!(
-                                        "no logs at or above {} for this profile",
-                                        log_panel_min_level.label()
-                                    ),
-                                );
-                            }
-                        },
-                    );
+                        if !rendered_any {
+                            ui.colored_label(
+                                Color32::from_gray(110),
+                                format!(
+                                    "no logs at or above {} for this profile",
+                                    log_panel_min_level.label()
+                                ),
+                            );
+                        }
+                    });
             });
 
         self.log_panel_min_level = log_panel_min_level;
@@ -5028,7 +5039,7 @@ impl App {
                     self.selected_process_logs = None;
                     return;
                 }
-                if ui.small_button("Refresh").clicked() {
+                if Self::refresh_button(ui, "Refresh").clicked() {
                     self.request_process_logs(&profile, slot_pid);
                 }
                 let details_label = if self.raw_log_show_details {
@@ -7504,9 +7515,9 @@ fn main() {
         .with_line_number(true)
         .try_init();
 
-    // TODO: eliminate this workaround, and allow version handshake to be purely advisory. UI decides if we continue.
     let protocol_build_hash = protocol_build_hash(&args);
     diag::set_protocol_version(protocol_build_hash.clone());
+    diag::set_protocol_lenient(args.lenient);
 
     if let Some(control_fd) = args.term_window_fd {
         if let Err(err) = run_term_window_process(control_fd) {
@@ -7516,7 +7527,7 @@ fn main() {
         return;
     }
 
-    info!(build_hash = %protocol_build_hash, "starting nsproxy-ui");
+    info!(build_hash = %protocol_build_hash, lenient = args.lenient, "starting nsproxy-ui");
     info!("launching ui event loop");
     if let Err(err) = run_manual_loop() {
         tracing::error!(%err, "ui event loop failed");

@@ -29,6 +29,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty;
+use alacritty_terminal::vte::ansi::Color;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
@@ -64,6 +65,7 @@ pub struct WindowContext {
     touch: TouchPurpose,
     occluded: bool,
     preserve_title: bool,
+    suppress_pty_replies: bool,
     title_prefix_provider: Option<TitlePrefixProvider>,
     #[cfg(not(windows))]
     master_fd: RawFd,
@@ -129,6 +131,7 @@ impl WindowContext {
         config: Rc<UiConfig>,
         mut options: WindowOptions,
         pty: T,
+        suppress_pty_replies: bool,
         title_prefix_provider: Option<TitlePrefixProvider>,
     ) -> Result<Self, Box<dyn Error>>
     where
@@ -175,6 +178,7 @@ impl WindowContext {
             options,
             proxy,
             pty,
+            suppress_pty_replies,
             title_prefix_provider,
             #[cfg(not(windows))]
             -1,
@@ -276,6 +280,7 @@ impl WindowContext {
             options,
             proxy,
             pty,
+            false,
             None,
             #[cfg(not(windows))]
             master_fd,
@@ -290,6 +295,7 @@ impl WindowContext {
         options: WindowOptions,
         proxy: EventSender,
         mut pty: T,
+        suppress_pty_replies: bool,
         title_prefix_provider: Option<TitlePrefixProvider>,
         #[cfg(not(windows))] master_fd: RawFd,
         #[cfg(not(windows))] shell_pid: u32,
@@ -338,6 +344,7 @@ impl WindowContext {
 
         Ok(WindowContext {
             preserve_title,
+            suppress_pty_replies,
             title_prefix_provider,
             terminal,
             display,
@@ -516,6 +523,19 @@ impl WindowContext {
         );
     }
 
+    pub fn reset_terminal_state(&mut self) {
+        {
+            let mut terminal = self.terminal.lock();
+            terminal.grid_mut().reset::<Color>();
+            terminal.reset_damage();
+        }
+
+        self.inline_search_state = Default::default();
+        self.search_state = Default::default();
+        self.display.pending_update.dirty = true;
+        self.dirty = true;
+    }
+
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
@@ -564,6 +584,7 @@ impl WindowContext {
             #[cfg(not(windows))]
             shell_pid: self.shell_pid,
             preserve_title: self.preserve_title,
+            suppress_pty_replies: self.suppress_pty_replies,
             title_prefix_provider: self.title_prefix_provider.clone(),
             config: &self.config,
             event_proxy,

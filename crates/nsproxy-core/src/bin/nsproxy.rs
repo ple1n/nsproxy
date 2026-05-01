@@ -118,6 +118,19 @@ use tun2socks5::{
 };
 
 use nsproxy_core::HotRoute;
+
+#[derive(Debug, Clone)]
+struct VethEndpoint {
+    arg: NsArg,
+    label: String,
+    pid: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum NetnsChildResult<T> {
+    Ok(T),
+    Err(String),
+}
 use nsproxy_core::internal_dns::run_dns_ipv4_only;
 
 const PTY_SCROLLBACK_CAP: usize = 256 * 1024;
@@ -1476,21 +1489,17 @@ fn main() -> anyhow::Result<()> {
             },
             internal_dns_server,
         )?,
-        MainCommand::Veth {
-            profile,
-            veth_name,
-            log,
-        } => {
-            let ns_meta = state_paths::profile_ns_meta(&profile);
-            let ns_alive = read_ns_alive(&ns_meta)?;
+        MainCommand::Veth { src, dst, veth_name, log } => {
+            // Todo, update virtual DNS too
+            
+            let src_endpoint = resolve_veth_endpoint(&src)?;
+            let dst_endpoint = resolve_veth_endpoint(&dst)?;
 
-            let child_pid = ns_alive
-                .child_pid
-                .ok_or_else(|| anyhow!("ns_alive has no child_pid"))?;
-
-            let vname = veth_name.unwrap_or_else(|| profile.clone());
-            let v_in = format!("{vname}_in");
-            let v_out = format!("{vname}_out");
+            let vname = veth_name.unwrap_or_else(|| {
+                format!("{}_{}", src_endpoint.label, dst_endpoint.label)
+            });
+            let v_src = veth_interface_name(&vname, "src");
+            let v_dst = veth_interface_name(&vname, "dst");
             let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
             let host_bits = 2;
             let subnet_prefix = 32 - host_bits;
@@ -1503,91 +1512,72 @@ fn main() -> anyhow::Result<()> {
             }
 
             rt.block_on(async move {
-                use tokio::io::AsyncWriteExt;
-
                 let nl = tokio_netlink_conn()?;
-                info!("attempting to add veths named, {}, {}", &v_out, &v_in);
-                let addrs = nl.fetch_all_ip_addrs().await?;
-                let ips: Vec<_> = addrs
-                    .iter()
-                    .filter_map(|f| match f {
-                        IpNetwork::V4(v4) => Some(v4.ip()),
-                        _ => None,
-                    })
-                    .collect();
+                warn!(
+                    src = ?src_endpoint.arg,
+                    dst = ?dst_endpoint.arg,
+                    src_if = %v_src,
+                    dst_if = %v_dst,
+                    "attempting to add veth pair"
+                );
 
-                let v1: Option<Ipv4Addr> = find_vacant_ipv4_subnet(ips, veth_net, host_bits);
-                if let Some(subnet) = v1 {
-                    nl.add_veth(&v_out, &v_in).await;
-                    let vin = nl.fetch_link_by_name(v_in.clone()).await?;
-                    let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
-                        .index(vin.header.index)
-                        .setns_by_pid(child_pid as u32);
-                    nl.link().set(msg.build()).execute().await;
+                remove_link_if_exists_in_namespace(src_endpoint.pid, &v_src).await?;
+                remove_link_if_exists_in_namespace(dst_endpoint.pid, &v_dst).await?;
+                nl.remove_link_if_exists(&v_src).await?;
+                nl.remove_link_if_exists(&v_dst).await?;
 
-                    let vout = nl.fetch_link_by_name(v_out.clone()).await?;
-                    nl.address()
-                        .add(
-                            vout.header.index,
-                            veth_addr_for(subnet, host_bits, true).into(),
-                            subnet_prefix,
-                        )
-                        .execute()
-                        .await?;
-                    nl.link()
-                        .set(
-                            LinkMessageBuilder::<LinkUnspec>::default()
-                                .index(vout.header.index)
-                                .up()
-                                .build(),
-                        )
-                        .execute()
-                        .await?;
-
-                    let clone = nsproxy_core::sys::clone3::<false>(false, false);
-                    match clone {
-                        Ok(clone) => match clone {
-                            Clone3Result::IsChild { mut tx } => {
-                                let ns_source = NSSource::Pid(child_pid as i32);
-                                ns_source.enter(CloneFlags::CLONE_NEWNET)?;
-
-                                let mut buf = [0u8; 4];
-                                tx.read_exact(&mut buf)?;
-                                let ip =
-                                    veth_addr_for(Ipv4Addr::from_octets(buf), host_bits, false);
-
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()?;
-                                rt.block_on(async {
-                                    let nl = tokio_netlink_conn()?;
-                                    nl.up_lo().await?;
-                                    let dev = nl.fetch_link_by_name(v_in).await?;
-                                    nl.address()
-                                        .add(dev.header.index, ip.into(), subnet_prefix)
-                                        .execute()
-                                        .await?;
-                                    nl.link()
-                                        .set(
-                                            LinkMessageBuilder::<LinkUnspec>::default()
-                                                .index(dev.header.index)
-                                                .up()
-                                                .build(),
-                                        )
-                                        .execute()
-                                        .await?;
-                                    Ok::<(), anyhow::Error>(())
-                                })?;
-                            }
-                            Clone3Result::Parent { mut tx, .. } => {
-                                tx.write(subnet.as_octets())?;
-                            }
-                        },
-                        Err(er) => warn!("Clone3 failed with {:?}", &er),
-                    }
-                } else {
-                    tracing::error!("cannot find any vacant ip");
+                let mut used = fetch_ipv4_in_namespace(std::process::id()).await?;
+                if src_endpoint.pid != std::process::id() {
+                    used.extend(fetch_ipv4_in_namespace(src_endpoint.pid).await?);
                 }
+                if dst_endpoint.pid != std::process::id() && dst_endpoint.pid != src_endpoint.pid {
+                    used.extend(fetch_ipv4_in_namespace(dst_endpoint.pid).await?);
+                }
+
+                let subnet = find_vacant_ipv4_subnet(used, veth_net, host_bits)
+                    .ok_or_else(|| anyhow!("cannot find any vacant ip"))?;
+
+                warn!(
+                    src_if = %v_src,
+                    dst_if = %v_dst,
+                    src_ip = %veth_addr_for(subnet, host_bits, true),
+                    dst_ip = %veth_addr_for(subnet, host_bits, false),
+                    subnet = %subnet,
+                    "selected veth endpoints"
+                );
+
+                nl.add_veth(&v_src, &v_dst).await?;
+
+                if src_endpoint.pid != std::process::id() {
+                    let src_link = nl.fetch_link_by_name(v_src.clone()).await?;
+                    let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
+                        .index(src_link.header.index)
+                        .setns_by_pid(src_endpoint.pid);
+                    nl.link().set(msg.build()).execute().await?;
+                }
+
+                if dst_endpoint.pid != std::process::id() {
+                    let dst_link = nl.fetch_link_by_name(v_dst.clone()).await?;
+                    let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
+                        .index(dst_link.header.index)
+                        .setns_by_pid(dst_endpoint.pid);
+                    nl.link().set(msg.build()).execute().await?;
+                }
+
+                configure_veth_endpoint(
+                    src_endpoint.pid,
+                    v_src,
+                    veth_addr_for(subnet, host_bits, true),
+                    subnet_prefix,
+                )
+                .await?;
+                configure_veth_endpoint(
+                    dst_endpoint.pid,
+                    v_dst,
+                    veth_addr_for(subnet, host_bits, false),
+                    subnet_prefix,
+                )
+                .await?;
 
                 aok!()
             })?;
@@ -2970,20 +2960,13 @@ async fn handle_up_client(
                                 let local_hash = nsproxy_core::build_tree_hash();
                                 if build_tree_hash == local_hash {
                                     warn!("up daemon stable step: upgrade accepted");
-                                    let stable_evt = diag::StableEvent::UpgradeAccepted {
-                                        build_tree_hash: local_hash.to_string(),
-                                    };
-                                    write_up_stable_frame(&mut write_half, &stable_evt).await?;
                                 } else {
-                                    warn!("up daemon stable step: upgrade rejected (hash mismatch)");
-                                    let stable_evt = diag::StableEvent::UpgradeRejected {
-                                        msg: format!(
-                                            "build hash mismatch: local={}, remote={}",
-                                            local_hash, build_tree_hash
-                                        ),
-                                    };
-                                    write_up_stable_frame(&mut write_half, &stable_evt).await?;
+                                    warn!("up daemon stable step: upgrade accepted with hash mismatch; client decides whether to continue");
                                 }
+                                let stable_evt = diag::StableEvent::UpgradeAccepted {
+                                    build_tree_hash: local_hash.to_string(),
+                                };
+                                write_up_stable_frame(&mut write_half, &stable_evt).await?;
                             }
                         }
                         continue;
@@ -3867,17 +3850,19 @@ async fn handle_root_daemon_client(
                             }
                             diag::StableRequest::Upgrade { build_tree_hash } => {
                                 let local_hash = nsproxy_core::build_tree_hash();
+                                upgraded = true;
                                 let stable_evt = if build_tree_hash == local_hash {
-                                    upgraded = true;
                                     diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted {
                                         build_tree_hash: local_hash.to_string(),
                                     })
                                 } else {
-                                    diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeRejected {
-                                        msg: format!(
-                                            "build hash mismatch: local={}, remote={}",
-                                            local_hash, build_tree_hash
-                                        ),
+                                    warn!(
+                                        local_hash = %local_hash,
+                                        remote_hash = %build_tree_hash,
+                                        "root daemon upgrade accepted with hash mismatch; client decides whether to continue"
+                                    );
+                                    diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted {
+                                        build_tree_hash: local_hash.to_string(),
                                     })
                                 };
                                 write_bincode_frame_async(&mut write_half, &stable_evt).await?;
@@ -4393,6 +4378,193 @@ fn pid_is_alive(pid: u32) -> bool {
         return false;
     }
     PathBuf::from("/proc").join(pid.to_string()).exists()
+}
+
+fn sanitize_veth_label(label: &str) -> String {
+    let mut sanitized: String = label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("ns");
+    }
+    sanitized
+}
+
+fn veth_interface_name(base: &str, suffix: &str) -> String {
+    const MAX_IFNAME_LEN: usize = 15;
+    let suffix = format!("_{suffix}");
+    let budget = MAX_IFNAME_LEN.saturating_sub(suffix.len());
+    let trimmed = if base.len() > budget { &base[..budget] } else { base };
+    format!("{trimmed}{suffix}")
+}
+
+fn resolve_veth_endpoint(arg: &NsArg) -> Result<VethEndpoint> {
+    match arg {
+        NsArg::This => Ok(VethEndpoint {
+            arg: NsArg::This,
+            label: "this".to_string(),
+            pid: std::process::id(),
+        }),
+        NsArg::Container(profile) => {
+            let ns_meta = state_paths::profile_ns_meta(profile);
+            let ns_alive = read_ns_alive(&ns_meta)?;
+            let child_pid = ns_alive
+                .child_pid
+                .ok_or_else(|| anyhow!("ns_alive has no child_pid for profile {}", profile))?;
+            Ok(VethEndpoint {
+                arg: NsArg::Container(profile.clone()),
+                label: sanitize_veth_label(profile),
+                pid: child_pid,
+            })
+        }
+    }
+}
+
+fn run_in_netns_clone3<T, F>(pid: u32, op: F) -> Result<T>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+{
+    match nsproxy_core::sys::clone3::<false>(false, false) {
+        Ok(Clone3Result::IsChild { mut tx }) => {
+            let outcome = match (|| -> Result<T> {
+                let ns_source = NSSource::Pid(pid as i32);
+                ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                op()
+            })() {
+                Ok(value) => NetnsChildResult::Ok(value),
+                Err(err) => NetnsChildResult::Err(err.to_string()),
+            };
+
+            let payload = bincode::serialize(&outcome).expect("serialize netns child result");
+            tx.write_all(&(payload.len() as u32).to_le_bytes())?;
+            tx.write_all(&payload)?;
+            exit(0);
+        }
+        Ok(Clone3Result::Parent { child_pid, mut tx, .. }) => {
+            let mut len_buf = [0u8; 4];
+            tx.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            tx.read_exact(&mut payload)?;
+            let _ = nix::sys::wait::waitpid(Pid::from_raw(child_pid), None);
+            match bincode::deserialize::<NetnsChildResult<T>>(&payload)? {
+                NetnsChildResult::Ok(value) => Ok(value),
+                NetnsChildResult::Err(msg) => Err(anyhow!(msg)),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn fetch_ipv4_in_namespace(pid: u32) -> Result<Vec<Ipv4Addr>> {
+    if pid == std::process::id() {
+        let nl = tokio_netlink_conn()?;
+        let addrs = nl.fetch_all_ip_addrs().await?;
+        Ok(addrs
+            .into_iter()
+            .filter_map(|net| match net {
+                IpNetwork::V4(v4) => Some(v4.ip()),
+                _ => None,
+            })
+            .collect())
+    } else {
+        run_in_netns_clone3(pid, move || {
+            run_tokio_on_fresh_thread(move || async move {
+                let nl = tokio_netlink_conn()?;
+                let addrs = nl.fetch_all_ip_addrs().await?;
+                Ok::<Vec<Ipv4Addr>, anyhow::Error>(
+                    addrs
+                        .into_iter()
+                        .filter_map(|net| match net {
+                            IpNetwork::V4(v4) => Some(v4.ip()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            })
+        })
+    }
+}
+
+async fn remove_link_if_exists_in_namespace(pid: u32, name: &str) -> Result<()> {
+    if pid == std::process::id() {
+        let nl = tokio_netlink_conn()?;
+        nl.remove_link_if_exists(name).await
+    } else {
+        let name = name.to_string();
+        run_in_netns_clone3(pid, move || {
+            run_tokio_on_fresh_thread(move || async move {
+                let nl = tokio_netlink_conn()?;
+                nl.remove_link_if_exists(&name).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+    }
+}
+
+async fn configure_veth_endpoint(pid: u32, if_name: String, ip: Ipv4Addr, prefix: u8) -> Result<()> {
+    if pid == std::process::id() {
+        let nl = tokio_netlink_conn()?;
+        nl.up_lo().await?;
+        let dev = nl.fetch_link_by_name(if_name).await?;
+        nl.address().add(dev.header.index, ip.into(), prefix).execute().await?;
+        nl.link()
+            .set(
+                LinkMessageBuilder::<LinkUnspec>::default()
+                    .index(dev.header.index)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await?;
+        Ok(())
+    } else {
+        run_in_netns_clone3(pid, move || {
+            run_tokio_on_fresh_thread(move || async move {
+                let nl = tokio_netlink_conn()?;
+                nl.up_lo().await?;
+                let dev = nl.fetch_link_by_name(if_name).await?;
+                nl.address().add(dev.header.index, ip.into(), prefix).execute().await?;
+                nl.link()
+                    .set(
+                        LinkMessageBuilder::<LinkUnspec>::default()
+                            .index(dev.header.index)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+    }
+}
+
+fn run_tokio_on_fresh_thread<F, Fut, T>(make_future: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(make_future())
+    })
+    .join()
+    .map_err(|panic| {
+        let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "tokio helper thread panicked".to_string()
+        };
+        anyhow!(msg)
+    })?
 }
 
 fn enter_all_profile_namespaces_of_pid(pid: u32) -> Result<()> {

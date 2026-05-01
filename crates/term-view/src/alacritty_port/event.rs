@@ -705,6 +705,7 @@ pub struct ActionContext<'a, N, T> {
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
+    pub suppress_pty_replies: bool,
     pub title_prefix_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     #[cfg(not(windows))]
     pub master_fd: RawFd,
@@ -1985,7 +1986,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         let text = format(self.ctx.size_info().into());
                         self.ctx.write_to_pty(text.into_bytes());
                     },
-                    TerminalEvent::PtyWrite(text) => self.ctx.write_to_pty(text.into_bytes()),
+                    TerminalEvent::PtyWrite(text) => {
+                        if !self.ctx.suppress_pty_replies {
+                            self.ctx.write_to_pty(text.into_bytes());
+                        }
+                    },
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),

@@ -3126,9 +3126,10 @@ enum RootDaemonConnectOutcome {
 async fn verify_root_daemon_stream(
     mut stream: diag::RootDaemonStream,
 ) -> Result<RootDaemonConnectOutcome> {
+    let local_hash = diag::protocol_version().to_string();
     stream
         .send_stable_request(&diag::StableRequest::Upgrade {
-            build_tree_hash: diag::protocol_version().to_string(),
+            build_tree_hash: local_hash.clone(),
         })
         .await
         .context("request root daemon protocol upgrade")?;
@@ -3142,8 +3143,28 @@ async fn verify_root_daemon_stream(
     };
 
     match event {
-        diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted { .. }) => {
-            Ok(RootDaemonConnectOutcome::Ready(stream))
+        diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeAccepted {
+            build_tree_hash,
+        }) => {
+            if build_tree_hash == local_hash {
+                Ok(RootDaemonConnectOutcome::Ready(stream))
+            } else if diag::protocol_lenient() {
+                warn!(
+                    local_hash = %local_hash,
+                    remote_hash = %build_tree_hash,
+                    "continuing after root-daemon protocol version mismatch"
+                );
+                Ok(RootDaemonConnectOutcome::Ready(stream))
+            } else {
+                let message = format!(
+                    "sp daemon version mismatch: {}; restarting",
+                    diag::protocol_mismatch_message(&local_hash, &build_tree_hash)
+                );
+                let _ = stream
+                    .send_stable_request(&diag::StableRequest::GracefulShutdown)
+                    .await;
+                Ok(RootDaemonConnectOutcome::RestartRequired { message })
+            }
         }
         diag::RootDaemonWireEvent::Stable(diag::StableEvent::UpgradeRejected { msg }) => {
             let message = format!("sp daemon version mismatch: {msg}; restarting");

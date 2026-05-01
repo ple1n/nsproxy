@@ -148,6 +148,7 @@ impl ExternalTermWindowClient {
         let child = Command::new(exe)
             .arg("--build-hash")
             .arg(build_hash)
+            .args(diag::protocol_lenient().then_some("--lenient"))
             .arg("--term-window-fd")
             .arg(fd_arg)
             .stdin(Stdio::null())
