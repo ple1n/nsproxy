@@ -13,6 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use diag::summary::DiagAccumulator;
 use diag::{ControlCommand, DiagEvent, DiagEventStream, LogEntry};
+use eframe::egui;
 use libc;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{execve, fork, ForkResult, Pid};
@@ -50,11 +51,17 @@ pub struct TrafficSnapshot {
 }
 
 /// A log entry combined with its source (up-daemon or serve process).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LogEntryOf {
     pub hash: u64,
     pub log: LogEntry,
     pub src: LogSource,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderedLogEntry {
+    pub entry: LogEntryOf,
+    pub ansi_parts: Arc<Vec<egui::RichText>>,
 }
 
 /// Source of a [`LogEntryOf`] entry.
@@ -66,14 +73,115 @@ pub enum LogSource {
     Pid(u32),
 }
 
+const LOG_VIEW_SLOTS: usize = 5;
+const MAX_LOG_ENTRIES: usize = 2048 * LOG_VIEW_SLOTS;
+
 fn fast_hash_log_entry(entry: &LogEntry) -> u64 {
     let mut hasher = twox_hash::XxHash3_64::default();
     entry.hash(&mut hasher);
     hasher.finish()
 }
 
-pub type LevelLogRings = BTreeMap<String, VecDeque<Arc<LogEntryOf>>>;
-pub type SharedLevelLogRings = Arc<RwLock<LevelLogRings>>;
+#[derive(Debug, Default)]
+pub struct LevelLogView {
+    entries: VecDeque<Arc<RenderedLogEntry>>,
+    visible_by_min_level: [VecDeque<Arc<RenderedLogEntry>>; LOG_VIEW_SLOTS],
+}
+
+impl LevelLogView {
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        let mut slot = 0;
+        while slot < LOG_VIEW_SLOTS {
+            self.visible_by_min_level[slot].clear();
+            slot += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn total_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn entries_for_min_level(&self, min_level_rank: u8) -> &VecDeque<Arc<RenderedLogEntry>> {
+        let slot = usize::min(min_level_rank as usize, LOG_VIEW_SLOTS.saturating_sub(1));
+        &self.visible_by_min_level[slot]
+    }
+
+    fn push_entry(&mut self, src: LogSource, entry: LogEntry) {
+        let shared = Arc::new(Self::render_entry(src, entry));
+        self.entries.push_back(shared.clone());
+
+        let rank = log_level_rank(&shared.entry.log.level) as usize;
+        let mut slot = 0;
+        while slot <= rank {
+            self.visible_by_min_level[slot].push_back(shared.clone());
+            slot += 1;
+        }
+
+        self.trim_to_cap();
+    }
+
+    fn replace_source<I>(&mut self, src: LogSource, entries: I)
+    where
+        I: IntoIterator<Item = LogEntry>,
+    {
+        self.entries.retain(|entry| entry.entry.src != src);
+        for entry in entries {
+            self.entries
+                .push_back(Arc::new(Self::render_entry(src.clone(), entry)));
+        }
+        self.trim_to_cap();
+        self.rebuild_views();
+    }
+
+    fn trim_to_cap(&mut self) {
+        while self.entries.len() > MAX_LOG_ENTRIES {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            let rank = log_level_rank(&evicted.entry.log.level) as usize;
+            let mut slot = 0;
+            while slot <= rank {
+                let _ = self.visible_by_min_level[slot].pop_front();
+                slot += 1;
+            }
+        }
+    }
+
+    fn rebuild_views(&mut self) {
+        let mut slot = 0;
+        while slot < LOG_VIEW_SLOTS {
+            self.visible_by_min_level[slot].clear();
+            slot += 1;
+        }
+
+        for entry in &self.entries {
+            let rank = log_level_rank(&entry.entry.log.level) as usize;
+            let mut view_slot = 0;
+            while view_slot <= rank {
+                self.visible_by_min_level[view_slot].push_back(entry.clone());
+                view_slot += 1;
+            }
+        }
+    }
+
+    fn render_entry(src: LogSource, entry: LogEntry) -> RenderedLogEntry {
+        RenderedLogEntry {
+            ansi_parts: Arc::new(egui_sgr::ansi_to_rich_text(&entry.message)),
+            entry: LogEntryOf {
+                hash: fast_hash_log_entry(&entry),
+                log: entry,
+                src,
+            },
+        }
+    }
+}
+
+pub type SharedLevelLogRings = Arc<RwLock<LevelLogView>>;
 pub type ProcessRawLogs = HashMap<u32, Vec<diag::RawLog>>;
 pub type SharedProcessRawLogs = Arc<RwLock<ProcessRawLogs>>;
 
@@ -116,7 +224,7 @@ pub struct ContainerState {
     pub ns_alive: Option<NsAlive>,
     pub up_ns: Option<NamespaceIndicator>,
     pub keeper_ns: Option<NamespaceIndicator>,
-    /// Client-side log storage keyed by normalized log level.
+    /// Client-side log storage with prebuilt views per minimum log level.
     #[serde(skip)]
     pub logs_by_level: SharedLevelLogRings,
     /// Local rolling copy of raw `DiagEvent`s received from tun_diag.sock.
@@ -392,7 +500,7 @@ impl SupervisorHandle {
             root_daemon_error: None,
             hotconfig_editor_status: None,
             profile_editor_status: None,
-            root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
+            root_daemon_logs: Arc::new(RwLock::new(LevelLogView::default())),
             auto_open_logs_target: None,
             generated_at: SystemTime::now(),
         });
@@ -828,7 +936,7 @@ impl Supervisor {
             next_root_daemon_op_id: 1,
             hotconfig_editor_status: None,
             profile_editor_status: None,
-            root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
+            root_daemon_logs: Arc::new(RwLock::new(LevelLogView::default())),
             diag_state: HashMap::new(),
             ns_alive_status: HashMap::new(),
             up_logs: HashMap::new(),
@@ -1147,7 +1255,7 @@ impl Supervisor {
                     let logs = self
                         .up_logs
                         .entry(profile.clone())
-                        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+                        .or_insert_with(|| Arc::new(RwLock::new(LevelLogView::default())))
                         .clone();
                     logs.write().unwrap_or_else(|e| e.into_inner()).clear();
                 }
@@ -2825,7 +2933,7 @@ impl Supervisor {
                         .up_logs
                         .get(profile)
                         .cloned()
-                        .unwrap_or_else(|| Arc::new(RwLock::new(BTreeMap::new()))),
+                        .unwrap_or_else(|| Arc::new(RwLock::new(LevelLogView::default()))),
                     diag_event_log: diag
                         .map(|d| d.diag_event_log.iter().cloned().collect())
                         .unwrap_or_default(),
@@ -4451,42 +4559,16 @@ fn push_up_log(
 }
 
 fn push_global_log(logs: &SharedLevelLogRings, src: LogSource, entry: LogEntry) {
-    const MAX_LOGS_PER_LEVEL: usize = 2048;
-    let level = normalized_log_level(&entry.level);
     let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
-    let buf = guard.entry(level).or_default();
-    buf.push_back(Arc::new(LogEntryOf {
-        hash: fast_hash_log_entry(&entry),
-        log: entry,
-        src,
-    }));
-    if buf.len() > MAX_LOGS_PER_LEVEL {
-        buf.pop_front();
-    }
+    guard.push_entry(src, entry);
 }
 
 fn replace_global_logs_for_source<I>(logs: &SharedLevelLogRings, src: LogSource, entries: I)
 where
     I: IntoIterator<Item = LogEntry>,
 {
-    const MAX_LOGS_PER_LEVEL: usize = 2048;
     let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
-    for buf in guard.values_mut() {
-        buf.retain(|entry| entry.src != src);
-    }
-    guard.retain(|_, buf| !buf.is_empty());
-    for entry in entries {
-        let level = normalized_log_level(&entry.level);
-        let buf = guard.entry(level).or_default();
-        buf.push_back(Arc::new(LogEntryOf {
-            hash: fast_hash_log_entry(&entry),
-            log: entry,
-            src: src.clone(),
-        }));
-        if buf.len() > MAX_LOGS_PER_LEVEL {
-            buf.pop_front();
-        }
-    }
+    guard.replace_source(src, entries);
 }
 
 fn push_profile_log(
@@ -4495,24 +4577,12 @@ fn push_profile_log(
     src: LogSource,
     entry: LogEntry,
 ) {
-    const MAX_LOGS_PER_LEVEL: usize = 2048;
-    let level = normalized_log_level(&entry.level);
     let logs = up_logs
         .entry(profile.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+        .or_insert_with(|| Arc::new(RwLock::new(LevelLogView::default())))
         .clone();
     let mut guard = logs.write().unwrap_or_else(|e| e.into_inner());
-    let buf = guard
-        .entry(level)
-        .or_default();
-    buf.push_back(Arc::new(LogEntryOf {
-        hash: fast_hash_log_entry(&entry),
-        log: entry,
-        src,
-    }));
-    if buf.len() > MAX_LOGS_PER_LEVEL {
-        buf.pop_front();
-    }
+    guard.push_entry(src, entry);
 }
 
 fn replace_profile_logs_for_source<I>(
@@ -4525,25 +4595,19 @@ fn replace_profile_logs_for_source<I>(
 {
     let logs = up_logs
         .entry(profile.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())))
+        .or_insert_with(|| Arc::new(RwLock::new(LevelLogView::default())))
         .clone();
     let mut profile_logs = logs.write().unwrap_or_else(|e| e.into_inner());
-    for buf in profile_logs.values_mut() {
-        buf.retain(|entry| entry.src != src);
-    }
-    profile_logs.retain(|_, buf| !buf.is_empty());
-    drop(profile_logs);
-    for entry in entries {
-        push_profile_log(up_logs, profile, src.clone(), entry);
-    }
+    profile_logs.replace_source(src, entries);
 }
 
-fn normalized_log_level(level: &str) -> String {
-    let trimmed = level.trim();
-    if trimmed.is_empty() {
-        "INFO".to_string()
-    } else {
-        trimmed.to_ascii_uppercase()
+fn log_level_rank(level: &str) -> u8 {
+    match level.trim().to_ascii_uppercase().as_str() {
+        "TRACE" => 0,
+        "DEBUG" => 1,
+        "WARN" => 3,
+        "ERROR" => 4,
+        _ => 2,
     }
 }
 

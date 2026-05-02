@@ -22,7 +22,7 @@ use nsproxy_core::{
     state_paths, HotConfig, NsAlive, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::path::Path;
@@ -43,7 +43,8 @@ mod supervisor;
 use alacritty_window::{run_term_window_process, ExternalTermWindowClient};
 use profile_loader::ProfileInfo;
 use supervisor::{
-    ContainerName, EditorStatus, LogEntryOf, LogSource, SupervisorCommand, SupervisorHandle,
+    ContainerName, EditorStatus, LogSource, RenderedLogEntry, SupervisorCommand,
+    SupervisorHandle,
 };
 use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
@@ -656,7 +657,7 @@ struct App {
     fps_window_start: Instant,
     fps_window_count: u32,
     last_fps: f32,
-    /// ANSI-render cache keyed by a fast collision-tolerant hash.
+    /// ANSI-render cache for raw process logs keyed by a fast collision-tolerant hash.
     cached_log: HashMap<u64, Vec<egui::RichText>>,
     log_panel_min_level: LogMinLevel,
 }
@@ -1112,7 +1113,7 @@ impl App {
                 root_daemon_error: None,
                 hotconfig_editor_status: None,
                 profile_editor_status: None,
-                root_daemon_logs: Arc::new(RwLock::new(BTreeMap::new())),
+                root_daemon_logs: Arc::new(RwLock::new(supervisor::LevelLogView::default())),
                 auto_open_logs_target: None,
                 generated_at: SystemTime::now(),
             },
@@ -3823,16 +3824,14 @@ impl App {
     }
 
     fn render_structured_log_panel(
-        &mut self,
         ui: &mut egui::Ui,
         panel_id: &str,
         empty_message: &str,
         no_level_message: String,
-        entries: Vec<Arc<LogEntryOf>>,
+        log_panel_min_level: &mut LogMinLevel,
+        entries: &VecDeque<Arc<RenderedLogEntry>>,
         total_entries: usize,
     ) {
-        let cached_log = &mut self.cached_log;
-
         egui::Frame::none()
             .fill(Color32::from_gray(18))
             .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
@@ -3844,11 +3843,11 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Min level");
                     egui::ComboBox::from_id_salt(("log_panel_min_level", panel_id))
-                        .selected_text(self.log_panel_min_level.label())
+                        .selected_text(log_panel_min_level.label())
                         .show_ui(ui, |ui| {
                             for level in LogMinLevel::ALL {
                                 ui.selectable_value(
-                                    &mut self.log_panel_min_level,
+                                    log_panel_min_level,
                                     level,
                                     level.label(),
                                 );
@@ -3880,12 +3879,12 @@ impl App {
                             return;
                         }
 
-                        for entry in entries
-                            .iter()
-                            .skip(row_range.start)
-                            .take(row_range.end.saturating_sub(row_range.start))
-                        {
-                            let (badge_text, badge_color) = match entry.src {
+                        let mut row_index = row_range.start;
+                        while row_index < row_range.end {
+                            let Some(entry) = entries.get(row_index) else {
+                                break;
+                            };
+                            let (badge_text, badge_color) = match entry.entry.src {
                                 LogSource::Serve => ("serve", Color32::from_rgb(100, 180, 130)),
                                 LogSource::Up => ("up", Color32::from_rgb(100, 150, 210)),
                                 LogSource::RootDaemon => {
@@ -3893,39 +3892,35 @@ impl App {
                                 }
                                 LogSource::Pid(_) => ("pid", Color32::from_rgb(140, 140, 220)),
                             };
-                            cached_log
-                                .entry(entry.hash)
-                                .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.log.message));
                             ui.horizontal(|ui| {
                                 ui.colored_label(badge_color, badge_text);
 
-                                let level_color = match entry.log.level.as_str() {
+                                let level_color = match entry.entry.log.level.as_str() {
                                     "ERROR" => Color32::from_rgb(220, 80, 80),
                                     "WARN" => Color32::from_rgb(210, 160, 60),
                                     "DEBUG" | "TRACE" => Color32::from_gray(120),
                                     _ => Color32::from_gray(200),
                                 };
-                                ui.colored_label(level_color, &entry.log.level);
+                                ui.colored_label(level_color, &entry.entry.log.level);
 
                                 ui.colored_label(
                                     Color32::from_gray(100),
-                                    format!("[{}]", entry.log.target),
+                                    format!("[{}]", entry.entry.log.target),
                                 );
 
-                                if let Some(ansi_parts) = cached_log.get(&entry.hash) {
-                                    for part in ansi_parts {
-                                        ui.label(part.clone());
-                                    }
-                                    for field in &entry.log.fields {
-                                        ui.add_space(6.0);
-                                        ui.colored_label(
-                                            Color32::from_gray(110),
-                                            format!("{}=", field.name),
-                                        );
-                                        ui.monospace(&field.value);
-                                    }
+                                for part in entry.ansi_parts.iter() {
+                                    ui.label(part.clone());
+                                }
+                                for field in &entry.entry.log.fields {
+                                    ui.add_space(6.0);
+                                    ui.colored_label(
+                                        Color32::from_gray(110),
+                                        format!("{}=", field.name),
+                                    );
+                                    ui.monospace(&field.value);
                                 }
                             });
+                            row_index += 1;
                         }
                     });
             });
@@ -3935,23 +3930,15 @@ impl App {
         ui.heading("sp daemon");
         ui.add_space(6.0);
 
-        let (entries, total_entries) = {
-            let guard = self
-                .snapshot
-                .root_daemon_logs
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut entries: Vec<Arc<LogEntryOf>> = guard
-                .iter()
-                .filter(|(level, _)| self.log_panel_min_level.matches(level))
-                .flat_map(|(_, ring)| ring.iter().cloned())
-                .collect();
-            entries.sort_by_key(|entry| entry.log.ts);
-            let total_entries = guard.values().map(|ring| ring.len()).sum();
-            (entries, total_entries)
-        };
+        let guard = self
+            .snapshot
+            .root_daemon_logs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let entries = guard.entries_for_min_level(self.log_panel_min_level.rank_value());
+        let total_entries = guard.total_entries();
 
-        self.render_structured_log_panel(
+        Self::render_structured_log_panel(
             ui,
             "root_daemon",
             "no daemon logs yet",
@@ -3959,6 +3946,7 @@ impl App {
                 "no daemon logs at or above {}",
                 self.log_panel_min_level.label()
             ),
+            &mut self.log_panel_min_level,
             entries,
             total_entries,
         );
@@ -4290,7 +4278,6 @@ impl App {
 
         ui.add_space(6.0);
         let snapshot = &self.snapshot;
-        let cached_log = &mut self.cached_log;
         let mut log_panel_min_level = self.log_panel_min_level;
         let profile = snapshot.profiles.get(profile_name);
         let logs_guard = match profile {
@@ -4303,110 +4290,35 @@ impl App {
             None => None,
         };
 
-        egui::Frame::none()
-            .fill(Color32::from_gray(18))
-            .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
-            .inner_margin(egui::Margin::same(6))
-            .show(ui, |ui| {
-                ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
-                ui.horizontal(|ui| {
-                    ui.label("Min level");
-                    egui::ComboBox::from_id_salt(("log_panel_min_level", profile_name))
-                        .selected_text(log_panel_min_level.label())
-                        .show_ui(ui, |ui| {
-                            for level in LogMinLevel::ALL {
-                                ui.selectable_value(&mut log_panel_min_level, level, level.label());
-                            }
-                        });
-                });
-
-                ui.add_space(6.0);
-
-                egui::ScrollArea::both()
-                    .id_salt(format!("log_panel_{}", profile_name))
-                    .max_height(500.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let Some(guard) = logs_guard.as_ref() else {
-                            ui.colored_label(
-                                Color32::from_gray(110),
-                                "no logs yet — start the container to see output",
-                            );
-                            return;
-                        };
-
-                        if guard.is_empty() {
-                            ui.colored_label(
-                                Color32::from_gray(110),
-                                "no logs yet — start the container to see output",
-                            );
-                            return;
-                        }
-
-                        let mut rendered_any = false;
-
-                        for (level, ring) in guard.iter() {
-                            if !log_panel_min_level.matches(level) {
-                                continue;
-                            }
-
-                            for entry in ring.iter() {
-                                rendered_any = true;
-                                let is_serve = matches!(entry.src, LogSource::Serve);
-                                cached_log.entry(entry.hash).or_insert_with(|| {
-                                    egui_sgr::ansi_to_rich_text(&entry.log.message)
-                                });
-                                ui.horizontal(|ui| {
-                                    let (badge_text, badge_color) = if is_serve {
-                                        ("serve", Color32::from_rgb(100, 180, 130))
-                                    } else {
-                                        ("up", Color32::from_rgb(100, 150, 210))
-                                    };
-                                    ui.colored_label(badge_color, badge_text);
-
-                                    let level_color = match entry.log.level.as_str() {
-                                        "ERROR" => Color32::from_rgb(220, 80, 80),
-                                        "WARN" => Color32::from_rgb(210, 160, 60),
-                                        "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                        _ => Color32::from_gray(200),
-                                    };
-                                    ui.colored_label(level_color, &entry.log.level);
-
-                                    ui.colored_label(
-                                        Color32::from_gray(100),
-                                        format!("[{}]", entry.log.target),
-                                    );
-
-                                    if let Some(ansi_parts) = cached_log.get(&entry.hash) {
-                                        ui.horizontal_wrapped(|ui| {
-                                            for part in ansi_parts {
-                                                ui.label(part.clone());
-                                            }
-                                            for field in &entry.log.fields {
-                                                ui.add_space(6.0);
-                                                ui.colored_label(
-                                                    Color32::from_gray(110),
-                                                    format!("{}=", field.name),
-                                                );
-                                                ui.monospace(&field.value);
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        }
-
-                        if !rendered_any {
-                            ui.colored_label(
-                                Color32::from_gray(110),
-                                format!(
-                                    "no logs at or above {} for this profile",
-                                    log_panel_min_level.label()
-                                ),
-                            );
-                        }
-                    });
-            });
+        if let Some(guard) = logs_guard.as_ref() {
+            let entries = guard.entries_for_min_level(log_panel_min_level.rank_value());
+            let total_entries = guard.total_entries();
+            Self::render_structured_log_panel(
+                ui,
+                profile_name,
+                "no logs yet — start the container to see output",
+                format!(
+                    "no logs at or above {} for this profile",
+                    log_panel_min_level.label()
+                ),
+                &mut log_panel_min_level,
+                entries,
+                total_entries,
+            );
+        } else {
+            Self::render_structured_log_panel(
+                ui,
+                profile_name,
+                "no logs yet — start the container to see output",
+                format!(
+                    "no logs at or above {} for this profile",
+                    log_panel_min_level.label()
+                ),
+                &mut log_panel_min_level,
+                &VecDeque::new(),
+                0,
+            );
+        }
 
         self.log_panel_min_level = log_panel_min_level;
     }
