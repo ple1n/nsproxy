@@ -478,7 +478,7 @@ impl Router {
                             break;
                         }
                         Err(relay_err) => {
-                            warn!(
+                            info!(
                                 "proxy {:?} relay failed for {peer}: {relay_err:?}, retrying",
                                 id
                             );
@@ -755,7 +755,7 @@ impl Router {
                             break;
                         }
                         Err(e) => {
-                            warn!("direct UDP relay failed for {peer}: {e:?}, retrying");
+                            info!("direct UDP relay failed for {peer}: {e:?}, retrying");
                             ctx.attempt_num += 1;
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
@@ -882,7 +882,7 @@ impl Router {
                             break;
                         }
                         Err(e) => {
-                            warn!(
+                            info!(
                                 "proxy {:?} UDP relay failed for {peer}: {e:?}, retrying",
                                 id
                             );

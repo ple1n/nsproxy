@@ -251,6 +251,9 @@ pub struct SupervisorSnapshot {
     pub root_daemon_error: Option<String>,
     pub hotconfig_editor_status: Option<EditorStatus>,
     pub profile_editor_status: Option<EditorStatus>,
+    pub constants_editor_status: Option<EditorStatus>,
+    pub constants_editor_content: Option<String>,
+    pub personal_runtime_state: diag::personal::PersonalRuntimeState,
     #[serde(skip)]
     pub root_daemon_logs: SharedLevelLogRings,
     pub auto_open_logs_target: Option<AutoOpenLogsTarget>,
@@ -342,6 +345,14 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         content: String,
     },
+    SaveConstantsPrivileged {
+        content: String,
+    },
+    LoadConstantsPrivileged,
+    SetPersonalRuntimeState {
+        profile: ContainerName,
+        state: diag::personal::PersonalRuntimeState,
+    },
     CreateProfilePrivileged {
         name: ContainerName,
         profile_content: String,
@@ -366,7 +377,7 @@ pub enum SupervisorCommand {
     },
     KillManagedProcess {
         profile: ContainerName,
-        pid: u32,
+        task_pgid: u32,
     },
     /// Request the most-recent raw stdout/stderr lines for a managed process.
     /// The response is stored in `ContainerState::process_raw_logs[pid]`.
@@ -413,6 +424,9 @@ pub enum SupervisorCommand {
     OnTabOpen {
         profile: ContainerName,
         tab: TabKind,
+    },
+    SetTrafficSubscription {
+        profile: Option<ContainerName>,
     },
 }
 
@@ -500,6 +514,9 @@ impl SupervisorHandle {
             root_daemon_error: None,
             hotconfig_editor_status: None,
             profile_editor_status: None,
+            constants_editor_status: None,
+            constants_editor_content: None,
+            personal_runtime_state: diag::personal::PersonalRuntimeState::default(),
             root_daemon_logs: Arc::new(RwLock::new(LevelLogView::default())),
             auto_open_logs_target: None,
             generated_at: SystemTime::now(),
@@ -547,6 +564,135 @@ impl SupervisorHandle {
         } else {
             None
         }
+    }
+
+    pub fn current_snapshot(&self) -> Option<SupervisorSnapshot> {
+        let rx = self.snapshot_rx.lock().ok()?;
+        let snapshot = rx.borrow().clone();
+        Some(snapshot)
+    }
+
+    pub fn subscribe_snapshots(&self) -> Option<tokio::sync::watch::Receiver<SupervisorSnapshot>> {
+        let rx = self.snapshot_rx.lock().ok()?;
+        Some(rx.clone())
+    }
+
+    async fn wait_for_snapshot<F>(&self, mut predicate: F) -> Result<SupervisorSnapshot>
+    where
+        F: FnMut(&SupervisorSnapshot) -> bool,
+    {
+        let mut rx = self
+            .subscribe_snapshots()
+            .context("supervisor snapshot subscription unavailable")?;
+        if predicate(&rx.borrow()) {
+            return Ok(rx.borrow().clone());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            loop {
+                rx.changed()
+                    .await
+                    .context("supervisor snapshot channel closed")?;
+                if predicate(&rx.borrow()) {
+                    return Ok(rx.borrow().clone());
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for supervisor state")?
+    }
+
+    pub async fn ensure_profile_running(&self, profile: &str) -> Result<()> {
+        if self.current_snapshot().as_ref().and_then(|snapshot| snapshot.profiles.get(profile)).is_some_and(|state| state.child_alive && state.up_connected) {
+            return Ok(());
+        }
+        self.send(SupervisorCommand::StartUp {
+            profile: profile.to_string(),
+        });
+        let _ = self
+            .wait_for_snapshot(|snapshot| {
+                snapshot
+                    .profiles
+                    .get(profile)
+                    .is_some_and(|state| state.child_alive && state.up_connected)
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn spawn_managed_process(
+        &self,
+        profile: &str,
+        args: diag::SpawnArgs,
+    ) -> Result<u32> {
+        let existing_slots = self
+            .current_snapshot()
+            .and_then(|snapshot| snapshot.profiles.get(profile).cloned())
+            .and_then(|state| state.process_list_snapshot)
+            .map(|snapshot| snapshot.procs.keys().copied().collect::<HashSet<u32>>())
+            .unwrap_or_default();
+
+        self.send(SupervisorCommand::StartDaemon {
+            profile: profile.to_string(),
+            args,
+        });
+
+        let snapshot = self
+            .wait_for_snapshot(|snapshot| {
+                snapshot
+                    .profiles
+                    .get(profile)
+                    .and_then(|state| state.process_list_snapshot.as_ref())
+                    .is_some_and(|plist| {
+                        plist.procs.iter().any(|(task_pgid, entry)| {
+                            !existing_slots.contains(task_pgid)
+                                && matches!(entry.status, diag::ProcessStatus::Alive)
+                        })
+                    })
+            })
+            .await?;
+
+        snapshot
+            .profiles
+            .get(profile)
+            .and_then(|state| state.process_list_snapshot.as_ref())
+            .and_then(|plist| {
+                plist.procs.iter().filter(|(task_pgid, entry)| {
+                    !existing_slots.contains(task_pgid)
+                        && matches!(entry.status, diag::ProcessStatus::Alive)
+                })
+                .max_by_key(|(_, entry)| {
+                    entry
+                        .spawned_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|delta| delta.as_micros())
+                        .unwrap_or(0)
+                })
+                .map(|(task_pgid, _)| *task_pgid)
+            })
+            .context("managed process spawned but no new task pgid was observed")
+    }
+
+    pub async fn stop_managed_process(&self, profile: &str, task_pgid: u32) -> Result<()> {
+        self.send(SupervisorCommand::KillManagedProcess {
+            profile: profile.to_string(),
+            task_pgid,
+        });
+        let _ = self
+            .wait_for_snapshot(|snapshot| {
+                !snapshot
+                    .profiles
+                    .get(profile)
+                    .and_then(|state| state.process_list_snapshot.as_ref())
+                    .and_then(|plist| plist.procs.get(&task_pgid))
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.status,
+                            diag::ProcessStatus::Alive | diag::ProcessStatus::Terminating
+                        )
+                    })
+            })
+            .await?;
+        Ok(())
     }
 
     /// Drain accumulated PTY bytes for a specific process.
@@ -646,6 +792,8 @@ struct CachedProfileConfig {
 enum PendingRootDaemonOp {
     SaveHotconfig { profile: ContainerName },
     SaveProfile { profile: ContainerName },
+    SaveConstants,
+    LoadConstants,
     CreateProfile { name: ContainerName },
 }
 
@@ -697,6 +845,9 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
         SupervisorCommand::SaveHotconfigPrivileged { .. } => "SaveHotconfigPrivileged",
         SupervisorCommand::SaveProfilePrivileged { .. } => "SaveProfilePrivileged",
+        SupervisorCommand::SaveConstantsPrivileged { .. } => "SaveConstantsPrivileged",
+        SupervisorCommand::LoadConstantsPrivileged => "LoadConstantsPrivileged",
+        SupervisorCommand::SetPersonalRuntimeState { .. } => "SetPersonalRuntimeState",
         SupervisorCommand::CreateProfilePrivileged { .. } => "CreateProfilePrivileged",
         SupervisorCommand::RunSandbox { .. } => "RunSandbox",
         SupervisorCommand::SpawnPty { .. } => "SpawnPty",
@@ -718,6 +869,7 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::RefreshNamespaces => "RefreshNamespaces",
         SupervisorCommand::Init => "Init",
         SupervisorCommand::OnTabOpen { .. } => "OnTabOpen",
+        SupervisorCommand::SetTrafficSubscription { .. } => "SetTrafficSubscription",
     }
 }
 
@@ -728,6 +880,7 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::StopServe { profile }
         | SupervisorCommand::SaveHotconfigPrivileged { profile, .. }
         | SupervisorCommand::SaveProfilePrivileged { profile, .. }
+        | SupervisorCommand::SetPersonalRuntimeState { profile, .. }
         | SupervisorCommand::DeleteContainer { profile }
         | SupervisorCommand::StopContainer { profile }
         | SupervisorCommand::KillContainer { profile }
@@ -745,11 +898,17 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::DetachPty { profile, .. }
         | SupervisorCommand::PtyInput { profile, .. }
         | SupervisorCommand::PtyResize { profile, .. }
-        | SupervisorCommand::Ctrl { profile, .. } => Some(profile.as_str()),
+        | SupervisorCommand::Ctrl { profile, .. }
+        | SupervisorCommand::SetTrafficSubscription {
+            profile: Some(profile),
+        } => Some(profile.as_str()),
         SupervisorCommand::CreateProfilePrivileged { name, .. } => Some(name.as_str()),
-        SupervisorCommand::LoadProfiles(_)
+        SupervisorCommand::SaveConstantsPrivileged { .. }
+        | SupervisorCommand::LoadConstantsPrivileged
+        | SupervisorCommand::LoadProfiles(_)
         | SupervisorCommand::RefreshNamespaces
-        | SupervisorCommand::Init => None,
+        | SupervisorCommand::Init
+        | SupervisorCommand::SetTrafficSubscription { profile: None } => None,
     }
 }
 
@@ -766,6 +925,7 @@ fn daemon_event_name(event: &diag::DaemonEvent) -> &'static str {
         diag::DaemonEvent::RawLogs { .. } => "RawLogs",
         diag::DaemonEvent::PtyOutput { .. } => "PtyOutput",
         diag::DaemonEvent::PtyScrollback { .. } => "PtyScrollback",
+        diag::DaemonEvent::Personal(_) => "Personal",
     }
 }
 
@@ -814,6 +974,9 @@ struct Supervisor {
     next_root_daemon_op_id: u64,
     hotconfig_editor_status: Option<EditorStatus>,
     profile_editor_status: Option<EditorStatus>,
+    constants_editor_status: Option<EditorStatus>,
+    constants_editor_content: Option<String>,
+    personal_runtime_state: diag::personal::PersonalRuntimeState,
     root_daemon_logs: SharedLevelLogRings,
     diag_state: HashMap<ContainerName, DiagState>,
     ns_alive_status: HashMap<ContainerName, NsAliveStatus>,
@@ -856,9 +1019,101 @@ struct Supervisor {
     /// Used by `up_pid_alive` to reject PIDs belonging to a different process
     /// that happened to reuse the same PID after the original `sp up` exited.
     up_start_time: HashMap<ContainerName, SystemTime>,
+    traffic_subscription: Option<ContainerName>,
 }
 
 impl Supervisor {
+    fn merge_process_list_snapshot(
+        existing: Option<&diag::ProcessListSnapshot>,
+        incoming: &mut diag::ProcessListSnapshot,
+    ) {
+        let Some(existing) = existing else {
+            return;
+        };
+
+        for (task_pgid, existing_entry) in &existing.procs {
+            let Some(incoming_entry) = incoming.procs.get_mut(task_pgid) else {
+                continue;
+            };
+
+            if existing_entry.spawned_at == incoming_entry.spawned_at
+                && matches!(existing_entry.status, diag::ProcessStatus::Killed)
+                && !matches!(incoming_entry.status, diag::ProcessStatus::Killed)
+            {
+                incoming_entry.status = diag::ProcessStatus::Killed;
+            }
+        }
+    }
+
+    fn start_up_profile(&mut self, profile: ContainerName) {
+        info!(profile = profile.as_str(), "starting sp up flow");
+        self.set_container_lifecycle(&profile, ContainerLifecycleState::Starting);
+        self.pending_start_sandbox.insert(profile.clone());
+        self.reset_backoff(&profile);
+        let cli = Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: Some(self.control_sock_path.clone()),
+            cmd: MainCommand::Up {
+                profile: profile.clone(),
+                cmd: None,
+                simulate_protocol_no_upgrade: false,
+                simulate_conn_close: false,
+                simulate_slow_shutdown: false,
+            },
+        };
+        {
+            let logs = self
+                .up_logs
+                .entry(profile.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(LevelLogView::default())))
+                .clone();
+            logs.write().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        push_up_log(
+            &mut self.up_logs,
+            &profile,
+            diag::LogEntry {
+                ts: diag::Timestamp::now(),
+                level: "INFO".to_string(),
+                target: "supervisor".to_string(),
+                message: "Starting container...".to_string(),
+                fields: Vec::new(),
+            },
+        );
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+            Ok(spawned) => {
+                spawn_bootstrap_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stdout,
+                    spawned.stdout_r,
+                    self.event_tx.clone(),
+                );
+                spawn_bootstrap_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stderr,
+                    spawned.stderr_r,
+                    self.event_tx.clone(),
+                );
+                self.up_start_time.insert(profile.clone(), SystemTime::now());
+                info!(
+                    profile = profile.as_str(),
+                    pid = spawned.pid.as_raw(),
+                    "spawned sp up process"
+                );
+            }
+            Err(err) => {
+                self.pending_start_sandbox.remove(&profile);
+                self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
+                warn!("failed to start sp up for {}: {err:?}", profile);
+            }
+        }
+        self.known_profiles.insert(profile.clone());
+        self.ensure_up_client(&profile);
+        self.refresh_profile_status(&profile);
+    }
+
     fn next_editor_status_token(&mut self) -> u64 {
         let token = self.next_root_daemon_op_id;
         self.next_root_daemon_op_id = self.next_root_daemon_op_id.saturating_add(1);
@@ -875,6 +1130,7 @@ impl Supervisor {
         let profile = match op {
             PendingRootDaemonOp::SaveHotconfig { profile }
             | PendingRootDaemonOp::SaveProfile { profile } => Some(profile.clone()),
+            PendingRootDaemonOp::SaveConstants | PendingRootDaemonOp::LoadConstants => None,
             PendingRootDaemonOp::CreateProfile { name } => Some(name.clone()),
         };
         let status = EditorStatus {
@@ -889,6 +1145,9 @@ impl Supervisor {
             }
             PendingRootDaemonOp::SaveProfile { .. } | PendingRootDaemonOp::CreateProfile { .. } => {
                 self.profile_editor_status = Some(status);
+            }
+            PendingRootDaemonOp::SaveConstants | PendingRootDaemonOp::LoadConstants => {
+                self.constants_editor_status = Some(status);
             }
         }
     }
@@ -936,6 +1195,9 @@ impl Supervisor {
             next_root_daemon_op_id: 1,
             hotconfig_editor_status: None,
             profile_editor_status: None,
+            constants_editor_status: None,
+            constants_editor_content: None,
+            personal_runtime_state: diag::personal::PersonalRuntimeState::default(),
             root_daemon_logs: Arc::new(RwLock::new(LevelLogView::default())),
             diag_state: HashMap::new(),
             ns_alive_status: HashMap::new(),
@@ -959,6 +1221,7 @@ impl Supervisor {
             auto_open_logs_token: 0,
             control_sock_path,
             up_start_time: HashMap::new(),
+            traffic_subscription: None,
         }
     }
 
@@ -1202,20 +1465,9 @@ impl Supervisor {
                     }
                 }
                 Some(ev) = self.event_rx.recv() => {
-                    // PtyOutput/PtyScrollback only write to pty_buf (not in the snapshot)
-                    // and already schedule a repaint via repaint_pty_target().
-                    let is_pty_data = matches!(
-                        &ev,
-                        SupervisorEvent::UpEvent {
-                            event: diag::DaemonEvent::PtyOutput { .. },
-                            ..
-                        } | SupervisorEvent::UpEvent {
-                            event: diag::DaemonEvent::PtyScrollback { .. },
-                            ..
-                        }
-                    );
+                    let needs_snapshot = self.event_requires_snapshot(&ev);
                     self.handle_event(ev);
-                    if !is_pty_data {
+                    if needs_snapshot {
                         self.emit_snapshot();
                     }
                 }
@@ -1233,75 +1485,7 @@ impl Supervisor {
         info!(command, profile, "supervisor handling command");
         match cmd {
             SupervisorCommand::StartUp { profile } => {
-                info!(profile = profile.as_str(), "starting sp up flow");
-                self.set_container_lifecycle(&profile, ContainerLifecycleState::Starting);
-                self.pending_start_sandbox.insert(profile.clone());
-                // Fresh backoff — intentional start, connect immediately.
-                self.reset_backoff(&profile);
-                let cli = Cli {
-                    conf: None,
-                    root: None,
-                    no_wrap_check: false,
-                    control_socket: Some(self.control_sock_path.clone()),
-                    cmd: MainCommand::Up {
-                        profile: profile.clone(),
-                        cmd: None,
-                        simulate_protocol_no_upgrade: false,
-                        simulate_conn_close: false,
-                        simulate_slow_shutdown: false,
-                    },
-                };
-                {
-                    let logs = self
-                        .up_logs
-                        .entry(profile.clone())
-                        .or_insert_with(|| Arc::new(RwLock::new(LevelLogView::default())))
-                        .clone();
-                    logs.write().unwrap_or_else(|e| e.into_inner()).clear();
-                }
-                push_up_log(
-                    &mut self.up_logs,
-                    &profile,
-                    diag::LogEntry {
-                        ts: diag::Timestamp::now(),
-                        level: "INFO".to_string(),
-                        target: "supervisor".to_string(),
-                        message: "Starting container...".to_string(),
-                        fields: Vec::new(),
-                    },
-                );
-                match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
-                    Ok(spawned) => {
-                        spawn_bootstrap_log_reader(
-                            profile.clone(),
-                            BootstrapLogStream::Stdout,
-                            spawned.stdout_r,
-                            self.event_tx.clone(),
-                        );
-                        spawn_bootstrap_log_reader(
-                            profile.clone(),
-                            BootstrapLogStream::Stderr,
-                            spawned.stderr_r,
-                            self.event_tx.clone(),
-                        );
-                        // Record the spawn wall-clock time for PID-reuse detection in up_pid_alive.
-                        self.up_start_time
-                            .insert(profile.clone(), SystemTime::now());
-                        info!(
-                            profile = profile.as_str(),
-                            pid = spawned.pid.as_raw(),
-                            "spawned sp up process"
-                        );
-                    }
-                    Err(err) => {
-                        self.pending_start_sandbox.remove(&profile);
-                        self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
-                        warn!("failed to start sp up for {}: {err:?}", profile);
-                    }
-                }
-                self.known_profiles.insert(profile.clone());
-                self.ensure_up_client(&profile);
-                self.refresh_profile_status(&profile);
+                self.start_up_profile(profile);
             }
             SupervisorCommand::StartServe { profile } => {
                 info!(
@@ -1406,6 +1590,33 @@ impl Supervisor {
                     },
                     PendingRootDaemonOp::SaveProfile { profile },
                 );
+            }
+            SupervisorCommand::SaveConstantsPrivileged { content } => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::WriteFile {
+                        path: state_paths::constants_config(),
+                        content: content.into_bytes(),
+                        create_parent: true,
+                    },
+                    PendingRootDaemonOp::SaveConstants,
+                );
+            }
+            SupervisorCommand::LoadConstantsPrivileged => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::ReadFile {
+                        path: state_paths::constants_config(),
+                    },
+                    PendingRootDaemonOp::LoadConstants,
+                );
+            }
+            SupervisorCommand::SetPersonalRuntimeState { profile, state } => {
+                self.personal_runtime_state = state.clone();
+                self.ensure_up_client(&profile);
+                if let Some(tx) = self.up_cmd.get(&profile) {
+                    let _ = tx.send(diag::DaemonRequest::Personal(
+                        diag::personal::PersonalDaemonRequest::SetState(state),
+                    ));
+                }
             }
             SupervisorCommand::CreateProfilePrivileged {
                 name,
@@ -1666,11 +1877,11 @@ impl Supervisor {
                 // Pid watcher is triggered by ConnectionUpdate::Disconnected (see handle_event).
                 self.refresh_profile_status(&profile);
             }
-            SupervisorCommand::KillManagedProcess { profile, pid } => {
-                info!(profile = profile.as_str(), pid, "killing managed process");
+            SupervisorCommand::KillManagedProcess { profile, task_pgid } => {
+                info!(profile = profile.as_str(), task_pgid, "killing managed task");
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    if tx.send(diag::DaemonRequest::Kill { pid }).is_err() {
-                        warn!("failed to send kill request for {} pid {}", profile, pid);
+                    if tx.send(diag::DaemonRequest::Kill { task_pgid }).is_err() {
+                        warn!("failed to send kill request for {} task pgid {}", profile, task_pgid);
                     }
                 }
                 self.refresh_profile_status(&profile);
@@ -1681,22 +1892,28 @@ impl Supervisor {
                 limit,
             } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::QueryRawLogs { pid, limit });
+                    let _ = tx.send(diag::DaemonRequest::QueryRawLogs {
+                        task_pgid: pid,
+                        limit,
+                    });
                 }
             }
             SupervisorCommand::AttachPty { profile, pid } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::AttachPty { pid });
+                    let _ = tx.send(diag::DaemonRequest::AttachPty { task_pgid: pid });
                 }
             }
             SupervisorCommand::DetachPty { profile, pid } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::DetachPty { pid });
+                    let _ = tx.send(diag::DaemonRequest::DetachPty { task_pgid: pid });
                 }
             }
             SupervisorCommand::PtyInput { profile, pid, data } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::PtyInput { pid, data });
+                    let _ = tx.send(diag::DaemonRequest::PtyInput {
+                        task_pgid: pid,
+                        data,
+                    });
                 }
             }
             SupervisorCommand::PtyResize {
@@ -1706,7 +1923,11 @@ impl Supervisor {
                 rows,
             } => {
                 if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::PtyResize { pid, cols, rows });
+                    let _ = tx.send(diag::DaemonRequest::PtyResize {
+                        task_pgid: pid,
+                        cols,
+                        rows,
+                    });
                 }
             }
             SupervisorCommand::StartHotconfigDaemons { profile } => {
@@ -1802,32 +2023,16 @@ impl Supervisor {
                     TabKind::Dns => {
                         let _ = self.send_diag_cmd(&profile, ControlCommand::QueryDnsState);
                     }
-                    TabKind::Traffic => {
-                        let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
-                        // let _ = self.send_diag_cmd(&profile, ControlCommand::SetTrackConns { enabled: true });
-                        // Pre-fetch diag event log if empty.
-                        let is_empty = self
-                            .diag_state
-                            .get(&profile)
-                            .map(|d| d.diag_event_log.is_empty())
-                            .unwrap_or(true);
-                        if is_empty {
-                            let _ = self.send_diag_cmd(
-                                &profile,
-                                ControlCommand::QueryRecentDiagEvents {
-                                    limit: diag::DIAG_EVENT_RING_CAP,
-                                },
-                            );
-                        }
-                        // Pre-fetch connection state snapshot.
-                        let _ = self.send_diag_cmd(&profile, ControlCommand::QueryConnsState);
-                    }
+                    TabKind::Traffic => {}
                     TabKind::Proxies => {
                         let _ = self.send_diag_cmd(&profile, ControlCommand::QueryUplinkStats);
                         let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
                     }
                     TabKind::Processes => {}
                 }
+            }
+            SupervisorCommand::SetTrafficSubscription { profile } => {
+                self.set_traffic_subscription(profile);
             }
         }
         info!(
@@ -1989,9 +2194,7 @@ impl Supervisor {
                 );
                 let state = self.diag_state.entry(profile.clone()).or_default();
                 state.accumulator.ingest(&event);
-                // Update client-side connection-tracking state.
                 state.conns_state.apply_event(&event);
-                // Accumulate raw events into the local diag event log (capped).
                 const MAX_DIAG_EVENTS: usize = 512;
                 match &event {
                     DiagEvent::RecentDiagEvents(_) | DiagEvent::ConnsStateSnapshot { .. } => {}
@@ -2020,8 +2223,6 @@ impl Supervisor {
                         );
                     }
                     DiagEvent::RecentDiagEvents(entries) => {
-                        // Historical backfill: only populate when our local log is empty
-                        // so we don't overwrite live data already accumulated.
                         if state.diag_event_log.is_empty() {
                             state.diag_event_log.extend(entries);
                         }
@@ -2045,6 +2246,9 @@ impl Supervisor {
                 // pid poll NOW — sp up has just closed its socket and is about to exit, so
                 // the 50 ms check fires right as the process disappears.
                 if target == ConnectionTarget::Up && state == ConnectionState::Disconnected {
+                    if profile == "basic" {
+                        self.personal_runtime_state = diag::personal::PersonalRuntimeState::default();
+                    }
                     let lc = self.container_lifecycle(&profile);
                     if matches!(
                         lc,
@@ -2101,43 +2305,56 @@ impl Supervisor {
                         LogSource::Up,
                         entries,
                     );
-                } else if let diag::DaemonEvent::RawLogs { pid, logs } = event {
+                } else if let diag::DaemonEvent::RawLogs { task_pgid, logs } = event {
                     self.process_raw_logs
                         .entry(profile.clone())
                         .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
                         .write()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(pid, logs);
-                } else if let diag::DaemonEvent::PtyScrollback { pid, data } = event {
+                        .insert(task_pgid, logs);
+                } else if let diag::DaemonEvent::PtyScrollback { task_pgid, data } = event {
                     {
                         let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.entry(profile.clone()).or_default().insert(pid, data);
+                        guard.entry(profile.clone()).or_default().insert(task_pgid, data);
                     }
-                    self.pty_wake_state.notify_pty_data(&profile, pid);
+                    self.pty_wake_state.notify_pty_data(&profile, task_pgid);
                     self.repaint_pty_target();
-                } else if let diag::DaemonEvent::PtyOutput { pid, data } = event {
+                } else if let diag::DaemonEvent::PtyOutput { task_pgid, data } = event {
                     {
                         let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
                         guard
                             .entry(profile.clone())
                             .or_default()
-                            .entry(pid)
+                            .entry(task_pgid)
                             .or_default()
                             .extend(data);
                     }
-                            self.pty_wake_state.notify_pty_data(&profile, pid);
+                            self.pty_wake_state.notify_pty_data(&profile, task_pgid);
                     self.repaint_pty_target();
-                } else if let diag::DaemonEvent::ProcessListSnapshot(snapshot) = event {
+                } else if let diag::DaemonEvent::ProcessExit { task_pgid } = event {
+                    if let Some(snapshot) = self.process_list_snapshot.get_mut(&profile) {
+                        if let Some(entry) = snapshot.procs.get_mut(&task_pgid) {
+                            entry.status = diag::ProcessStatus::Killed;
+                        }
+                    }
+                    if let Some(status) = self.ns_alive_status.get_mut(&profile) {
+                        if status.serve_pid == Some(task_pgid as i32) {
+                            status.serve_alive = false;
+                        }
+                    }
+                } else if let diag::DaemonEvent::Personal(diag::personal::PersonalDaemonEvent::State(state)) = event {
+                    self.personal_runtime_state = state;
+                } else if let diag::DaemonEvent::ProcessListSnapshot(mut snapshot) = event {
                     if let Some(status) = self.ns_alive_status.get_mut(&profile) {
                         // `snapshot.serve` is the PID of the sp-serve process (0 = none).
                         // Its live status lives inside `snapshot.procs[serve_pid].status`.
                         let (new_serve_pid, new_serve_alive) = if snapshot.serve != 0 {
                             match snapshot.procs.get(&snapshot.serve).map(|e| &e.status) {
                                 Some(
-                                    diag::ProcessStatus::Alive(_)
-                                    | diag::ProcessStatus::Terminating(_),
+                                    diag::ProcessStatus::Alive
+                                    | diag::ProcessStatus::Terminating,
                                 ) => (Some(snapshot.serve as i32), true),
-                                Some(diag::ProcessStatus::Killed(_)) | None => {
+                                Some(diag::ProcessStatus::Killed) | None => {
                                     (Some(snapshot.serve as i32), false)
                                 }
                                 Some(diag::ProcessStatus::Vacant) => (None, false),
@@ -2191,6 +2408,10 @@ impl Supervisor {
                         }
                     }
 
+                    Self::merge_process_list_snapshot(
+                        self.process_list_snapshot.get(&profile),
+                        &mut snapshot,
+                    );
                     self.process_list_snapshot.insert(profile, snapshot);
                 }
             }
@@ -2263,6 +2484,12 @@ impl Supervisor {
                             );
                         }
                     }
+                    diag::RootDaemonResult::ReadFile { content, .. } => {
+                        self.constants_editor_content = Some(content);
+                        if let Some(op) = pending.as_ref() {
+                            self.publish_editor_status(op, true, event.op_id, "loaded constants.json");
+                        }
+                    }
                     diag::RootDaemonResult::Ok { message, profile, .. } => {
                         if let Some(op) = pending.as_ref() {
                             self.publish_editor_status(op, true, event.op_id, message.clone());
@@ -2277,6 +2504,8 @@ impl Supervisor {
                                     self.refresh_profile_status(profile);
                                     self.spawn_sandbox_reconcile(profile, "profile saved");
                                 }
+                                PendingRootDaemonOp::SaveConstants => {}
+                                PendingRootDaemonOp::LoadConstants => {}
                                 PendingRootDaemonOp::CreateProfile { name } => {
                                     self.known_profiles.insert(name.clone());
                                     self.refresh_config_cache(name);
@@ -2465,7 +2694,6 @@ impl Supervisor {
                 );
             }
         }
-        self.ectx.request_repaint();
     }
 
     fn remove_profile(&mut self, profile: &str) {
@@ -2558,6 +2786,59 @@ impl Supervisor {
         self.diag_cmd
             .get(profile)
             .is_some_and(|tx| tx.send(cmd).is_ok())
+    }
+
+    fn event_requires_snapshot(&self, ev: &SupervisorEvent) -> bool {
+        match ev {
+            SupervisorEvent::UpEvent {
+                event: diag::DaemonEvent::PtyOutput { .. },
+                ..
+            }
+            | SupervisorEvent::UpEvent {
+                event: diag::DaemonEvent::PtyScrollback { .. },
+                ..
+            } => false,
+            SupervisorEvent::DiagEvent { profile, event } => {
+                !diag_event_is_traffic_only(event) || self.is_traffic_subscribed(profile.as_str())
+            }
+            _ => true,
+        }
+    }
+
+    fn is_traffic_subscribed(&self, profile: &str) -> bool {
+        self.traffic_subscription.as_deref() == Some(profile)
+    }
+
+    fn set_traffic_subscription(&mut self, profile: Option<ContainerName>) {
+        if self.traffic_subscription == profile {
+            return;
+        }
+
+        let previous = self.traffic_subscription.take();
+
+        if let Some(old_profile) = previous {
+            if self.diag_cmd.contains_key(&old_profile) {
+                let _ = self.send_diag_cmd(
+                    &old_profile,
+                    ControlCommand::SetTrackConns { enabled: false },
+                );
+            }
+        }
+
+        if let Some(profile) = profile {
+            self.traffic_subscription = Some(profile.clone());
+            self.known_profiles.insert(profile.clone());
+            self.refresh_profile_status(&profile);
+            let _ = self.send_diag_cmd(&profile, ControlCommand::SetTrackConns { enabled: true });
+            let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
+            let _ = self.send_diag_cmd(
+                &profile,
+                ControlCommand::QueryRecentDiagEvents {
+                    limit: diag::DIAG_EVENT_RING_CAP,
+                },
+            );
+            let _ = self.send_diag_cmd(&profile, ControlCommand::QueryConnsState);
+        }
     }
 
     fn update_connection_status(
@@ -2916,7 +3197,11 @@ impl Supervisor {
                     dns_state: diag.and_then(|d| d.dns_state.clone()),
                     diag_connected,
                     diag_summary: diag.and_then(build_diag_summary),
-                    traffic: diag.map(build_traffic_snapshot).unwrap_or_default(),
+                    traffic: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(build_traffic_snapshot).unwrap_or_default()
+                    } else {
+                        TrafficSnapshot::default()
+                    },
                     proxy_stats: diag.map(|d| d.proxy_stats.clone()).unwrap_or_default(),
                     hotconfig_value,
                     template_value,
@@ -2934,10 +3219,17 @@ impl Supervisor {
                         .get(profile)
                         .cloned()
                         .unwrap_or_else(|| Arc::new(RwLock::new(LevelLogView::default()))),
-                    diag_event_log: diag
-                        .map(|d| d.diag_event_log.iter().cloned().collect())
-                        .unwrap_or_default(),
-                    conns_state: diag.map(|d| d.conns_state.clone()).unwrap_or_default(),
+                    diag_event_log: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| d.diag_event_log.iter().cloned().collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                    conns_state: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| d.conns_state.clone()).unwrap_or_default()
+                    } else {
+                        diag::ConnsState::default()
+                    },
                     process_raw_logs: self
                         .process_raw_logs
                         .get(profile)
@@ -2955,6 +3247,9 @@ impl Supervisor {
             root_daemon_error: self.root_daemon_connection.last_error.clone(),
             hotconfig_editor_status: self.hotconfig_editor_status.clone(),
             profile_editor_status: self.profile_editor_status.clone(),
+            constants_editor_status: self.constants_editor_status.clone(),
+            constants_editor_content: self.constants_editor_content.clone(),
+            personal_runtime_state: self.personal_runtime_state.clone(),
             root_daemon_logs: self.root_daemon_logs.clone(),
             auto_open_logs_target: self.auto_open_logs_target.clone(),
             generated_at: SystemTime::now(),
@@ -3160,6 +3455,12 @@ async fn up_stream_loop(
         .send_unstable_request(&diag::DaemonRequest::GetProcessList)
         .await
         .context("request initial process list")?;
+    writer
+        .send_unstable_request(&diag::DaemonRequest::Personal(
+            diag::personal::PersonalDaemonRequest::GetState,
+        ))
+        .await
+        .context("request personal runtime state")?;
     writer
         .send_unstable_request(&diag::DaemonRequest::QueryRecentLogs {
             limit: diag::LOG_RING_CAP,
@@ -4022,6 +4323,23 @@ fn build_traffic_snapshot(state: &DiagState) -> TrafficSnapshot {
         loop_min_us: acc.loop_stats.min_us(),
         loop_samples: acc.loop_stats.recent.len(),
     }
+}
+
+fn diag_event_is_traffic_only(event: &DiagEvent) -> bool {
+    matches!(
+        event,
+        DiagEvent::Accept { .. }
+            | DiagEvent::Dispatched { .. }
+            | DiagEvent::Route { .. }
+            | DiagEvent::Connected { .. }
+            | DiagEvent::Finished { .. }
+            | DiagEvent::DnsResolved { .. }
+            | DiagEvent::DnsQuery { .. }
+            | DiagEvent::Wait { .. }
+            | DiagEvent::WaitEnded { .. }
+            | DiagEvent::RecentDiagEvents(_)
+            | DiagEvent::ConnsStateSnapshot { .. }
+    )
 }
 
 fn default_nsproxy_path() -> PathBuf {

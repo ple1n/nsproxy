@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::state_paths;
 
@@ -15,7 +15,7 @@ pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
     fn load_or_default() -> Result<Self> {
         let path = Self::path();
         if path.exists() {
-            warn!("load_state_read {:?}", path);
+            info!("load_state_read {:?}", path);
             let content = std::fs::read_to_string(&path)
                 .context(format!("Failed to read state from {:?}", path))?;
             let state: Self =
@@ -36,7 +36,7 @@ pub trait PersistentState: Serialize + DeserializeOwned + Default + Sized {
         let tmp = path.with_extension("tmp");
         let content = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
         std::fs::write(&tmp, content).context("Failed to write temp state file")?;
-        warn!("save_state {:?}", path);
+        info!("save_state {:?}", path);
         std::fs::rename(&tmp, &path).context("Failed to replace state file atomically")?;
         Ok(())
     }
@@ -115,6 +115,7 @@ pub fn global_state_tree() -> StateNode {
         state_paths::persist_root(),
         vec![
             StateNode::leaf("namespaces_registry", state_paths::namespaces_registry()),
+            StateNode::leaf("constants", state_paths::constants_config()),
             StateNode::leaf(
                 "wrapped_binaries",
                 state_paths::wrapped_binaries_config(),

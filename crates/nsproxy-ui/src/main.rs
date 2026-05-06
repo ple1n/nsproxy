@@ -18,6 +18,7 @@ use nsproxy_core::uplink::clash::{ClashState, GroupId};
 use nsproxy_core::uplink::{
     uplink_proxy_default_udp_expected, UplinkHub, UplinkProxy, UplinkStatsState,
 };
+use nsproxy_core::personal::PersonalConstants;
 use nsproxy_core::{
     state_paths, HotConfig, NsAlive, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
 };
@@ -37,6 +38,7 @@ use twox_hash::XxHash3_64;
 use which;
 
 mod alacritty_window;
+mod personal;
 mod profile_loader;
 mod supervisor;
 
@@ -177,6 +179,7 @@ impl ProxyType {
 enum RightTab {
     Proxies,
     Daemon,
+    Actions,
     Processes,
     Traffic,
     Hotconfig,
@@ -605,6 +608,7 @@ struct App {
     proxy_filters: ProxyFilters,
     all_groups: HashSet<GroupId>,
     supervisor: SupervisorHandle,
+    personal_state: personal::PersonalUiState,
     snapshot: supervisor::SupervisorSnapshot,
     run_command: RunCommandDraft,
     int_input: IntInput,
@@ -631,6 +635,7 @@ struct App {
     hotconfig_editor_status: Option<String>,
     selected_traffic_conn: Option<diag::ConnId>,
     traffic_subview: TrafficSubview,
+    traffic_subscription_profile: Option<ContainerName>,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
     /// State for the special swap terminal child process, if any.
@@ -874,6 +879,25 @@ fn refresh_run_command_preview(run_command: &mut RunCommandDraft) {
 }
 
 impl App {
+    fn desired_traffic_subscription(&self) -> Option<ContainerName> {
+        if self.right_tab == RightTab::Traffic {
+            self.selected_profile.clone()
+        } else {
+            None
+        }
+    }
+
+    fn sync_traffic_subscription(&mut self) {
+        let desired = self.desired_traffic_subscription();
+        if self.traffic_subscription_profile == desired {
+            return;
+        }
+
+        self.traffic_subscription_profile = desired.clone();
+        self.supervisor
+            .send(SupervisorCommand::SetTrafficSubscription { profile: desired });
+    }
+
     pub fn new(ectx: egui::Context) -> Self {
         info!("initializing nsproxy-ui app state");
         let snapshot = load_proxies_from_persisted();
@@ -913,7 +937,14 @@ impl App {
             .build()
             .expect("failed to build tokio runtime for ui supervisor");
         let (supervisor, supervisor_task) = SupervisorHandle::new(ectx.clone());
+        let personal_state = personal::PersonalUiState::default();
         tokio_rt.spawn(supervisor_task.run());
+        personal::install_personal_actor(&tokio_rt, supervisor.clone(), personal_state.clone());
+        personal::install_systemd_suspend_hook(
+            &tokio_rt,
+            supervisor.clone(),
+            personal_state.clone(),
+        );
 
         // Initialize supervisor: discover and load all profiles
         supervisor.send(supervisor::SupervisorCommand::Init);
@@ -1090,7 +1121,6 @@ impl App {
             initial_proxy_count = proxies.len(),
             "nsproxy-ui app initialized"
         );
-
         Self {
             selected_profile: None,
             remove_containers_armed: false,
@@ -1106,6 +1136,7 @@ impl App {
             proxy_filters: ProxyFilters::default(),
             all_groups,
             supervisor,
+            personal_state,
             snapshot: supervisor::SupervisorSnapshot {
                 profiles: BTreeMap::new(),
                 ui_ns: supervisor::NamespaceIndicator::default(),
@@ -1113,6 +1144,9 @@ impl App {
                 root_daemon_error: None,
                 hotconfig_editor_status: None,
                 profile_editor_status: None,
+                constants_editor_status: None,
+                constants_editor_content: None,
+                personal_runtime_state: diag::personal::PersonalRuntimeState::default(),
                 root_daemon_logs: Arc::new(RwLock::new(supervisor::LevelLogView::default())),
                 auto_open_logs_target: None,
                 generated_at: SystemTime::now(),
@@ -1141,6 +1175,7 @@ impl App {
             hotconfig_editor_status: None,
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
+            traffic_subscription_profile: None,
             selected_process_logs: None,
             swap_term_window: ExternalTermWindowClient::default(),
             dedicated_term_windows: HashMap::new(),
@@ -1170,6 +1205,7 @@ impl App {
         match self.right_tab {
             RightTab::Proxies => "Proxies",
             RightTab::Daemon => "Daemon",
+            RightTab::Actions => "Actions",
             RightTab::Processes => "Processes",
             RightTab::Traffic => "Traffic",
             RightTab::Hotconfig => "Hotconfig",
@@ -2791,11 +2827,29 @@ fn default_profile_text() -> String {
     serde_json::to_string_pretty(&TemplateConfig::default()).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn default_constants_text() -> String {
+    serde_json::to_string_pretty(&PersonalConstants::default()).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn json_syntax() -> Syntax {
     Syntax::new("json")
         .with_case_sensitive(true)
         .with_comment("//")
         .with_keywords(["true", "false", "null"])
+}
+
+fn load_constants_json<F: FnOnce() -> String>(fallback: Option<F>) -> LoadResult {
+    let path = state_paths::constants_config();
+    match std::fs::read_to_string(path) {
+        Ok(content) => LoadResult {
+            text: content,
+            error: None,
+        },
+        Err(_) => LoadResult {
+            text: fallback.map_or_else(|| default_constants_text(), |f| f()),
+            error: None,
+        },
+    }
 }
 
 fn load_profile_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>) -> LoadResult {
@@ -3129,11 +3183,19 @@ impl eframe::App for App {
                             });
                     }
                 }
+
+                    self.sync_traffic_subscription();
                 if ui
                     .selectable_label(self.right_tab == RightTab::Daemon, "Daemon")
                     .clicked()
                 {
                     self.right_tab = RightTab::Daemon;
+                }
+                if ui
+                    .selectable_label(self.right_tab == RightTab::Actions, "Actions")
+                    .clicked()
+                {
+                    self.right_tab = RightTab::Actions;
                 }
                 if ui
                     .selectable_label(self.right_tab == RightTab::Processes, "Processes")
@@ -3146,13 +3208,6 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.right_tab = RightTab::Traffic;
-                    if let Some(profile_name) = &self.selected_profile {
-                        self.supervisor
-                            .send(supervisor::SupervisorCommand::OnTabOpen {
-                                profile: profile_name.clone(),
-                                tab: supervisor::TabKind::Traffic,
-                            });
-                    }
                 }
                 if ui
                     .selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig")
@@ -3225,6 +3280,7 @@ impl eframe::App for App {
                 .show(ui, |ui| match self.right_tab {
                     RightTab::Proxies => self.render_proxies_tab(ui),
                     RightTab::Daemon => self.render_daemon_tab(ui),
+                    RightTab::Actions => personal::render_actions_tab(self, ui),
                     RightTab::Processes => self.render_processes_tab(ui),
                     RightTab::Traffic => self.render_traffic_tab(ui),
                     RightTab::Hotconfig => self.render_hotconfig_tab(ui),
@@ -4447,7 +4503,7 @@ impl App {
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::auto()) // Profile
-            .column(Column::exact(58.0)) // PID
+            .column(Column::exact(58.0)) // PGID
             .column(Column::exact(80.0)) // State
             .column(Column::auto()) // Program
             .column(Column::exact(42.0)) // UID
@@ -4463,7 +4519,7 @@ impl App {
                     ui.strong("Profile");
                 });
                 header.col(|ui| {
-                    ui.strong("PID");
+                    ui.strong("PGID");
                 });
                 header.col(|ui| {
                     ui.strong("State");
@@ -4496,20 +4552,20 @@ impl App {
                             ui.label(row_profile.as_str());
                         });
 
-                        // PID (prefer the live pid from status)
-                        let live_pid = entry.status.pid().unwrap_or(*slot_pid);
+                        // Managed task identity is the process-group id.
+                        let task_pgid = *slot_pid;
                         row.col(|ui| {
-                            ui.label(live_pid.to_string());
+                            ui.label(task_pgid.to_string());
                         });
 
                         // State — colored
                         row.col(|ui| {
                             let (label, color) = match &entry.status {
-                                diag::ProcessStatus::Alive(_) => ("running", Color32::LIGHT_GREEN),
-                                diag::ProcessStatus::Terminating(_) => {
+                                diag::ProcessStatus::Alive => ("running", Color32::LIGHT_GREEN),
+                                diag::ProcessStatus::Terminating => {
                                     ("stopping", Color32::from_rgb(220, 165, 60))
                                 }
-                                diag::ProcessStatus::Killed(_) => {
+                                diag::ProcessStatus::Killed => {
                                     ("dead", Color32::from_rgb(200, 80, 80))
                                 }
                                 diag::ProcessStatus::Vacant => ("vacant", Color32::from_gray(130)),
@@ -4575,10 +4631,10 @@ impl App {
                         row.col(|ui| {
                             if matches!(
                                 &entry.status,
-                                diag::ProcessStatus::Alive(_) | diag::ProcessStatus::Terminating(_)
+                                diag::ProcessStatus::Alive | diag::ProcessStatus::Terminating
                             ) {
                                 if ui.small_button("Kill").clicked() {
-                                    kill_request = Some((row_profile.clone(), live_pid));
+                                    kill_request = Some((row_profile.clone(), task_pgid));
                                 }
                             }
                         });
@@ -4671,9 +4727,9 @@ impl App {
                 }
             });
 
-        if let Some((profile, pid)) = kill_request {
+        if let Some((profile, task_pgid)) = kill_request {
             self.supervisor
-                .send(SupervisorCommand::KillManagedProcess { profile, pid });
+            .send(SupervisorCommand::KillManagedProcess { profile, task_pgid });
         }
         if let Some((profile, pid)) = inspect_request {
             self.selected_process_spawn_args = Some((profile, pid));

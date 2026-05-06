@@ -4406,6 +4406,7 @@ dependencies = [
  "twox-hash",
  "which",
  "winit",
+ "zbus 4.4.0",
 ]
 
 [[package]]

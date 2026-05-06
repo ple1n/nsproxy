@@ -59,6 +59,7 @@ pub mod cmd_uplink;
 pub mod env;
 pub mod hot_reload;
 pub mod internal_dns;
+pub mod personal;
 pub mod prelude;
 pub mod sandbox;
 pub mod shell;
@@ -1694,7 +1695,7 @@ pub enum CliDaemonRequest {
     Ping,
     GetProcessList,
     Kill {
-        pid: u32,
+        task_pgid: u32,
     },
     Stop,
 }
@@ -1727,6 +1728,9 @@ pub enum DaemonCliRequest {
     Ping,
     Stop,
     CreateDirAll {
+        path: PathBuf,
+    },
+    ReadFile {
         path: PathBuf,
     },
     WriteFile {

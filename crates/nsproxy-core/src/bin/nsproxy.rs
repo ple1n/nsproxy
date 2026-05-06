@@ -34,7 +34,7 @@ use nix::{
     sched::{CloneFlags, unshare},
     unistd::{
         ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, getresuid, pipe,
-        setgroups, setresgid, setresuid, setsid,
+        setgroups, setpgid, setresgid, setresuid, setsid,
     },
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
@@ -1122,7 +1122,7 @@ fn main() -> anyhow::Result<()> {
                 let req = match cli_req {
                     CliDaemonRequest::GetProcessList => diag::DaemonRequest::GetProcessList,
                     CliDaemonRequest::Ping => diag::DaemonRequest::Ping,
-                    CliDaemonRequest::Kill { pid } => diag::DaemonRequest::Kill { pid },
+                    CliDaemonRequest::Kill { task_pgid } => diag::DaemonRequest::Kill { task_pgid },
                     CliDaemonRequest::Stop => diag::DaemonRequest::Stop,
                     CliDaemonRequest::Spawn { args } => {
                         let dra = diag::SpawnArgs {
@@ -1738,6 +1738,10 @@ fn main() -> anyhow::Result<()> {
                         op_id: 0,
                         op: diag::RootDaemonOp::CreateDirAll { path },
                     },
+                    DaemonCliRequest::ReadFile { path } => diag::RootDaemonRequest {
+                        op_id: 0,
+                        op: diag::RootDaemonOp::ReadFile { path },
+                    },
                     DaemonCliRequest::WriteFile {
                         path,
                         content,
@@ -2175,7 +2179,7 @@ fn cmd_serve(
                             match read_bincode_frame_async::<diag::LogEntry, _>(&mut child_log_stream)
                                 .await
                             {
-                                Ok(Some(entry)) => diag_srv.emit(diag::DiagEvent::Log(entry)),
+                                Ok(Some(entry)) => diag_srv.emit_forwarded_log(entry),
                                 Ok(None) => break,
                                 Err(err) => {
                                     warn!("serve child log relay failed: {}", err);
@@ -2473,6 +2477,7 @@ struct UpDaemonState {
     /// The corresponding entry in `process_list.processes` carries the
     /// live `ProcessStatus`; this field is the look-up key.
     serve_pid: u32,
+    personal_runtime_state: diag::personal::PersonalRuntimeState,
 }
 
 pub fn try_resolve_nsinput(nsi: NsInput) -> Result<Option<ExactNS>> {
@@ -2556,6 +2561,8 @@ async fn run_up_daemon(
     simulate_conn_close: bool,
     simulate_slow_shutdown: bool,
 ) -> Result<()> {
+    enable_child_subreaper()?;
+
     let sock_path = diag::up_sock_path(profile);
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2575,6 +2582,7 @@ async fn run_up_daemon(
             processes: BTreeMap::new(),
         },
         serve_pid: 0,
+        personal_runtime_state: diag::personal::PersonalRuntimeState::default(),
     })));
 
     // Shared per-process stdout/stderr ring buffer.
@@ -2583,16 +2591,31 @@ async fn run_up_daemon(
     // Shared PTY byte scrollback ring per process.
     let pty_scrollback: Arc<Mutex<BTreeMap<u32, PtyScrollbackState>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
-    // PTY master fd per process for input/resize control.
+    // PTY master fd per task for input/resize control.
     let pty_masters: Arc<Mutex<BTreeMap<u32, OwnedFd>>> = Arc::new(Mutex::new(BTreeMap::new()));
-    // PTY output broadcast channels keyed by process pid.
+    // PTY output broadcast channels keyed by task pgid.
     let pty_streams: Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
-    // Daemon-level broadcast for process exit notifications.  Hoisted out of
-    // handle_up_client so that watcher tasks spawned on an older connection
-    // survive a reconnect and can still update state and notify the new client.
+    // Daemon-level broadcast for task-group exit notifications.
     let (exit_broadcast_tx, _) = tokio::sync::broadcast::channel::<u32>(64);
     let exit_broadcast_tx: Arc<tokio::sync::broadcast::Sender<u32>> = Arc::new(exit_broadcast_tx);
+    {
+        let state = state.clone();
+        let exit_broadcast_tx = Arc::clone(&exit_broadcast_tx);
+        tokio::spawn(async move {
+            let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+                .expect("failed to install SIGCHLD handler for up daemon");
+            while sigchld.recv().await.is_some() {
+                let exited = reap_dead_task_groups_into_state(&state);
+                if !exited.is_empty() {
+                    info!(count = exited.len(), task_pgids = ?exited, "sigchld reaped tasks");
+                }
+                for task_pgid in exited {
+                    let _ = exit_broadcast_tx.send(task_pgid);
+                }
+            }
+        });
+    }
 
     // If the UI passed a control socket path, connect to it immediately and serve it
     // as a reversed-role client.  This is event-triggered: the UI doesn't need to
@@ -2771,16 +2794,11 @@ fn append_pty_scrollback(state: &mut PtyScrollbackState, data: &[u8]) {
 }
 
 fn signal_pty_foreground_process_group(fd: std::os::fd::RawFd) -> anyhow::Result<()> {
-    let mut pgid: libc::pid_t = 0;
-    let rc = unsafe { libc::ioctl(fd, libc::TIOCGPGRP, &mut pgid) };
-    if rc != 0 {
-        return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
-    }
-    if pgid <= 0 {
+    let Some(pgid) = pty_foreground_process_group(fd)? else {
         return Ok(());
-    }
+    };
 
-    let rc = unsafe { libc::killpg(pgid, libc::SIGWINCH) };
+    let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGWINCH) };
     if rc == 0 {
         Ok(())
     } else {
@@ -2791,6 +2809,19 @@ fn signal_pty_foreground_process_group(fd: std::os::fd::RawFd) -> anyhow::Result
             Err(anyhow::anyhow!(err))
         }
     }
+}
+
+fn pty_foreground_process_group(fd: std::os::fd::RawFd) -> anyhow::Result<Option<u32>> {
+    let mut pgid: libc::pid_t = 0;
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGPGRP, &mut pgid) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
+    }
+    if pgid <= 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(pgid as u32))
 }
 
 /// Scan `chunk` for DA1 (`ESC [ c` / `ESC [ 0 c`) and DA2 (`ESC [ > c` / `ESC [ > 0 c`)
@@ -2915,10 +2946,8 @@ async fn handle_up_client(
                     break;
                 };
 
-                // Reap before dispatching so that GetProcessList returns
-                // the freshest state (catches children that exited since
-                // the last event loop iteration).
-                reap_dead_children_into_state(&state);
+                // Reap before dispatching so that GetProcessList returns the freshest task state.
+                reap_dead_task_groups_into_state(&state);
 
                 let req = match req {
                     diag::UpWireRequest::Stable(stable_req) => {
@@ -2983,14 +3012,61 @@ async fn handle_up_client(
                         });
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
-                    diag::DaemonRequest::Kill { pid } => {
+                    diag::DaemonRequest::Personal(diag::personal::PersonalDaemonRequest::GetState) => {
+                        let s = state.load();
+                        let evt = diag::DaemonEvent::Personal(diag::personal::PersonalDaemonEvent::State(
+                            s.personal_runtime_state.clone(),
+                        ));
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
+                    }
+                    diag::DaemonRequest::Personal(diag::personal::PersonalDaemonRequest::SetState(personal_runtime_state)) => {
+                        let mut new = (*state.load_full()).clone();
+                        new.personal_runtime_state = personal_runtime_state.clone();
+                        state.store(Arc::new(new));
+                        let evt = diag::DaemonEvent::Personal(diag::personal::PersonalDaemonEvent::State(
+                            personal_runtime_state,
+                        ));
+                        write_up_unstable_frame(&mut write_half, &evt).await?;
+                    }
+                    diag::DaemonRequest::Kill { task_pgid } => {
+                        let (target, pty_foreground_pgid) = {
+                            let s = state.load();
+                            let entry = s.process_list.processes.get(&task_pgid);
+                            let pty_foreground_pgid = entry
+                                .filter(|entry| matches!(entry.meta, diag::SpawnedEntry::Pty(_)))
+                                .and_then(|_| {
+                                    let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.get(&task_pgid).and_then(|fd| {
+                                        match pty_foreground_process_group(fd.as_raw_fd()) {
+                                            Ok(pgid) => pgid,
+                                            Err(err) => {
+                                                warn!(task_pgid, %err, "failed to read PTY foreground process group during kill");
+                                                None
+                                            }
+                                        }
+                                    })
+                                });
+                            (task_signal_target(task_pgid, entry), pty_foreground_pgid)
+                        };
+                        info!(
+                            task_pgid,
+                            target = target.as_raw(),
+                            pty_foreground_pgid,
+                            "task kill requested"
+                        );
                         let _ = nix::sys::signal::kill(
-                            Pid::from_raw(pid as i32),
+                            target,
                             nix::sys::signal::Signal::SIGTERM,
                         );
+                        if let Some(foreground_pgid) = pty_foreground_pgid.filter(|pgid| *pgid != task_pgid) {
+                            let _ = nix::sys::signal::kill(
+                                Pid::from_raw(-(foreground_pgid as i32)),
+                                nix::sys::signal::Signal::SIGTERM,
+                            );
+                        }
                         let mut new = (*state.load_full()).clone();
-                        if let Some(entry) = new.process_list.processes.get_mut(&pid) {
-                            entry.status = diag::ProcessStatus::Terminating(pid);
+                        if let Some(entry) = new.process_list.processes.get_mut(&task_pgid) {
+                            entry.status = diag::ProcessStatus::Terminating;
                         }
                         state.store(Arc::new(new));
                         let s = state.load();
@@ -3004,44 +3080,45 @@ async fn handle_up_client(
                         let raw_log_cap = ringbuf_cap_from_args(&args, diag::RAW_LOG_RING_CAP);
                         let ns_alive = read_ns_alive(&ns_meta)?;
                         let (child, stdout_r, stderr_r) = spawn_daemon_process(&args, &ns_alive)?;
-                        let child_pid = match child {
+                        let task_pgid = match child {
                             Clone3Result::Parent { child_pid, .. } => child_pid as u32,
                             _ => {
                                 let evt = diag::DaemonEvent::Error {
                                     msg: "spawn daemon in child context".to_string(),
                                 };
                                 write_up_unstable_frame(&mut write_half, &evt).await?;
-                                reap_dead_children_into_state(&state);
+                                reap_dead_task_groups_into_state(&state);
                                 continue;
                             }
                         };
                         let mut new = (*state.load_full()).clone();
                         new.process_list.processes.insert(
-                            child_pid,
+                            task_pgid,
                             diag::ProcessEntry {
                                 meta: diag::SpawnedEntry::Args(args),
                                 spawned_at: SystemTime::now(),
-                                status: diag::ProcessStatus::Alive(child_pid),
+                                task_pgid,
+                                status: diag::ProcessStatus::Alive,
                             },
                         );
                         state.store(Arc::new(new));
 
                         spawn_pipe_reader(
-                            child_pid,
+                            task_pgid,
                             diag::RawLogKind::Stdout,
                             stdout_r,
                             raw_logs.clone(),
                             raw_log_cap,
                         );
                         spawn_pipe_reader(
-                            child_pid,
+                            task_pgid,
                             diag::RawLogKind::Stderr,
                             stderr_r,
                             raw_logs.clone(),
                             raw_log_cap,
                         );
 
-                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        let spawned = diag::DaemonEvent::Spawned { task_pgid };
                         write_up_unstable_frame(&mut write_half, &spawned).await?;
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
@@ -3049,22 +3126,6 @@ async fn handle_up_client(
                             serve: s.serve_pid,
                         });
                         write_up_unstable_frame(&mut write_half, &snapshot).await?;
-
-                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
-                        let state_w = state.clone();
-                        tokio::spawn(async move {
-                            wait_for_child_exit_async(child_pid).await;
-                            let mut new = (*state_w.load_full()).clone();
-                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
-                                entry.status = diag::ProcessStatus::Killed(child_pid);
-                            }
-                            if new.serve_pid == child_pid {
-                                new.serve_pid = 0;
-                            }
-                            state_w.store(Arc::new(new));
-                            info!("child pid {} exited", child_pid);
-                            let _ = exit_tx2.send(child_pid);
-                        });
                     }
                     diag::DaemonRequest::SpawnCli { cli_bincode, ns } => {
                         let cli = match bincode::deserialize::<Cli>(&cli_bincode) {
@@ -3074,54 +3135,55 @@ async fn handle_up_client(
                                     msg: format!("invalid cli payload: {err}"),
                                 };
                                 write_up_unstable_frame(&mut write_half, &evt).await?;
-                                reap_dead_children_into_state(&state);
+                                reap_dead_task_groups_into_state(&state);
                                 continue;
                             }
                         };
                         let is_serve = matches!(&cli.cmd, MainCommand::Serve { .. });
                         let ns_alive = read_ns_alive(&ns_meta)?;
-                        let (child_pid, stdout_r, stderr_r) =
+                        let (task_pgid, stdout_r, stderr_r) =
                             match spawn_cli_process(&cli, &ns_alive, ns)? {
-                            Some((pid, stdout_r, stderr_r)) => (pid, stdout_r, stderr_r),
+                            Some((task_pgid, stdout_r, stderr_r)) => (task_pgid, stdout_r, stderr_r),
                             None => {
-                                reap_dead_children_into_state(&state);
+                                reap_dead_task_groups_into_state(&state);
                                 continue;
                             }
                         };
                         let cli_bytes = bincode::serialize(&cli)?;
                         let mut new = (*state.load_full()).clone();
                         new.process_list.processes.insert(
-                            child_pid,
+                            task_pgid,
                             diag::ProcessEntry {
                                 meta: diag::SpawnedEntry::Cli(diag::SpawnCliType {
                                     cli_bincode: cli_bytes,
                                     is_serve,
                                 }),
                                 spawned_at: SystemTime::now(),
-                                status: diag::ProcessStatus::Alive(child_pid),
+                                task_pgid,
+                                status: diag::ProcessStatus::Alive,
                             },
                         );
                         if is_serve {
-                            new.serve_pid = child_pid;
+                            new.serve_pid = task_pgid;
                         }
                         state.store(Arc::new(new));
 
                         spawn_pipe_reader(
-                            child_pid,
+                            task_pgid,
                             diag::RawLogKind::Stdout,
                             stdout_r,
                             raw_logs.clone(),
                             diag::RAW_LOG_RING_CAP,
                         );
                         spawn_pipe_reader(
-                            child_pid,
+                            task_pgid,
                             diag::RawLogKind::Stderr,
                             stderr_r,
                             raw_logs.clone(),
                             diag::RAW_LOG_RING_CAP,
                         );
 
-                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        let spawned = diag::DaemonEvent::Spawned { task_pgid };
                         write_up_unstable_frame(&mut write_half, &spawned).await?;
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
@@ -3129,69 +3191,54 @@ async fn handle_up_client(
                             serve: s.serve_pid,
                         });
                         write_up_unstable_frame(&mut write_half, &snapshot).await?;
-
-                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
-                        let state_w = state.clone();
-                        tokio::spawn(async move {
-                            wait_for_child_exit_async(child_pid).await;
-                            let mut new = (*state_w.load_full()).clone();
-                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
-                                entry.status = diag::ProcessStatus::Killed(child_pid);
-                            }
-                            if new.serve_pid == child_pid {
-                                new.serve_pid = 0;
-                            }
-                            state_w.store(Arc::new(new));
-                            info!("child pid {} exited", child_pid);
-                            let _ = exit_tx2.send(child_pid);
-                        });
                     }
                     diag::DaemonRequest::SpawnPty { args } => {
                         let ns_alive = read_ns_alive(&ns_meta)?;
                         let pty_scrollback_cap = ringbuf_cap_from_args(&args, PTY_SCROLLBACK_CAP);
-                        let (child_pid, master_fd) = spawn_pty_process(&args, &ns_alive)?;
+                        let (task_pgid, master_fd) = spawn_pty_process(&args, &ns_alive)?;
                         let relay_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };
                         if relay_raw < 0 {
                             let evt = diag::DaemonEvent::Error {
                                 msg: format!("dup PTY master failed: {}", std::io::Error::last_os_error()),
                             };
                             write_up_unstable_frame(&mut write_half, &evt).await?;
-                            reap_dead_children_into_state(&state);
+                            reap_dead_task_groups_into_state(&state);
                             continue;
                         }
                         let relay_fd = unsafe { OwnedFd::from_raw_fd(relay_raw) };
 
                         {
                             let mut guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.insert(child_pid, master_fd);
+                            guard.insert(task_pgid, master_fd);
                         }
                         {
                             let mut guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
                             guard
-                                .entry(child_pid)
+                                .entry(task_pgid)
                                 .or_insert_with(|| PtyScrollbackState::new(pty_scrollback_cap));
                         }
                         {
                             let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
                             guard
-                                .entry(child_pid)
+                                .entry(task_pgid)
                                 .or_insert_with(|| tokio::sync::broadcast::channel(PTY_BROADCAST_CAP).0);
                         }
 
-                        spawn_pty_relay(child_pid, relay_fd, pty_scrollback.clone(), pty_streams.clone());
+                        spawn_pty_relay(task_pgid, relay_fd, pty_scrollback.clone(), pty_streams.clone());
 
                         let mut new = (*state.load_full()).clone();
                         new.process_list.processes.insert(
-                            child_pid,
+                            task_pgid,
                             diag::ProcessEntry {
                                 meta: diag::SpawnedEntry::Pty(args),
                                 spawned_at: SystemTime::now(),
-                                status: diag::ProcessStatus::Alive(child_pid),
+                                task_pgid,
+                                status: diag::ProcessStatus::Alive,
                             },
                         );
                         state.store(Arc::new(new));
 
-                        let spawned = diag::DaemonEvent::Spawned { pid: child_pid };
+                        let spawned = diag::DaemonEvent::Spawned { task_pgid };
                         write_up_unstable_frame(&mut write_half, &spawned).await?;
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
@@ -3199,43 +3246,27 @@ async fn handle_up_client(
                             serve: s.serve_pid,
                         });
                         write_up_unstable_frame(&mut write_half, &snapshot).await?;
-
-                        let exit_tx2 = Arc::clone(&exit_broadcast_tx);
-                        let state_w = state.clone();
-                        tokio::spawn(async move {
-                            wait_for_child_exit_async(child_pid).await;
-                            let mut new = (*state_w.load_full()).clone();
-                            if let Some(entry) = new.process_list.processes.get_mut(&child_pid) {
-                                entry.status = diag::ProcessStatus::Killed(child_pid);
-                            }
-                            if new.serve_pid == child_pid {
-                                new.serve_pid = 0;
-                            }
-                            state_w.store(Arc::new(new));
-                            info!("child pid {} exited", child_pid);
-                            let _ = exit_tx2.send(child_pid);
-                        });
                     }
-                    diag::DaemonRequest::AttachPty { pid } => {
+                    diag::DaemonRequest::AttachPty { task_pgid } => {
                         let scrollback = {
                             let guard = pty_scrollback.lock().unwrap_or_else(|e| e.into_inner());
                             guard
-                                .get(&pid)
+                                .get(&task_pgid)
                                 .map(|state| state.ring.iter().copied().collect::<Vec<u8>>())
                                 .unwrap_or_default()
                         };
                         let evt = diag::DaemonEvent::PtyScrollback {
-                            pid,
+                            task_pgid,
                             data: scrollback,
                         };
                         write_up_unstable_frame(&mut write_half, &evt).await?;
 
                         let tx_opt = {
                             let guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.get(&pid).cloned()
+                            guard.get(&task_pgid).cloned()
                         };
                         if let Some(tx) = tx_opt {
-                            if let Some(old) = attached_pty_tasks.remove(&pid) {
+                            if let Some(old) = attached_pty_tasks.remove(&task_pgid) {
                                 old.abort();
                             }
                             let mut rx = tx.subscribe();
@@ -3244,40 +3275,40 @@ async fn handle_up_client(
                                 loop {
                                     match rx.recv().await {
                                         Ok(data) => {
-                                            let _ = pty_evt_tx2.send(diag::DaemonEvent::PtyOutput { pid, data });
+                                            let _ = pty_evt_tx2.send(diag::DaemonEvent::PtyOutput { task_pgid, data });
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     }
                                 }
                             });
-                            attached_pty_tasks.insert(pid, task);
+                            attached_pty_tasks.insert(task_pgid, task);
                         }
                     }
-                    diag::DaemonRequest::DetachPty { pid } => {
-                        if let Some(task) = attached_pty_tasks.remove(&pid) {
+                    diag::DaemonRequest::DetachPty { task_pgid } => {
+                        if let Some(task) = attached_pty_tasks.remove(&task_pgid) {
                             task.abort();
                         }
                     }
-                    diag::DaemonRequest::PtyInput { pid, data } => {
+                    diag::DaemonRequest::PtyInput { task_pgid, data } => {
                         let write_result = {
                             let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
                             guard
-                                .get(&pid)
-                                .ok_or_else(|| anyhow!("pty pid {} not found", pid))
+                                .get(&task_pgid)
+                                .ok_or_else(|| anyhow!("pty task pgid {} not found", task_pgid))
                                 .and_then(|fd| nix::unistd::write(fd.as_raw_fd(), &data).map(|_| ()).map_err(|e| anyhow!(e)))
                         };
                         if let Err(e) = write_result {
                             let evt = diag::DaemonEvent::Error {
-                                msg: format!("pty input failed for pid {}: {}", pid, e),
+                                msg: format!("pty input failed for task pgid {}: {}", task_pgid, e),
                             };
                             write_up_unstable_frame(&mut write_half, &evt).await?;
                         }
                     }
-                    diag::DaemonRequest::PtyResize { pid, cols, rows } => {
+                    diag::DaemonRequest::PtyResize { task_pgid, cols, rows } => {
                         let (resize_result, refresh_result) = {
                             let guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(fd) = guard.get(&pid) {
+                            if let Some(fd) = guard.get(&task_pgid) {
                                 let ws = libc::winsize {
                                     ws_row: rows.max(1),
                                     ws_col: cols.max(1),
@@ -3291,16 +3322,16 @@ async fn handle_up_client(
                                     (Err(anyhow!(std::io::Error::last_os_error())), Ok(()))
                                 }
                             } else {
-                                (Err(anyhow!("pty pid {} not found", pid)), Ok(()))
+                                (Err(anyhow!("pty task pgid {} not found", task_pgid)), Ok(()))
                             }
                         };
                         if let Err(e) = resize_result {
                             let evt = diag::DaemonEvent::Error {
-                                msg: format!("pty resize failed for pid {}: {}", pid, e),
+                                msg: format!("pty resize failed for task pgid {}: {}", task_pgid, e),
                             };
                             write_up_unstable_frame(&mut write_half, &evt).await?;
                         } else if let Err(e) = refresh_result {
-                            warn!(%e, pid, "pty refresh signal failed after resize");
+                            warn!(%e, task_pgid, "pty refresh signal failed after resize");
                         }
                     }
                     diag::DaemonRequest::Stop => {
@@ -3324,51 +3355,46 @@ async fn handle_up_client(
                         let evt = diag::DaemonEvent::RecentLogs(entries);
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
-                    diag::DaemonRequest::QueryRawLogs { pid, limit } => {
+                    diag::DaemonRequest::QueryRawLogs { task_pgid, limit } => {
                         let logs = {
                             let guard = raw_logs.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.get(&pid)
+                            guard.get(&task_pgid)
                                 .map(|state| {
                                     let skip = state.ring.len().saturating_sub(limit);
                                     state.ring.iter().skip(skip).cloned().collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default()
                         };
-                        let evt = diag::DaemonEvent::RawLogs { pid, logs };
+                        let evt = diag::DaemonEvent::RawLogs { task_pgid, logs };
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                 }
 
-                reap_dead_children_into_state(&state);
+                let exited_task_pgids = reap_dead_task_groups_into_state(&state);
+                emit_task_exit_updates(
+                    &mut write_half,
+                    &state,
+                    &mut attached_pty_tasks,
+                    &pty_masters,
+                    &pty_streams,
+                    exited_task_pgids,
+                ).await?;
             }
 
-            exited_pid = exit_rx.recv() => {
-                match exited_pid {
-                    Ok(pid) => {
-                        // State was already updated by the watcher task; just clean up
-                        // per-connection PTY resources and push events to the client.
-                        if let Some(task) = attached_pty_tasks.remove(&pid) {
-                            task.abort();
-                        }
-                        {
-                            let mut guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.remove(&pid);
-                        }
-                        {
-                            let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.remove(&pid);
-                        }
-                        let exit_evt = diag::DaemonEvent::ProcessExit { pid };
-                        write_up_unstable_frame(&mut write_half, &exit_evt).await?;
-                        let s = state.load();
-                        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
-                            procs: s.process_list.processes.clone(),
-                            serve: s.serve_pid,
-                        });
-                        write_up_unstable_frame(&mut write_half, &snapshot).await?;
+            exited_task_pgid = exit_rx.recv() => {
+                match exited_task_pgid {
+                    Ok(task_pgid) => {
+                        emit_task_exit_updates(
+                            &mut write_half,
+                            &state,
+                            &mut attached_pty_tasks,
+                            &pty_masters,
+                            &pty_streams,
+                            std::iter::once(task_pgid),
+                        ).await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("exit broadcast lagged by {}, sending full snapshot", n);
+                        warn!("task-exit broadcast lagged by {}, sending full snapshot", n);
                         let s = state.load();
                         let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
                             procs: s.process_list.processes.clone(),
@@ -3402,6 +3428,19 @@ async fn handle_up_client(
     Ok(())
 }
 
+fn enable_child_subreaper() -> Result<()> {
+    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "failed to enable child subreaper: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    info!("child subreaper enabled");
+    Ok(())
+}
+
 async fn write_up_stable_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     stream: &mut W,
     evt: &diag::StableEvent,
@@ -3416,16 +3455,86 @@ async fn write_up_unstable_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     write_bincode_frame_async(stream, &diag::UpWireEvent::Unstable(evt.clone())).await
 }
 
+async fn emit_task_exit_updates<W: tokio::io::AsyncWriteExt + Unpin>(
+    write_half: &mut W,
+    state: &Arc<ArcSwap<UpDaemonState>>,
+    attached_pty_tasks: &mut HashMap<u32, tokio::task::JoinHandle<()>>,
+    pty_masters: &Arc<Mutex<BTreeMap<u32, OwnedFd>>>,
+    pty_streams: &Arc<Mutex<BTreeMap<u32, tokio::sync::broadcast::Sender<Vec<u8>>>>>,
+    exited_task_pgids: impl IntoIterator<Item = u32>,
+) -> Result<()> {
+    let mut emitted = false;
+    let mut personal_changed = false;
+    for task_pgid in exited_task_pgids {
+        emitted = true;
+        info!(task_pgid, "emitting task exit");
+        if let Some(task) = attached_pty_tasks.remove(&task_pgid) {
+            task.abort();
+        }
+        {
+            let mut guard = pty_masters.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&task_pgid);
+        }
+        {
+            let mut guard = pty_streams.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&task_pgid);
+        }
+        let exit_evt = diag::DaemonEvent::ProcessExit { task_pgid };
+        write_up_unstable_frame(write_half, &exit_evt).await?;
+
+        let mut new = (*state.load_full()).clone();
+        if new.personal_runtime_state.llamacpp_task_pgid == Some(task_pgid) {
+            new.personal_runtime_state.llamacpp_task_pgid = None;
+            personal_changed = true;
+        }
+        if new.personal_runtime_state.cinny_task_pgid == Some(task_pgid) {
+            new.personal_runtime_state.cinny_task_pgid = None;
+            personal_changed = true;
+        }
+        state.store(Arc::new(new));
+    }
+
+    if personal_changed {
+        let s = state.load();
+        let evt = diag::DaemonEvent::Personal(diag::personal::PersonalDaemonEvent::State(
+            s.personal_runtime_state.clone(),
+        ));
+        write_up_unstable_frame(write_half, &evt).await?;
+    }
+
+    if emitted {
+        let s = state.load();
+        let snapshot = diag::DaemonEvent::ProcessListSnapshot(diag::ProcessListSnapshot {
+            procs: s.process_list.processes.clone(),
+            serve: s.serve_pid,
+        });
+        write_up_unstable_frame(write_half, &snapshot).await?;
+    }
+
+    Ok(())
+}
+
+fn task_signal_target(task_pgid: u32, entry: Option<&diag::ProcessEntry>) -> Pid {
+    let task_pgid = entry.map(|entry| entry.task_pgid).unwrap_or(task_pgid);
+    Pid::from_raw(-(task_pgid as i32))
+}
+
+fn task_process_alive(task_pgid: u32, entry: &diag::ProcessEntry) -> bool {
+    let target = task_signal_target(task_pgid, Some(entry)).as_raw() as libc::pid_t;
+    let rc = unsafe { libc::kill(target, 0) };
+    rc == 0 || nix::errno::Errno::last() == nix::errno::Errno::EPERM
+}
+
 async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid: u32) -> bool {
     warn!(keeper_pid, "up daemon stop: begin stop sequence");
     {
         let s = state.load();
         // serve is tracked in process_list.processes under its PID,
         // so .keys() already covers it — no extra chain needed.
-        for pid in s.process_list.processes.keys().copied() {
-            warn!(pid, "up daemon stop: sending SIGTERM to child");
+        for (&task_pgid, entry) in s.process_list.processes.iter() {
+            warn!(task_pgid, "up daemon stop: sending SIGTERM to task group");
             let _ = nix::sys::signal::kill(
-                Pid::from_raw(pid as i32),
+                task_signal_target(task_pgid, Some(entry)),
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
@@ -3439,12 +3548,12 @@ async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid:
 
     if !keeper_dead {
         warn!("keeper pid {} did not exit within 5 seconds", keeper_pid);
-        reap_dead_children_into_state(state);
+        reap_dead_task_groups_into_state(state);
         return false;
     }
 
     warn!("up daemon stop: keeper exited; waiting for managed child processes");
-    reap_dead_children_into_state(state);
+    reap_dead_task_groups_into_state(state);
     wait_all_children_async(state, Duration::from_secs(5)).await;
     if any_child_alive(state) {
         warn!(
@@ -3457,80 +3566,94 @@ async fn perform_up_daemon_stop(state: &Arc<ArcSwap<UpDaemonState>>, keeper_pid:
     true
 }
 
-/// Returns `true` if any process recorded in `state` is still alive according to the OS.
-/// `Killed` entries are skipped to avoid unnecessary syscalls — they are kept in the map
+/// Returns true if any tracked task group still has living processes.
+/// Killed tasks are ignored; they remain in the process table
 /// for history but are known dead.
 fn any_child_alive(state: &Arc<ArcSwap<UpDaemonState>>) -> bool {
     let s = state.load();
     s.process_list
         .processes
         .iter()
-        .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed(_)))
-        .any(|(&pid, _)| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 })
+        .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed))
+        .any(|(&task_pgid, entry)| task_process_alive(task_pgid, entry))
 }
 
-/// Wait asynchronously for a child process to exit using `pidfd`.
-///
-/// Opens a `pidfd` for the process and registers it with Tokio's I/O reactor
-/// via `AsyncFd`.  A pidfd becomes `EPOLLIN`-readable the instant the process
-/// exits — no polling, no sleep loops.  `waitpid(WNOHANG)` reaps the zombie
-/// after the fd fires.
-async fn wait_for_child_exit_async(pid: u32) {
-    use std::os::unix::io::AsRawFd as _;
-    use tokio::io::Interest;
-    use tokio::io::unix::AsyncFd;
+fn reap_dead_task_groups_into_state(state: &Arc<ArcSwap<UpDaemonState>>) -> Vec<u32> {
+    let tracked_task_pgids: Vec<u32> = {
+        let snapshot = state.load();
+        snapshot
+            .process_list
+            .processes
+            .iter()
+            .filter(|(_, entry)| !matches!(entry.status, diag::ProcessStatus::Killed))
+            .map(|(&task_pgid, _)| task_pgid)
+            .collect()
+    };
 
-    let pidfd = unsafe { pidfd::PidFd::open(pid as libc::pid_t, 0) }.expect("pidfd_open failed");
-    // O_NONBLOCK is required by tokio's AsyncFd.
-    unsafe {
-        let flags = libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL, 0);
-        libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    if tracked_task_pgids.is_empty() {
+        return Vec::new();
     }
-    let async_fd =
-        AsyncFd::with_interest(pidfd, Interest::READABLE).expect("AsyncFd creation failed");
-    let mut guard = async_fd
-        .readable()
-        .await
-        .expect("AsyncFd readable wait failed");
-    guard.retain_ready();
-    // Reap the zombie.
-    let _ = nix::sys::wait::waitpid(
-        Pid::from_raw(pid as i32),
-        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-    );
-}
 
-fn reap_dead_children_into_state(state: &Arc<ArcSwap<UpDaemonState>>) {
-    let mut dead_pids: Vec<u32> = Vec::new();
-    loop {
-        match nix::sys::wait::waitpid(
-            Pid::from_raw(-1),
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-        ) {
-            Ok(nix::sys::wait::WaitStatus::Exited(pid, _))
-            | Ok(nix::sys::wait::WaitStatus::Signaled(pid, _, _)) => {
-                if pid.as_raw() > 0 {
-                    dead_pids.push(pid.as_raw() as u32);
+    let mut new = (*state.load_full()).clone();
+    let mut exited_task_pgids = Vec::new();
+    let mut changed = false;
+
+    for task_pgid in tracked_task_pgids {
+        let mut saw_wait_event = false;
+        loop {
+            match nix::sys::wait::waitpid(
+                Pid::from_raw(-(task_pgid as i32)),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                    saw_wait_event = true;
+                }
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+                | Err(nix::errno::Errno::ECHILD)
+                | Err(nix::errno::Errno::ESRCH) => break,
+                Ok(_) => break,
+                Err(err) => {
+                    warn!(task_pgid, %err, "waitpid on task group failed during reap");
+                    break;
                 }
             }
-            _ => break,
+        }
+
+        let alive = new
+            .process_list
+            .processes
+            .get(&task_pgid)
+            .is_some_and(|entry| task_process_alive(task_pgid, entry));
+        if !alive {
+            if let Some(entry) = new.process_list.processes.get_mut(&task_pgid) {
+                if !matches!(entry.status, diag::ProcessStatus::Killed) {
+                    info!(task_pgid, previous_status = ?entry.status, "task marked killed");
+                    entry.status = diag::ProcessStatus::Killed;
+                    exited_task_pgids.push(task_pgid);
+                    changed = true;
+                }
+            }
+            if new.serve_pid == task_pgid {
+                new.serve_pid = 0;
+                changed = true;
+            }
+        } else if saw_wait_event {
+            let status = new
+                .process_list
+                .processes
+                .get(&task_pgid)
+                .map(|entry| format!("{:?}", entry.status))
+                .unwrap_or_else(|| "<missing>".to_string());
+            warn!(task_pgid, status, "task still alive after reap");
         }
     }
-    if !dead_pids.is_empty() {
-        let mut new = (*state.load_full()).clone();
-        for dead in &dead_pids {
-            // Mark the entry as Killed rather than removing it so that the UI
-            // can see the full process history in the snapshot.
-            if let Some(entry) = new.process_list.processes.get_mut(dead) {
-                entry.status = diag::ProcessStatus::Killed(*dead);
-            }
-            // Reset the serve tracker when serve exits.
-            if new.serve_pid == *dead {
-                new.serve_pid = 0;
-            }
-        }
+
+    if changed {
         state.store(Arc::new(new));
     }
+
+    exited_task_pgids
 }
 
 fn spawn_cli_process(
@@ -3558,6 +3681,7 @@ fn spawn_cli_process(
             let _ = dup2(stderr_w, 2);
             let _ = nix::unistd::close(stdout_w);
             let _ = nix::unistd::close(stderr_w);
+            let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
             if matches!(ns, diag::NamespaceSpawn::Inside) {
                 enter_ns(ns_alive, &ns_alive.bind_mount)?;
@@ -3684,6 +3808,7 @@ fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
         diag::RootDaemonOp::Ping => "ping",
         diag::RootDaemonOp::Stop => "stop",
         diag::RootDaemonOp::CreateDirAll { .. } => "create_dir_all",
+        diag::RootDaemonOp::ReadFile { .. } => "read_file",
         diag::RootDaemonOp::WriteFile { .. } => "write_file",
         diag::RootDaemonOp::CreateProfile { .. } => "create_profile",
     }
@@ -3700,6 +3825,9 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
             info!(op_id, op = op_name, "root daemon op received");
         }
         diag::RootDaemonOp::CreateDirAll { path } => {
+            info!(op_id, op = op_name, path = %path.display(), "root daemon op received");
+        }
+        diag::RootDaemonOp::ReadFile { path } => {
             info!(op_id, op = op_name, path = %path.display(), "root daemon op received");
         }
         diag::RootDaemonOp::WriteFile {
@@ -3744,6 +3872,21 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
             Ok(()) => {
                 info!(op_id, op = op_name, path = %path.display(), "root daemon op completed");
                 daemon_ok(op_id, format!("created {}", path.display()), None, Some(path))
+            }
+            Err(err) => {
+                warn!(op_id, op = op_name, path = %path.display(), error = %err, "root daemon op failed");
+                daemon_err(op_id, err.to_string(), None, Some(path))
+            }
+        }),
+        diag::RootDaemonOp::ReadFile { path } => RootDaemonAction::Reply(match ensure_daemon_path_allowed(&path)
+            .and_then(|_| std::fs::read_to_string(&path).map_err(anyhow::Error::from))
+        {
+            Ok(content) => {
+                info!(op_id, op = op_name, path = %path.display(), "root daemon op completed");
+                diag::RootDaemonEvent {
+                    op_id,
+                    result: diag::RootDaemonResult::ReadFile { content, path },
+                }
             }
             Err(err) => {
                 warn!(op_id, op = op_name, path = %path.display(), error = %err, "root daemon op failed");
@@ -3889,20 +4032,14 @@ async fn handle_root_daemon_client(
                         }
                     }
                     diag::RootDaemonWireRequest::QueryRecentLogs { limit } => {
-                        if !upgraded {
-                            let stable_evt = diag::RootDaemonWireEvent::Stable(diag::StableEvent::Error {
-                                msg: "root daemon protocol upgrade required before log queries".to_string(),
-                            });
-                            write_bincode_frame_async(&mut write_half, &stable_evt).await?;
-                            continue;
-                        }
-                        let evt = diag::RootDaemonWireEvent::RecentLogs(diag::query_recent_logs(limit));
+                        let entries = diag::query_recent_logs(limit);
+                        let evt = diag::RootDaemonWireEvent::RecentLogs(entries);
                         write_bincode_frame_async(&mut write_half, &evt).await?;
                     }
                 }
             }
-            frame = log_rx.recv(), if upgraded => {
-                match frame {
+            log_result = log_rx.recv() => {
+                match log_result {
                     Ok(frame) => write_half.write_all(&frame).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "root daemon log client lagged");
@@ -4049,6 +4186,7 @@ fn spawn_daemon_process(
             let _ = dup2(stderr_w, 2);
             let _ = nix::unistd::close(stdout_w);
             let _ = nix::unistd::close(stderr_w);
+            let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
             if matches!(args.ns, diag::NamespaceSpawn::Inside) {
                 enter_ns(ns_alive, &ns_alive.bind_mount)?;
@@ -4579,23 +4717,23 @@ fn enter_all_profile_namespaces_of_pid(pid: u32) -> Result<()> {
     Ok(())
 }
 
-async fn kill_and_wait_for_exit_async(pid: u32, timeout: Duration) -> bool {
-    if pid == 0 {
+async fn kill_and_wait_for_exit_async(task_pgid: u32, timeout: Duration) -> bool {
+    if task_pgid == 0 {
         return false;
     }
 
-    let target = Pid::from_raw(pid as i32);
+    let target = Pid::from_raw(-(task_pgid as i32));
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
         if let Err(e) = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL) {
             match e {
                 nix::errno::Errno::ESRCH => {
-                    info!("pid {} is gone (no such process)", pid);
+                    info!("task group {} is gone (no such process)", task_pgid);
                     return true;
                 }
                 _ => {
-                    warn!("failed to send SIGKILL to pid {}: {}", pid, e);
+                    warn!("failed to send SIGKILL to task group {}: {}", task_pgid, e);
                 }
             }
         }
@@ -4606,23 +4744,35 @@ async fn kill_and_wait_for_exit_async(pid: u32, timeout: Duration) -> bool {
             }
             Ok(nix::sys::wait::WaitStatus::Exited(_, _))
             | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
-                info!("pid {} reaped", pid);
-                return true;
+                if unsafe { libc::kill(-(task_pgid as libc::pid_t), 0) } != 0
+                    && nix::errno::Errno::last() == nix::errno::Errno::ESRCH
+                {
+                    info!("task group {} reaped", task_pgid);
+                    return true;
+                }
             }
             Ok(_) => {
-                info!("pid {} ended", pid);
-                return true;
+                if unsafe { libc::kill(-(task_pgid as libc::pid_t), 0) } != 0
+                    && nix::errno::Errno::last() == nix::errno::Errno::ESRCH
+                {
+                    info!("task group {} ended", task_pgid);
+                    return true;
+                }
             }
             Err(nix::errno::Errno::ECHILD) => {
-                info!("pid {} ended (ECHILD)", pid);
-                return true;
+                if unsafe { libc::kill(-(task_pgid as libc::pid_t), 0) } != 0
+                    && nix::errno::Errno::last() == nix::errno::Errno::ESRCH
+                {
+                    info!("task group {} ended (ECHILD)", task_pgid);
+                    return true;
+                }
             }
             Err(nix::errno::Errno::ESRCH) => {
-                info!("pid {} is gone (ESRCH)", pid);
+                info!("task group {} is gone (ESRCH)", task_pgid);
                 return true;
             }
             Err(e) => {
-                warn!("waitpid for pid {} failed: {}", pid, e);
+                warn!("waitpid for task group {} failed: {}", task_pgid, e);
             }
         }
 
@@ -4632,36 +4782,36 @@ async fn kill_and_wait_for_exit_async(pid: u32, timeout: Duration) -> bool {
     false
 }
 
-/// Wait for all tracked child processes to exit, driving each with
+/// Wait for all tracked task groups to exit, driving each with
 /// `kill_and_wait_for_exit_async` concurrently via `FuturesUnordered`.
-/// Updates `state` by reaping dead children when done.
+/// Updates `state` by reaping dead task groups when done.
 async fn wait_all_children_async(state: &Arc<ArcSwap<UpDaemonState>>, timeout: Duration) {
     use futures::StreamExt as _;
 
-    let pids: Vec<u32> = {
+    let task_pgids: Vec<u32> = {
         let s = state.load();
-        // serve is stored in process_list.processes under its own PID;
+        // serve is stored in process_list.processes under its own task pgid;
         // no extra chain required.
         s.process_list
             .processes
             .iter()
-            .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed(_)))
-            .map(|(&pid, _)| pid)
+            .filter(|(_, e)| !matches!(e.status, diag::ProcessStatus::Killed))
+            .map(|(&task_pgid, _)| task_pgid)
             .collect()
     };
 
-    if pids.is_empty() {
+    if task_pgids.is_empty() {
         return;
     }
 
-    let mut futs: FuturesUnordered<_> = pids
+    let mut futs: FuturesUnordered<_> = task_pgids
         .into_iter()
-        .map(|pid| kill_and_wait_for_exit_async(pid, timeout))
+        .map(|task_pgid| kill_and_wait_for_exit_async(task_pgid, timeout))
         .collect();
 
     while futs.next().await.is_some() {}
 
-    reap_dead_children_into_state(state);
+    reap_dead_task_groups_into_state(state);
 }
 
 fn write_bincode_frame<T: Serialize>(stream: &mut UnixStream, val: &T) -> Result<()> {

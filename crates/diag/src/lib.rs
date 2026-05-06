@@ -34,6 +34,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
+pub mod personal;
 pub mod summary;
 
 // ── Wire protocol types ──────────────────────────────────────────────
@@ -215,6 +216,9 @@ pub enum RootDaemonOp {
     CreateDirAll {
         path: PathBuf,
     },
+    ReadFile {
+        path: PathBuf,
+    },
     WriteFile {
         path: PathBuf,
         content: Vec<u8>,
@@ -255,6 +259,10 @@ pub enum RootDaemonWireEvent {
 pub enum RootDaemonResult {
     Pong {
         version: String,
+    },
+    ReadFile {
+        content: String,
+        path: PathBuf,
     },
     Ok {
         message: String,
@@ -738,6 +746,16 @@ impl DiagServer {
         } else {
             warn!("diag: failed to encode event: {:?}", event);
         }
+    }
+
+    /// Emit a forwarded log entry that originated in another process.
+    ///
+    /// Unlike [`Self::emit`] with `DiagEvent::Log`, this also appends the entry to the
+    /// process-local log ring so `QueryRecentLogs` can replay logs that arrived before
+    /// any client was attached.
+    pub fn emit_forwarded_log(&self, entry: LogEntry) {
+        push_log_ring(&entry);
+        self.emit(DiagEvent::Log(entry));
     }
 
     /// Get the current value of the connection-tracking flag.
@@ -1295,6 +1313,7 @@ pub struct SpawnArgs {
     pub exec: Option<String>,
     pub cwd: Option<PathBuf>,
     pub gids: Vec<u32>,
+    /// args[0] should be executable name
     pub args: Vec<String>,
     /// Optional process output ring buffer limit.
     /// For PTY mode this is retained bytes; for output mode this is retained log entries.
@@ -1362,30 +1381,30 @@ pub enum DaemonRequest {
     SpawnPty {
         args: SpawnArgs,
     },
-    /// Attach this client connection to PTY output stream for `pid`.
+    /// Attach this client connection to PTY output stream for `task_pgid`.
     AttachPty {
-        pid: u32,
+        task_pgid: u32,
     },
-    /// Detach this client connection from PTY output stream for `pid`.
+    /// Detach this client connection from PTY output stream for `task_pgid`.
     DetachPty {
-        pid: u32,
+        task_pgid: u32,
     },
     /// Write raw bytes to a PTY child's stdin.
     PtyInput {
-        pid: u32,
+        task_pgid: u32,
         data: Vec<u8>,
     },
     /// Notify PTY resize in character cells.
     PtyResize {
-        pid: u32,
+        task_pgid: u32,
         cols: u16,
         rows: u16,
     },
     /// Request current process list snapshot
     GetProcessList,
-    /// Kill a child process by PID
+    /// Kill a managed task by its process group id.
     Kill {
-        pid: u32,
+        task_pgid: u32,
     },
     /// Ping the daemon and expect a Pong response (useful for liveness checks)
     Ping,
@@ -1393,9 +1412,10 @@ pub enum DaemonRequest {
     /// Request the most-recent `limit` log entries from the up-daemon ring buffer.
     /// The server responds immediately with `DaemonEvent::RecentLogs`.
     QueryRecentLogs { limit: usize },
-    /// Request the most-recent `limit` raw stdout/stderr lines captured from process `pid`.
+    /// Request the most-recent `limit` raw stdout/stderr lines captured from the managed task `task_pgid`.
     /// The server responds immediately with `DaemonEvent::RawLogs`.
-    QueryRawLogs { pid: u32, limit: usize },
+    QueryRawLogs { task_pgid: u32, limit: usize },
+    Personal(personal::PersonalDaemonRequest),
 }
 
 /// Stable control requests available across protocol versions.
@@ -1428,11 +1448,11 @@ pub struct SpawnCliType {
 /// Snapshot of all managed processes transmitted on state change
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonEvent {
-    /// Child process was spawned
-    Spawned { pid: u32 },
-    /// Child process exited
-    ProcessExit { pid: u32 },
-    /// Snapshot of all managed processes (live and dead)
+    /// Managed task was spawned.
+    Spawned { task_pgid: u32 },
+    /// Managed task exited.
+    ProcessExit { task_pgid: u32 },
+    /// Snapshot of all managed tasks (live and dead)
     ProcessListSnapshot(ProcessListSnapshot),
     /// Error response
     Error { msg: String },
@@ -1445,13 +1465,14 @@ pub enum DaemonEvent {
     /// Historical log entries from the up-daemon ring buffer.
     /// Sent in response to `DaemonRequest::QueryRecentLogs`.
     RecentLogs(Vec<LogEntry>),
-    /// Raw stdout/stderr lines captured from a managed process.
+    /// Raw stdout/stderr lines captured from a managed task.
     /// Sent in response to `DaemonRequest::QueryRawLogs`.
-    RawLogs { pid: u32, logs: Vec<RawLog> },
+    RawLogs { task_pgid: u32, logs: Vec<RawLog> },
     /// Raw PTY bytes for a managed PTY child.
-    PtyOutput { pid: u32, data: Vec<u8> },
+    PtyOutput { task_pgid: u32, data: Vec<u8> },
     /// Initial PTY scrollback bytes sent on successful attach.
-    PtyScrollback { pid: u32, data: Vec<u8> },
+    PtyScrollback { task_pgid: u32, data: Vec<u8> },
+    Personal(personal::PersonalDaemonEvent),
 }
 
 /// Stable control responses available across protocol versions.
@@ -1478,22 +1499,11 @@ pub enum UpWireEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ProcessStatus {
-    Alive(u32),
-    Terminating(u32),
-    Killed(u32),
+    Alive,
+    Terminating,
+    Killed,
     #[default]
     Vacant,
-}
-
-impl ProcessStatus {
-    pub fn pid(&self) -> Option<u32> {
-        match self {
-            ProcessStatus::Alive(pid)
-            | ProcessStatus::Terminating(pid)
-            | ProcessStatus::Killed(pid) => Some(*pid),
-            ProcessStatus::Vacant => None,
-        }
-    }
 }
 
 /// Information about a spawned process (may be dead)
@@ -1501,6 +1511,8 @@ impl ProcessStatus {
 pub struct ProcessEntry {
     pub meta: SpawnedEntry,
     pub spawned_at: SystemTime,
+    /// Managed-task identity. Every tracked task is its own process-group leader.
+    pub task_pgid: u32,
     pub status: ProcessStatus,
 }
 
@@ -1514,12 +1526,13 @@ pub enum SpawnedEntry {
 /// Snapshot of the process list sent in `DaemonEvent::ProcessListSnapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessListSnapshot {
+    /// Managed tasks keyed by task process-group id.
     pub procs: BTreeMap<u32, ProcessEntry>,
-    /// PID in procs
+    /// `sp serve` task pgid in `procs`
     pub serve: u32,
 }
 
-/// In-memory snapshot of all managed processes (pid -> entry)
+/// In-memory snapshot of all managed tasks (task pgid -> entry)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessList {
     pub processes: BTreeMap<u32, ProcessEntry>,

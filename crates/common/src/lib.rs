@@ -135,6 +135,12 @@ pub mod state_paths {
         persist_root().join("wrapped_binaries.json")
     }
 
+    /// Personal constants config path.
+    /// Returns /nsp3/constants.json
+    pub fn constants_config() -> PathBuf {
+        persist_root().join("constants.json")
+    }
+
     /// Centralized Clash state path
     /// Returns /nsp3/uplink/clash.json
     pub fn uplink_clash_state() -> PathBuf {

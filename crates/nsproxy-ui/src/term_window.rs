@@ -467,7 +467,7 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, shared: Arc<Shared
                             if let Some(active_writer) = writer.as_mut() {
                                 if prev.pid != next.pid || prev.profile != next.profile {
                                     let _ = active_writer
-                                        .send_unstable_request(&DaemonRequest::DetachPty { pid: prev.pid })
+                                        .send_unstable_request(&DaemonRequest::DetachPty { task_pgid: prev.pid })
                                         .await;
                                 }
                             }
@@ -487,7 +487,7 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, shared: Arc<Shared
                         if let Some(prev) = target.take() {
                             if let Some(active_writer) = writer.as_mut() {
                                 let _ = active_writer
-                                    .send_unstable_request(&DaemonRequest::DetachPty { pid: prev.pid })
+                                    .send_unstable_request(&DaemonRequest::DetachPty { task_pgid: prev.pid })
                                     .await;
                             }
                         }
@@ -504,7 +504,7 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, shared: Arc<Shared
                     BackendCommand::Input(data) => {
                         if let (Some(active_target), Some(active_writer)) = (target.as_ref(), writer.as_mut()) {
                             if let Err(err) = active_writer
-                                .send_unstable_request(&DaemonRequest::PtyInput { pid: active_target.pid, data })
+                                .send_unstable_request(&DaemonRequest::PtyInput { task_pgid: active_target.pid, data })
                                 .await
                             {
                                 warn!(%err, pid = active_target.pid, "terminal input send failed");
@@ -518,7 +518,7 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, shared: Arc<Shared
                         if let (Some(active_target), Some(active_writer)) = (target.as_ref(), writer.as_mut()) {
                             if let Err(err) = active_writer
                                 .send_unstable_request(&DaemonRequest::PtyResize {
-                                    pid: active_target.pid,
+                                    task_pgid: active_target.pid,
                                     cols,
                                     rows,
                                 })
@@ -577,7 +577,7 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, shared: Arc<Shared
 
     if let (Some(active_target), Some(active_writer)) = (target.as_ref(), writer.as_mut()) {
         let _ = active_writer
-            .send_unstable_request(&DaemonRequest::DetachPty { pid: active_target.pid })
+            .send_unstable_request(&DaemonRequest::DetachPty { task_pgid: active_target.pid })
             .await;
     }
     shared.request_close();
@@ -616,7 +616,7 @@ async fn ensure_attached(
 
     if let Some(active_writer) = writer.as_mut() {
         if let Err(err) = active_writer
-            .send_unstable_request(&DaemonRequest::AttachPty { pid: active_target.pid })
+            .send_unstable_request(&DaemonRequest::AttachPty { task_pgid: active_target.pid })
             .await
         {
             shared.set_status(Some(format!(
@@ -643,13 +643,13 @@ fn handle_up_event(
     };
 
     match event {
-        DaemonEvent::PtyScrollback { pid, data } | DaemonEvent::PtyOutput { pid, data }
-            if pid == active_target.pid =>
+        DaemonEvent::PtyScrollback { task_pgid, data } | DaemonEvent::PtyOutput { task_pgid, data }
+            if task_pgid == active_target.pid =>
         {
             shared.append_incoming(&data);
             shared.set_status(None);
         }
-        DaemonEvent::ProcessExit { pid } if pid == active_target.pid => {
+        DaemonEvent::ProcessExit { task_pgid } if task_pgid == active_target.pid => {
             shared.set_status(Some(format!(
                 "Process {} / PID {} exited.",
                 active_target.profile, active_target.pid
