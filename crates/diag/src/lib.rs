@@ -13,6 +13,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs::OpenOptions,
     io::Write,
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream as StdUnixStream,
@@ -1081,6 +1082,20 @@ static SERVE_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std:
 /// stream. The parent process can decode and relay those entries into the normal diag path.
 static CHILD_LOG_FORWARD: OnceLock<Arc<Mutex<StdUnixStream>>> = OnceLock::new();
 
+/// Per-process file-backed log ring state.
+///
+/// This mirrors the in-memory ring buffer to a JSONL file under the global persist root so the
+/// last emitted breadcrumbs survive socket-path failures and abrupt process death.
+static FILE_LOG_RING: OnceLock<Arc<Mutex<FileLogRingState>>> = OnceLock::new();
+
+const FILE_LOG_COMPACT_INTERVAL: usize = 128;
+
+struct FileLogRingState {
+    path: PathBuf,
+    approx_entries: usize,
+    writes_since_compact: usize,
+}
+
 /// Initialise the global up-daemon log broadcast channel.
 /// Safe to call multiple times; only the first call takes effect.
 pub fn init_up_log_broadcast() {
@@ -1101,6 +1116,42 @@ pub fn init_root_daemon_log_broadcast() {
 /// stream and the parent relays them as ordinary diag log events.
 pub fn install_child_log_forward(stream: StdUnixStream) {
     let _ = CHILD_LOG_FORWARD.set(Arc::new(Mutex::new(stream)));
+}
+
+/// Enable the per-process file-backed log ring for the current process.
+///
+/// The sink is intentionally per-process and low-complexity: each log entry is appended to a
+/// JSONL file, and the file is periodically compacted back to the in-memory ring snapshot.
+pub fn enable_process_log_file(process_label: &str) -> Result<PathBuf> {
+    let path = state_paths::process_log_file(process_label, std::process::id());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+
+    let state = Arc::new(Mutex::new(FileLogRingState {
+        path: path.clone(),
+        approx_entries: 0,
+        writes_since_compact: 0,
+    }));
+
+    match FILE_LOG_RING.set(state) {
+        Ok(()) => Ok(path),
+        Err(_) => current_process_log_path()
+            .ok_or_else(|| anyhow::anyhow!("process log file sink already configured")),
+    }
+}
+
+/// Return the current process file-backed log path when enabled.
+pub fn current_process_log_path() -> Option<PathBuf> {
+    FILE_LOG_RING
+        .get()
+        .and_then(|state| state.lock().ok().map(|guard| guard.path.clone()))
 }
 
 /// Subscribe to the up-daemon log broadcast, receiving pre-encoded `DaemonEvent::Log` frames.
@@ -1147,11 +1198,11 @@ fn push_log_ring(entry: &LogEntry) {
 /// Use this to serve `ControlCommand::QueryRecentLogs` / `DaemonRequest::QueryRecentLogs`.
 pub fn query_recent_logs(limit: usize) -> Vec<LogEntry> {
     match log_ring().lock() {
-        Ok(guard) => {
+        Ok(guard) if !guard.is_empty() => {
             let skip = guard.len().saturating_sub(limit);
             guard.iter().skip(skip).cloned().collect()
         }
-        Err(_) => vec![],
+        Ok(_) | Err(_) => query_recent_file_logs(limit),
     }
 }
 
@@ -1184,6 +1235,7 @@ where
 
         // Always push to the in-process ring buffer so clients can query history.
         push_log_ring(&entry);
+        sync_file_log_ring(&entry);
 
         // Forked children can forward log entries to their parent, which then re-emits them
         // through the normal diag/UI path.
@@ -1294,6 +1346,88 @@ impl tracing::field::Visit for LogVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         self.record_rendered(field, format!("{:?}", value));
     }
+}
+
+fn append_file_log_entry(path: &Path, entry: &LogEntry) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, entry)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn snapshot_log_ring() -> Vec<LogEntry> {
+    match log_ring().lock() {
+        Ok(guard) => guard.iter().cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn rewrite_file_log_snapshot(path: &Path, snapshot: &[LogEntry]) -> Result<()> {
+    let tmp_path = path.with_extension("jsonl.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        for entry in snapshot {
+            serde_json::to_writer(&mut file, entry)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+    }
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn compact_file_log_ring() {
+    let snapshot = snapshot_log_ring();
+    if let Some(file_ring) = FILE_LOG_RING.get() {
+        if let Ok(mut state) = file_ring.lock() {
+            if rewrite_file_log_snapshot(&state.path, &snapshot).is_ok() {
+                state.approx_entries = snapshot.len();
+                state.writes_since_compact = 0;
+            }
+        }
+    }
+}
+
+fn sync_file_log_ring(entry: &LogEntry) {
+    let mut should_compact = false;
+
+    if let Some(file_ring) = FILE_LOG_RING.get() {
+        if let Ok(mut state) = file_ring.lock() {
+            if append_file_log_entry(&state.path, entry).is_ok() {
+                state.approx_entries = state.approx_entries.saturating_add(1);
+                state.writes_since_compact = state.writes_since_compact.saturating_add(1);
+                should_compact = state.approx_entries > LOG_RING_CAP
+                    || state.writes_since_compact >= FILE_LOG_COMPACT_INTERVAL;
+            }
+        }
+    }
+
+    if should_compact {
+        compact_file_log_ring();
+    }
+}
+
+fn query_recent_file_logs(limit: usize) -> Vec<LogEntry> {
+    let Some(path) = current_process_log_path() else {
+        return vec![];
+    };
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+
+    let mut entries = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<LogEntry>(line).ok())
+        .collect::<Vec<_>>();
+    let skip = entries.len().saturating_sub(limit);
+    entries.drain(0..skip);
+    entries
 }
 
 // ── Atomic connection-id generator ───────────────────────────────────
@@ -1408,6 +1542,8 @@ pub enum DaemonRequest {
     },
     /// Ping the daemon and expect a Pong response (useful for liveness checks)
     Ping,
+    /// Ensure the profile-scoped private D-Bus daemon is running.
+    EnsureDbus,
     Stop,
     /// Request the most-recent `limit` log entries from the up-daemon ring buffer.
     /// The server responds immediately with `DaemonEvent::RecentLogs`.
@@ -1440,9 +1576,16 @@ pub enum UpWireRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpawnCliKind {
+    Serve,
+    Dbus,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnCliType {
     pub cli_bincode: Vec<u8>,
-    pub is_serve: bool,
+    pub kind: SpawnCliKind,
 }
 
 /// Snapshot of all managed processes transmitted on state change

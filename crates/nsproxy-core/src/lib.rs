@@ -1164,6 +1164,9 @@ pub struct TemplateConfig {
     /// Browser profile name for env isolation (set NSPROXY_PROFILE_BROWSER)
     #[serde(default)]
     pub browser_profile: Option<String>,
+    /// Route session-bus traffic through a private per-runtime D-Bus.
+    #[serde(default)]
+    pub dbus: bool,
     #[serde(default)]
     pub rootfs: Rootfs,
 }
@@ -1191,6 +1194,7 @@ impl Default for TemplateConfig {
             hot_init: Some(HotConfig::default()),
             sargs: ShellArgs::default(),
             browser_profile: None,
+            dbus: false,
             rootfs: Rootfs::Default,
         }
     }
@@ -1367,6 +1371,7 @@ impl TemplateConfig {
             },
             chmod: Vec::new(),
             browser_profile: None,
+            dbus: false,
             rootfs: Rootfs::Default,
         })
     }
@@ -1693,6 +1698,7 @@ pub enum CliDaemonRequest {
     },
     /// Liveness ping
     Ping,
+    EnsureDbus,
     GetProcessList,
     Kill {
         task_pgid: u32,
@@ -1707,6 +1713,7 @@ impl std::str::FromStr for CliDaemonRequest {
         match t.to_ascii_lowercase().as_str() {
             "stop" => Ok(CliDaemonRequest::Stop),
             "ping" => Ok(CliDaemonRequest::Ping),
+            "ensuredbus" | "ensure_dbus" | "dbus" => Ok(CliDaemonRequest::EnsureDbus),
             "get" | "getprocesslist" | "get_process_list" | "processlist" => {
                 Ok(CliDaemonRequest::GetProcessList)
             }
@@ -1927,6 +1934,12 @@ pub enum MainCommand {
         /// This was intended for Geph, because at the point of writing Geph doesn't work with IPv6 properly
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         internal_dns_server: Option<bool>,
+    },
+    /// Run a private per-runtime session D-Bus inside an already-up profile namespace.
+    Dbus {
+        /// Profile name (must have been brought up with `up` first)
+        #[arg(long)]
+        profile: String,
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {

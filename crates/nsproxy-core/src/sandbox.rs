@@ -80,6 +80,14 @@ fn reconcile_bind_target(mount_info: &MountInfo, source: &Path, target: &Path) -
     Ok(true)
 }
 
+fn path_exists_no_follow(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub fn apply_mounts(vars: &PathExpansionState, mounts: &[ProfileMount]) -> Result<()> {
     let mount_info = MountInfo::load()?;
 
@@ -163,9 +171,17 @@ fn populate_writable_etc(new_root: &Path) -> Result<()> {
         if meta.file_type().is_symlink() {
             info!("read_link({:?})", source);
             let link_target = std::fs::read_link(&source)?;
-            if !target.exists() {
-                info!("symlink({:?} -> {:?})", link_target, target);
-                fs::symlink(&link_target, &target)?;
+            let sandbox_target = if link_target.is_absolute() {
+                link_target.clone()
+            } else {
+                source
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/"))
+                    .join(&link_target)
+            };
+            if !path_exists_no_follow(&target)? {
+                info!("symlink({:?} -> {:?})", sandbox_target, target);
+                fs::symlink(&sandbox_target, &target)?;
             }
             continue;
         }
@@ -494,6 +510,20 @@ mod tests {
         let meta = std::fs::metadata(&target).expect("target directory should exist");
         assert!(meta.is_dir(), "target should be created as a directory");
         assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn path_exists_no_follow_detects_broken_symlink() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("test dir should be created");
+        let link = root.join("broken-link");
+
+        fs::symlink(root.join("missing-target"), &link).expect("symlink should be created");
+
+        assert!(path_exists_no_follow(&link).expect("lstat should succeed"));
+        assert!(!link.exists(), "broken symlink should not be followed by Path::exists");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -65,7 +65,6 @@ version = "0.3.5"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ple1n/nsproxy"
-
 [profile.dev]
 panic = "abort"
 opt-level = 0       # No optimizations → fastest compile
@@ -90,6 +89,7 @@ nsproxy-hickory-recursor = { path = "../hickory-dns/crates/recursor" }
 nsproxy-hickory-server = { path = "../hickory-dns/crates/server" }
 nsproxy-hickory-dns = { path = "../hickory-dns/bin" }
 nsproxy-hickory-util = { path = "../hickory-dns/util" }
+busd = { path = "crates/busd" }
 
 [workspace.dependencies]
 tun-rs = { version = "2.7.2", features = ["async_io"] }

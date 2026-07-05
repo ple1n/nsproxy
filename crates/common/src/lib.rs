@@ -175,6 +175,25 @@ pub mod state_paths {
     pub fn namespaces_registry() -> PathBuf {
         persist_root().join("namespaces.json")
     }
+
+    /// Root directory for per-process diagnostic logs.
+    /// Returns /nsp3/logs
+    pub fn logs_root() -> PathBuf {
+        persist_root().join("logs")
+    }
+
+    /// Per-process diagnostic log path.
+    /// Returns /nsp3/logs/{process_label}-{pid}.jsonl
+    pub fn process_log_file(process_label: &str, pid: u32) -> PathBuf {
+        let safe_label: String = process_label
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+                _ => '_',
+            })
+            .collect();
+        logs_root().join(format!("{}-{}.jsonl", safe_label, pid))
+    }
 }
 
 pub fn current_boot_time_secs() -> Result<u64> {
@@ -623,9 +642,9 @@ where
 pub fn trace_spawn_result<F, T, E>(
     task_name: &'static str,
     future: F,
-) -> impl Future<Output = ()> + Send + 'static
+) -> impl Future<Output = ()> + Send
 where
-    F: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    F: Future<Output = std::result::Result<T, E>> + Send,
     E: Display,
 {
     let location = std::panic::Location::caller();

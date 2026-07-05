@@ -129,6 +129,7 @@ impl<'a> ExactSizeIterator for CommandEnvs<'a> {
 pub static ENV_PROFILE: &'static str = "NSPROXY_PROFILE_BROWSER";
 pub static ENV_CONTAINER: &'static str = "NSPROXY_PROFILE";
 pub static ENV_NSWRAP: &'static str = "NSWRAP";
+pub static ENV_DBUS_SESSION_BUS_ADDRESS: &'static str = "DBUS_SESSION_BUS_ADDRESS";
 
 // For mounted paths
 pub static ENV_NS: &'static str = "NSROXY_NS";

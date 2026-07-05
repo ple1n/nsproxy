@@ -61,3 +61,6 @@
 [submodule "crates/hickory-dns"]
 	path = crates/hickory-dns
 	url = https://github.com/ple1n/hickory-dns
+[submodule "crates/busd"]
+	path = crates/busd
+	url = https://github.com/z-galaxy/busd.git

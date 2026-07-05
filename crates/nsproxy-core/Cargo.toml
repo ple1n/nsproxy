@@ -114,6 +114,7 @@ nsproxy-hickory-client = "0.25"
 nsproxy-hickory-dns = "0.25"
 nsproxy-hickory-server = { version = "0.25", features = ["recursor", "resolver"]}
 nsproxy-hickory-resolver = { version = "0.25", features = ["tokio"] }
+busd = "0.5.0"
 
 [lints.clippy]
 all = "allow"

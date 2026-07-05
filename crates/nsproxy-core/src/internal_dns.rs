@@ -6,6 +6,7 @@ use hickory_server::authority::Catalog;
 use hickory_server::authority::MessageResponse;
 use hickory_server::server::ServerFuture;
 use hickory_server::store::forwarder::{ForwardAuthority, ForwardConfig};
+use nsproxy_common::trace_spawn_result;
 use std::io;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -36,9 +37,12 @@ pub async fn run_dns_ipv4_only() -> anyhow::Result<()> {
     let socket = UdpSocket::bind("127.0.0.1:53").await?;
     server.register_socket(socket);
 
-    server.block_until_done().await?;
     warn!("Internal DNS running");
 
+    loop {
+        trace_spawn_result("dns server", server.block_until_done()).await
+    }
+    
     Ok(())
 }
 
@@ -64,7 +68,10 @@ impl RequestHandler for RequestProxy {
         request: &mut Request,
         mut response_handle: R,
     ) -> ResponseInfo {
-        request.queries.queries.retain(|query| query.query_type() != RecordType::AAAA);
+        request
+            .queries
+            .queries
+            .retain(|query| query.query_type() != RecordType::AAAA);
 
         self.internal.handle_request(request, response_handle).await
     }
@@ -109,7 +116,9 @@ impl<R: ResponseHandler> ResponseHandler for ResponseProxy<R> {
                 name_servers: response
                     .name_servers
                     .filter(|record| record.record_type() != RecordType::AAAA),
-                soa: response.soa.filter(|record| record.record_type() != RecordType::AAAA),
+                soa: response
+                    .soa
+                    .filter(|record| record.record_type() != RecordType::AAAA),
                 additionals: response
                     .additionals
                     .filter(|record| record.record_type() != RecordType::AAAA),

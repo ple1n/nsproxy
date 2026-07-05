@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "sandbox_mode": "Pivot",
+  "mounts": [
+    {
+      "source": "@/.mozilla/firefox",
+      "target": "~/.mozilla/firefox"
+    },
+    {
+      "source": "@/.cache/mozilla/firefox",
+      "target": "~/.cache/mozilla/firefox"
+    },
+    {
+      "source": "@/.mozilla/native-messaging-hosts",
+      "target": "~/.mozilla/native-messaging-hosts",
+      "skip_missing": true
+    },
+    {
+      "source": "/run/user/1000/wayland-0",
+      "target": "/run/user/1000/wayland-0",
+      "skip_missing": true
+    },
+    {
+      "source": "/run/user/1000/wayland-1",
+      "target": "/run/user/1000/wayland-1",
+      "skip_missing": true
+    },
+    {
+      "source": "/run/user/1000/pipewire-0",
+      "target": "/run/user/1000/pipewire-0"
+    },
+    {
+      "source": "/run/user/1000/pipewire-0-manager",
+      "target": "/run/user/1000/pipewire-0-manager"
+    },
+    {
+      "source": "/run/user/1000/pulse",
+      "target": "/run/user/1000/pulse"
+    },
+    {
+      "source": "/run/user/1000/dconf",
+      "target": "/run/user/1000/dconf"
+    },
+    {
+      "source": "/run/user/1000/gvfs",
+      "target": "/run/user/1000/gvfs"
+    },
+    {
+      "source": "/run/user/1000/systemd",
+      "target": "/run/user/1000/systemd"
+    },
+    {
+      "source": "/run/systemd",
+      "target": "/run/systemd"
+    },
+    {
+      "source": "/sys/fs/cgroup",
+      "target": "/sys/fs/cgroup"
+    }
+  ],
+  "chmod": [
+    {
+      "path": "/run/user/1000",
+      "uid": 1000,
+      "gid": 1000
+    },
+    {
+      "path": "/home",
+      "uid": 1000,
+      "gid": 1000,
+      "mkdir": true
+    },
+    {
+      "path": "~/.mozilla",
+      "uid": 1000,
+      "gid": 1000,
+      "mkdir": true
+    },
+    {
+      "path": "~/.cache",
+      "uid": 1000,
+      "gid": 1000,
+      "mkdir": true
+    }
+  ],
+  "env": {
+    "NO_AT_BRIDGE": "1",
+    "GIO_USE_VFS": "local"
+  },
+  "inherit_env": true,
+  "dbus": true,
+  "hot": "@/hot.json",
+  "sargs": {
+    "uid": null,
+    "gid": null,
+    "shell": null,
+    "cwd": null,
+    "gids": [],
+    "args": []
+  },
+  "browser_profile": "firefox"
+}

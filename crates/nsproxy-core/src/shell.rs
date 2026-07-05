@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
 use crate::{
-    env::{CommandEnv, ENV_CONTAINER, ENV_NS, ENV_PROFILE},
+    env::{CommandEnv, ENV_CONTAINER, ENV_DBUS_SESSION_BUS_ADDRESS, ENV_NS, ENV_PROFILE},
     prelude::*,
     sys::{Clone3Result, NSEnter, clone3},
 };
@@ -166,6 +166,22 @@ impl ShellPrefs {
         }
         self.env.push_front(
             CString::from_str(&format!("{}={}", ENV_NS, ns.unwrap_or("UNSPEC"))).unwrap(),
+        );
+    }
+    pub fn set_dbus_session_bus_env(&mut self, address: &str) {
+        unsafe {
+            std::env::set_var(ENV_DBUS_SESSION_BUS_ADDRESS, address);
+        }
+        self.env.retain(|env_entry| {
+            if let Ok(s) = env_entry.to_str() {
+                !s.starts_with(&format!("{}=", ENV_DBUS_SESSION_BUS_ADDRESS))
+            } else {
+                true
+            }
+        });
+        self.env.push_front(
+            CString::from_str(&format!("{}={}", ENV_DBUS_SESSION_BUS_ADDRESS, address))
+                .unwrap(),
         );
     }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations

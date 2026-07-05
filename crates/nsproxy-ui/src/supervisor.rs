@@ -23,6 +23,7 @@ use nsproxy_common::stats::ProxyStats;
 use nsproxy_common::NsAlive;
 use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_core::cmd_common::read_ns_alive;
+use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_core::sandbox::SandboxStatus;
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{cli_to_inheritable_fd, to_cstr, Cli, HotConfig, MainCommand, TemplateConfig};
@@ -1009,6 +1010,8 @@ struct Supervisor {
     pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
     sandbox_in_flight: HashSet<ContainerName>,
     pending_start_sandbox: HashSet<ContainerName>,
+    /// Profiles that already have a sandbox_status.json file watcher spawned.
+    sandbox_status_watchers: HashSet<ContainerName>,
     /// Last computed "open raw logs for this process" target sent to UI.
     auto_open_logs_target: Option<AutoOpenLogsTarget>,
     /// Monotonic token for auto-open targets so UI can consume each target once.
@@ -1048,6 +1051,9 @@ impl Supervisor {
     fn start_up_profile(&mut self, profile: ContainerName) {
         info!(profile = profile.as_str(), "starting sp up flow");
         self.set_container_lifecycle(&profile, ContainerLifecycleState::Starting);
+        // Clear stale process list from any previous sp up instance so restart
+        // always shows a clean slate — new sp up sends its own fresh snapshot.
+        self.process_list_snapshot.remove(&profile);
         self.pending_start_sandbox.insert(profile.clone());
         self.reset_backoff(&profile);
         let cli = Cli {
@@ -1217,6 +1223,7 @@ impl Supervisor {
             pending_auto_open_logs: HashMap::new(),
             sandbox_in_flight: HashSet::new(),
             pending_start_sandbox: HashSet::new(),
+            sandbox_status_watchers: HashSet::new(),
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
             control_sock_path,
@@ -1290,6 +1297,64 @@ impl Supervisor {
         self.set_container_lifecycle(profile, next);
     }
 
+    /// Spawn a one-time file-watcher for `sandbox_status.json` for `profile` if not already running.
+    fn ensure_sandbox_status_watcher(&mut self, profile: &ContainerName) {
+        if self.sandbox_status_watchers.contains(profile) {
+            return;
+        }
+        self.sandbox_status_watchers.insert(profile.clone());
+        let path = state_paths::sandbox_status(profile.as_str());
+        let profile = profile.clone();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            // Watch the parent directory so we also catch the initial create.
+            let watch_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut watcher = match RecommendedWatcher::new(
+                move |res: std::result::Result<Event, notify::Error>| {
+                    if let Ok(ev) = res {
+                        let relevant = matches!(
+                            ev.kind,
+                            EventKind::Modify(ModifyKind::Data(_))
+                                | EventKind::Create(_)
+                                | EventKind::Remove(_)
+                        ) && ev.paths.iter().any(|p| p.ends_with("sandbox_status.json"));
+                        if relevant {
+                            let _ = tx.try_send(());
+                        }
+                    }
+                },
+                notify::Config::default(),
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(profile = profile.as_str(), "sandbox_status watcher init failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = watcher.watch(&watch_dir, notify::RecursiveMode::NonRecursive) {
+                warn!(profile = profile.as_str(), "sandbox_status watcher start failed: {e}");
+                return;
+            }
+            while rx.recv().await.is_some() {
+                // Debounce: drain any rapid-fire extras.
+                while let Ok(()) = rx.try_recv() {}
+                let status = match tokio::fs::read_to_string(&path).await {
+                    Ok(content) => serde_json::from_str::<SandboxStatus>(&content).ok(),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        warn!(profile = profile.as_str(), "sandbox_status read error: {e}");
+                        continue;
+                    }
+                };
+                let _ = event_tx.send(SupervisorEvent::SandboxStatusChanged {
+                    profile: profile.clone(),
+                    status,
+                });
+            }
+        });
+    }
+
     /// Re-read hotconfig and template from disk for `profile` and store in the cache.
     /// Called on explicit Load/Reload commands.  `emit_snapshot` reads from this cache.
     fn refresh_config_cache(&mut self, profile: &ContainerName) {
@@ -1312,6 +1377,7 @@ impl Supervisor {
                 template_error,
             },
         );
+        self.ensure_sandbox_status_watcher(profile);
     }
 
     fn spawn_sandbox_reconcile(&mut self, profile: &ContainerName, reason: &str) {
@@ -1415,6 +1481,45 @@ impl Supervisor {
                     ),
                 );
             }
+        }
+    }
+
+    /// Send `EnsureDbus` to sp up for `profile` if:
+    /// - the profile has `dbus: true` in TemplateConfig
+    /// - the persisted sandbox status shows the sandbox is already `Pivoted`
+    /// - sp up is currently connected
+    fn maybe_ensure_dbus(&mut self, profile: &ContainerName) {
+        let dbus_enabled = load_template_from_disk(profile)
+            .map(|t| t.dbus)
+            .unwrap_or(false);
+        if !dbus_enabled {
+            return;
+        }
+        let sandbox_status = load_sandbox_status_from_disk(profile);
+        let sandbox_ready = sandbox_status.as_ref().is_some_and(|s| {
+            s.detected_state == nsproxy_core::sandbox::SandboxState::Pivoted
+                || s.configured_mode == nsproxy_core::SandboxMode::Overlay
+        });
+        if !sandbox_ready {
+            info!(
+                profile = profile.as_str(),
+                sandbox_status = ?sandbox_status.as_ref().map(|s| (&s.configured_mode, &s.detected_state)),
+                "maybe_ensure_dbus: sandbox not ready yet, skipping"
+            );
+            return;
+        }
+        if let Some(tx) = self.up_cmd.get(profile) {
+            let _ = tx.send(diag::DaemonRequest::EnsureDbus);
+            push_up_log(
+                &mut self.up_logs,
+                profile,
+                plain_log_entry("INFO", "supervisor", "Ensuring sp dbus is running"),
+            );
+        } else {
+            warn!(
+                profile = profile.as_str(),
+                "maybe_ensure_dbus: up_cmd tx not present, cannot send EnsureDbus"
+            );
         }
     }
 
@@ -2180,6 +2285,11 @@ impl Supervisor {
         }
         if child_alive && !had_child_alive && self.pending_start_sandbox.remove(profile) {
             self.spawn_sandbox_reconcile(profile, "container startup");
+        } else if child_alive && !had_child_alive {
+            // Container came alive but no sandbox reconcile was pending (restart after
+            // sandbox already applied).  Check the persisted sandbox status and start
+            // dbus immediately if the sandbox is already pivoted.
+            self.maybe_ensure_dbus(profile);
         }
     }
 
@@ -2671,6 +2781,11 @@ impl Supervisor {
                     self.refresh_profile_status(&profile);
                 }
             }
+            SupervisorEvent::SandboxStatusChanged { profile, status } => {
+                if let Some(cache) = self.config_cache.get_mut(&profile) {
+                    cache.sandbox_status = status;
+                }
+            }
             SupervisorEvent::SandboxFinished {
                 profile,
                 success,
@@ -2692,6 +2807,9 @@ impl Supervisor {
                         },
                     ),
                 );
+                if success {
+                    self.maybe_ensure_dbus(&profile);
+                }
             }
         }
     }
@@ -3348,6 +3466,11 @@ enum SupervisorEvent {
         profile: ContainerName,
         success: bool,
         detail: String,
+    },
+    /// Fired when `sandbox_status.json` on disk changes for a profile.
+    SandboxStatusChanged {
+        profile: ContainerName,
+        status: Option<SandboxStatus>,
     },
 }
 
