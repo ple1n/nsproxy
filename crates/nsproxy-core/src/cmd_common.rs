@@ -6,7 +6,7 @@ use nix::unistd::getresuid;
 use nsproxy_common::{NSSource, current_boot_time_secs};
 use tracing::warn;
 
-use crate::{NsAlive, WrappedBinariesConfig, shell::ShellPrefs, sys::NSEnter};
+use crate::{NsAlive, SandboxMode, WrappedBinariesConfig, sandbox::{SandboxState, SandboxStatus}, shell::ShellPrefs, sys::NSEnter};
 
 fn sanitize_ns_alive_for_current_boot(ns_meta: &Path, mut ns_alive: NsAlive) -> NsAlive {
     let current_boot = match current_boot_time_secs() {
@@ -129,6 +129,28 @@ pub fn enter_ns(ns_alive: &NsAlive, fallback_netns: &Path) -> Result<()> {
         ns.enter(CloneFlags::CLONE_NEWNET)?;
     }
     Ok(())
+}
+
+/// Gated enter: requires a valid same-boot `SandboxStatus`.
+/// For Pivot-mode containers, bails if the sandbox has not been applied yet —
+/// entering an unpivoted container would expose the host filesystem.
+pub fn enter_ns_sandboxed(
+    ns_alive: &NsAlive,
+    sandbox_status: &SandboxStatus,
+    fallback_netns: &Path,
+) -> Result<()> {
+    if sandbox_status.configured_mode == SandboxMode::Pivot
+        && sandbox_status.detected_state != SandboxState::Pivoted
+    {
+        bail!(
+            "refusing to enter container '{}': sandbox mode is Pivot but pivot has not been applied \
+             (detected_state={:?}). Run 'sp sandbox {}' first.",
+            ns_alive.profile_name.as_deref().unwrap_or("?"),
+            sandbox_status.detected_state,
+            ns_alive.profile_name.as_deref().unwrap_or("<profile>"),
+        );
+    }
+    enter_ns(ns_alive, fallback_netns)
 }
 
 pub fn apply_ns_env(shell: &mut ShellPrefs, ns_alive: &NsAlive) {

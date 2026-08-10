@@ -46,14 +46,14 @@ use nsproxy_core::{
     BasisCommand, Cli, DaemonCliRequest, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths,
     PathsBinds, SandboxMode, TemplateConfig, TunMaker,
     cmd_common::{
-        apply_ns_env, check_proxy_mode, enter_ns, read_ns_alive, read_ns_alive_opt,
-        report_clone3_err, update_ns_alive,
+        apply_ns_env, check_proxy_mode, enter_ns, enter_ns_sandboxed, read_ns_alive,
+        read_ns_alive_opt, report_clone3_err, update_ns_alive,
     },
     env::{ENV_DBUS_SESSION_BUS_ADDRESS, ENV_NS, args_deduce_mount, name_to_mount_path},
     hot_reload::{VethIps, sync_links, watch_hot},
     sandbox::{
         apply_chmod, apply_mounts, assert_mount_ns_matches, collect_sandbox_status,
-        write_sandbox_status,
+        read_sandbox_status, write_sandbox_status,
     },
     shell::{ShellArgs, ShellPrefs},
     state_paths,
@@ -178,18 +178,39 @@ fn session_bus_ready(socket_path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket_path).is_ok()
 }
 
-fn profile_uses_dbus(ns_alive: &nsproxy_core::NsAlive) -> bool {
+fn dbus_mode_for_profile(ns_alive: &nsproxy_core::NsAlive) -> nsproxy_core::DbusMode {
     ns_alive
         .profile_name
         .as_ref()
         .and_then(|profile| TemplateConfig::load(&state_paths::profile_config(profile)).ok())
         .map(|template| template.dbus)
-        .unwrap_or(false)
+        .unwrap_or_default()
 }
 
 fn maybe_session_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String> {
     let profile = ns_alive.profile_name.as_deref()?;
-    profile_uses_dbus(ns_alive).then(|| profile_bus_address(profile))
+    match dbus_mode_for_profile(ns_alive) {
+        nsproxy_core::DbusMode::Block => None,
+        nsproxy_core::DbusMode::Pass => std::env::var(ENV_DBUS_SESSION_BUS_ADDRESS).ok(),
+        nsproxy_core::DbusMode::Proxy => Some(profile_bus_address(profile)),
+    }
+}
+
+/// Apply the correct D-Bus environment to `shell_prefs` based on the profile's DbusMode.
+/// Must be called AFTER `shell_prefs.adjust()`:
+/// - Block: strip DBUS_SESSION_BUS_ADDRESS (adjust() captured it from parent env)
+/// - Pass:  do nothing (already inherited from parent env via adjust())
+/// - Proxy: replace with the private per-profile busd socket address
+fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive) {
+    match dbus_mode_for_profile(ns_alive) {
+        nsproxy_core::DbusMode::Block => shell_prefs.strip_dbus_env(),
+        nsproxy_core::DbusMode::Pass => {}
+        nsproxy_core::DbusMode::Proxy => {
+            if let Some(profile) = ns_alive.profile_name.as_deref() {
+                shell_prefs.set_dbus_session_bus_env(&profile_bus_address(profile));
+            }
+        }
+    }
 }
 
 fn build_spawn_env_pairs(
@@ -655,11 +676,12 @@ fn main() -> anyhow::Result<()> {
 
             if let Some(path) = resolved_path {
                 if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
-                    enter_ns(&ns_alive, &path)?;
+                    let profile = ns_alive.profile_name.as_deref().unwrap_or(target.as_str());
+                    let sandbox_status = read_sandbox_status(profile)
+                        .ok_or_else(|| anyhow!("no valid sandbox status for '{}' — run 'sp sandbox {}' first", profile, profile))?;
+                    enter_ns_sandboxed(&ns_alive, &sandbox_status, &path)?;
                     apply_ns_env(&mut shell_prefs, &ns_alive);
-                    if let Some(bus_address) = maybe_session_bus_address(&ns_alive) {
-                        shell_prefs.set_dbus_session_bus_env(&bus_address);
-                    }
+                    apply_dbus_env(&mut shell_prefs, &ns_alive);
                 } else {
                     error!("NS data not found at {:?}", nsdata)
                 }
@@ -1436,9 +1458,8 @@ fn main() -> anyhow::Result<()> {
 
                         if profile_conf.sandbox_mode == SandboxMode::Pivot {
                             let sandbox_status_path = state_paths::sandbox_status(&profile);
-                            let prior_state = std::fs::read_to_string(&sandbox_status_path)
-                                .ok()
-                                .and_then(|s| serde_json::from_str::<nsproxy_core::sandbox::SandboxStatus>(&s).ok())
+                            // read_sandbox_status purges stale (previous-boot) state automatically.
+                            let prior_state = read_sandbox_status(profile.as_str())
                                 .map(|s| s.detected_state);
                             match prior_state {
                                 Some(nsproxy_core::sandbox::SandboxState::Pivoted) => {
@@ -1468,6 +1489,22 @@ fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
+                        } else if profile_conf.sandbox_mode == SandboxMode::Overlay {
+                            // Overlay containers do not go through `sp sandbox`, so
+                            // sandbox_status.json is never written by that path.  Write it
+                            // here during `sp up` so that the daemon can spawn processes
+                            // (sp serve, sp dbus, PTYs, etc.) which all require the file.
+                            let sandbox_status = collect_sandbox_status(
+                                SandboxMode::Overlay,
+                                nsproxy_core::sandbox::SandboxState::NoPivot,
+                                &[],
+                                None,
+                            )?;
+                            write_sandbox_status(&profile, &sandbox_status)?;
+                            info!(
+                                profile = profile.as_str(),
+                                "wrote sandbox_status.json for overlay container"
+                            );
                         }
 
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1495,23 +1532,25 @@ fn main() -> anyhow::Result<()> {
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let bind_mount = state_paths::profile_netns_bind(&profile);
             let profile_dir = state_paths::profile_dir(&profile);
-            let sandbox_root = configured_sandbox_root(&profile)?;
-            let mut sandbox_mounts_removed = !sandbox_root.exists();
+            let sandbox_root = configured_sandbox_root(&profile);
+            let mut sandbox_mounts_removed = sandbox_root.as_ref().map_or(true, |r| !r.exists());
 
             // Kill the keeper process if we know its PID.
             if ns_meta.exists() {
                 if let Ok(content) = std::fs::read_to_string(&ns_meta) {
                     if let Ok(ns_alive) = serde_json::from_str::<nsproxy_core::NsAlive>(&content) {
                         if rm {
-                            match cleanup_sandbox_mounts(&ns_alive, &sandbox_root) {
-                                Ok(()) => {
-                                    sandbox_mounts_removed = true;
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        "failed to detach sandbox-owned mounts for {:?}: {}",
-                                        profile, err
-                                    );
+                            if let Some(ref root) = sandbox_root {
+                                match cleanup_sandbox_mounts(&ns_alive, root) {
+                                    Ok(()) => {
+                                        sandbox_mounts_removed = true;
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            "failed to detach sandbox-owned mounts for {:?}: {}",
+                                            profile, err
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1560,11 +1599,13 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if bind_mount_removed && sandbox_mounts_removed {
-                    if sandbox_root.exists() {
-                        std::fs::remove_dir_all(&sandbox_root)?;
-                        info!("removed profile rootfs directory {:?}", sandbox_root);
-                    } else {
-                        warn!("profile rootfs directory {:?} does not exist", sandbox_root);
+                    if let Some(ref sandbox_root) = sandbox_root {
+                        if sandbox_root.exists() {
+                            std::fs::remove_dir_all(sandbox_root)?;
+                            info!("removed profile rootfs directory {:?}", sandbox_root);
+                        } else {
+                            warn!("profile rootfs directory {:?} does not exist", sandbox_root);
+                        }
                     }
                     if profile_dir.exists() {
                         std::fs::remove_dir_all(&profile_dir)?;
@@ -1617,8 +1658,8 @@ fn main() -> anyhow::Result<()> {
 
             let profile_conf = TemplateConfig::load(&profile_path)?;
             ensure!(
-                profile_conf.dbus,
-                "profile '{}' has dbus disabled in TemplateConfig",
+                profile_conf.dbus == nsproxy_core::DbusMode::Proxy,
+                "profile '{}' dbus mode is not 'proxy' in TemplateConfig",
                 profile
             );
 
@@ -1632,7 +1673,9 @@ fn main() -> anyhow::Result<()> {
                 anyhow!("profile namespace registry entry missing for {}", profile)
             })?;
 
-            enter_ns(&ns_alive, &bind_mount)?;
+            let sandbox_status = read_sandbox_status(&profile)
+                .ok_or_else(|| anyhow!("no valid sandbox status for '{}' — run 'sp sandbox {}' first", profile, profile))?;
+            enter_ns_sandboxed(&ns_alive, &sandbox_status, &bind_mount)?;
 
             // Refuse to run if we are not in the expected mount namespace.
             // This prevents any fs ops from touching the host tree.
@@ -1789,9 +1832,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
                     enter_ns(&ns_alive, &bind_mount)?;
                     apply_ns_env(&mut shell_prefs, &ns_alive);
-                    if let Some(bus_address) = maybe_session_bus_address(&ns_alive) {
-                        shell_prefs.set_dbus_session_bus_env(&bus_address);
-                    }
+                    apply_dbus_env(&mut shell_prefs, &ns_alive);
                 } else {
                     let ns = NSSource::Path(bind_mount.clone());
                     ns.enter(CloneFlags::CLONE_NEWNET)?;
@@ -2999,13 +3040,10 @@ async fn run_up_daemon(
     // This covers both fresh start and restart of an already-sandboxed container.
     {
         let template_path = state_paths::profile_config(profile);
-        let sandbox_status_path = state_paths::sandbox_status(profile);
         let dbus_enabled = TemplateConfig::load(&template_path)
-            .map(|t| t.dbus)
+            .map(|t| t.dbus == nsproxy_core::DbusMode::Proxy)
             .unwrap_or(false);
-        let sandbox_ready = std::fs::read_to_string(&sandbox_status_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<nsproxy_core::sandbox::SandboxStatus>(&s).ok())
+        let sandbox_ready = read_sandbox_status(profile)
             .is_some_and(|s| {
                 s.detected_state == nsproxy_core::sandbox::SandboxState::Pivoted
                     || s.configured_mode == SandboxMode::Overlay
@@ -3016,7 +3054,7 @@ async fn run_up_daemon(
                 "sp up startup: sandbox ready and dbus enabled, spawning sp dbus"
             );
             let template = TemplateConfig::load(&state_paths::profile_config(profile))?;
-            if template.dbus {
+            if template.dbus == nsproxy_core::DbusMode::Proxy {
                 let cli = Cli {
                     conf: None,
                     root: None,
@@ -3028,8 +3066,10 @@ async fn run_up_daemon(
                 };
                 let cli_bytes = bincode::serialize(&cli)?;
                 let ns_alive = read_ns_alive(&ns_meta)?;
+                let sandbox_status = read_sandbox_status(&profile)
+                    .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
                 if let Some((task_pgid, stdout_r, stderr_r)) =
-                    spawn_cli_process(&cli, &ns_alive, diag::NamespaceSpawn::Outside)?
+                    spawn_cli_process(&cli, &ns_alive, &sandbox_status, diag::NamespaceSpawn::Outside)?
                 {
                     let mut new = (*state.load_full()).clone();
                     new.process_list.processes.insert(
@@ -3447,7 +3487,7 @@ async fn handle_up_client(
 
                         if !dbus_running {
                             let template = TemplateConfig::load(&state_paths::profile_config(&profile))?;
-                            if template.dbus {
+                            if template.dbus == nsproxy_core::DbusMode::Proxy {
                                 let cli = Cli {
                                     conf: None,
                                     root: None,
@@ -3459,9 +3499,12 @@ async fn handle_up_client(
                                 };
                                 let cli_bytes = bincode::serialize(&cli)?;
                                 let ns_alive = read_ns_alive(&ns_meta)?;
+                                let sandbox_status = read_sandbox_status(&profile)
+                                    .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
                                 let (task_pgid, stdout_r, stderr_r) = match spawn_cli_process(
                                     &cli,
                                     &ns_alive,
+                                    &sandbox_status,
                                     diag::NamespaceSpawn::Outside,
                                 )? {
                                     Some((task_pgid, stdout_r, stderr_r)) => {
@@ -3566,7 +3609,9 @@ async fn handle_up_client(
                     diag::DaemonRequest::Spawn { args } => {
                         let raw_log_cap = ringbuf_cap_from_args(&args, diag::RAW_LOG_RING_CAP);
                         let ns_alive = read_ns_alive(&ns_meta)?;
-                        let (child, stdout_r, stderr_r) = spawn_daemon_process(&args, &ns_alive)?;
+                        let sandbox_status = read_sandbox_status(profile.as_str())
+                            .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
+                        let (child, stdout_r, stderr_r) = spawn_daemon_process(&args, &ns_alive, &sandbox_status)?;;
                         let task_pgid = match child {
                             Clone3Result::Parent { child_pid, .. } => child_pid as u32,
                             _ => {
@@ -3633,8 +3678,10 @@ async fn handle_up_client(
                         };
                         let is_serve = matches!(kind, diag::SpawnCliKind::Serve);
                         let ns_alive = read_ns_alive(&ns_meta)?;
+                        let sandbox_status = read_sandbox_status(profile.as_str())
+                            .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
                         let (task_pgid, stdout_r, stderr_r) =
-                            match spawn_cli_process(&cli, &ns_alive, ns)? {
+                            match spawn_cli_process(&cli, &ns_alive, &sandbox_status, ns)? {
                             Some((task_pgid, stdout_r, stderr_r)) => (task_pgid, stdout_r, stderr_r),
                             None => {
                                 reap_dead_task_groups_into_state(&state);
@@ -3687,7 +3734,9 @@ async fn handle_up_client(
                     diag::DaemonRequest::SpawnPty { args } => {
                         let ns_alive = read_ns_alive(&ns_meta)?;
                         let pty_scrollback_cap = ringbuf_cap_from_args(&args, PTY_SCROLLBACK_CAP);
-                        let (task_pgid, master_fd) = spawn_pty_process(&args, &ns_alive)?;
+                        let sandbox_status = read_sandbox_status(profile.as_str())
+                            .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
+                        let (task_pgid, master_fd) = spawn_pty_process(&args, &ns_alive, &sandbox_status)?;
                         let relay_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };
                         if relay_raw < 0 {
                             let evt = diag::DaemonEvent::Error {
@@ -4175,6 +4224,7 @@ fn reap_dead_task_groups_into_state(state: &Arc<ArcSwap<UpDaemonState>>) -> Vec<
 fn spawn_cli_process(
     cli: &Cli,
     ns_alive: &nsproxy_core::NsAlive,
+    sandbox_status: &nsproxy_core::sandbox::SandboxStatus,
     ns: diag::NamespaceSpawn,
 ) -> Result<Option<(u32, std::os::unix::io::RawFd, std::os::unix::io::RawFd)>> {
     let exe = std::env::current_exe()?;
@@ -4200,7 +4250,7 @@ fn spawn_cli_process(
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
             if matches!(ns, diag::NamespaceSpawn::Inside) {
-                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+                enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
             let dbus_address = if matches!(ns, diag::NamespaceSpawn::Inside) {
@@ -4655,6 +4705,7 @@ async fn run_root_daemon(control_socket: Option<PathBuf>) -> Result<()> {
 fn spawn_daemon_process(
     args: &diag::SpawnArgs,
     ns_alive: &nsproxy_core::NsAlive,
+    sandbox_status: &nsproxy_core::sandbox::SandboxStatus,
 ) -> Result<(
     Clone3Result,
     std::os::unix::io::RawFd,
@@ -4702,7 +4753,7 @@ fn spawn_daemon_process(
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
             if matches!(args.ns, diag::NamespaceSpawn::Inside) {
-                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+                enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
             let dbus_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
@@ -4756,6 +4807,7 @@ fn spawn_daemon_process(
 fn spawn_pty_process(
     args: &diag::SpawnArgs,
     ns_alive: &nsproxy_core::NsAlive,
+    sandbox_status: &nsproxy_core::sandbox::SandboxStatus,
 ) -> Result<(u32, OwnedFd)> {
     let exec = args
         .exec
@@ -4795,7 +4847,7 @@ fn spawn_pty_process(
             let _ = dup2(slave_fd, 2);
 
             if matches!(args.ns, diag::NamespaceSpawn::Inside) {
-                enter_ns(ns_alive, &ns_alive.bind_mount)?;
+                enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
             let dbus_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
@@ -4916,14 +4968,15 @@ fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
     false
 }
 
-fn configured_sandbox_root(profile: &str) -> Result<PathBuf> {
+fn configured_sandbox_root(profile: &str) -> Option<PathBuf> {
     let profile_path = state_paths::profile_config(profile);
     if !profile_path.exists() {
-        return Ok(state_paths::pivot_root(profile));
+        return Some(state_paths::pivot_root(profile));
     }
-
-    let profile_conf = TemplateConfig::load(&profile_path)?;
-    Ok(match profile_conf.rootfs {
+    let conf = TemplateConfig::load(&profile_path)
+        .map_err(|e| warn!("could not read profile config for rootfs path, skipping rootfs cleanup: {}", e))
+        .ok()?;
+    Some(match conf.rootfs {
         Rootfs::Default => state_paths::pivot_root(profile),
         Rootfs::Tempfs => state_paths::pivot_root_mem(profile),
         Rootfs::Path(path) => path,

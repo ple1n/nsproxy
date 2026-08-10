@@ -256,7 +256,7 @@ mod tests {
             .expect("HOME must be set for expansion tests");
 
         let mut profile = TemplateConfig {
-            schema: 1,
+            schema: TemplateConfigV2::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: vec![ProfileMount {
                 source: PathBuf::from("@/mnt-src"),
@@ -887,7 +887,7 @@ pub enum HotRoute {
 
 impl HotRoute {}
 
-#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
@@ -1136,9 +1136,21 @@ impl HotConfig {
     }
 }
 
+// [schema-bump] To add schema VN:
+//   1. Rename this type alias to point at `TemplateConfigVN` — the compiler
+//      will flag every struct literal that has stale/missing fields.
+//   2. Freeze the current `TemplateConfigV2` (remove `pub` fields you want
+//      hidden, keep it `Deserialize`-only).
+//   3. Add `TemplateConfigVN` with the new shape + `VERSION` const.
+//   4. Add `From<TemplateConfigV(N-1)> for TemplateConfigVN`.
+//   5. Add the new arm in `TemplateConfig::load()`.
+//   6. In nsproxy-ui/src/main.rs search `[schema-bump:wizard]` for the
+//      wizard factory sites.
+pub type TemplateConfig = TemplateConfigV2;
+
 /// Explicit, stable profile config for filesystem isolation and app launch
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct TemplateConfig {
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TemplateConfigV2 {
     /// Schema version for compatibility checks
     pub schema: u32,
     /// Filesystem isolation mode
@@ -1164,14 +1176,88 @@ pub struct TemplateConfig {
     /// Browser profile name for env isolation (set NSPROXY_PROFILE_BROWSER)
     #[serde(default)]
     pub browser_profile: Option<String>,
-    /// Route session-bus traffic through a private per-runtime D-Bus.
+    /// D-Bus exposure mode. Schema 2+; Block is the absent-field default.
     #[serde(default)]
-    pub dbus: bool,
+    pub dbus: DbusMode,
     #[serde(default)]
     pub rootfs: Rootfs,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+impl TemplateConfigV2 {
+    pub const VERSION: u32 = 2;
+}
+
+/// Schema-1 profile config. The `dbus` field was a plain `bool`:
+/// `true` = run private busd proxy, `false`/absent = host bus inherited.
+/// Used only for deserializing legacy configs inside `TemplateConfig::load()`.
+#[derive(Deserialize)]
+struct TemplateConfigV1 {
+    #[serde(default = "schema_one")]
+    schema: u32,
+    sandbox_mode: SandboxMode,
+    #[serde(default)]
+    mounts: Vec<ProfileMount>,
+    #[serde(default)]
+    chmod: Vec<ProfileChmod>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default = "default_inherit_env")]
+    inherit_env: bool,
+    hot: PathBuf,
+    #[serde(default)]
+    hot_init: Option<HotConfig>,
+    #[serde(default)]
+    sargs: ShellArgs,
+    #[serde(default)]
+    browser_profile: Option<String>,
+    /// false/absent = Pass (host env inherited), true = Proxy (busd)
+    #[serde(default)]
+    dbus: bool,
+    #[serde(default)]
+    rootfs: Rootfs,
+}
+
+impl TemplateConfigV1 {
+    const VERSION: u32 = 1;
+}
+
+fn schema_one() -> u32 { TemplateConfigV1::VERSION }
+
+impl From<TemplateConfigV1> for TemplateConfigV2 {
+    fn from(v1: TemplateConfigV1) -> Self {
+        TemplateConfigV2 {
+            schema: TemplateConfigV2::VERSION,
+            sandbox_mode: v1.sandbox_mode,
+            mounts: v1.mounts,
+            chmod: v1.chmod,
+            env: v1.env,
+            inherit_env: v1.inherit_env,
+            hot: v1.hot,
+            hot_init: v1.hot_init,
+            sargs: v1.sargs,
+            browser_profile: v1.browser_profile,
+            // false/absent → Pass (legacy: host bus was inherited through adjust())
+            // true          → Proxy (busd was spawned)
+            dbus: if v1.dbus { DbusMode::Proxy } else { DbusMode::Pass },
+            rootfs: v1.rootfs,
+        }
+    }
+}
+
+/// Controls how the session D-Bus is exposed inside the container.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DbusMode {
+    /// Block D-Bus: strip DBUS_SESSION_BUS_ADDRESS from the spawn environment.
+    #[default]
+    Block,
+    /// Pass the host session bus through directly (risky — host services reachable).
+    Pass,
+    /// Run a private per-profile busd daemon; container processes share it.
+    Proxy,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum Rootfs {
     #[default]
     /// Mount it at default nsp3 state path
@@ -1181,10 +1267,10 @@ pub enum Rootfs {
     Path(PathBuf),
 }
 
-impl Default for TemplateConfig {
+impl Default for TemplateConfigV2 {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: TemplateConfigV2::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: Vec::new(),
             chmod: Vec::new(),
@@ -1194,7 +1280,7 @@ impl Default for TemplateConfig {
             hot_init: Some(HotConfig::default()),
             sargs: ShellArgs::default(),
             browser_profile: None,
-            dbus: false,
+            dbus: DbusMode::Block,
             rootfs: Rootfs::Default,
         }
     }
@@ -1230,7 +1316,7 @@ pub struct ProfileMount {
 }
 
 /// Permission/ownership operation to apply inside the container root
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProfileChmod {
     /// Target path inside the container root
     pub path: PathBuf,
@@ -1252,8 +1338,22 @@ fn default_recursive() -> bool {
 impl TemplateConfig {
     pub fn load(path: &Path) -> Result<TemplateConfig> {
         create_dir_all(state_paths::persist_root())?;
-        let fc = std::fs::read_to_string(path)?;
-        let conf: TemplateConfig = serde_json::from_str(&fc)?;
+        let content = std::fs::read_to_string(path)?;
+        // Peek at schema to select the right versioned struct for deserialization.
+        // Missing schema field defaults to 1 (legacy).
+        let schema: u32 = serde_json::from_str::<serde_json::Value>(&content)?
+            .get("schema")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        // [schema-bump] add new arms here (oldest first); exhaustive match
+        // ensures every version is explicitly handled.
+        let conf = match schema {
+            s if s < TemplateConfigV2::VERSION => {
+                // V1: dbus was a plain bool. Migrate via TemplateConfigV1 → TemplateConfigV2.
+                TemplateConfigV2::from(serde_json::from_str::<TemplateConfigV1>(&content)?)
+            }
+            _ => serde_json::from_str::<TemplateConfigV2>(&content)?,
+        };
         conf.validate()?;
         Ok(conf)
     }
@@ -1354,7 +1454,7 @@ impl TemplateConfig {
             .collect();
 
         Ok(TemplateConfig {
-            schema: 1,
+            schema: TemplateConfigV2::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: vec![],
             env: HashMap::new(),
@@ -1371,7 +1471,7 @@ impl TemplateConfig {
             },
             chmod: Vec::new(),
             browser_profile: None,
-            dbus: false,
+            dbus: DbusMode::Block,
             rootfs: Rootfs::Default,
         })
     }

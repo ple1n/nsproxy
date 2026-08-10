@@ -24,7 +24,7 @@ use nsproxy_common::NsAlive;
 use nsproxy_common::{ExactNS, NSFrom, PidPath};
 use nsproxy_core::cmd_common::read_ns_alive;
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use nsproxy_core::sandbox::SandboxStatus;
+use nsproxy_core::sandbox::{SandboxStatus, read_sandbox_status};
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{cli_to_inheritable_fd, to_cstr, Cli, HotConfig, MainCommand, TemplateConfig};
 use serde::{Deserialize, Serialize};
@@ -1339,14 +1339,8 @@ impl Supervisor {
             while rx.recv().await.is_some() {
                 // Debounce: drain any rapid-fire extras.
                 while let Ok(()) = rx.try_recv() {}
-                let status = match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => serde_json::from_str::<SandboxStatus>(&content).ok(),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => {
-                        warn!(profile = profile.as_str(), "sandbox_status read error: {e}");
-                        continue;
-                    }
-                };
+                // read_sandbox_status enforces the boot_id invariant and purges stale files.
+                let status = read_sandbox_status(profile.as_str());
                 let _ = event_tx.send(SupervisorEvent::SandboxStatusChanged {
                     profile: profile.clone(),
                     status,
@@ -1485,12 +1479,12 @@ impl Supervisor {
     }
 
     /// Send `EnsureDbus` to sp up for `profile` if:
-    /// - the profile has `dbus: true` in TemplateConfig
+    /// - the profile has `dbus: proxy` in TemplateConfig
     /// - the persisted sandbox status shows the sandbox is already `Pivoted`
     /// - sp up is currently connected
     fn maybe_ensure_dbus(&mut self, profile: &ContainerName) {
         let dbus_enabled = load_template_from_disk(profile)
-            .map(|t| t.dbus)
+            .map(|t| t.dbus == nsproxy_core::DbusMode::Proxy)
             .unwrap_or(false);
         if !dbus_enabled {
             return;
@@ -4701,22 +4695,7 @@ fn load_hotconfig_from_disk(profile: &ContainerName) -> Option<HotConfig> {
 }
 
 fn load_sandbox_status_from_disk(profile: &ContainerName) -> Option<SandboxStatus> {
-    let path = state_paths::sandbox_status(profile.as_str());
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            warn!("failed to read sandbox status for {}: {err}", profile);
-            return None;
-        }
-    };
-    match serde_json::from_str::<SandboxStatus>(&content) {
-        Ok(status) => Some(status),
-        Err(err) => {
-            warn!("invalid sandbox status JSON on disk for {}: {err}", profile);
-            None
-        }
-    }
+    read_sandbox_status(profile.as_str())
 }
 
 fn pid_exists(pid: u32) -> bool {
@@ -5054,7 +5033,5 @@ fn log_level_rank(level: &str) -> u8 {
 
 fn load_template_from_disk(profile: &ContainerName) -> Result<TemplateConfig, String> {
     let path = state_paths::profile_config(profile.as_str());
-    let content = std::fs::read_to_string(&path)
-        .map_err(|_| format!("TemplateConfig missing at {}", path.display()))?;
-    serde_json::from_str::<TemplateConfig>(&content).map_err(|e| format!("invalid JSON: {e}"))
+    TemplateConfig::load(&path).map_err(|e| format!("invalid JSON: {e}"))
 }

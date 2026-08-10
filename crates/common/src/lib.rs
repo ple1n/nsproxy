@@ -209,6 +209,12 @@ pub fn current_boot_time_secs() -> Result<u64> {
     Ok(value.parse()?)
 }
 
+/// Returns the kernel boot ID from `/proc/sys/kernel/random/boot_id`.
+/// This is a UUID that changes on every boot, suitable for cache/state invalidation.
+pub fn current_boot_id() -> Result<String> {
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct NsAlive {
     #[serde(default)]

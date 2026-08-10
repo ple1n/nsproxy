@@ -184,6 +184,23 @@ impl ShellPrefs {
                 .unwrap(),
         );
     }
+
+    /// Remove DBUS_SESSION_BUS_ADDRESS from the spawn environment.
+    /// Call this after `adjust()` to enforce Block mode — `adjust()` captures
+    /// the parent env (which may include the host bus address) before we can
+    /// check the profile's DbusMode.
+    pub fn strip_dbus_env(&mut self) {
+        self.env.retain(|env_entry| {
+            if let Ok(s) = env_entry.to_str() {
+                !s.starts_with(&format!("{}=", ENV_DBUS_SESSION_BUS_ADDRESS))
+            } else {
+                true
+            }
+        });
+        unsafe {
+            std::env::remove_var(ENV_DBUS_SESSION_BUS_ADDRESS);
+        }
+    }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations
     pub fn adjust(&mut self) -> Result<()> {
         if self.uid == None {

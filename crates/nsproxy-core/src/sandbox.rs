@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount2};
 use nix::unistd::{Gid, Uid, chown};
-use nsproxy_common::{ExactNS, NSFrom, PidPath, UniqueFile};
+use nsproxy_common::{ExactNS, NSFrom, PidPath, UniqueFile, current_boot_id};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use tracing::{info, warn};
@@ -411,6 +411,10 @@ pub struct SandboxMountStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxStatus {
     pub updated_at_secs: u64,
+    /// Kernel boot ID (`/proc/sys/kernel/random/boot_id`) at the time this
+    /// status was written. Used to detect and purge stale state from a previous boot.
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub configured_mode: SandboxMode,
     pub detected_state: SandboxState,
     pub pivot_dir_status: SandboxPathStatus,
@@ -561,6 +565,7 @@ pub fn collect_sandbox_status(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        boot_id: current_boot_id().ok(),
         configured_mode,
         detected_state,
         pivot_dir_status: inspect_path(Path::new("/pivot")),
@@ -579,6 +584,60 @@ pub fn write_sandbox_status(profile_name: &str, status: &SandboxStatus) -> Resul
     info!("syscall: write({:?}, {} bytes)", path, content.len());
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Read and return the persisted sandbox status for `profile_name`.
+///
+/// If the stored status was written during a different boot (detected via
+/// `/proc/stat btime`), the file is deleted and `None` is returned.  Stale
+/// sandbox state is always wrong and must never be acted on.
+pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
+    let path = crate::state_paths::sandbox_status(profile_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let status: SandboxStatus = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(profile = profile_name, "invalid sandbox_status.json, ignoring: {err}");
+            return None;
+        }
+    };
+
+    // Purge unless the stored boot ID is present and matches the running boot.
+    // A missing boot_id means the file predates this field — treat as stale.
+    let purge = match (&status.boot_id, current_boot_id()) {
+        (Some(stored_id), Ok(ref current_id)) if stored_id == current_id => false,
+        (None, _) => {
+            warn!(
+                profile = profile_name,
+                path = %path.display(),
+                "sandbox_status.json has no boot_id — treating as stale and deleting"
+            );
+            true
+        }
+        (Some(stored_id), Ok(ref current_id)) => {
+            warn!(
+                profile = profile_name,
+                stored_boot_id = stored_id.as_str(),
+                current_boot_id = current_id.as_str(),
+                path = %path.display(),
+                "sandbox_status.json is from a previous boot — deleting stale state"
+            );
+            true
+        }
+        (_, Err(err)) => {
+            warn!("could not read current boot ID to validate sandbox_status.json: {err}");
+            // Can't verify — safer to purge than to trust potentially stale state.
+            true
+        }
+    };
+    if purge {
+        if let Err(err) = std::fs::remove_file(&path) {
+            warn!(path = %path.display(), "failed to delete stale sandbox_status.json: {err}");
+        }
+        return None;
+    }
+
+    Some(status)
 }
 
 /// Check whether the current process is in the expected profile mount namespace.

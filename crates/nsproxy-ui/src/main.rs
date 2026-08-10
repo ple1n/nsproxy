@@ -1,16 +1,17 @@
+use clap::Parser;
 use diag::{LogEntry, Timestamp};
 use eframe::egui;
 use eframe::egui::Color32;
-use egui::{RichText, Vec2};
+use egui::{Margin, RichText, Vec2};
 use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular;
 use egui_plot::{GridInput, GridMark, Line, LineStyle, PlotPoints};
-use clap::Parser;
 use nsproxy_common::crdt::CRDT;
 use nsproxy_common::normalize_domain;
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::stats::ProxyStats;
+use nsproxy_core::personal::PersonalConstants;
 use nsproxy_core::sandbox::{SandboxState, SandboxStatus};
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::state_blueprint::PersistentState as _;
@@ -18,9 +19,9 @@ use nsproxy_core::uplink::clash::{ClashState, GroupId};
 use nsproxy_core::uplink::{
     uplink_proxy_default_udp_expected, UplinkHub, UplinkProxy, UplinkStatsState,
 };
-use nsproxy_core::personal::PersonalConstants;
 use nsproxy_core::{
-    state_paths, HotConfig, NsAlive, ProfileChmod, ProfileMount, SandboxMode, TemplateConfig,
+    state_paths, DbusMode, HotConfig, NsAlive, ProfileChmod, ProfileMount, Rootfs, SandboxMode,
+    TemplateConfig,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -47,8 +48,7 @@ mod supervisor;
 use alacritty_window::{run_term_window_process, ExternalTermWindowClient};
 use profile_loader::ProfileInfo;
 use supervisor::{
-    ContainerName, EditorStatus, LogSource, RenderedLogEntry, SupervisorCommand,
-    SupervisorHandle,
+    ContainerName, EditorStatus, LogSource, RenderedLogEntry, SupervisorCommand, SupervisorHandle,
 };
 use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
@@ -220,6 +220,113 @@ enum RightTab {
     Traffic,
     Hotconfig,
     ProfileEditor,
+    State,
+    Manage,
+}
+
+// ── Manage / creation wizard ──────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum WizardMode {
+    #[default]
+    Landing,
+    CreateFromTemplate,
+    CloneExisting,
+}
+
+/// Which template preset the user selected.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum WizardTemplateKind {
+    /// Overlay sandbox, maximum host-compatibility. Mirrors /nsp3/config/basic.
+    #[default]
+    OverlayBasic,
+    /// Pivot sandbox with an empty rootfs — tabula rasa.
+    PivotEmpty,
+    /// Pivot sandbox pre-wired for a Firefox browser profile.
+    PivotFirefox,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum WizardDnsMode {
+    /// nsproxy runs an internal DNS server at 127.0.0.1 inside the container;
+    /// DNS requests are resolved as SOCKS5 domain queries (hostname passed to proxy).
+    #[default]
+    InternalServer,
+    /// DNS goes through the TUN device and is proxied as regular UDP.
+    TunUdp,
+    /// No resolv.conf rewriting; inherit host DNS.
+    PassThrough,
+    /// User-supplied custom nameserver.
+    Custom,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum WizardStep {
+    #[default]
+    Landing,
+    TemplateKind,
+    DbusMode,
+    PortListeners,
+    RouteTargets,
+    DnsHandling,
+    ReviewHotconfig,
+    Name,
+}
+
+#[derive(Clone, Debug)]
+struct ManageWizard {
+    mode: WizardMode,
+    step: WizardStep,
+    /// Template preset chosen by the user.
+    template_kind: WizardTemplateKind,
+    /// D-Bus mode chosen by the user.
+    dbus_mode: DbusMode,
+    /// The TemplateConfig being built.
+    template: TemplateConfig,
+    /// The HotConfig being built.
+    hot: HotConfig,
+    hot_json: String,
+    hot_json_error: Option<String>,
+    /// DNS strategy chosen.
+    dns_mode: WizardDnsMode,
+    /// Custom DNS text input.
+    dns_custom_text: String,
+    /// Port listener input (container_port text).
+    local_port_input: String,
+    /// Profile to clone from.
+    clone_source: String,
+    /// New profile name.
+    new_name: String,
+    /// Path to an existing hot.json to merge into the editor.
+    merge_path: String,
+    merge_error: Option<String>,
+    /// Status message for the final create action.
+    status: Option<String>,
+}
+
+impl Default for ManageWizard {
+    fn default() -> Self {
+        let hot = HotConfig::default();
+        let hot_json = serde_json::to_string_pretty(&hot).unwrap_or_default();
+        Self {
+            mode: WizardMode::default(),
+            step: WizardStep::default(),
+            template_kind: WizardTemplateKind::default(),
+            dbus_mode: DbusMode::Block,
+            template: TemplateConfig::default(),
+            hot,
+            hot_json,
+            hot_json_error: None,
+            dns_mode: WizardDnsMode::default(),
+            dns_custom_text: String::new(),
+            local_port_input: String::new(),
+            clone_source: String::new(),
+            new_name: String::new(),
+            merge_path: String::new(),
+            merge_error: None,
+            status: None,
+        }
+    }
 }
 
 /// Sub-view toggle inside the Traffic tab.
@@ -706,6 +813,8 @@ struct App {
     /// ANSI-render cache for raw process logs keyed by a fast collision-tolerant hash.
     cached_log: HashMap<u64, Vec<egui::RichText>>,
     log_panel_min_level: LogMinLevel,
+    /// State for the Manage (creation wizard) tab.
+    manage_wizard: ManageWizard,
 }
 
 fn fast_hash_value<T: Hash>(value: &T) -> u64 {
@@ -930,17 +1039,19 @@ impl App {
     }
 
     fn request_persisted_logs_refresh(&mut self) {
-        let _ = self.persisted_logs_tx.try_send(PersistedLogsRequest::Refresh {
-            selected_file: self.selected_persisted_log_file.clone(),
-            selected_pid: self
-                .selected_process_logs
-                .as_ref()
-                .and_then(|(_, pid)| (!self.selected_process_is_pty()).then_some(*pid)),
-            logs_tab_visible: self.right_tab == RightTab::Logs,
-            process_logs_visible: self.right_tab == RightTab::Processes
-                && self.selected_process_logs.is_some()
-                && !self.selected_process_is_pty(),
-        });
+        let _ = self
+            .persisted_logs_tx
+            .try_send(PersistedLogsRequest::Refresh {
+                selected_file: self.selected_persisted_log_file.clone(),
+                selected_pid: self
+                    .selected_process_logs
+                    .as_ref()
+                    .and_then(|(_, pid)| (!self.selected_process_is_pty()).then_some(*pid)),
+                logs_tab_visible: self.right_tab == RightTab::Logs,
+                process_logs_visible: self.right_tab == RightTab::Processes
+                    && self.selected_process_logs.is_some()
+                    && !self.selected_process_is_pty(),
+            });
         self.last_persisted_logs_refresh = Instant::now();
     }
 
@@ -981,8 +1092,7 @@ impl App {
         // Background reload: caller sends () to trigger a reload on a worker thread.
         let (reload_tx, reload_rx) = flume::bounded::<()>(1);
         let (proxy_tx, proxy_rx) = flume::bounded::<ProxySnapshot>(1);
-        let (persisted_logs_tx, persisted_logs_req_rx) =
-            flume::bounded::<PersistedLogsRequest>(1);
+        let (persisted_logs_tx, persisted_logs_req_rx) = flume::bounded::<PersistedLogsRequest>(1);
         let (persisted_logs_snapshot_tx, persisted_logs_rx) =
             flume::bounded::<PersistedLogsSnapshot>(1);
         thread::spawn(move || {
@@ -1294,6 +1404,7 @@ impl App {
             last_fps: 0.0,
             cached_log: HashMap::new(),
             log_panel_min_level: LogMinLevel::default(),
+            manage_wizard: ManageWizard::default(),
         }
     }
 
@@ -1307,6 +1418,8 @@ impl App {
             RightTab::Traffic => "Traffic",
             RightTab::Hotconfig => "Hotconfig",
             RightTab::ProfileEditor => "ProfileEditor",
+            RightTab::State => "State",
+            RightTab::Manage => "Manage",
         }
     }
 
@@ -1733,6 +1846,32 @@ impl App {
         resp.on_hover_text(tooltip)
     }
 
+    fn remove_armed_button(ui: &mut egui::Ui, armed: bool) -> egui::Response {
+        let size = egui::vec2(16.0, 16.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        let armed_col = egui::Color32::from_rgba_unmultiplied(220, 100, 100, 200);
+        let base = egui::Color32::from_rgba_unmultiplied(200, 200, 200, 140);
+        let hover_col = egui::Color32::from_rgba_unmultiplied(240, 240, 240, 200);
+        let col = if armed {
+            armed_col
+        } else if resp.hovered() {
+            hover_col
+        } else {
+            base
+        };
+
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            regular::TRASH,
+            egui::FontId::proportional(14.0),
+            col,
+        );
+
+        resp.on_hover_text("Enable Ctrl+D to remove the selected container")
+    }
+
     fn render_mount_list(ui: &mut egui::Ui, mounts: &mut Vec<ProfileMount>, title: &str) -> bool {
         let mut changed = false;
         section_frame(ui, |ui| {
@@ -1753,7 +1892,6 @@ impl App {
             let mut remove_ixs = Vec::new();
             for (i, mount) in mounts.iter_mut().enumerate() {
                 ui.push_id(("mount-row", i), |ui| {
-                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(format!("#{}", i + 1));
                     });
@@ -1799,7 +1937,7 @@ impl App {
                         mode: None,
                         uid: None,
                         gid: None,
-                        mkdir: false
+                        mkdir: false,
                     });
                     changed = true;
                 }
@@ -1808,7 +1946,6 @@ impl App {
             let mut remove_ixs = Vec::new();
             for (i, op) in chmod.iter_mut().enumerate() {
                 ui.push_id(("chmod-row", i), |ui| {
-                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(format!("#{}", i + 1));
                     });
@@ -2236,7 +2373,6 @@ impl App {
             let mut remove_ix = None;
             for (i, args) in list.iter_mut().enumerate() {
                 ui.push_id((id_prefix, "daemon", i), |ui| {
-                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(format!("#{}", i + 1));
                         if ui.button("Remove").clicked() {
@@ -2520,10 +2656,8 @@ impl App {
                         ui.add_space(4.0);
                         if ui
                             .add(
-                                egui::Button::new(
-                                    egui::RichText::new("default user").size(11.0),
-                                )
-                                .small(),
+                                egui::Button::new(egui::RichText::new("default user").size(11.0))
+                                    .small(),
                             )
                             .on_hover_text("Reset uid/gid to current user")
                             .clicked()
@@ -2573,9 +2707,7 @@ impl App {
             }
 
             let uid_gid_value_changed = ui
-                .data_mut(|d| {
-                    d.remove_temp::<bool>(egui::Id::new((id_prefix, "uid_gid_changed")))
-                })
+                .data_mut(|d| d.remove_temp::<bool>(egui::Id::new((id_prefix, "uid_gid_changed"))))
                 .unwrap_or(false);
 
             ui.add_space(4.0);
@@ -2694,10 +2826,7 @@ impl App {
                 args.args.remove(ix);
                 changed = true;
             }
-            if ui
-                .add(egui::Button::new("+ Add arg").small())
-                .clicked()
-            {
+            if ui.add(egui::Button::new("+ Add arg").small()).clicked() {
                 args.args.push(String::new());
                 changed = true;
             }
@@ -2800,7 +2929,6 @@ impl App {
             }
 
             if enabled {
-                ui.separator();
                 ui.label("hot_init (same form as Hotconfig tab)");
                 let mut hot_init = self
                     .profile_editor_template
@@ -3006,6 +3134,237 @@ fn default_profile_text() -> String {
     serde_json::to_string_pretty(&TemplateConfig::default()).unwrap_or_else(|_| "{}".to_string())
 }
 
+// ── Wizard template factories ─────────────────────────────────────────────────
+
+/// Build a (TemplateConfig, HotConfig) pair for the given wizard template kind.
+/// All values are constructed from Rust native types — no JSON strings.
+fn wizard_build_template(kind: WizardTemplateKind) -> (TemplateConfig, HotConfig) {
+    match kind {
+        WizardTemplateKind::OverlayBasic => wizard_template_overlay_basic(),
+        WizardTemplateKind::PivotEmpty => wizard_template_pivot_empty(),
+        WizardTemplateKind::PivotFirefox => wizard_template_pivot_firefox(),
+    }
+}
+
+/// Overlay sandbox — maximum host-compatibility (mirrors /nsp3/config/basic).
+///
+/// Pre-configures:
+/// - Port 9909 (Geph SOCKS5) forwarded into the container
+/// - Internal DNS server at 127.0.0.1 (nsproxy resolves hostnames via the proxy)
+fn wizard_template_overlay_basic() -> (TemplateConfig, HotConfig) {
+    let hot = HotConfig {
+        locals: [(9909u32, 9909u32)].into_iter().collect(),
+        resolv_conf_dns: "127.0.0.1".to_string(),
+        ..HotConfig::default()
+    };
+    let template = TemplateConfig {
+        schema: TemplateConfig::VERSION, // [schema-bump:wizard]
+        sandbox_mode: SandboxMode::Overlay,
+        mounts: vec![],
+        chmod: vec![],
+        env: HashMap::new(),
+        inherit_env: true,
+        hot: PathBuf::from("@/hot.json"),
+        hot_init: Some(hot.clone()),
+        sargs: nsproxy_core::shell::ShellArgs::default(),
+        browser_profile: None,
+        dbus: DbusMode::Block,
+        rootfs: Rootfs::Default,
+    };
+    (template, hot)
+}
+
+/// Pivot sandbox — empty rootfs (tabula rasa). No mounts, no presets.
+fn wizard_template_pivot_empty() -> (TemplateConfig, HotConfig) {
+    let hot = HotConfig::default();
+    let template = TemplateConfig {
+        schema: TemplateConfig::VERSION, // [schema-bump:wizard]
+        sandbox_mode: SandboxMode::Pivot,
+        mounts: vec![],
+        chmod: vec![],
+        env: HashMap::new(),
+        inherit_env: true,
+        hot: PathBuf::from("@/hot.json"),
+        hot_init: None,
+        sargs: nsproxy_core::shell::ShellArgs::default(),
+        browser_profile: None,
+        dbus: DbusMode::Block,
+        rootfs: Rootfs::Default,
+    };
+    (template, hot)
+}
+
+/// Pivot sandbox pre-wired for a Firefox browser profile.
+///
+/// - Firefox profile data stored inside the nsp3 profile directory (@/)
+/// - Mounts Wayland, PipeWire, PulseAudio, dconf, gvfs, systemd, cgroups
+/// - env: NO_AT_BRIDGE=1, GIO_USE_VFS=local
+/// - D-Bus: Proxy (private busd)
+fn wizard_template_pivot_firefox() -> (TemplateConfig, HotConfig) {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/root"));
+    let run_user = format!("/run/user/{}", uid);
+
+    let mounts = vec![
+        // Firefox profile data stored inside the nsp3 profile dir
+        ProfileMount {
+            source: PathBuf::from("@/.mozilla/firefox"),
+            target: PathBuf::from(format!("{}/.mozilla/firefox", home)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        ProfileMount {
+            source: PathBuf::from("@/.cache/mozilla/firefox"),
+            target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        ProfileMount {
+            source: PathBuf::from("@/.mozilla/native-messaging-hosts"),
+            target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),
+            read_only: false,
+            recursive: true,
+            skip_missing: true,
+        },
+        // Wayland compositor sockets
+        ProfileMount {
+            source: PathBuf::from(format!("{}/wayland-0", run_user)),
+            target: PathBuf::from(format!("{}/wayland-0", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: true,
+        },
+        ProfileMount {
+            source: PathBuf::from(format!("{}/wayland-1", run_user)),
+            target: PathBuf::from(format!("{}/wayland-1", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: true,
+        },
+        // PipeWire audio/video bus
+        ProfileMount {
+            source: PathBuf::from(format!("{}/pipewire-0", run_user)),
+            target: PathBuf::from(format!("{}/pipewire-0", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        ProfileMount {
+            source: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
+            target: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // PulseAudio
+        ProfileMount {
+            source: PathBuf::from(format!("{}/pulse", run_user)),
+            target: PathBuf::from(format!("{}/pulse", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // dconf settings daemon
+        ProfileMount {
+            source: PathBuf::from(format!("{}/dconf", run_user)),
+            target: PathBuf::from(format!("{}/dconf", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // GVfs virtual filesystem
+        ProfileMount {
+            source: PathBuf::from(format!("{}/gvfs", run_user)),
+            target: PathBuf::from(format!("{}/gvfs", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // systemd user session
+        ProfileMount {
+            source: PathBuf::from(format!("{}/systemd", run_user)),
+            target: PathBuf::from(format!("{}/systemd", run_user)),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // System-wide systemd
+        ProfileMount {
+            source: PathBuf::from("/run/systemd"),
+            target: PathBuf::from("/run/systemd"),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+        // cgroups (needed by Firefox's sandbox)
+        ProfileMount {
+            source: PathBuf::from("/sys/fs/cgroup"),
+            target: PathBuf::from("/sys/fs/cgroup"),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        },
+    ];
+
+    let chmod = vec![
+        ProfileChmod {
+            path: PathBuf::from(run_user),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: false,
+        },
+        ProfileChmod {
+            path: PathBuf::from("/home"),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: true,
+        },
+        ProfileChmod {
+            path: PathBuf::from(format!("{}/.mozilla", home)),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: true,
+        },
+        ProfileChmod {
+            path: PathBuf::from(format!("{}/.cache", home)),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: true,
+        },
+    ];
+
+    let env: HashMap<String, String> = [
+        ("NO_AT_BRIDGE".to_string(), "1".to_string()),
+        ("GIO_USE_VFS".to_string(), "local".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let hot = HotConfig::default();
+    let template = TemplateConfig {
+        schema: TemplateConfig::VERSION, // [schema-bump:wizard]
+        sandbox_mode: SandboxMode::Pivot,
+        mounts,
+        chmod,
+        env,
+        inherit_env: true,
+        hot: PathBuf::from("@/hot.json"),
+        hot_init: None,
+        sargs: nsproxy_core::shell::ShellArgs::default(),
+        browser_profile: Some("firefox".to_string()),
+        dbus: DbusMode::Proxy,
+        rootfs: Rootfs::Default,
+    };
+    (template, hot)
+}
+
 fn default_constants_text() -> String {
     serde_json::to_string_pretty(&PersonalConstants::default()).unwrap_or_else(|_| "{}".to_string())
 }
@@ -3033,18 +3392,15 @@ fn load_constants_json<F: FnOnce() -> String>(fallback: Option<F>) -> LoadResult
 
 fn load_profile_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>) -> LoadResult {
     let path = state_paths::profile_config(profile);
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => {
-            return LoadResult {
-                text: fallback.map_or_else(|| default_profile_text(), |f| f()),
-                error: None,
-            };
-        }
-    };
-    match serde_json::from_str::<TemplateConfig>(&content) {
+    if !path.exists() {
+        return LoadResult {
+            text: fallback.map_or_else(|| default_profile_text(), |f| f()),
+            error: None,
+        };
+    }
+    match nsproxy_core::TemplateConfig::load(&path) {
         Ok(parsed) => LoadResult {
-            text: serde_json::to_string_pretty(&parsed).unwrap_or(content),
+            text: serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| default_profile_text()),
             error: None,
         },
         Err(err) => LoadResult {
@@ -3222,21 +3578,24 @@ impl eframe::App for App {
         egui::SidePanel::left("left_sidebar")
             .resizable(false)
             .default_width(280.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(Margin::same(8)),
+            )
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.heading("Containers");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(5.);
                         if Self::refresh_button(ui, "Reload all container status").clicked() {
                             self.reload_all_ns_alive();
                         }
+                        if Self::remove_armed_button(ui, self.remove_containers_armed).clicked() {
+                            self.remove_containers_armed = !self.remove_containers_armed;
+                        }
                     });
-                });
-
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.toggle_value(&mut self.remove_containers_armed, "remove containers")
-                        .on_hover_text("Enable Ctrl+D to remove the selected container");
                 });
 
                 ui.add_space(6.0);
@@ -3296,24 +3655,6 @@ impl eframe::App for App {
                             is_selected,
                             status_color,
                         );
-                        if unpivoted_warning {
-                            let banner_rect = egui::Rect::from_min_max(
-                                box_resp.rect.min,
-                                egui::pos2(box_resp.rect.max.x, box_resp.rect.min.y + 18.0),
-                            );
-                            ui.painter().rect_filled(
-                                banner_rect,
-                                8.0,
-                                Color32::from_rgba_unmultiplied(255, 185, 0, 200),
-                            );
-                            ui.painter().text(
-                                banner_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "\u{26a0} no sandbox",
-                                egui::FontId::proportional(11.0),
-                                Color32::from_rgb(60, 40, 0),
-                            );
-                        }
                         if box_resp.clicked() {
                             self.selected_profile = Some(profile_name.clone());
                             self.supervisor
@@ -3327,16 +3668,12 @@ impl eframe::App for App {
 
                 ui.add_space(6.0);
 
-                ui.group(|ui| {
+                egui::Frame::none().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Namespaces")
-                                .small()
-                                .strong()
-                                .color(egui::Color32::GRAY),
-                        );
+                        ui.heading("Namespaces");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(5.);
                             if Self::refresh_button(ui, "Refresh namespace view").clicked() {
                                 self.supervisor.send(SupervisorCommand::RefreshNamespaces);
                             }
@@ -3406,132 +3743,168 @@ impl eframe::App for App {
                 // minimal dev-only frame info intentionally omitted here
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Tabs
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Proxies, "Proxies")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Proxies;
-                    if let Some(profile_name) = &self.selected_profile {
-                        self.supervisor
-                            .send(supervisor::SupervisorCommand::OnTabOpen {
-                                profile: profile_name.clone(),
-                                tab: supervisor::TabKind::Proxies,
-                            });
+        let tab_fill = {
+            let base = ctx.style().visuals.panel_fill;
+            Color32::from_rgb(
+                base.r().saturating_add(15),
+                base.g().saturating_add(15),
+                base.b().saturating_add(15),
+            )
+        };
+        egui::TopBottomPanel::top("tab_bar")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(tab_fill)
+                    .inner_margin(egui::Margin {
+                        left: 8,
+                        right: 8,
+                        top: 10,
+                        bottom: 10,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Proxies, "Proxies")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Proxies;
+                        if let Some(profile_name) = &self.selected_profile {
+                            self.supervisor
+                                .send(supervisor::SupervisorCommand::OnTabOpen {
+                                    profile: profile_name.clone(),
+                                    tab: supervisor::TabKind::Proxies,
+                                });
+                        }
                     }
-                }
 
                     self.sync_traffic_subscription();
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Daemon, "Daemon")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Daemon;
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Logs, "Logs")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Logs;
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Actions, "Actions")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Actions;
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Processes, "Processes")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Processes;
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Traffic, "Traffic")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Traffic;
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::Hotconfig;
-                    if let Some(profile_name) = &self.selected_profile {
-                        self.supervisor
-                            .send(supervisor::SupervisorCommand::OnTabOpen {
-                                profile: profile_name.clone(),
-                                tab: supervisor::TabKind::Hotconfig,
-                            });
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Daemon, "Daemon")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Daemon;
                     }
-                }
-                if ui
-                    .selectable_label(self.right_tab == RightTab::ProfileEditor, "Profile")
-                    .clicked()
-                {
-                    self.right_tab = RightTab::ProfileEditor;
-                    if let Some(profile_name) = &self.selected_profile {
-                        self.supervisor
-                            .send(supervisor::SupervisorCommand::OnTabOpen {
-                                profile: profile_name.clone(),
-                                tab: supervisor::TabKind::ProfileEditor,
-                            });
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Logs, "Logs")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Logs;
                     }
-                }
-
-                let profile_state = self
-                    .selected_profile
-                    .as_ref()
-                    .and_then(|profile| self.snapshot.profiles.get(profile));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(ps) = profile_state {
-                        let mut hover_text = None;
-                        let (label, color) = if ps.template_error.is_some() {
-                            ("misconfigured", Color32::from_rgb(220, 120, 60))
-                        } else if ps.up_connection == supervisor::ConnectionState::Connecting
-                            || ps.diag_connection == supervisor::ConnectionState::Connecting
-                        {
-                            ("connecting", Color32::from_rgb(220, 180, 90))
-                        } else if ps.child_alive && !ps.up_connected {
-                            hover_text = ps.up_error.clone();
-                            ("container disconnected", Color32::from_rgb(220, 120, 60))
-                        } else if ps.serve_alive && !ps.diag_connected {
-                            hover_text = ps.diag_error.clone();
-                            ("serve disconnected", Color32::from_rgb(220, 120, 60))
-                        } else if ps.diag_connected {
-                            ("connected", Color32::LIGHT_GREEN)
-                        } else {
-                            ("disconnected", Color32::LIGHT_RED)
-                        };
-                        let mut resp = ui.colored_label(color, label);
-                        if let Some(text) = hover_text {
-                            resp = resp.on_hover_text(text);
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Actions, "Actions")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Actions;
+                    }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Processes, "Processes")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Processes;
+                    }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Traffic, "Traffic")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Traffic;
+                    }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Hotconfig, "Hotconfig")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Hotconfig;
+                        if let Some(profile_name) = &self.selected_profile {
+                            self.supervisor
+                                .send(supervisor::SupervisorCommand::OnTabOpen {
+                                    profile: profile_name.clone(),
+                                    tab: supervisor::TabKind::Hotconfig,
+                                });
                         }
-                        let _ = resp;
                     }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::ProfileEditor, "Profile")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::ProfileEditor;
+                        if let Some(profile_name) = &self.selected_profile {
+                            self.supervisor
+                                .send(supervisor::SupervisorCommand::OnTabOpen {
+                                    profile: profile_name.clone(),
+                                    tab: supervisor::TabKind::ProfileEditor,
+                                });
+                        }
+                    }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::State, "State")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::State;
+                    }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Manage, "Manage")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Manage;
+                    }
+
+                    let profile_state = self
+                        .selected_profile
+                        .as_ref()
+                        .and_then(|profile| self.snapshot.profiles.get(profile));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(ps) = profile_state {
+                            let mut hover_text = None;
+                            let (label, color) = if ps.template_error.is_some() {
+                                ("misconfigured", Color32::from_rgb(220, 120, 60))
+                            } else if ps.up_connection == supervisor::ConnectionState::Connecting
+                                || ps.diag_connection == supervisor::ConnectionState::Connecting
+                            {
+                                ("connecting", Color32::from_rgb(220, 180, 90))
+                            } else if ps.child_alive && !ps.up_connected {
+                                hover_text = ps.up_error.clone();
+                                ("container disconnected", Color32::from_rgb(220, 120, 60))
+                            } else if ps.serve_alive && !ps.diag_connected {
+                                hover_text = ps.diag_error.clone();
+                                ("serve disconnected", Color32::from_rgb(220, 120, 60))
+                            } else if ps.diag_connected {
+                                ("connected", Color32::LIGHT_GREEN)
+                            } else {
+                                ("disconnected", Color32::LIGHT_RED)
+                            };
+                            let mut resp = ui.colored_label(color, label);
+                            if let Some(text) = hover_text {
+                                resp = resp.on_hover_text(text);
+                            }
+                            let _ = resp;
+                        }
+                    });
                 });
             });
 
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-
-            let scroll_id = format!("right_tab_panel_scroll_{}", self.right_tab_label());
-            egui::ScrollArea::vertical()
-                .id_salt(scroll_id)
-                .auto_shrink([false, false])
-                .show(ui, |ui| match self.right_tab {
-                    RightTab::Proxies => self.render_proxies_tab(ui),
-                    RightTab::Daemon => self.render_daemon_tab(ui),
-                    RightTab::Logs => self.render_logs_tab(ui),
-                    RightTab::Actions => personal::render_actions_tab(self, ui),
-                    RightTab::Processes => self.render_processes_tab(ui),
-                    RightTab::Traffic => self.render_traffic_tab(ui),
-                    RightTab::Hotconfig => self.render_hotconfig_tab(ui),
-                    RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
-                });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.right_tab == RightTab::Manage {
+                // Manage tab manages its own scroll + bottom panel
+                self.render_manage_tab(ui);
+            } else {
+                let scroll_id = format!("right_tab_panel_scroll_{}", self.right_tab_label());
+                egui::ScrollArea::vertical()
+                    .id_salt(scroll_id)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.right_tab {
+                        RightTab::Proxies => self.render_proxies_tab(ui),
+                        RightTab::Daemon => self.render_daemon_tab(ui),
+                        RightTab::Logs => self.render_logs_tab(ui),
+                        RightTab::Actions => personal::render_actions_tab(self, ui),
+                        RightTab::Processes => self.render_processes_tab(ui),
+                        RightTab::Traffic => self.render_traffic_tab(ui),
+                        RightTab::Hotconfig => self.render_hotconfig_tab(ui),
+                        RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
+                        RightTab::State => self.render_state_tab(ui),
+                        RightTab::Manage => unreachable!(),
+                    });
+            }
         });
 
         self.render_external_pty_window(ctx);
@@ -3559,9 +3932,12 @@ impl eframe::App for App {
                     ui.add_space(6.0);
 
                     ui.label(
-                        egui::RichText::new(format!("{}ms  {:.1}fps", self.last_frame_elapsed_ms, fps))
-                            .small()
-                            .color(Color32::from_rgba_unmultiplied(200, 200, 200, 120)),
+                        egui::RichText::new(format!(
+                            "{}ms  {:.1}fps",
+                            self.last_frame_elapsed_ms, fps
+                        ))
+                        .small()
+                        .color(Color32::from_rgba_unmultiplied(200, 200, 200, 120)),
                     );
                 });
             });
@@ -3618,8 +3994,6 @@ impl App {
 
         self.render_selected_proxy_summary(ui);
         ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
 
         self.render_proxy_filters(ui);
         if self.filters_dirty {
@@ -3627,8 +4001,6 @@ impl App {
             self.filters_dirty = false;
         }
 
-        ui.add_space(6.0);
-        ui.separator();
         ui.add_space(6.0);
 
         self.render_proxies_table(ui);
@@ -4147,11 +4519,7 @@ impl App {
                         .selected_text(log_panel_min_level.label())
                         .show_ui(ui, |ui| {
                             for level in LogMinLevel::ALL {
-                                ui.selectable_value(
-                                    log_panel_min_level,
-                                    level,
-                                    level.label(),
-                                );
+                                ui.selectable_value(log_panel_min_level, level, level.label());
                             }
                         });
                     ui.add_space(8.0);
@@ -4401,7 +4769,10 @@ impl App {
 
         // True when the container is up but pivot-root sandbox has not been applied yet.
         let unpivoted = up_running
-            && matches!(container_lifecycle, supervisor::ContainerLifecycleState::Running)
+            && matches!(
+                container_lifecycle,
+                supervisor::ContainerLifecycleState::Running
+            )
             && sandbox_mode == SandboxMode::Pivot
             && sandbox_status
                 .as_ref()
@@ -4415,10 +4786,9 @@ impl App {
             let up_subtitle = if up_disabled {
                 template_error.as_deref().unwrap_or("invalid").to_string()
             } else if unpivoted {
-                child_pid
-                    .map_or("no sandbox — click to apply".to_string(), |p| {
-                        format!("no sandbox  pid={p}")
-                    })
+                child_pid.map_or("no sandbox — click to apply".to_string(), |p| {
+                    format!("no sandbox  pid={p}")
+                })
             } else {
                 match container_lifecycle {
                     supervisor::ContainerLifecycleState::Stopped => "down".to_string(),
@@ -4517,37 +4887,37 @@ impl App {
                         reason: "apply sandbox from process controls (unpivoted)".to_string(),
                     });
                 } else {
-                match container_lifecycle {
-                    supervisor::ContainerLifecycleState::Stopped => {
-                        info!(
-                            profile = profile_name.as_str(),
-                            "ui clicked Start Container"
-                        );
-                        self.supervisor.send(SupervisorCommand::StartUp {
-                            profile: profile_name.clone(),
-                        });
+                    match container_lifecycle {
+                        supervisor::ContainerLifecycleState::Stopped => {
+                            info!(
+                                profile = profile_name.as_str(),
+                                "ui clicked Start Container"
+                            );
+                            self.supervisor.send(SupervisorCommand::StartUp {
+                                profile: profile_name.clone(),
+                            });
+                        }
+                        supervisor::ContainerLifecycleState::Starting
+                        | supervisor::ContainerLifecycleState::Running => {
+                            info!(
+                                profile = profile_name.as_str(),
+                                child_pid, "ui clicked Restart Container"
+                            );
+                            self.supervisor.send(SupervisorCommand::StartUp {
+                                profile: profile_name.clone(),
+                            });
+                        }
+                        supervisor::ContainerLifecycleState::Stopping { .. }
+                        | supervisor::ContainerLifecycleState::Killing { .. } => {
+                            info!(
+                                profile = profile_name.as_str(),
+                                child_pid, "ui clicked Kill Container"
+                            );
+                            self.supervisor.send(SupervisorCommand::KillContainer {
+                                profile: profile_name.clone(),
+                            });
+                        }
                     }
-                    supervisor::ContainerLifecycleState::Starting
-                    | supervisor::ContainerLifecycleState::Running => {
-                        info!(
-                            profile = profile_name.as_str(),
-                            child_pid, "ui clicked Restart Container"
-                        );
-                        self.supervisor.send(SupervisorCommand::StartUp {
-                            profile: profile_name.clone(),
-                        });
-                    }
-                    supervisor::ContainerLifecycleState::Stopping { .. }
-                    | supervisor::ContainerLifecycleState::Killing { .. } => {
-                        info!(
-                            profile = profile_name.as_str(),
-                            child_pid, "ui clicked Kill Container"
-                        );
-                        self.supervisor.send(SupervisorCommand::KillContainer {
-                            profile: profile_name.clone(),
-                        });
-                    }
-                }
                 } // end else !unpivoted
             }
 
@@ -5009,7 +5379,7 @@ impl App {
 
         if let Some((profile, task_pgid)) = kill_request {
             self.supervisor
-            .send(SupervisorCommand::KillManagedProcess { profile, task_pgid });
+                .send(SupervisorCommand::KillManagedProcess { profile, task_pgid });
         }
         if let Some((profile, pid)) = inspect_request {
             self.selected_process_spawn_args = Some((profile, pid));
@@ -5371,7 +5741,9 @@ impl App {
                                 cached_log
                                     .entry(fast_hash_value(&entry.content))
                                     .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.content));
-                                if let Some(ansi_parts) = cached_log.get(&fast_hash_value(&entry.content)) {
+                                if let Some(ansi_parts) =
+                                    cached_log.get(&fast_hash_value(&entry.content))
+                                {
                                     for part in ansi_parts {
                                         ui.label(part.clone());
                                     }
@@ -5449,10 +5821,7 @@ impl App {
                             };
 
                             ui.horizontal(|ui| {
-                                ui.colored_label(
-                                    Color32::from_rgb(140, 140, 220),
-                                    "saved",
-                                );
+                                ui.colored_label(Color32::from_rgb(140, 140, 220), "saved");
 
                                 let level_color = match entry.log.level.as_str() {
                                     "ERROR" => Color32::from_rgb(220, 80, 80),
@@ -5533,7 +5902,10 @@ impl App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if files.is_empty() {
-                                ui.colored_label(Color32::from_gray(110), "no persisted log files yet");
+                                ui.colored_label(
+                                    Color32::from_gray(110),
+                                    "no persisted log files yet",
+                                );
                                 return;
                             }
 
@@ -5609,17 +5981,20 @@ impl App {
                             ui.label(RichText::new(label).strong());
                             ui.add_space(8.0);
                             ui.label("Min level");
-                            egui::ComboBox::from_id_salt(("persisted_logs_min_level", &selected_path))
-                                .selected_text(self.log_panel_min_level.label())
-                                .show_ui(ui, |ui| {
-                                    for level in LogMinLevel::ALL {
-                                        ui.selectable_value(
-                                            &mut self.log_panel_min_level,
-                                            level,
-                                            level.label(),
-                                        );
-                                    }
-                                });
+                            egui::ComboBox::from_id_salt((
+                                "persisted_logs_min_level",
+                                &selected_path,
+                            ))
+                            .selected_text(self.log_panel_min_level.label())
+                            .show_ui(ui, |ui| {
+                                for level in LogMinLevel::ALL {
+                                    ui.selectable_value(
+                                        &mut self.log_panel_min_level,
+                                        level,
+                                        level.label(),
+                                    );
+                                }
+                            });
                             ui.add_space(8.0);
                             ui.colored_label(
                                 Color32::from_gray(130),
@@ -5649,45 +6024,64 @@ impl App {
                                         .id_salt(("persisted_logs_view", &selected_path))
                                         .auto_shrink([false, false])
                                         .stick_to_bottom(true)
-                                        .show_rows(ui, row_h, visible_entries.len(), |ui, row_range| {
-                                            for row_index in row_range {
-                                                let Some(entry) = visible_entries.get(row_index) else {
-                                                    continue;
-                                                };
-                                                ui.horizontal(|ui| {
-                                                    ui.colored_label(
-                                                        Color32::from_rgb(140, 140, 220),
-                                                        "saved",
-                                                    );
-                                                    let level_color = match entry.log.level.as_str() {
-                                                        "ERROR" => Color32::from_rgb(220, 80, 80),
-                                                        "WARN" => Color32::from_rgb(210, 160, 60),
-                                                        "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                                        _ => Color32::from_gray(200),
+                                        .show_rows(
+                                            ui,
+                                            row_h,
+                                            visible_entries.len(),
+                                            |ui, row_range| {
+                                                for row_index in row_range {
+                                                    let Some(entry) =
+                                                        visible_entries.get(row_index)
+                                                    else {
+                                                        continue;
                                                     };
-                                                    ui.colored_label(level_color, &entry.log.level);
-                                                    ui.colored_label(
-                                                        Color32::from_gray(90),
-                                                        format_timestamp_age(entry.log.ts),
-                                                    );
-                                                    ui.colored_label(
-                                                        Color32::from_gray(100),
-                                                        format!("[{}]", entry.log.target),
-                                                    );
-                                                    for part in egui_sgr::ansi_to_rich_text(&entry.log.message) {
-                                                        ui.label(part);
-                                                    }
-                                                    for field in &entry.log.fields {
-                                                        ui.add_space(6.0);
+                                                    ui.horizontal(|ui| {
                                                         ui.colored_label(
-                                                            Color32::from_gray(110),
-                                                            format!("{}=", field.name),
+                                                            Color32::from_rgb(140, 140, 220),
+                                                            "saved",
                                                         );
-                                                        ui.monospace(&field.value);
-                                                    }
-                                                });
-                                            }
-                                        });
+                                                        let level_color =
+                                                            match entry.log.level.as_str() {
+                                                                "ERROR" => {
+                                                                    Color32::from_rgb(220, 80, 80)
+                                                                }
+                                                                "WARN" => {
+                                                                    Color32::from_rgb(210, 160, 60)
+                                                                }
+                                                                "DEBUG" | "TRACE" => {
+                                                                    Color32::from_gray(120)
+                                                                }
+                                                                _ => Color32::from_gray(200),
+                                                            };
+                                                        ui.colored_label(
+                                                            level_color,
+                                                            &entry.log.level,
+                                                        );
+                                                        ui.colored_label(
+                                                            Color32::from_gray(90),
+                                                            format_timestamp_age(entry.log.ts),
+                                                        );
+                                                        ui.colored_label(
+                                                            Color32::from_gray(100),
+                                                            format!("[{}]", entry.log.target),
+                                                        );
+                                                        for part in egui_sgr::ansi_to_rich_text(
+                                                            &entry.log.message,
+                                                        ) {
+                                                            ui.label(part);
+                                                        }
+                                                        for field in &entry.log.fields {
+                                                            ui.add_space(6.0);
+                                                            ui.colored_label(
+                                                                Color32::from_gray(110),
+                                                                format!("{}=", field.name),
+                                                            );
+                                                            ui.monospace(&field.value);
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                        );
                                 });
                         }
                     } else {
@@ -5714,19 +6108,13 @@ impl App {
 
                 // Title row
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Run Command")
-                            .strong()
-                            .size(14.0),
-                    );
+                    ui.label(egui::RichText::new("Run Command").strong().size(14.0));
                     ui.weak("POSIX compatible command line");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_run = self.run_command.pending_spawn_args.is_some();
                         let run_btn = ui.add_enabled(
                             can_run,
-                            egui::Button::new(
-                                egui::RichText::new("  Run  ").strong(),
-                            ),
+                            egui::Button::new(egui::RichText::new("  Run  ").strong()),
                         );
                         if run_btn.clicked() {
                             if let Some(args) = self.run_command.pending_spawn_args.clone() {
@@ -6540,6 +6928,848 @@ impl App {
         }
     }
 
+    // ── Manage tab ────────────────────────────────────────────────────────────
+
+    fn wizard_do_create(&mut self) {
+        let name = self.manage_wizard.new_name.trim().to_string();
+        self.manage_wizard.template.dbus = self.manage_wizard.dbus_mode.clone();
+        self.manage_wizard.template.hot = PathBuf::from("@/hot.json");
+        self.manage_wizard.template.hot_init = Some(self.manage_wizard.hot.clone());
+        let profile_content = match serde_json::to_string_pretty(&self.manage_wizard.template) {
+            Ok(s) => s,
+            Err(e) => {
+                self.manage_wizard.status = Some(format!("Serialize error: {e}"));
+                return;
+            }
+        };
+        let hot_content = serde_json::to_string_pretty(&self.manage_wizard.hot).ok();
+        self.manage_wizard.status = Some(format!("Creating '{}'...", name));
+        self.supervisor
+            .send(SupervisorCommand::CreateProfilePrivileged {
+                name,
+                profile_content,
+                hot_content,
+            });
+    }
+
+    fn render_manage_tab(&mut self, ui: &mut egui::Ui) {
+        let step = self.manage_wizard.step.clone();
+        let mode = self.manage_wizard.mode.clone();
+
+        // Read keyboard shortcuts before any mutable borrow of ui
+        let key_back = !ui.ctx().wants_keyboard_input()
+            && ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let key_next = !ui.ctx().wants_keyboard_input()
+            && ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowRight));
+
+        // Compute back/next step for this step
+        let back_step: Option<WizardStep> = match step {
+            WizardStep::Landing => None,
+            WizardStep::TemplateKind => Some(WizardStep::Landing),
+            WizardStep::DbusMode => Some(if mode == WizardMode::CloneExisting {
+                WizardStep::Landing
+            } else {
+                WizardStep::TemplateKind
+            }),
+            WizardStep::PortListeners => Some(WizardStep::DbusMode),
+            WizardStep::RouteTargets => Some(WizardStep::PortListeners),
+            WizardStep::DnsHandling => Some(WizardStep::RouteTargets),
+            WizardStep::ReviewHotconfig => Some(WizardStep::DnsHandling),
+            WizardStep::Name => Some(WizardStep::ReviewHotconfig),
+        };
+
+        let next_step: Option<(WizardStep, &str)> = match step {
+            WizardStep::Landing | WizardStep::Name => None,
+            WizardStep::TemplateKind => Some((WizardStep::DbusMode, "Next: D-Bus")),
+            WizardStep::DbusMode => Some((WizardStep::PortListeners, "Next: Port Listeners")),
+            WizardStep::PortListeners => Some((WizardStep::RouteTargets, "Next: Route Targets")),
+            WizardStep::RouteTargets => Some((WizardStep::DnsHandling, "Next: DNS")),
+            WizardStep::DnsHandling => Some((WizardStep::ReviewHotconfig, "Next: Review")),
+            WizardStep::ReviewHotconfig => Some((WizardStep::Name, "Next: Create")),
+        };
+
+        let name_ok = step == WizardStep::Name && {
+            let n = self.manage_wizard.new_name.trim();
+            !n.is_empty() && !n.contains('/')
+        };
+
+        // ── Bottom nav bar (must be declared before content area) ──────────
+        let mut do_back = false;
+        let mut do_next: Option<WizardStep> = None;
+        let mut do_create = false;
+
+        if back_step.is_some() || step == WizardStep::Name {
+            egui::TopBottomPanel::bottom("wizard_bottom_nav")
+                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(8, 8)))
+                .show_separator_line(false)
+                .show_inside(ui, |ui| {
+                    // Draw top border
+                    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+                    let r = ui.max_rect();
+                    ui.painter()
+                        .hline(r.x_range(), r.top(), egui::Stroke::new(1.0, border_color));
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        // Back card
+                        if let Some(ref bstep) = back_step {
+                            if wizard_nav_card(ui, "← Back", "Left Arrow", true).clicked()
+                                || key_back
+                            {
+                                do_back = true;
+                                let _ = bstep; // used below
+                            }
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if step == WizardStep::Name {
+                                // Create card
+                                if wizard_nav_card(ui, "✓ Create Profile", "Right Arrow", name_ok)
+                                    .clicked()
+                                    || (key_next && name_ok)
+                                {
+                                    do_create = true;
+                                }
+                            } else if let Some((ref nstep, label)) = next_step {
+                                if wizard_nav_card(ui, &format!("{} →", label), "Right Arrow", true)
+                                    .clicked()
+                                    || key_next
+                                {
+                                    do_next = Some(nstep.clone());
+                                }
+                            }
+                        });
+                    });
+                });
+        }
+
+        // Apply nav actions
+        if do_back {
+            if let Some(s) = back_step {
+                self.manage_wizard.step = s;
+            }
+        }
+        if let Some(s) = do_next {
+            self.manage_wizard.step = s;
+        }
+        if do_create {
+            self.wizard_do_create();
+        }
+
+        // ── Step content ───────────────────────────────────────────────────
+        egui::ScrollArea::vertical()
+            .id_salt("wizard_content_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("Manage Containers");
+                ui.add_space(6.0);
+                match step {
+                    WizardStep::Landing => self.render_wizard_landing(ui),
+                    WizardStep::TemplateKind => self.render_wizard_template_kind(ui),
+                    WizardStep::DbusMode => self.render_wizard_dbus_mode(ui),
+                    WizardStep::PortListeners => self.render_wizard_port_listeners(ui),
+                    WizardStep::RouteTargets => self.render_wizard_route_targets(ui),
+                    WizardStep::DnsHandling => self.render_wizard_dns_handling(ui),
+                    WizardStep::ReviewHotconfig => self.render_wizard_review_hotconfig(ui),
+                    WizardStep::Name => self.render_wizard_name(ui),
+                }
+            });
+    }
+
+    fn wizard_step_label(step: &WizardStep) -> &'static str {
+        match step {
+            WizardStep::Landing => "Start",
+            WizardStep::TemplateKind => "1 / Template",
+            WizardStep::DbusMode => "2 / D-Bus",
+            WizardStep::PortListeners => "3 / Port Listeners",
+            WizardStep::RouteTargets => "4 / Route Targets",
+            WizardStep::DnsHandling => "5 / DNS Handling",
+            WizardStep::ReviewHotconfig => "6 / Review",
+            WizardStep::Name => "7 / Create",
+        }
+    }
+
+    fn render_wizard_breadcrumb(&self, ui: &mut egui::Ui) {
+        let steps = [
+            WizardStep::TemplateKind,
+            WizardStep::DbusMode,
+            WizardStep::PortListeners,
+            WizardStep::RouteTargets,
+            WizardStep::DnsHandling,
+            WizardStep::ReviewHotconfig,
+            WizardStep::Name,
+        ];
+        ui.horizontal_wrapped(|ui| {
+            for step in &steps {
+                let label = Self::wizard_step_label(step);
+                let is_current = step == &self.manage_wizard.step;
+                if is_current {
+                    ui.label(RichText::new(label).color(Color32::LIGHT_BLUE).strong());
+                } else {
+                    ui.colored_label(Color32::from_gray(100), label);
+                }
+                ui.colored_label(Color32::from_gray(60), "›");
+            }
+        });
+        ui.add_space(8.0);
+    }
+
+    fn render_wizard_landing(&mut self, ui: &mut egui::Ui) {
+        ui.label("What would you like to do?");
+        ui.add_space(12.0);
+
+        section_frame(ui, |ui| {
+            ui.heading("Create from Template");
+            ui.label("Set up a new container from a pre-configured starting point.");
+            ui.add_space(6.0);
+            if ui.button("Start guided setup  →").clicked() {
+                self.manage_wizard.mode = WizardMode::CreateFromTemplate;
+                // Apply default template immediately so hotconfig reflects it
+                let (tmpl, hot) = wizard_build_template(WizardTemplateKind::OverlayBasic);
+                self.manage_wizard.template = tmpl;
+                self.manage_wizard.hot = hot;
+                self.manage_wizard.hot_json =
+                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+                self.manage_wizard.step = WizardStep::TemplateKind;
+            }
+        });
+
+        ui.add_space(8.0);
+
+        section_frame(ui, |ui| {
+            ui.heading("Clone Existing Container");
+            ui.label("Copy the configuration of an existing profile as a starting point.");
+            ui.add_space(8.0);
+
+            let profiles: Vec<(String, String)> = self
+                .snapshot
+                .profiles
+                .iter()
+                .map(|(name, snap)| {
+                    let subtitle = if snap.child_alive {
+                        "running".to_string()
+                    } else {
+                        format!("{:?}", snap.template.sandbox_mode)
+                    };
+                    (name.clone(), subtitle)
+                })
+                .collect();
+
+            if profiles.is_empty() {
+                ui.colored_label(
+                    Color32::from_gray(120),
+                    "No existing profiles found. Create one from a template first.",
+                );
+            } else {
+                let mut clone_src: Option<String> = None;
+                for (name, subtitle) in &profiles {
+                    let selected = self.manage_wizard.clone_source == *name;
+                    let status_color = if self
+                        .snapshot
+                        .profiles
+                        .get(name)
+                        .map(|s| s.child_alive)
+                        .unwrap_or(false)
+                    {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::from_gray(100)
+                    };
+                    if sidebar_box(ui, name, subtitle, selected, status_color).clicked() {
+                        clone_src = Some(name.clone());
+                    }
+                    ui.add_space(2.0);
+                }
+
+                if let Some(src) = clone_src {
+                    let profile_path = state_paths::profile_config(&src);
+                    let hot_path = state_paths::hot_config(&src);
+                    match TemplateConfig::load(&profile_path) {
+                        Ok(tmpl) => {
+                            self.manage_wizard.template = tmpl;
+                            self.manage_wizard.hot = std::fs::read_to_string(&hot_path)
+                                .ok()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default();
+                            self.manage_wizard.hot_json =
+                                serde_json::to_string_pretty(&self.manage_wizard.hot)
+                                    .unwrap_or_default();
+                            self.manage_wizard.clone_source = src;
+                            self.manage_wizard.mode = WizardMode::CloneExisting;
+                            self.manage_wizard.step = WizardStep::DbusMode;
+                            self.manage_wizard.status = None;
+                        }
+                        Err(e) => {
+                            self.manage_wizard.status =
+                                Some(format!("Could not load profile: {}", e));
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = &self.manage_wizard.status {
+                ui.add_space(4.0);
+                ui.colored_label(Color32::LIGHT_RED, err);
+            }
+        });
+    }
+
+    fn render_wizard_template_kind(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("Choose a Template");
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("In Pivot mode, the state is contained within the container. This is the best possible method to prevent");
+            ui.label(
+                RichText::new(" accidental IP leaks ")
+                    .background_color(Color32::from_rgb(66, 54, 0))
+                    .color(Color32::from_rgb(255, 230, 150))
+                    .strong(),
+            );
+            ui.label("by app launches in a wrong network namespace, because outside the right container, your application can not access identity data");
+        });
+        ui.add_space(10.0);
+
+        let mut apply_template = None;
+
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                let selected = self.manage_wizard.template_kind == WizardTemplateKind::OverlayBasic;
+                if ui.selectable_label(selected, "Overlay — Basic").clicked() {
+                    self.manage_wizard.template_kind = WizardTemplateKind::OverlayBasic;
+                    apply_template = Some(WizardTemplateKind::OverlayBasic);
+                }
+            });
+            ui.label(
+                "Overlay sandbox keeps the host root filesystem visible. Maximum compatibility \
+                for most desktop software. Pre-configures localhost port 9909 (Geph) and an \
+                internal DNS server at 127.0.0.1.",
+            );
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                let selected = self.manage_wizard.template_kind == WizardTemplateKind::PivotEmpty;
+                if ui.selectable_label(selected, "Pivot — Empty").clicked() {
+                    self.manage_wizard.template_kind = WizardTemplateKind::PivotEmpty;
+                    apply_template = Some(WizardTemplateKind::PivotEmpty);
+                }
+            });
+            ui.label(
+                "Pivot sandbox replaces the root filesystem with a fresh tmpfs. \
+                Nothing from the host is visible. Add mounts manually as needed.",
+            );
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                let selected = self.manage_wizard.template_kind == WizardTemplateKind::PivotFirefox;
+                if ui.selectable_label(selected, "Pivot — Firefox").clicked() {
+                    self.manage_wizard.template_kind = WizardTemplateKind::PivotFirefox;
+                    apply_template = Some(WizardTemplateKind::PivotFirefox);
+                }
+            });
+            ui.label(
+                "Pivot sandbox wired for a Firefox browser profile. Pre-mounts Wayland, \
+                PipeWire, PulseAudio, dconf, gvfs and systemd sockets. Firefox profile data \
+                is stored inside the nsp3 profile directory (@/). \
+                D-Bus mode defaults to Proxy.",
+            );
+        });
+
+        if let Some(kind) = apply_template {
+            let (tmpl, hot) = wizard_build_template(kind.clone());
+            // Preserve any dbus mode already chosen
+            let mut tmpl = tmpl;
+            tmpl.dbus = self.manage_wizard.dbus_mode.clone();
+            self.manage_wizard.template_kind = kind;
+            self.manage_wizard.template = tmpl;
+            self.manage_wizard.hot = hot;
+            self.manage_wizard.hot_json =
+                serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+        }
+    }
+
+    fn render_wizard_dbus_mode(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("D-Bus Mode");
+        ui.add_space(4.0);
+        ui.label("Controls whether and how the session D-Bus is exposed inside the container.");
+        ui.add_space(10.0);
+
+        let mut changed = false;
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dbus_mode == DbusMode::Block;
+            if ui
+                .selectable_label(sel, "Block  (default, recommended)")
+                .clicked()
+            {
+                self.manage_wizard.dbus_mode = DbusMode::Block;
+                changed = true;
+            }
+            ui.label("No session D-Bus inside the container. DBUS_SESSION_BUS_ADDRESS is unset.");
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dbus_mode == DbusMode::Proxy;
+            if ui.selectable_label(sel, "Proxy  (private bus)").clicked() {
+                self.manage_wizard.dbus_mode = DbusMode::Proxy;
+                changed = true;
+            }
+            ui.label(
+                "nsproxy runs a private D-Bus daemon (busd) inside the container. \
+                Apps can communicate with each other but cannot reach host services.",
+            );
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dbus_mode == DbusMode::Pass;
+            if ui
+                .selectable_label(sel, "Pass  (host session bus)")
+                .clicked()
+            {
+                self.manage_wizard.dbus_mode = DbusMode::Pass;
+                changed = true;
+            }
+            if self.manage_wizard.dbus_mode == DbusMode::Pass {
+                ui.label(
+                    RichText::new(
+                        "⚠  The container can reach ALL host D-Bus services. \
+                        Suitable only for trusted software.",
+                    )
+                    .color(Color32::from_rgb(236, 168, 52)),
+                );
+            } else {
+                ui.label("Passes the host DBUS_SESSION_BUS_ADDRESS through. Risky — only for trusted apps.");
+            }
+        });
+
+        if changed {
+            self.manage_wizard.template.dbus = self.manage_wizard.dbus_mode.clone();
+        }
+    }
+
+    fn render_wizard_port_listeners(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("Port Listeners");
+        ui.add_space(4.0);
+        ui.label(
+            "Map host localhost ports into the container. \
+            Processes inside the container will reach host:port as localhost:port.",
+        );
+        ui.add_space(8.0);
+
+        // Preset buttons
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Presets:");
+            if ui.button("Geph  (9909)").clicked() {
+                self.manage_wizard.hot.locals.insert(9909, 9909);
+                self.manage_wizard.hot_json =
+                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+            }
+            if ui.button("Chrome DevTools  (9222)").clicked() {
+                self.manage_wizard.hot.locals.insert(9222, 9222);
+                self.manage_wizard.hot_json =
+                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+            }
+        });
+        ui.add_space(6.0);
+
+        // Custom port input
+        ui.horizontal(|ui| {
+            ui.label("Custom port:");
+            ui.text_edit_singleline(&mut self.manage_wizard.local_port_input);
+            if ui.button("Add").clicked() {
+                let trimmed = self.manage_wizard.local_port_input.trim();
+                if let Ok(port) = trimmed.parse::<u32>() {
+                    self.manage_wizard.hot.locals.insert(port, port);
+                    self.manage_wizard.hot_json =
+                        serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+                    self.manage_wizard.local_port_input.clear();
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        // Show current locals
+        let locals: Vec<(u32, u32)> = self
+            .manage_wizard
+            .hot
+            .locals
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        if locals.is_empty() {
+            ui.colored_label(Color32::from_gray(120), "No port listeners configured.");
+        } else {
+            ui.label("Configured:");
+            let mut to_remove = None;
+            for (container_port, host_port) in &locals {
+                ui.horizontal(|ui| {
+                    ui.label(format!("container:{} → host:{}", container_port, host_port));
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(regular::X)
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(200, 100, 100)),
+                            )
+                            .small()
+                            .frame(false),
+                        )
+                        .on_hover_text("Remove")
+                        .clicked()
+                    {
+                        to_remove = Some(*container_port);
+                    }
+                });
+            }
+            if let Some(port) = to_remove {
+                self.manage_wizard.hot.locals.remove(&port);
+                self.manage_wizard.hot_json =
+                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+            }
+        }
+    }
+
+    fn render_wizard_route_targets(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("Route Targets");
+        ui.add_space(4.0);
+        ui.label(
+            "Select which uplink proxy routes traffic from this container. \
+            The proxy must be reachable via a configured port listener.",
+        );
+        ui.add_space(8.0);
+
+        // Show available proxies
+        if self.proxies.is_empty() {
+            ui.colored_label(
+                Color32::from_gray(130),
+                "No uplink proxies configured yet. Add proxies in the Proxies tab first.",
+            );
+        } else {
+            let current_route = self.manage_wizard.hot.route.clone();
+            let mut new_route = current_route.clone();
+            for (proxy_id, item) in &self.proxies {
+                let is_selected = matches!(&current_route, nsproxy_core::HotRoute::SimpleProxy { proxy_id: pid } if pid == proxy_id);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(is_selected, &item.name).clicked() {
+                        new_route = nsproxy_core::HotRoute::SimpleProxy {
+                            proxy_id: proxy_id.clone(),
+                        };
+                    }
+                    ui.colored_label(Color32::from_gray(140), &item.url);
+                });
+            }
+
+            let is_none = matches!(&current_route, nsproxy_core::HotRoute::None);
+            if ui.selectable_label(is_none, "None  (no proxy)").clicked() {
+                new_route = nsproxy_core::HotRoute::None;
+            }
+
+            if new_route != current_route {
+                self.manage_wizard.hot.route = new_route;
+                self.manage_wizard.hot_json =
+                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Note").strong());
+        ui.label(
+            "Geph (port 9909) is a popular choice. Add '9909' in Port Listeners if not already done, \
+            then configure a Geph proxy in the Proxies tab.",
+        );
+    }
+
+    fn render_wizard_dns_handling(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("DNS Handling");
+        ui.add_space(4.0);
+        ui.label("Controls how DNS queries are resolved inside the container.");
+        ui.add_space(10.0);
+
+        let mut changed = false;
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dns_mode == WizardDnsMode::InternalServer;
+            if ui
+                .selectable_label(sel, "Internal DNS server  (127.0.0.1)  — recommended")
+                .clicked()
+            {
+                self.manage_wizard.dns_mode = WizardDnsMode::InternalServer;
+                changed = true;
+            }
+            ui.label(
+                "nsproxy spins up an internal DNS resolver at 127.0.0.1:53 inside the container. \
+                DNS requests are forwarded to the SOCKS5 proxy as domain-name queries — \
+                the proxy resolves hostnames, preventing DNS leaks.",
+            );
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dns_mode == WizardDnsMode::TunUdp;
+            if ui
+                .selectable_label(sel, "TUN UDP DNS  (100.68.0.1)")
+                .clicked()
+            {
+                self.manage_wizard.dns_mode = WizardDnsMode::TunUdp;
+                changed = true;
+            }
+            ui.label(
+                "Sets resolv.conf to the TUN device's virtual DNS address. DNS packets travel \
+                through the TUN as regular UDP datagrams and are proxied upstream.",
+            );
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dns_mode == WizardDnsMode::PassThrough;
+            if ui
+                .selectable_label(sel, "Pass through  (host DNS)")
+                .clicked()
+            {
+                self.manage_wizard.dns_mode = WizardDnsMode::PassThrough;
+                changed = true;
+            }
+            ui.label("Do not rewrite resolv.conf. The container inherits the host nameserver.");
+        });
+        ui.add_space(6.0);
+
+        section_frame(ui, |ui| {
+            let sel = self.manage_wizard.dns_mode == WizardDnsMode::Custom;
+            if ui.selectable_label(sel, "Custom nameserver").clicked() {
+                self.manage_wizard.dns_mode = WizardDnsMode::Custom;
+                changed = true;
+            }
+            if self.manage_wizard.dns_mode == WizardDnsMode::Custom {
+                ui.horizontal(|ui| {
+                    ui.label("Nameserver IP:");
+                    if ui
+                        .text_edit_singleline(&mut self.manage_wizard.dns_custom_text)
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+            }
+        });
+
+        if changed {
+            self.manage_wizard.hot.resolv_conf_dns = match &self.manage_wizard.dns_mode {
+                WizardDnsMode::InternalServer => "127.0.0.1".to_string(),
+                WizardDnsMode::TunUdp => "100.68.0.1".to_string(),
+                WizardDnsMode::PassThrough => String::new(),
+                WizardDnsMode::Custom => self.manage_wizard.dns_custom_text.trim().to_string(),
+            };
+            self.manage_wizard.hot_json =
+                serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+        }
+    }
+
+    fn render_wizard_review_hotconfig(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("Review Configuration");
+        ui.add_space(4.0);
+        ui.label(
+            "Review the full profile JSON below (template + embedded hot config). \
+            Adjust the hot config in the editor; the preview updates automatically.",
+        );
+        ui.add_space(6.0);
+
+        // Full profile JSON preview (TemplateConfig with hot_init embedded)
+        section_frame(ui, |ui| {
+            ui.label(RichText::new("Profile JSON (preview)").strong());
+            ui.add_space(4.0);
+            let mut preview_tmpl = self.manage_wizard.template.clone();
+            preview_tmpl.dbus = self.manage_wizard.dbus_mode.clone();
+            preview_tmpl.hot = std::path::PathBuf::from("@/hot.json");
+            preview_tmpl.hot_init = Some(self.manage_wizard.hot.clone());
+            let preview_json = serde_json::to_string_pretty(&preview_tmpl).unwrap_or_default();
+            let mut preview_json_display = preview_json.clone();
+            egui::ScrollArea::vertical()
+                .id_salt("wizard-review-preview-scroll")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    let mut editor = CodeEditor::default()
+                        .id_source("wizard-review-preview-editor")
+                        .with_rows(18)
+                        .with_theme(ColorTheme::GRUVBOX)
+                        .with_syntax(json_syntax())
+                        .with_numlines(true)
+                        .with_ui_fontsize(ui);
+                    let _ = editor.show(ui, &mut preview_json_display);
+                });
+        });
+        ui.add_space(8.0);
+
+        // Merge-from-file section
+        section_frame(ui, |ui| {
+            ui.label(RichText::new("Merge from existing hot.json").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                ui.text_edit_singleline(&mut self.manage_wizard.merge_path);
+                if ui.button("Merge").clicked() {
+                    let path = self.manage_wizard.merge_path.trim().to_string();
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => match serde_json::from_str::<HotConfig>(&content) {
+                            Ok(imported) => {
+                                // Merge: union dns, locals, mounts; overwrite route/resolv if non-empty
+                                self.manage_wizard.hot.dns.extend(imported.dns);
+                                self.manage_wizard.hot.locals.extend(imported.locals);
+                                self.manage_wizard.hot.mounts.extend(imported.mounts);
+                                if !imported.resolv_conf_dns.is_empty() {
+                                    self.manage_wizard.hot.resolv_conf_dns =
+                                        imported.resolv_conf_dns;
+                                }
+                                if !matches!(imported.route, nsproxy_core::HotRoute::None) {
+                                    self.manage_wizard.hot.route = imported.route;
+                                }
+                                self.manage_wizard.hot_json =
+                                    serde_json::to_string_pretty(&self.manage_wizard.hot)
+                                        .unwrap_or_default();
+                                self.manage_wizard.merge_error = None;
+                            }
+                            Err(e) => {
+                                self.manage_wizard.merge_error = Some(format!("Parse error: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            self.manage_wizard.merge_error = Some(format!("Read error: {e}"));
+                        }
+                    }
+                }
+            });
+            if let Some(err) = &self.manage_wizard.merge_error {
+                ui.colored_label(Color32::LIGHT_RED, err);
+            }
+        });
+        ui.add_space(8.0);
+
+        // Show the hotconfig editor (same form as the Hotconfig tab)
+        let changed = Self::render_hotconfig_editor_split(
+            ui,
+            &mut self.int_input,
+            "manage-wizard-hotconfig",
+            &mut self.manage_wizard.hot,
+            &mut self.manage_wizard.hot_json,
+            &mut self.manage_wizard.hot_json_error,
+        );
+        if changed {
+            // Sync resolv_conf_dns back to dns_mode state
+            self.manage_wizard.dns_mode = match self.manage_wizard.hot.resolv_conf_dns.as_str() {
+                "127.0.0.1" => WizardDnsMode::InternalServer,
+                "100.68.0.1" => WizardDnsMode::TunUdp,
+                "" => WizardDnsMode::PassThrough,
+                other => {
+                    self.manage_wizard.dns_custom_text = other.to_string();
+                    WizardDnsMode::Custom
+                }
+            };
+        }
+    }
+
+    fn render_wizard_name(&mut self, ui: &mut egui::Ui) {
+        self.render_wizard_breadcrumb(ui);
+        ui.heading("Create Profile");
+        ui.add_space(6.0);
+
+        // Summary
+        section_frame(ui, |ui| {
+            ui.label(RichText::new("Summary").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_gray(160), "Template:");
+                if self.manage_wizard.mode == WizardMode::CloneExisting {
+                    ui.label(format!("Cloned from: {}", self.manage_wizard.clone_source));
+                } else {
+                    ui.label(match &self.manage_wizard.template_kind {
+                        WizardTemplateKind::OverlayBasic => "Overlay — Basic",
+                        WizardTemplateKind::PivotEmpty => "Pivot — Empty",
+                        WizardTemplateKind::PivotFirefox => "Pivot — Firefox",
+                    });
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_gray(160), "Sandbox:");
+                ui.label(format!("{:?}", self.manage_wizard.template.sandbox_mode));
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_gray(160), "D-Bus:");
+                let (label, color) = match &self.manage_wizard.dbus_mode {
+                    DbusMode::Block => ("block", Color32::from_gray(160)),
+                    DbusMode::Proxy => ("proxy", Color32::LIGHT_GREEN),
+                    DbusMode::Pass => ("pass ⚠", Color32::from_rgb(236, 168, 52)),
+                };
+                ui.colored_label(color, label);
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_gray(160), "Port listeners:");
+                let ports: Vec<String> = self
+                    .manage_wizard
+                    .hot
+                    .locals
+                    .keys()
+                    .map(|p| p.to_string())
+                    .collect();
+                if ports.is_empty() {
+                    ui.colored_label(Color32::from_gray(120), "none");
+                } else {
+                    ui.label(ports.join(", "));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_gray(160), "DNS:");
+                ui.label(&self.manage_wizard.hot.resolv_conf_dns);
+            });
+        });
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Profile name:");
+            ui.text_edit_singleline(&mut self.manage_wizard.new_name);
+        });
+
+        let name = self.manage_wizard.new_name.trim().to_string();
+        let name_ok = !name.is_empty() && !name.contains('/');
+        if !name_ok && !name.is_empty() {
+            ui.colored_label(Color32::LIGHT_RED, "Name must not be empty or contain '/'");
+        }
+
+        if let Some(status) = &self.manage_wizard.status {
+            ui.add_space(4.0);
+            ui.label(status);
+        }
+
+        // Check if creation succeeded (profile appeared in snapshot)
+        let created = !self.manage_wizard.new_name.is_empty()
+            && self
+                .snapshot
+                .profiles
+                .contains_key(self.manage_wizard.new_name.trim());
+        if created {
+            ui.add_space(8.0);
+            ui.colored_label(
+                Color32::LIGHT_GREEN,
+                format!(
+                    "Profile '{}' created successfully.",
+                    self.manage_wizard.new_name.trim()
+                ),
+            );
+            if ui.button("Start over").clicked() {
+                self.manage_wizard = ManageWizard::default();
+            }
+        }
+    }
+
     fn render_hotconfig_tab(&mut self, ui: &mut egui::Ui) {
         self.refresh_hotconfig_editor_target();
 
@@ -6549,7 +7779,7 @@ impl App {
         }
 
         let profile_name = self.selected_profile.clone().unwrap_or_default();
-        let (dns_state, sandbox_status, child_alive) = self
+        let (dns_state, sandbox_status, child_alive, dbus_mode) = self
             .snapshot
             .profiles
             .get(&profile_name)
@@ -6558,9 +7788,10 @@ impl App {
                     profile.dns_state.clone(),
                     profile.sandbox_status.clone(),
                     profile.child_alive,
+                    profile.template.dbus.clone(),
                 )
             })
-            .unwrap_or((None, None, false));
+            .unwrap_or((None, None, false, DbusMode::Block));
         ui.horizontal(|ui| {
             ui.heading(format!("Hotconfig - {}", profile_name));
             if ui.button("Reload").clicked() {
@@ -6595,6 +7826,34 @@ impl App {
                 }
             });
         }
+        ui.add_space(4.0);
+        egui::Frame::none()
+            .fill(Color32::from_gray(18))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("D-Bus:").strong());
+                    match dbus_mode {
+                        DbusMode::Block => {
+                            ui.colored_label(Color32::from_gray(150), "block (default, no dbus)");
+                        }
+                        DbusMode::Pass => {
+                            ui.label(
+                                RichText::new("pass — host session bus exposed")
+                                    .color(Color32::from_rgb(236, 168, 52))
+                                    .strong(),
+                            );
+                            ui.colored_label(
+                                Color32::from_rgb(200, 140, 40),
+                                "⚠ container can reach host dbus services",
+                            );
+                        }
+                        DbusMode::Proxy => {
+                            ui.colored_label(Color32::LIGHT_GREEN, "proxy (private busd)");
+                        }
+                    }
+                });
+            });
         ui.add_space(8.0);
         match sandbox_status.as_ref() {
             Some(status) => Self::render_sandbox_status_panel(ui, status),
@@ -6776,6 +8035,624 @@ impl App {
                             });
                     });
             });
+    }
+
+    fn render_state_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(profile_name) = self.selected_profile.clone() else {
+            ui.label("Select a profile to view its state.");
+            return;
+        };
+
+        let Some(cs) = self.snapshot.profiles.get(&profile_name).cloned() else {
+            ui.label("Profile state not yet loaded.");
+            return;
+        };
+
+        let sandbox_mode = &cs.template.sandbox_mode;
+        let is_pivot = *sandbox_mode == SandboxMode::Pivot;
+
+        // ── Header ────────────────────────────────────────────────────────────
+        ui.heading(format!("State — {}", profile_name));
+        ui.add_space(4.0);
+        egui::Frame::none()
+            .fill(Color32::from_gray(22))
+            .inner_margin(egui::Margin::same(10))
+            .rounding(egui::Rounding::same(6))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "The totality of state that is accessible by the container is illustrated as follows.",
+                    )
+                    .strong()
+                    .size(14.0),
+                );
+            });
+
+        ui.add_space(8.0);
+
+        // ── Sandbox Mode ──────────────────────────────────────────────────────
+        egui::Frame::none()
+            .fill(Color32::from_gray(18))
+            .inner_margin(egui::Margin::same(10))
+            .rounding(egui::Rounding::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Filesystem isolation mode:").strong());
+                    if is_pivot {
+                        ui.colored_label(Color32::LIGHT_BLUE, "Pivot");
+                    } else {
+                        ui.colored_label(Color32::from_rgb(236, 198, 92), "Overlay");
+                    }
+                });
+                ui.add_space(4.0);
+                if is_pivot {
+                    ui.label(
+                        "In Pivot mode the container's filesystem access is explicitly and \
+                         precisely controlled. The container root is replaced via pivot_root(2) \
+                         with a fresh isolated tree. Every path the container can reach has been \
+                         deliberately mounted — no host path is accessible unless it appears in \
+                         the mount list below. Sources prefixed with @ refer to nsproxy-managed \
+                         state directories that nsproxy owns and maintains. The previous host \
+                         root is accessible inside the container at /pivot, giving an explicit \
+                         and auditable escape hatch. This mode maximises reproducibility, \
+                         privacy hygiene, and blast-radius reduction.",
+                    );
+                } else {
+                    ui.label(
+                        "In Overlay mode the container inherits the entire host filesystem \
+                         unchanged. The container can read and write everything the launching \
+                         user can access on the host. This mode offers maximum compatibility \
+                         and minimal breakage — applications see a familiar, complete \
+                         environment — but it makes no isolation guarantees. Anything on the \
+                         host is reachable. Use Pivot mode when reproducibility, privacy \
+                         hygiene, or explicit access control matters.",
+                    );
+                }
+            });
+
+        ui.add_space(10.0);
+
+        // ── Persistent State Paths ─────────────────────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("Persistent State Paths").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "All filesystem paths that nsproxy uses to store, expose, or wire \
+                     state for this container. These exist on the host regardless of \
+                     whether the container is running.",
+                );
+                ui.add_space(6.0);
+
+                let paths: &[(&str, PathBuf, &str)] = &[
+                    (
+                        "Profile config dir",
+                        state_paths::profile_dir(&profile_name),
+                        "Root directory for all persistent state of this profile",
+                    ),
+                    (
+                        "Profile config (profile.json)",
+                        state_paths::profile_config(&profile_name),
+                        "Template / profile schema — defines sandbox mode, mounts, env, etc.",
+                    ),
+                    (
+                        "Hot config",
+                        state_paths::hot_config(&profile_name),
+                        "Frequently-reloaded runtime config: DNS, TUN, mounts, daemons",
+                    ),
+                    (
+                        "Sandbox status snapshot",
+                        state_paths::sandbox_status(&profile_name),
+                        "Latest sandbox inspection result written by sp sandbox",
+                    ),
+                    (
+                        "Network namespace bind",
+                        state_paths::profile_netns_bind(&profile_name),
+                        "Bind-mounted network namespace file that keeps the netns alive",
+                    ),
+                    (
+                        "Namespace metadata",
+                        state_paths::profile_ns_meta(&profile_name),
+                        "JSON record of live PIDs and namespace identities (ns_alive.json)",
+                    ),
+                    (
+                        "Rootfs dir",
+                        state_paths::profile_rootfs_dir(&profile_name),
+                        "Pivot-mode root filesystem tree (used only when mode = Pivot)",
+                    ),
+                    (
+                        "Pivot staging dir",
+                        state_paths::pivot_root_mem(&profile_name),
+                        "Temporary staging path in RAM used during pivot_root(2) transitions",
+                    ),
+                    (
+                        "Logs dir",
+                        state_paths::logs_root(),
+                        "Per-process diagnostic log files for all profiles",
+                    ),
+                    (
+                        "Uplink state root",
+                        state_paths::uplink_root(),
+                        "Root for uplink (proxy) runtime state shared across profiles",
+                    ),
+                ];
+
+                egui::ScrollArea::horizontal()
+                    .id_salt("state-paths-scroll")
+                    .show(ui, |ui| {
+                        TableBuilder::new(ui)
+                            .id_salt("state-paths-table")
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().at_least(200.0))
+                            .column(Column::remainder().at_least(260.0))
+                            .column(Column::remainder().at_least(220.0))
+                            .header(20.0, |mut h| {
+                                h.col(|ui| {
+                                    ui.strong("Name");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("Path");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("Purpose");
+                                });
+                            })
+                            .body(|mut body| {
+                                body.rows(22.0, paths.len(), |mut row| {
+                                    let (name, path, desc) = &paths[row.index()];
+                                    let exists = path.exists();
+                                    row.col(|ui| {
+                                        ui.label(RichText::new(*name).strong());
+                                    });
+                                    row.col(|ui| {
+                                        let color = if exists {
+                                            Color32::LIGHT_GREEN
+                                        } else {
+                                            Color32::from_gray(110)
+                                        };
+                                        ui.label(
+                                            RichText::new(path.display().to_string())
+                                                .monospace()
+                                                .color(color),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(Color32::from_gray(190), *desc);
+                                    });
+                                });
+                            });
+                    });
+            });
+
+        ui.add_space(8.0);
+
+        // ── Template Mounts ───────────────────────────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("Profile Mounts (template)").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "Bind mounts declared in profile.json. These are applied once when the \
+                     container starts. Sources marked @ are nsproxy-managed state directories.",
+                );
+                ui.add_space(4.0);
+                if cs.template.mounts.is_empty() {
+                    ui.colored_label(Color32::from_gray(130), "No profile mounts configured.");
+                } else {
+                    Self::render_profile_mount_list(ui, &cs.template.mounts, "state-tmpl-mounts");
+                }
+            });
+
+        ui.add_space(8.0);
+
+        // ── Hotconfig Mounts ──────────────────────────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("Hotconfig Mounts (hot.json)").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "Bind mounts from hot.json. These are applied on every hot-reload \
+                     without restarting the container.",
+                );
+                ui.add_space(4.0);
+                let has_mounts = !cs.hotconfig.mounts.is_empty();
+                let has_mnt = !cs.hotconfig.mnt.is_empty();
+                if !has_mounts && !has_mnt {
+                    ui.colored_label(Color32::from_gray(130), "No hotconfig mounts configured.");
+                } else {
+                    if has_mounts {
+                        ui.label(RichText::new("mounts (structured):").italics());
+                        Self::render_profile_mount_list(
+                            ui,
+                            &cs.hotconfig.mounts,
+                            "state-hot-mounts",
+                        );
+                        ui.add_space(4.0);
+                    }
+                    if has_mnt {
+                        ui.label(RichText::new("mnt (shorthand source → target map):").italics());
+                        egui::ScrollArea::horizontal()
+                            .id_salt("state-hot-mnt-scroll")
+                            .show(ui, |ui| {
+                                TableBuilder::new(ui)
+                                    .id_salt("state-hot-mnt-table")
+                                    .striped(true)
+                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .column(Column::remainder().at_least(240.0))
+                                    .column(Column::remainder().at_least(240.0))
+                                    .header(20.0, |mut h| {
+                                        h.col(|ui| {
+                                            ui.strong("Source (host)");
+                                        });
+                                        h.col(|ui| {
+                                            ui.strong("Target (container)");
+                                        });
+                                    })
+                                    .body(|mut body| {
+                                        let entries: Vec<_> = cs.hotconfig.mnt.iter().collect();
+                                        body.rows(22.0, entries.len(), |mut row| {
+                                            let (target, source) = entries[row.index()];
+                                            row.col(|ui| {
+                                                ui.label(
+                                                    RichText::new(source.display().to_string())
+                                                        .monospace(),
+                                                );
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(
+                                                    RichText::new(target.display().to_string())
+                                                        .monospace(),
+                                                );
+                                            });
+                                        });
+                                    });
+                            });
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+
+        // ── Sandbox Status (live mount inspection) ────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("Live Sandbox State").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "Result of the most recent sp sandbox inspection. Shows whether each \
+                     configured mount is actually present in the container's mount namespace.",
+                );
+                ui.add_space(4.0);
+                match cs.sandbox_status.as_ref() {
+                    Some(status) => Self::render_sandbox_status_panel(ui, status),
+                    None => {
+                        ui.colored_label(
+                            Color32::from_gray(130),
+                            "No sandbox snapshot available yet. Run sp sandbox or start the container.",
+                        );
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+
+        // ── Environment Variables ─────────────────────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("Environment Variables (template)").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    "Environment variables set for processes inside this container. When \
+                     inherit_env is enabled these override the parent environment; otherwise \
+                     they replace it entirely.",
+                );
+                ui.add_space(4.0);
+                let inherit = cs.template.inherit_env;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("inherit_env:").strong());
+                    if inherit {
+                        ui.colored_label(
+                            Color32::LIGHT_GREEN,
+                            "true — parent env inherited, overrides applied",
+                        );
+                    } else {
+                        ui.colored_label(
+                            Color32::from_rgb(236, 198, 92),
+                            "false — env is fully replaced",
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+                if cs.template.env.is_empty() {
+                    ui.colored_label(
+                        Color32::from_gray(130),
+                        "No environment overrides configured.",
+                    );
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("state-env-scroll")
+                        .show(ui, |ui| {
+                            TableBuilder::new(ui)
+                                .id_salt("state-env-table")
+                                .striped(true)
+                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                .column(Column::auto().at_least(200.0))
+                                .column(Column::remainder().at_least(300.0))
+                                .header(20.0, |mut h| {
+                                    h.col(|ui| {
+                                        ui.strong("Variable");
+                                    });
+                                    h.col(|ui| {
+                                        ui.strong("Value");
+                                    });
+                                })
+                                .body(|mut body| {
+                                    let mut entries: Vec<_> = cs.template.env.iter().collect();
+                                    entries.sort_by_key(|(k, _)| k.as_str());
+                                    body.rows(22.0, entries.len(), |mut row| {
+                                        let (key, val) = entries[row.index()];
+                                        row.col(|ui| {
+                                            ui.label(
+                                                RichText::new(key.as_str()).monospace().strong(),
+                                            );
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(RichText::new(val.as_str()).monospace());
+                                        });
+                                    });
+                                });
+                        });
+                }
+            });
+
+        ui.add_space(8.0);
+
+        // ── Chmod / Ownership Operations ──────────────────────────────────────
+        if !cs.template.chmod.is_empty() {
+            egui::CollapsingHeader::new(
+                RichText::new("Chmod / Ownership Operations (template)").strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    "Permission and ownership adjustments applied inside the container \
+                         root after mounts are in place.",
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::horizontal()
+                    .id_salt("state-chmod-scroll")
+                    .show(ui, |ui| {
+                        TableBuilder::new(ui)
+                            .id_salt("state-chmod-table")
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::remainder().at_least(220.0))
+                            .column(Column::auto().at_least(80.0))
+                            .column(Column::auto().at_least(60.0))
+                            .column(Column::auto().at_least(60.0))
+                            .column(Column::auto().at_least(60.0))
+                            .header(20.0, |mut h| {
+                                h.col(|ui| {
+                                    ui.strong("Path");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("Mode");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("UID");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("GID");
+                                });
+                                h.col(|ui| {
+                                    ui.strong("mkdir");
+                                });
+                            })
+                            .body(|mut body| {
+                                body.rows(22.0, cs.template.chmod.len(), |mut row| {
+                                    let c = &cs.template.chmod[row.index()];
+                                    row.col(|ui| {
+                                        ui.label(
+                                            RichText::new(c.path.display().to_string()).monospace(),
+                                        );
+                                    });
+                                    row.col(|ui| match c.mode {
+                                        Some(m) => {
+                                            ui.label(format!("{:04o}", m));
+                                        }
+                                        None => {
+                                            ui.colored_label(Color32::from_gray(120), "—");
+                                        }
+                                    });
+                                    row.col(|ui| match c.uid {
+                                        Some(u) => {
+                                            ui.label(u.to_string());
+                                        }
+                                        None => {
+                                            ui.colored_label(Color32::from_gray(120), "—");
+                                        }
+                                    });
+                                    row.col(|ui| match c.gid {
+                                        Some(g) => {
+                                            ui.label(g.to_string());
+                                        }
+                                        None => {
+                                            ui.colored_label(Color32::from_gray(120), "—");
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        if c.mkdir {
+                                            ui.colored_label(Color32::LIGHT_GREEN, "yes");
+                                        } else {
+                                            ui.colored_label(Color32::from_gray(120), "no");
+                                        }
+                                    });
+                                });
+                            });
+                    });
+            });
+            ui.add_space(8.0);
+        }
+
+        // ── D-Bus Mode ────────────────────────────────────────────────────────
+        egui::CollapsingHeader::new(RichText::new("D-Bus Exposure").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    "Controls whether and how the D-Bus session bus is visible inside \
+                     the container. Blocking it improves isolation; passing it grants \
+                     access to host services.",
+                );
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(Color32::from_gray(14))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("D-Bus mode:").strong());
+                            match &cs.template.dbus {
+                                DbusMode::Block => {
+                                    ui.colored_label(Color32::from_gray(160), "block — D-Bus is completely absent inside the container.");
+                                }
+                                DbusMode::Pass => {
+                                    ui.colored_label(
+                                        Color32::from_rgb(236, 168, 52),
+                                        "pass — host session bus forwarded directly. Container can reach all host D-Bus services.",
+                                    );
+                                }
+                                DbusMode::Proxy => {
+                                    ui.colored_label(Color32::LIGHT_GREEN, "proxy — private per-profile busd instance. Isolated from host session bus.");
+                                }
+                            }
+                        });
+                    });
+            });
+
+        ui.add_space(8.0);
+
+        // ── Namespace Identity ────────────────────────────────────────────────
+        if cs.child_alive {
+            egui::CollapsingHeader::new(RichText::new("Active Namespace Identity").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(
+                        "Live namespace handles for the running container. These kernel \
+                         identities uniquely describe the container's isolation boundaries.",
+                    );
+                    ui.add_space(4.0);
+                    if let Some(ns) = &cs.up_ns {
+                        ui.label(RichText::new("up daemon namespaces:").italics());
+                        if let Some(mnt) = &ns.mnt {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("mnt:").strong());
+                                ui.label(RichText::new(mnt).monospace());
+                            });
+                        }
+                        if let Some(net) = &ns.net {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("net:").strong());
+                                ui.label(RichText::new(net).monospace());
+                            });
+                        }
+                        if let Some(pid) = &ns.pid {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("pid:").strong());
+                                ui.label(RichText::new(pid).monospace());
+                            });
+                        }
+                    }
+                    if let Some(ns_alive) = &cs.ns_alive {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Recorded identity (ns_alive.json):").italics());
+                        if let Some(pid) = ns_alive.child_pid {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("container pid:").strong());
+                                ui.label(RichText::new(pid.to_string()).monospace());
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("netns bind mount:").strong());
+                            ui.label(
+                                RichText::new(ns_alive.bind_mount.display().to_string())
+                                    .monospace(),
+                            );
+                        });
+                    }
+                });
+        }
+    }
+
+    fn render_profile_mount_list(ui: &mut egui::Ui, mounts: &[ProfileMount], salt: &str) {
+        egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
+            TableBuilder::new(ui)
+                .id_salt(format!("{}-table", salt))
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::remainder().at_least(200.0))
+                .column(Column::remainder().at_least(200.0))
+                .column(Column::auto().at_least(40.0))
+                .column(Column::auto().at_least(50.0))
+                .column(Column::auto().at_least(70.0))
+                .header(20.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong("Source (host / @-var)");
+                    });
+                    h.col(|ui| {
+                        ui.strong("Target (container)");
+                    });
+                    h.col(|ui| {
+                        ui.strong("ro");
+                    });
+                    h.col(|ui| {
+                        ui.strong("rec");
+                    });
+                    h.col(|ui| {
+                        ui.strong("optional");
+                    });
+                })
+                .body(|mut body| {
+                    body.rows(22.0, mounts.len(), |mut row| {
+                        let m = &mounts[row.index()];
+                        let src_str = m.source.display().to_string();
+                        let is_managed =
+                            src_str == "@" || src_str.starts_with("@/") || src_str.starts_with('@');
+                        row.col(|ui| {
+                            let color = if is_managed {
+                                Color32::from_rgb(130, 200, 255)
+                            } else {
+                                Color32::from_gray(220)
+                            };
+                            let text = RichText::new(&src_str).monospace().color(color);
+                            let resp = ui.label(text);
+                            if is_managed {
+                                resp.on_hover_text(
+                                    "@ refers to nsproxy-managed state for this profile",
+                                );
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(m.target.display().to_string()).monospace());
+                        });
+                        row.col(|ui| {
+                            if m.read_only {
+                                ui.colored_label(Color32::LIGHT_GREEN, "ro");
+                            } else {
+                                ui.colored_label(Color32::from_gray(120), "rw");
+                            }
+                        });
+                        row.col(|ui| {
+                            if m.recursive {
+                                ui.colored_label(Color32::from_gray(160), "rec");
+                            } else {
+                                ui.colored_label(Color32::from_gray(100), "—");
+                            }
+                        });
+                        row.col(|ui| {
+                            if m.skip_missing {
+                                ui.colored_label(Color32::from_rgb(236, 198, 92), "optional");
+                            } else {
+                                ui.colored_label(Color32::from_gray(120), "required");
+                            }
+                        });
+                    });
+                });
+        });
     }
 
     fn render_profile_editor_tab(&mut self, ui: &mut egui::Ui) {
@@ -7037,7 +8914,12 @@ fn list_persisted_log_files() -> Vec<PersistedLogFileInfo> {
         })
         .collect::<Vec<_>>();
 
-    files.sort_by(|left, right| right.modified.cmp(&left.modified).then_with(|| left.file_name.cmp(&right.file_name)));
+    files.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
     files
 }
 
@@ -7078,10 +8960,10 @@ fn build_persisted_logs_snapshot(
     let mut selected_file_entries = Vec::new();
 
     for file in &files {
-        let should_load_selected_file = logs_tab_visible
-            && selected_file.is_some_and(|selected| selected == file.path);
-        let should_load_pid_entries = process_logs_visible
-            && selected_pid.is_some_and(|pid| file.pid == Some(pid));
+        let should_load_selected_file =
+            logs_tab_visible && selected_file.is_some_and(|selected| selected == file.path);
+        let should_load_pid_entries =
+            process_logs_visible && selected_pid.is_some_and(|pid| file.pid == Some(pid));
 
         if !(should_load_selected_file || should_load_pid_entries) {
             continue;
@@ -7945,12 +9827,7 @@ fn format_namespace_indicator(ns: &supervisor::NamespaceIndicator) -> String {
     format!("mnt={mnt} net={net} pid={pid_ns}")
 }
 
-fn render_namespace_badge(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: Option<&str>,
-    accent: Color32,
-) {
+fn render_namespace_badge(ui: &mut egui::Ui, label: &str, value: Option<&str>, accent: Color32) {
     let text = format!("{label} {}", value.unwrap_or("?"));
     ui.label(
         RichText::new(text)
@@ -8007,7 +9884,7 @@ fn sidebar_box_width(
     status_color: eframe::egui::Color32,
     width_override: Option<f32>,
 ) -> eframe::egui::Response {
-    use eframe::egui::{Align2, FontId, Stroke};
+    use eframe::egui::{Align2, FontId};
 
     let desired = ui.available_size_before_wrap();
     let width = width_override.unwrap_or_else(|| desired.x.max(220.0).min(ui.available_width()));
@@ -8016,28 +9893,18 @@ fn sidebar_box_width(
 
     let visuals = ui.visuals();
     let bg = if selected {
-        visuals.widgets.active.bg_fill
+        // translucent accent when selected
+        let sel = visuals.selection.bg_fill;
+        eframe::egui::Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 60)
     } else if resp.hovered() {
-        visuals.widgets.hovered.bg_fill
+        let h = visuals.widgets.hovered.bg_fill;
+        eframe::egui::Color32::from_rgba_unmultiplied(h.r(), h.g(), h.b(), 30)
     } else {
-        visuals.widgets.inactive.bg_fill
+        eframe::egui::Color32::TRANSPARENT
     };
 
-    // Background and border
+    // Background only — no border
     ui.painter().rect_filled(rect, 8.0, bg);
-    let stroke_color = if selected {
-        visuals.selection.stroke.color
-    } else if resp.hovered() {
-        visuals.widgets.hovered.fg_stroke.color
-    } else {
-        visuals.widgets.inactive.fg_stroke.color
-    };
-    ui.painter().rect_stroke(
-        rect,
-        8.0,
-        Stroke::new(if selected { 2.0 } else { 1.0 }, stroke_color),
-        egui::StrokeKind::Middle,
-    );
 
     // Avatar circle on the left
     let avatar_radius = 20.0;
@@ -8103,6 +9970,66 @@ fn section_frame<R>(
             ui.set_width(ui.available_width());
             add_contents(ui)
         })
+}
+
+/// Navigation card used in the wizard bottom bar.
+/// Looks like a minimal card with a title and a small keyboard-shortcut hint below it.
+fn wizard_nav_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    shortcut_hint: &str,
+    enabled: bool,
+) -> egui::Response {
+    use eframe::egui::{Align2, FontId};
+
+    let desired_width = (title.len() as f32 * 9.0 + 32.0).max(120.0).min(240.0);
+    let size = egui::vec2(desired_width, 48.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let bg = if !enabled {
+            egui::Color32::TRANSPARENT
+        } else if resp.is_pointer_button_down_on() {
+            let c = visuals.selection.bg_fill;
+            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 80)
+        } else if resp.hovered() {
+            let h = visuals.widgets.hovered.bg_fill;
+            egui::Color32::from_rgba_unmultiplied(h.r(), h.g(), h.b(), 40)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, 6.0, bg);
+
+        let title_color = if enabled {
+            visuals.text_color()
+        } else {
+            egui::Color32::from_gray(80)
+        };
+        let hint_color = egui::Color32::from_gray(if enabled { 110 } else { 55 });
+
+        ui.painter().text(
+            egui::pos2(rect.min.x + 8.0, rect.min.y + 8.0),
+            Align2::LEFT_TOP,
+            title,
+            FontId::proportional(13.0),
+            title_color,
+        );
+        ui.painter().text(
+            egui::pos2(rect.min.x + 8.0, rect.min.y + 28.0),
+            Align2::LEFT_TOP,
+            shortcut_hint,
+            FontId::proportional(10.0),
+            hint_color,
+        );
+    }
+
+    resp
 }
 
 /// Try to load a CJK font from common system paths and register it with egui.
