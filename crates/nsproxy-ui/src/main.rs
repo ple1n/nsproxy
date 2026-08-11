@@ -260,12 +260,14 @@ impl PivotAppKind {
     }
     fn description(&self) -> &'static str {
         match self {
-            PivotAppKind::Firefox =>
+            PivotAppKind::Firefox => {
                 "Mounts Wayland, PipeWire, PulseAudio, dconf, gvfs and systemd. \
-                Firefox profile stored in @/.",
-            PivotAppKind::SignalAppImage =>
+                Firefox profile stored in @/."
+            }
+            PivotAppKind::SignalAppImage => {
                 "Mounts Wayland, PipeWire, PulseAudio, dconf and systemd. \
-                Signal data stored in @/.config/Signal AppImage.",
+                Signal data stored in @/.config/Signal AppImage."
+            }
         }
     }
 }
@@ -3219,22 +3221,70 @@ fn wizard_build_pivot_template(
 
     let mut mounts: Vec<ProfileMount> = Vec::new();
     let mut chmod: Vec<ProfileChmod> = vec![
-        ProfileChmod { path: PathBuf::from("/home"), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
-        ProfileChmod { path: PathBuf::from(&run_user), mode: None, uid: Some(uid), gid: Some(gid), mkdir: false },
+        ProfileChmod {
+            path: PathBuf::from("/home"),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: true,
+        },
+        ProfileChmod {
+            path: PathBuf::from(&run_user),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: false,
+        },
     ];
     let mut env: HashMap<String, String> = HashMap::new();
     let has_graphical = !apps.is_empty();
 
     if apps.contains(&PivotAppKind::Firefox) {
         mounts.extend([
-            ProfileMount { source: PathBuf::from("@/.mozilla/firefox"),                    target: PathBuf::from(format!("{}/.mozilla/firefox", home)),                    read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from("@/.cache/mozilla/firefox"),              target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),              read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from("@/.mozilla/native-messaging-hosts"),     target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),     read_only: false, recursive: true, skip_missing: true  },
-            ProfileMount { source: PathBuf::from(format!("{}/gvfs", run_user)),            target: PathBuf::from(format!("{}/gvfs", run_user)),                           read_only: false, recursive: true, skip_missing: false },
+            ProfileMount {
+                source: PathBuf::from("@/.mozilla/firefox"),
+                target: PathBuf::from(format!("{}/.mozilla/firefox", home)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from("@/.cache/mozilla/firefox"),
+                target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from("@/.mozilla/native-messaging-hosts"),
+                target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),
+                read_only: false,
+                recursive: true,
+                skip_missing: true,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/gvfs", run_user)),
+                target: PathBuf::from(format!("{}/gvfs", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
         ]);
         chmod.extend([
-            ProfileChmod { path: PathBuf::from(format!("{}/.mozilla", home)), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
-            ProfileChmod { path: PathBuf::from(format!("{}/.cache", home)),   mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
+            ProfileChmod {
+                path: PathBuf::from(format!("{}/.mozilla", home)),
+                mode: None,
+                uid: Some(uid),
+                gid: Some(gid),
+                mkdir: true,
+            },
+            ProfileChmod {
+                path: PathBuf::from(format!("{}/.cache", home)),
+                mode: None,
+                uid: Some(uid),
+                gid: Some(gid),
+                mkdir: true,
+            },
         ]);
     }
 
@@ -3242,23 +3292,85 @@ fn wizard_build_pivot_template(
         mounts.push(ProfileMount {
             source: PathBuf::from("@/.config/Signal AppImage"),
             target: PathBuf::from(format!("{}/.config/Signal AppImage", home)),
-            read_only: false, recursive: true, skip_missing: false,
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
         });
-        chmod.push(ProfileChmod { path: PathBuf::from(format!("{}/.config", home)), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true });
+        chmod.push(ProfileChmod {
+            path: PathBuf::from(format!("{}/.config", home)),
+            mode: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            mkdir: true,
+        });
     }
 
     if has_graphical {
         // Shared graphical/audio infrastructure — added once regardless of which apps are selected
         mounts.extend([
-            ProfileMount { source: PathBuf::from(format!("{}/wayland-0", run_user)),         target: PathBuf::from(format!("{}/wayland-0", run_user)),         read_only: false, recursive: true, skip_missing: true  },
-            ProfileMount { source: PathBuf::from(format!("{}/wayland-1", run_user)),         target: PathBuf::from(format!("{}/wayland-1", run_user)),         read_only: false, recursive: true, skip_missing: true  },
-            ProfileMount { source: PathBuf::from(format!("{}/pipewire-0", run_user)),        target: PathBuf::from(format!("{}/pipewire-0", run_user)),        read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),target: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from(format!("{}/pulse", run_user)),             target: PathBuf::from(format!("{}/pulse", run_user)),             read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from(format!("{}/dconf", run_user)),             target: PathBuf::from(format!("{}/dconf", run_user)),             read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from(format!("{}/systemd", run_user)),          target: PathBuf::from(format!("{}/systemd", run_user)),          read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from("/run/systemd"),                           target: PathBuf::from("/run/systemd"),                           read_only: false, recursive: true, skip_missing: false },
-            ProfileMount { source: PathBuf::from("/sys/fs/cgroup"),                         target: PathBuf::from("/sys/fs/cgroup"),                         read_only: false, recursive: true, skip_missing: false },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/wayland-0", run_user)),
+                target: PathBuf::from(format!("{}/wayland-0", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: true,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/wayland-1", run_user)),
+                target: PathBuf::from(format!("{}/wayland-1", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: true,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/pipewire-0", run_user)),
+                target: PathBuf::from(format!("{}/pipewire-0", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
+                target: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/pulse", run_user)),
+                target: PathBuf::from(format!("{}/pulse", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/dconf", run_user)),
+                target: PathBuf::from(format!("{}/dconf", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from(format!("{}/systemd", run_user)),
+                target: PathBuf::from(format!("{}/systemd", run_user)),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from("/run/systemd"),
+                target: PathBuf::from("/run/systemd"),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
+            ProfileMount {
+                source: PathBuf::from("/sys/fs/cgroup"),
+                target: PathBuf::from("/sys/fs/cgroup"),
+                read_only: false,
+                recursive: true,
+                skip_missing: false,
+            },
         ]);
         env.extend([
             ("NO_AT_BRIDGE".to_string(), "1".to_string()),
@@ -3268,12 +3380,17 @@ fn wizard_build_pivot_template(
 
     // Deduplicate mounts by target so combining multiple apps doesn't double-mount shared sockets.
     let mut seen_targets = std::collections::HashSet::new();
-    let mounts: Vec<ProfileMount> = mounts.into_iter()
+    let mounts: Vec<ProfileMount> = mounts
+        .into_iter()
         .filter(|m| seen_targets.insert(m.target.clone()))
         .collect();
 
     let dbus = DbusMode::Container;
-    let browser_profile = if apps.contains(&PivotAppKind::Firefox) { Some("firefox".to_string()) } else { None };
+    let browser_profile = if apps.contains(&PivotAppKind::Firefox) {
+        Some("firefox".to_string())
+    } else {
+        None
+    };
 
     let hot = HotConfig::default();
     let template = TemplateConfig {
@@ -6899,7 +7016,7 @@ impl App {
                     WizardStep::PivotApps
                 } else {
                     WizardStep::Landing
-                }
+                },
             ),
             WizardStep::PortListeners => Some(WizardStep::DbusMode),
             WizardStep::RouteTargets => Some(WizardStep::PortListeners),
@@ -7138,7 +7255,9 @@ impl App {
                                 .color(Color32::from_rgb(255, 230, 150))
                                 .strong(),
                         );
-                        ui.label("by app launches in the wrong namespace. Choose which apps run inside on the next step.");
+                        ui.label("by app launches in the wrong namespace. Choose which apps run inside on the next step. 
+In a state-based identity model, programs launched outside the container can not access the state associated with an identity; therefore you can not accidentally correlate IPs with a particular identity.
+Pivot-enabled containers have URL opening handled right within the container, which is a trouble for Dbus available overlay-type container.");
                     });
                 })
                 .response
@@ -7276,7 +7395,11 @@ impl App {
 
         for app in &all_apps {
             let is_active = self.manage_wizard.pivot_apps.contains(app);
-            let fill = if is_active { pivot_active_fill } else { pivot_fill };
+            let fill = if is_active {
+                pivot_active_fill
+            } else {
+                pivot_fill
+            };
             let resp = egui::Frame::none()
                 .fill(fill)
                 .inner_margin(egui::Margin::same(8))
@@ -7352,7 +7475,10 @@ impl App {
 
         section_frame(ui, |ui| {
             let sel = self.manage_wizard.dbus_mode == DbusMode::Container;
-            if ui.selectable_label(sel, "Container  (default, private bus)").clicked() {
+            if ui
+                .selectable_label(sel, "Container  (default, private bus)")
+                .clicked()
+            {
                 self.manage_wizard.dbus_mode = DbusMode::Container;
                 changed = true;
             }
@@ -7888,7 +8014,10 @@ impl App {
                             ui.colored_label(Color32::from_gray(150), "block (no dbus)");
                         }
                         DbusMode::Proxy => {
-                            ui.colored_label(Color32::from_gray(150), "proxy (legacy no-op, no dbus)");
+                            ui.colored_label(
+                                Color32::from_gray(150),
+                                "proxy (legacy no-op, no dbus)",
+                            );
                         }
                         DbusMode::Pass => {
                             ui.label(
@@ -7902,7 +8031,10 @@ impl App {
                             );
                         }
                         DbusMode::Container => {
-                            ui.colored_label(Color32::LIGHT_GREEN, "container (private dbus-daemon)");
+                            ui.colored_label(
+                                Color32::LIGHT_GREEN,
+                                "container (private dbus-daemon)",
+                            );
                         }
                     }
                 });
