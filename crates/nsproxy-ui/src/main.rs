@@ -3216,7 +3216,6 @@ fn wizard_build_pivot_template(
 ) -> (TemplateConfig, HotConfig) {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let run_user = format!("/run/user/{}", uid);
 
     let mut mounts: Vec<ProfileMount> = Vec::new();
@@ -3243,21 +3242,21 @@ fn wizard_build_pivot_template(
         mounts.extend([
             ProfileMount {
                 source: PathBuf::from("@/.mozilla/firefox"),
-                target: PathBuf::from(format!("{}/.mozilla/firefox", home)),
+                target: PathBuf::from("~/.mozilla/firefox"),
                 read_only: false,
                 recursive: true,
                 skip_missing: false,
             },
             ProfileMount {
                 source: PathBuf::from("@/.cache/mozilla/firefox"),
-                target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),
+                target: PathBuf::from("~/.cache/mozilla/firefox"),
                 read_only: false,
                 recursive: true,
                 skip_missing: false,
             },
             ProfileMount {
                 source: PathBuf::from("@/.mozilla/native-messaging-hosts"),
-                target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),
+                target: PathBuf::from("~/.mozilla/native-messaging-hosts"),
                 read_only: false,
                 recursive: true,
                 skip_missing: true,
@@ -3272,14 +3271,14 @@ fn wizard_build_pivot_template(
         ]);
         chmod.extend([
             ProfileChmod {
-                path: PathBuf::from(format!("{}/.mozilla", home)),
+                path: PathBuf::from("~/.mozilla"),
                 mode: None,
                 uid: Some(uid),
                 gid: Some(gid),
                 mkdir: true,
             },
             ProfileChmod {
-                path: PathBuf::from(format!("{}/.cache", home)),
+                path: PathBuf::from("~/.cache"),
                 mode: None,
                 uid: Some(uid),
                 gid: Some(gid),
@@ -3291,13 +3290,13 @@ fn wizard_build_pivot_template(
     if apps.contains(&PivotAppKind::SignalAppImage) {
         mounts.push(ProfileMount {
             source: PathBuf::from("@/.config/Signal AppImage"),
-            target: PathBuf::from(format!("{}/.config/Signal AppImage", home)),
+            target: PathBuf::from("~/.config/Signal AppImage"),
             read_only: false,
             recursive: true,
             skip_missing: false,
         });
         chmod.push(ProfileChmod {
-            path: PathBuf::from(format!("{}/.config", home)),
+            path: PathBuf::from("~/.config"),
             mode: None,
             uid: Some(uid),
             gid: Some(gid),
