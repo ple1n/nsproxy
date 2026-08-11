@@ -234,16 +234,40 @@ enum WizardMode {
     CloneExisting,
 }
 
-/// Which template preset the user selected.
+/// Which top-level sandbox type the user selected.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 enum WizardTemplateKind {
-    /// Overlay sandbox, maximum host-compatibility. Mirrors /nsp3/config/basic.
+    /// Overlay sandbox, maximum host-compatibility.
     #[default]
     OverlayBasic,
-    /// Pivot sandbox with an empty rootfs — tabula rasa.
-    PivotEmpty,
-    /// Pivot sandbox pre-wired for a Firefox browser profile.
-    PivotFirefox,
+    /// Pivot sandbox; app modules chosen separately on the PivotApps step.
+    Pivot,
+}
+
+/// App profile module selectable in the Pivot multi-selector.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum PivotAppKind {
+    Firefox,
+    SignalAppImage,
+}
+
+impl PivotAppKind {
+    fn label(&self) -> &'static str {
+        match self {
+            PivotAppKind::Firefox => "Firefox",
+            PivotAppKind::SignalAppImage => "Signal AppImage",
+        }
+    }
+    fn description(&self) -> &'static str {
+        match self {
+            PivotAppKind::Firefox =>
+                "Mounts Wayland, PipeWire, PulseAudio, dconf, gvfs and systemd. \
+                Firefox profile stored in @/.",
+            PivotAppKind::SignalAppImage =>
+                "Mounts Wayland, PipeWire, PulseAudio, dconf and systemd. \
+                Signal data stored in @/.config/Signal AppImage.",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -264,7 +288,8 @@ enum WizardDnsMode {
 enum WizardStep {
     #[default]
     Landing,
-    TemplateKind,
+    /// Multi-select app modules for the Pivot sandbox.
+    PivotApps,
     DbusMode,
     PortListeners,
     RouteTargets,
@@ -279,6 +304,8 @@ struct ManageWizard {
     step: WizardStep,
     /// Template preset chosen by the user.
     template_kind: WizardTemplateKind,
+    /// App modules selected for the Pivot sandbox (additive).
+    pivot_apps: std::collections::BTreeSet<PivotAppKind>,
     /// D-Bus mode chosen by the user.
     dbus_mode: DbusMode,
     /// The TemplateConfig being built.
@@ -312,7 +339,8 @@ impl Default for ManageWizard {
             mode: WizardMode::default(),
             step: WizardStep::default(),
             template_kind: WizardTemplateKind::default(),
-            dbus_mode: DbusMode::Block,
+            pivot_apps: std::collections::BTreeSet::new(),
+            dbus_mode: DbusMode::Container,
             template: TemplateConfig::default(),
             hot,
             hot_json,
@@ -3138,11 +3166,13 @@ fn default_profile_text() -> String {
 
 /// Build a (TemplateConfig, HotConfig) pair for the given wizard template kind.
 /// All values are constructed from Rust native types — no JSON strings.
-fn wizard_build_template(kind: WizardTemplateKind) -> (TemplateConfig, HotConfig) {
+fn wizard_build_template(
+    kind: WizardTemplateKind,
+    pivot_apps: &std::collections::BTreeSet<PivotAppKind>,
+) -> (TemplateConfig, HotConfig) {
     match kind {
         WizardTemplateKind::OverlayBasic => wizard_template_overlay_basic(),
-        WizardTemplateKind::PivotEmpty => wizard_template_pivot_empty(),
-        WizardTemplateKind::PivotFirefox => wizard_template_pivot_firefox(),
+        WizardTemplateKind::Pivot => wizard_build_pivot_template(pivot_apps),
     }
 }
 
@@ -3168,184 +3198,82 @@ fn wizard_template_overlay_basic() -> (TemplateConfig, HotConfig) {
         hot_init: Some(hot.clone()),
         sargs: nsproxy_core::shell::ShellArgs::default(),
         browser_profile: None,
-        dbus: DbusMode::Block,
+        dbus: DbusMode::Container,
         rootfs: Rootfs::Default,
     };
     (template, hot)
 }
 
-/// Pivot sandbox — empty rootfs (tabula rasa). No mounts, no presets.
-fn wizard_template_pivot_empty() -> (TemplateConfig, HotConfig) {
-    let hot = HotConfig::default();
-    let template = TemplateConfig {
-        schema: TemplateConfig::VERSION, // [schema-bump:wizard]
-        sandbox_mode: SandboxMode::Pivot,
-        mounts: vec![],
-        chmod: vec![],
-        env: HashMap::new(),
-        inherit_env: true,
-        hot: PathBuf::from("@/hot.json"),
-        hot_init: None,
-        sargs: nsproxy_core::shell::ShellArgs::default(),
-        browser_profile: None,
-        dbus: DbusMode::Block,
-        rootfs: Rootfs::Default,
-    };
-    (template, hot)
-}
-
-/// Pivot sandbox pre-wired for a Firefox browser profile.
+/// Pivot sandbox with selected app modules merged additively.
 ///
-/// - Firefox profile data stored inside the nsp3 profile directory (@/)
-/// - Mounts Wayland, PipeWire, PulseAudio, dconf, gvfs, systemd, cgroups
-/// - env: NO_AT_BRIDGE=1, GIO_USE_VFS=local
-/// - D-Bus: Proxy (private busd)
-fn wizard_template_pivot_firefox() -> (TemplateConfig, HotConfig) {
+/// Shared graphical infrastructure (Wayland, PipeWire, PulseAudio, dconf,
+/// systemd, cgroups) is included once whenever any graphical app is selected.
+/// Mount targets are deduplicated so running Firefox + Signal doesn't double-mount sockets.
+fn wizard_build_pivot_template(
+    apps: &std::collections::BTreeSet<PivotAppKind>,
+) -> (TemplateConfig, HotConfig) {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/root"));
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let run_user = format!("/run/user/{}", uid);
 
-    let mounts = vec![
-        // Firefox profile data stored inside the nsp3 profile dir
-        ProfileMount {
-            source: PathBuf::from("@/.mozilla/firefox"),
-            target: PathBuf::from(format!("{}/.mozilla/firefox", home)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        ProfileMount {
-            source: PathBuf::from("@/.cache/mozilla/firefox"),
-            target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        ProfileMount {
-            source: PathBuf::from("@/.mozilla/native-messaging-hosts"),
-            target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),
-            read_only: false,
-            recursive: true,
-            skip_missing: true,
-        },
-        // Wayland compositor sockets
-        ProfileMount {
-            source: PathBuf::from(format!("{}/wayland-0", run_user)),
-            target: PathBuf::from(format!("{}/wayland-0", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: true,
-        },
-        ProfileMount {
-            source: PathBuf::from(format!("{}/wayland-1", run_user)),
-            target: PathBuf::from(format!("{}/wayland-1", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: true,
-        },
-        // PipeWire audio/video bus
-        ProfileMount {
-            source: PathBuf::from(format!("{}/pipewire-0", run_user)),
-            target: PathBuf::from(format!("{}/pipewire-0", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        ProfileMount {
-            source: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
-            target: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // PulseAudio
-        ProfileMount {
-            source: PathBuf::from(format!("{}/pulse", run_user)),
-            target: PathBuf::from(format!("{}/pulse", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // dconf settings daemon
-        ProfileMount {
-            source: PathBuf::from(format!("{}/dconf", run_user)),
-            target: PathBuf::from(format!("{}/dconf", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // GVfs virtual filesystem
-        ProfileMount {
-            source: PathBuf::from(format!("{}/gvfs", run_user)),
-            target: PathBuf::from(format!("{}/gvfs", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // systemd user session
-        ProfileMount {
-            source: PathBuf::from(format!("{}/systemd", run_user)),
-            target: PathBuf::from(format!("{}/systemd", run_user)),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // System-wide systemd
-        ProfileMount {
-            source: PathBuf::from("/run/systemd"),
-            target: PathBuf::from("/run/systemd"),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
-        // cgroups (needed by Firefox's sandbox)
-        ProfileMount {
-            source: PathBuf::from("/sys/fs/cgroup"),
-            target: PathBuf::from("/sys/fs/cgroup"),
-            read_only: false,
-            recursive: true,
-            skip_missing: false,
-        },
+    let mut mounts: Vec<ProfileMount> = Vec::new();
+    let mut chmod: Vec<ProfileChmod> = vec![
+        ProfileChmod { path: PathBuf::from("/home"), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
+        ProfileChmod { path: PathBuf::from(&run_user), mode: None, uid: Some(uid), gid: Some(gid), mkdir: false },
     ];
+    let mut env: HashMap<String, String> = HashMap::new();
+    let has_graphical = !apps.is_empty();
 
-    let chmod = vec![
-        ProfileChmod {
-            path: PathBuf::from(run_user),
-            mode: None,
-            uid: Some(uid),
-            gid: Some(gid),
-            mkdir: false,
-        },
-        ProfileChmod {
-            path: PathBuf::from("/home"),
-            mode: None,
-            uid: Some(uid),
-            gid: Some(gid),
-            mkdir: true,
-        },
-        ProfileChmod {
-            path: PathBuf::from(format!("{}/.mozilla", home)),
-            mode: None,
-            uid: Some(uid),
-            gid: Some(gid),
-            mkdir: true,
-        },
-        ProfileChmod {
-            path: PathBuf::from(format!("{}/.cache", home)),
-            mode: None,
-            uid: Some(uid),
-            gid: Some(gid),
-            mkdir: true,
-        },
-    ];
+    if apps.contains(&PivotAppKind::Firefox) {
+        mounts.extend([
+            ProfileMount { source: PathBuf::from("@/.mozilla/firefox"),                    target: PathBuf::from(format!("{}/.mozilla/firefox", home)),                    read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from("@/.cache/mozilla/firefox"),              target: PathBuf::from(format!("{}/.cache/mozilla/firefox", home)),              read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from("@/.mozilla/native-messaging-hosts"),     target: PathBuf::from(format!("{}/.mozilla/native-messaging-hosts", home)),     read_only: false, recursive: true, skip_missing: true  },
+            ProfileMount { source: PathBuf::from(format!("{}/gvfs", run_user)),            target: PathBuf::from(format!("{}/gvfs", run_user)),                           read_only: false, recursive: true, skip_missing: false },
+        ]);
+        chmod.extend([
+            ProfileChmod { path: PathBuf::from(format!("{}/.mozilla", home)), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
+            ProfileChmod { path: PathBuf::from(format!("{}/.cache", home)),   mode: None, uid: Some(uid), gid: Some(gid), mkdir: true },
+        ]);
+    }
 
-    let env: HashMap<String, String> = [
-        ("NO_AT_BRIDGE".to_string(), "1".to_string()),
-        ("GIO_USE_VFS".to_string(), "local".to_string()),
-    ]
-    .into_iter()
-    .collect();
+    if apps.contains(&PivotAppKind::SignalAppImage) {
+        mounts.push(ProfileMount {
+            source: PathBuf::from("@/.config/Signal AppImage"),
+            target: PathBuf::from(format!("{}/.config/Signal AppImage", home)),
+            read_only: false, recursive: true, skip_missing: false,
+        });
+        chmod.push(ProfileChmod { path: PathBuf::from(format!("{}/.config", home)), mode: None, uid: Some(uid), gid: Some(gid), mkdir: true });
+    }
+
+    if has_graphical {
+        // Shared graphical/audio infrastructure — added once regardless of which apps are selected
+        mounts.extend([
+            ProfileMount { source: PathBuf::from(format!("{}/wayland-0", run_user)),         target: PathBuf::from(format!("{}/wayland-0", run_user)),         read_only: false, recursive: true, skip_missing: true  },
+            ProfileMount { source: PathBuf::from(format!("{}/wayland-1", run_user)),         target: PathBuf::from(format!("{}/wayland-1", run_user)),         read_only: false, recursive: true, skip_missing: true  },
+            ProfileMount { source: PathBuf::from(format!("{}/pipewire-0", run_user)),        target: PathBuf::from(format!("{}/pipewire-0", run_user)),        read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),target: PathBuf::from(format!("{}/pipewire-0-manager", run_user)),read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from(format!("{}/pulse", run_user)),             target: PathBuf::from(format!("{}/pulse", run_user)),             read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from(format!("{}/dconf", run_user)),             target: PathBuf::from(format!("{}/dconf", run_user)),             read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from(format!("{}/systemd", run_user)),          target: PathBuf::from(format!("{}/systemd", run_user)),          read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from("/run/systemd"),                           target: PathBuf::from("/run/systemd"),                           read_only: false, recursive: true, skip_missing: false },
+            ProfileMount { source: PathBuf::from("/sys/fs/cgroup"),                         target: PathBuf::from("/sys/fs/cgroup"),                         read_only: false, recursive: true, skip_missing: false },
+        ]);
+        env.extend([
+            ("NO_AT_BRIDGE".to_string(), "1".to_string()),
+            ("GIO_USE_VFS".to_string(), "local".to_string()),
+        ]);
+    }
+
+    // Deduplicate mounts by target so combining multiple apps doesn't double-mount shared sockets.
+    let mut seen_targets = std::collections::HashSet::new();
+    let mounts: Vec<ProfileMount> = mounts.into_iter()
+        .filter(|m| seen_targets.insert(m.target.clone()))
+        .collect();
+
+    let dbus = DbusMode::Container;
+    let browser_profile = if apps.contains(&PivotAppKind::Firefox) { Some("firefox".to_string()) } else { None };
 
     let hot = HotConfig::default();
     let template = TemplateConfig {
@@ -3358,8 +3286,8 @@ fn wizard_template_pivot_firefox() -> (TemplateConfig, HotConfig) {
         hot: PathBuf::from("@/hot.json"),
         hot_init: None,
         sargs: nsproxy_core::shell::ShellArgs::default(),
-        browser_profile: Some("firefox".to_string()),
-        dbus: DbusMode::Proxy,
+        browser_profile,
+        dbus,
         rootfs: Rootfs::Default,
     };
     (template, hot)
@@ -6965,12 +6893,14 @@ impl App {
         // Compute back/next step for this step
         let back_step: Option<WizardStep> = match step {
             WizardStep::Landing => None,
-            WizardStep::TemplateKind => Some(WizardStep::Landing),
-            WizardStep::DbusMode => Some(if mode == WizardMode::CloneExisting {
-                WizardStep::Landing
-            } else {
-                WizardStep::TemplateKind
-            }),
+            WizardStep::PivotApps => Some(WizardStep::Landing),
+            WizardStep::DbusMode => Some(
+                if self.manage_wizard.template_kind == WizardTemplateKind::Pivot {
+                    WizardStep::PivotApps
+                } else {
+                    WizardStep::Landing
+                }
+            ),
             WizardStep::PortListeners => Some(WizardStep::DbusMode),
             WizardStep::RouteTargets => Some(WizardStep::PortListeners),
             WizardStep::DnsHandling => Some(WizardStep::RouteTargets),
@@ -6980,7 +6910,7 @@ impl App {
 
         let next_step: Option<(WizardStep, &str)> = match step {
             WizardStep::Landing | WizardStep::Name => None,
-            WizardStep::TemplateKind => Some((WizardStep::DbusMode, "Next: D-Bus")),
+            WizardStep::PivotApps => Some((WizardStep::DbusMode, "Next: D-Bus")),
             WizardStep::DbusMode => Some((WizardStep::PortListeners, "Next: Port Listeners")),
             WizardStep::PortListeners => Some((WizardStep::RouteTargets, "Next: Route Targets")),
             WizardStep::RouteTargets => Some((WizardStep::DnsHandling, "Next: DNS")),
@@ -7065,7 +6995,7 @@ impl App {
                 ui.add_space(6.0);
                 match step {
                     WizardStep::Landing => self.render_wizard_landing(ui),
-                    WizardStep::TemplateKind => self.render_wizard_template_kind(ui),
+                    WizardStep::PivotApps => self.render_wizard_pivot_apps(ui),
                     WizardStep::DbusMode => self.render_wizard_dbus_mode(ui),
                     WizardStep::PortListeners => self.render_wizard_port_listeners(ui),
                     WizardStep::RouteTargets => self.render_wizard_route_targets(ui),
@@ -7079,7 +7009,7 @@ impl App {
     fn wizard_step_label(step: &WizardStep) -> &'static str {
         match step {
             WizardStep::Landing => "Start",
-            WizardStep::TemplateKind => "1 / Template",
+            WizardStep::PivotApps => "1 / Apps",
             WizardStep::DbusMode => "2 / D-Bus",
             WizardStep::PortListeners => "3 / Port Listeners",
             WizardStep::RouteTargets => "4 / Route Targets",
@@ -7089,28 +7019,60 @@ impl App {
         }
     }
 
-    fn render_wizard_breadcrumb(&self, ui: &mut egui::Ui) {
-        let steps = [
-            WizardStep::TemplateKind,
-            WizardStep::DbusMode,
-            WizardStep::PortListeners,
-            WizardStep::RouteTargets,
-            WizardStep::DnsHandling,
-            WizardStep::ReviewHotconfig,
-            WizardStep::Name,
-        ];
+    fn render_wizard_breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let is_pivot = self.manage_wizard.template_kind == WizardTemplateKind::Pivot;
+        let steps: &[WizardStep] = if is_pivot {
+            &[
+                WizardStep::PivotApps,
+                WizardStep::DbusMode,
+                WizardStep::PortListeners,
+                WizardStep::RouteTargets,
+                WizardStep::DnsHandling,
+                WizardStep::ReviewHotconfig,
+                WizardStep::Name,
+            ]
+        } else {
+            &[
+                WizardStep::DbusMode,
+                WizardStep::PortListeners,
+                WizardStep::RouteTargets,
+                WizardStep::DnsHandling,
+                WizardStep::ReviewHotconfig,
+                WizardStep::Name,
+            ]
+        };
+        let current_idx = steps
+            .iter()
+            .position(|s| s == &self.manage_wizard.step)
+            .unwrap_or(usize::MAX);
+        let mut jump_to: Option<WizardStep> = None;
+
         ui.horizontal_wrapped(|ui| {
-            for step in &steps {
+            for (i, step) in steps.iter().enumerate() {
                 let label = Self::wizard_step_label(step);
-                let is_current = step == &self.manage_wizard.step;
-                if is_current {
+                if i == current_idx {
+                    // Current step — highlighted, not interactive
                     ui.label(RichText::new(label).color(Color32::LIGHT_BLUE).strong());
                 } else {
-                    ui.colored_label(Color32::from_gray(100), label);
+                    // Any other step — all independent, all jumpable; dim, no text selection
+                    let resp = ui
+                        .add(
+                            egui::Label::new(RichText::new(label).color(Color32::from_gray(100)))
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        jump_to = Some(step.clone());
+                    }
                 }
-                ui.colored_label(Color32::from_gray(60), "›");
+                ui.colored_label(Color32::from_gray(50), "›");
             }
         });
+
+        if let Some(step) = jump_to {
+            self.manage_wizard.step = step;
+        }
         ui.add_space(8.0);
     }
 
@@ -7118,21 +7080,97 @@ impl App {
         ui.label("What would you like to do?");
         ui.add_space(12.0);
 
+        let overlay_fill = Color32::from_rgb(38, 30, 14);
+        let overlay_hover = Color32::from_rgba_unmultiplied(200, 150, 60, 28);
+        let pivot_fill = Color32::from_rgb(14, 24, 40);
+        let pivot_hover = Color32::from_rgba_unmultiplied(80, 130, 200, 28);
+
+        let mut go_overlay = false;
+        let mut go_pivot = false;
+
         section_frame(ui, |ui| {
             ui.heading("Create from Template");
-            ui.label("Set up a new container from a pre-configured starting point.");
             ui.add_space(6.0);
-            if ui.button("Start guided setup  →").clicked() {
-                self.manage_wizard.mode = WizardMode::CreateFromTemplate;
-                // Apply default template immediately so hotconfig reflects it
-                let (tmpl, hot) = wizard_build_template(WizardTemplateKind::OverlayBasic);
-                self.manage_wizard.template = tmpl;
-                self.manage_wizard.hot = hot;
-                self.manage_wizard.hot_json =
-                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
-                self.manage_wizard.step = WizardStep::TemplateKind;
+
+            // ── Overlay — Basic ───────────────────────────────────
+            let resp = egui::Frame::none()
+                .fill(overlay_fill)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Overlay — Basic").strong());
+                    ui.label(
+                        "Host root filesystem visible inside the container. Maximum compatibility \
+                        for most desktop software. Pre-configures port 9909 (Geph) and internal DNS.",
+                    );
+                })
+                .response
+                .interact(egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(resp.rect, 0.0, overlay_hover);
+            }
+            if resp.clicked() {
+                go_overlay = true;
+            }
+
+            ui.add_space(4.0);
+
+            // ── Pivot ─────────────────────────────────────────────────
+            let resp = egui::Frame::none()
+                .fill(pivot_fill)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Pivot").strong());
+                        ui.label(
+                            RichText::new(" best isolation ")
+                                .background_color(Color32::from_rgb(28, 52, 88))
+                                .color(Color32::from_rgb(130, 175, 220))
+                                .small(),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Replaces the root filesystem entirely. Best method to prevent");
+                        ui.label(
+                            RichText::new(" accidental IP leaks ")
+                                .background_color(Color32::from_rgb(66, 54, 0))
+                                .color(Color32::from_rgb(255, 230, 150))
+                                .strong(),
+                        );
+                        ui.label("by app launches in the wrong namespace. Choose which apps run inside on the next step.");
+                    });
+                })
+                .response
+                .interact(egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(resp.rect, 0.0, pivot_hover);
+            }
+            if resp.clicked() {
+                go_pivot = true;
             }
         });
+
+        if go_overlay {
+            self.manage_wizard.mode = WizardMode::CreateFromTemplate;
+            self.manage_wizard.template_kind = WizardTemplateKind::OverlayBasic;
+            let (mut tmpl, hot) = wizard_build_template(
+                WizardTemplateKind::OverlayBasic,
+                &std::collections::BTreeSet::new(),
+            );
+            tmpl.dbus = self.manage_wizard.dbus_mode.clone();
+            self.manage_wizard.template = tmpl;
+            self.manage_wizard.hot = hot;
+            self.manage_wizard.hot_json =
+                serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
+            self.manage_wizard.step = WizardStep::DbusMode;
+        }
+        if go_pivot {
+            self.manage_wizard.mode = WizardMode::CreateFromTemplate;
+            self.manage_wizard.template_kind = WizardTemplateKind::Pivot;
+            self.manage_wizard.pivot_apps.clear();
+            self.manage_wizard.step = WizardStep::PivotApps;
+        }
 
         ui.add_space(8.0);
 
@@ -7214,77 +7252,75 @@ impl App {
         });
     }
 
-    fn render_wizard_template_kind(&mut self, ui: &mut egui::Ui) {
+    // render_wizard_template_kind removed — template selection merged into render_wizard_landing
+
+    fn render_wizard_pivot_apps(&mut self, ui: &mut egui::Ui) {
         self.render_wizard_breadcrumb(ui);
-        ui.heading("Choose a Template");
+        ui.heading("Choose Apps");
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("In Pivot mode, the state is contained within the container. This is the best possible method to prevent");
-            ui.label(
-                RichText::new(" accidental IP leaks ")
-                    .background_color(Color32::from_rgb(66, 54, 0))
-                    .color(Color32::from_rgb(255, 230, 150))
-                    .strong(),
-            );
-            ui.label("by app launches in a wrong network namespace, because outside the right container, your application can not access identity data");
-        });
-        ui.add_space(10.0);
+        ui.label(
+            "Select the apps that will run inside this container. \
+            Each adds its profile data and required sockets. \
+            Multiple apps share the same network namespace — they are additive.",
+        );
+        ui.add_space(8.0);
 
-        let mut apply_template = None;
+        let pivot_fill = Color32::from_rgb(14, 24, 40);
+        let pivot_active_fill = Color32::from_rgb(22, 38, 62);
+        let pivot_hover = Color32::from_rgba_unmultiplied(80, 130, 200, 28);
+        let badge_bg = Color32::from_rgb(28, 52, 88);
+        let badge_fg = Color32::from_rgb(130, 175, 220);
 
-        section_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                let selected = self.manage_wizard.template_kind == WizardTemplateKind::OverlayBasic;
-                if ui.selectable_label(selected, "Overlay — Basic").clicked() {
-                    self.manage_wizard.template_kind = WizardTemplateKind::OverlayBasic;
-                    apply_template = Some(WizardTemplateKind::OverlayBasic);
+        let all_apps = [PivotAppKind::Firefox, PivotAppKind::SignalAppImage];
+        let mut changed = false;
+
+        for app in &all_apps {
+            let is_active = self.manage_wizard.pivot_apps.contains(app);
+            let fill = if is_active { pivot_active_fill } else { pivot_fill };
+            let resp = egui::Frame::none()
+                .fill(fill)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(app.label()).strong());
+                        if is_active {
+                            ui.label(
+                                RichText::new(" added ")
+                                    .background_color(badge_bg)
+                                    .color(badge_fg)
+                                    .small(),
+                            );
+                        }
+                    });
+                    ui.label(app.description());
+                })
+                .response
+                .interact(egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(resp.rect, 0.0, pivot_hover);
+            }
+            if resp.clicked() {
+                if is_active {
+                    self.manage_wizard.pivot_apps.remove(app);
+                } else {
+                    self.manage_wizard.pivot_apps.insert(app.clone());
                 }
-            });
-            ui.label(
-                "Overlay sandbox keeps the host root filesystem visible. Maximum compatibility \
-                for most desktop software. Pre-configures localhost port 9909 (Geph) and an \
-                internal DNS server at 127.0.0.1.",
-            );
-        });
-        ui.add_space(6.0);
+                changed = true;
+            }
+            ui.add_space(4.0);
+        }
 
-        section_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                let selected = self.manage_wizard.template_kind == WizardTemplateKind::PivotEmpty;
-                if ui.selectable_label(selected, "Pivot — Empty").clicked() {
-                    self.manage_wizard.template_kind = WizardTemplateKind::PivotEmpty;
-                    apply_template = Some(WizardTemplateKind::PivotEmpty);
-                }
-            });
-            ui.label(
-                "Pivot sandbox replaces the root filesystem with a fresh tmpfs. \
-                Nothing from the host is visible. Add mounts manually as needed.",
+        if self.manage_wizard.pivot_apps.is_empty() {
+            ui.colored_label(
+                Color32::from_gray(120),
+                "No apps selected — creates a bare pivot sandbox with no pre-configured mounts.",
             );
-        });
-        ui.add_space(6.0);
+        }
 
-        section_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                let selected = self.manage_wizard.template_kind == WizardTemplateKind::PivotFirefox;
-                if ui.selectable_label(selected, "Pivot — Firefox").clicked() {
-                    self.manage_wizard.template_kind = WizardTemplateKind::PivotFirefox;
-                    apply_template = Some(WizardTemplateKind::PivotFirefox);
-                }
-            });
-            ui.label(
-                "Pivot sandbox wired for a Firefox browser profile. Pre-mounts Wayland, \
-                PipeWire, PulseAudio, dconf, gvfs and systemd sockets. Firefox profile data \
-                is stored inside the nsp3 profile directory (@/). \
-                D-Bus mode defaults to Proxy.",
-            );
-        });
-
-        if let Some(kind) = apply_template {
-            let (tmpl, hot) = wizard_build_template(kind.clone());
-            // Preserve any dbus mode already chosen
-            let mut tmpl = tmpl;
+        if changed {
+            let (mut tmpl, hot) = wizard_build_pivot_template(&self.manage_wizard.pivot_apps);
             tmpl.dbus = self.manage_wizard.dbus_mode.clone();
-            self.manage_wizard.template_kind = kind;
             self.manage_wizard.template = tmpl;
             self.manage_wizard.hot = hot;
             self.manage_wizard.hot_json =
@@ -7304,7 +7340,7 @@ impl App {
         section_frame(ui, |ui| {
             let sel = self.manage_wizard.dbus_mode == DbusMode::Block;
             if ui
-                .selectable_label(sel, "Block  (default, recommended)")
+                .selectable_label(sel, "Block  (no session bus)")
                 .clicked()
             {
                 self.manage_wizard.dbus_mode = DbusMode::Block;
@@ -7315,13 +7351,13 @@ impl App {
         ui.add_space(6.0);
 
         section_frame(ui, |ui| {
-            let sel = self.manage_wizard.dbus_mode == DbusMode::Proxy;
-            if ui.selectable_label(sel, "Proxy  (private bus)").clicked() {
-                self.manage_wizard.dbus_mode = DbusMode::Proxy;
+            let sel = self.manage_wizard.dbus_mode == DbusMode::Container;
+            if ui.selectable_label(sel, "Container  (default, private bus)").clicked() {
+                self.manage_wizard.dbus_mode = DbusMode::Container;
                 changed = true;
             }
             ui.label(
-                "nsproxy runs a private D-Bus daemon (busd) inside the container. \
+                "nsproxy runs one private dbus-daemon session bus inside the container. \
                 Apps can communicate with each other but cannot reach host services.",
             );
         });
@@ -7596,7 +7632,7 @@ impl App {
             let mut preview_json_display = preview_json.clone();
             egui::ScrollArea::vertical()
                 .id_salt("wizard-review-preview-scroll")
-                .max_height(260.0)
+                .max_height(520.0)
                 .show(ui, |ui| {
                     let mut editor = CodeEditor::default()
                         .id_source("wizard-review-preview-editor")
@@ -7691,11 +7727,24 @@ impl App {
                 if self.manage_wizard.mode == WizardMode::CloneExisting {
                     ui.label(format!("Cloned from: {}", self.manage_wizard.clone_source));
                 } else {
-                    ui.label(match &self.manage_wizard.template_kind {
-                        WizardTemplateKind::OverlayBasic => "Overlay — Basic",
-                        WizardTemplateKind::PivotEmpty => "Pivot — Empty",
-                        WizardTemplateKind::PivotFirefox => "Pivot — Firefox",
-                    });
+                    match &self.manage_wizard.template_kind {
+                        WizardTemplateKind::OverlayBasic => {
+                            ui.label("Overlay — Basic");
+                        }
+                        WizardTemplateKind::Pivot => {
+                            if self.manage_wizard.pivot_apps.is_empty() {
+                                ui.label("Pivot — (no apps)");
+                            } else {
+                                let names: Vec<&str> = self
+                                    .manage_wizard
+                                    .pivot_apps
+                                    .iter()
+                                    .map(PivotAppKind::label)
+                                    .collect();
+                                ui.label(format!("Pivot — {}", names.join(", ")));
+                            }
+                        }
+                    };
                 }
             });
             ui.horizontal(|ui| {
@@ -7706,7 +7755,8 @@ impl App {
                 ui.colored_label(Color32::from_gray(160), "D-Bus:");
                 let (label, color) = match &self.manage_wizard.dbus_mode {
                     DbusMode::Block => ("block", Color32::from_gray(160)),
-                    DbusMode::Proxy => ("proxy", Color32::LIGHT_GREEN),
+                    DbusMode::Proxy => ("proxy (legacy no-op)", Color32::from_gray(160)),
+                    DbusMode::Container => ("container", Color32::LIGHT_GREEN),
                     DbusMode::Pass => ("pass ⚠", Color32::from_rgb(236, 168, 52)),
                 };
                 ui.colored_label(color, label);
@@ -7835,7 +7885,10 @@ impl App {
                     ui.label(RichText::new("D-Bus:").strong());
                     match dbus_mode {
                         DbusMode::Block => {
-                            ui.colored_label(Color32::from_gray(150), "block (default, no dbus)");
+                            ui.colored_label(Color32::from_gray(150), "block (no dbus)");
+                        }
+                        DbusMode::Proxy => {
+                            ui.colored_label(Color32::from_gray(150), "proxy (legacy no-op, no dbus)");
                         }
                         DbusMode::Pass => {
                             ui.label(
@@ -7848,8 +7901,8 @@ impl App {
                                 "⚠ container can reach host dbus services",
                             );
                         }
-                        DbusMode::Proxy => {
-                            ui.colored_label(Color32::LIGHT_GREEN, "proxy (private busd)");
+                        DbusMode::Container => {
+                            ui.colored_label(Color32::LIGHT_GREEN, "container (private dbus-daemon)");
                         }
                     }
                 });
@@ -8510,14 +8563,17 @@ impl App {
                                 DbusMode::Block => {
                                     ui.colored_label(Color32::from_gray(160), "block — D-Bus is completely absent inside the container.");
                                 }
+                                DbusMode::Proxy => {
+                                    ui.colored_label(Color32::from_gray(160), "proxy — legacy no-op; no D-Bus service is started.");
+                                }
                                 DbusMode::Pass => {
                                     ui.colored_label(
                                         Color32::from_rgb(236, 168, 52),
                                         "pass — host session bus forwarded directly. Container can reach all host D-Bus services.",
                                     );
                                 }
-                                DbusMode::Proxy => {
-                                    ui.colored_label(Color32::LIGHT_GREEN, "proxy — private per-profile busd instance. Isolated from host session bus.");
+                                DbusMode::Container => {
+                                    ui.colored_label(Color32::LIGHT_GREEN, "container — private per-container dbus-daemon session bus. Isolated from host session bus.");
                                 }
                             }
                         });

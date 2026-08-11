@@ -861,26 +861,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f30e7476521f6f8af1a1c4c0b8cc94f0bee37d91763d0ca2665f299b6cd8aec"
 
 [[package]]
-name = "busd"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "clap",
- "enumflags2",
- "event-listener",
- "fastrand",
- "futures-util",
- "quick-xml 0.40.1",
- "rustix 1.1.4",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "xdg-home",
- "zbus 5.15.0",
-]
-
-[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4027,7 +4007,6 @@ dependencies = [
  "bimap",
  "bincode",
  "blake3",
- "busd",
  "bytes 1.11.1",
  "capctl",
  "cargo-lock",
@@ -5353,16 +5332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick-xml"
-version = "0.40.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "quick_cache"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6637,7 +6606,6 @@ dependencies = [
  "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -8395,9 +8363,6 @@ name = "winnow"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"
@@ -8598,35 +8563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zbus"
-version = "5.15.0"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "async-broadcast",
- "async-recursion",
- "async-trait",
- "enumflags2",
- "event-listener",
- "futures-core",
- "futures-lite",
- "hex",
- "libc",
- "ordered-stream",
- "rustix 1.1.4",
- "serde",
- "serde_repr",
- "tokio",
- "tracing",
- "uds_windows",
- "uuid",
- "windows-sys 0.61.2",
- "winnow 1.0.1",
- "zbus_macros 5.15.0",
- "zbus_names 4.3.2",
- "zvariant 5.11.0",
-]
-
-[[package]]
 name = "zbus-lockstep"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8703,20 +8639,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zbus_macros"
-version = "5.15.0"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
- "zbus_names 4.3.2",
- "zvariant 5.11.0",
- "zvariant_utils 3.3.1",
-]
-
-[[package]]
 name = "zbus_names"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8737,16 +8659,6 @@ dependencies = [
  "static_assertions",
  "winnow 0.7.15",
  "zvariant 5.8.0",
-]
-
-[[package]]
-name = "zbus_names"
-version = "4.3.2"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "serde",
- "winnow 1.0.1",
- "zvariant 5.11.0",
 ]
 
 [[package]]
@@ -8835,19 +8747,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zvariant"
-version = "5.11.0"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "endi",
- "enumflags2",
- "serde",
- "winnow 1.0.1",
- "zvariant_derive 5.11.0",
- "zvariant_utils 3.3.1",
-]
-
-[[package]]
 name = "zvariant_derive"
 version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8874,18 +8773,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zvariant_derive"
-version = "5.11.0"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
- "zvariant_utils 3.3.1",
-]
-
-[[package]]
 name = "zvariant_utils"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8907,18 +8794,6 @@ dependencies = [
  "serde",
  "syn 2.0.106",
  "winnow 0.7.15",
-]
-
-[[package]]
-name = "zvariant_utils"
-version = "3.3.1"
-source = "git+https://github.com/z-galaxy/zbus#df1df79aa390df32e35a427959c7ca3916b74697"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "syn 2.0.106",
- "winnow 1.0.1",
 ]
 
 [[patch.unused]]

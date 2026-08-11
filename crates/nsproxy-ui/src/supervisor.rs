@@ -1479,12 +1479,12 @@ impl Supervisor {
     }
 
     /// Send `EnsureDbus` to sp up for `profile` if:
-    /// - the profile has `dbus: proxy` in TemplateConfig
+    /// - the profile has `dbus: container` in TemplateConfig
     /// - the persisted sandbox status shows the sandbox is already `Pivoted`
     /// - sp up is currently connected
     fn maybe_ensure_dbus(&mut self, profile: &ContainerName) {
         let dbus_enabled = load_template_from_disk(profile)
-            .map(|t| t.dbus == nsproxy_core::DbusMode::Proxy)
+            .map(|t| t.dbus == nsproxy_core::DbusMode::Container)
             .unwrap_or(false);
         if !dbus_enabled {
             return;

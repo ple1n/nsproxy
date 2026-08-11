@@ -301,6 +301,7 @@ mod tests {
                 args: Vec::new(),
             },
             browser_profile: None,
+            dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
         };
 
@@ -1176,7 +1177,7 @@ pub struct TemplateConfigV2 {
     /// Browser profile name for env isolation (set NSPROXY_PROFILE_BROWSER)
     #[serde(default)]
     pub browser_profile: Option<String>,
-    /// D-Bus exposure mode. Schema 2+; Block is the absent-field default.
+    /// D-Bus exposure mode. Schema 2+; Container is the absent-field default.
     #[serde(default)]
     pub dbus: DbusMode,
     #[serde(default)]
@@ -1188,7 +1189,7 @@ impl TemplateConfigV2 {
 }
 
 /// Schema-1 profile config. The `dbus` field was a plain `bool`:
-/// `true` = run private busd proxy, `false`/absent = host bus inherited.
+/// `true` = run a private container D-Bus daemon, `false`/absent = host bus inherited.
 /// Used only for deserializing legacy configs inside `TemplateConfig::load()`.
 #[derive(Deserialize)]
 struct TemplateConfigV1 {
@@ -1210,7 +1211,7 @@ struct TemplateConfigV1 {
     sargs: ShellArgs,
     #[serde(default)]
     browser_profile: Option<String>,
-    /// false/absent = Pass (host env inherited), true = Proxy (busd)
+    /// false/absent = Pass (host env inherited), true = Container (private daemon)
     #[serde(default)]
     dbus: bool,
     #[serde(default)]
@@ -1237,8 +1238,8 @@ impl From<TemplateConfigV1> for TemplateConfigV2 {
             sargs: v1.sargs,
             browser_profile: v1.browser_profile,
             // false/absent → Pass (legacy: host bus was inherited through adjust())
-            // true          → Proxy (busd was spawned)
-            dbus: if v1.dbus { DbusMode::Proxy } else { DbusMode::Pass },
+            // true          → Container (private daemon is spawned)
+            dbus: if v1.dbus { DbusMode::Container } else { DbusMode::Pass },
             rootfs: v1.rootfs,
         }
     }
@@ -1249,12 +1250,15 @@ impl From<TemplateConfigV1> for TemplateConfigV2 {
 #[serde(rename_all = "lowercase")]
 pub enum DbusMode {
     /// Block D-Bus: strip DBUS_SESSION_BUS_ADDRESS from the spawn environment.
-    #[default]
     Block,
     /// Pass the host session bus through directly (risky — host services reachable).
     Pass,
-    /// Run a private per-profile busd daemon; container processes share it.
+    /// Legacy private-proxy mode. It is retained for configuration compatibility
+    /// but intentionally starts no service and exposes no session bus.
     Proxy,
+    /// Run one private `dbus-daemon` session bus inside the container.
+    #[default]
+    Container,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -1280,7 +1284,7 @@ impl Default for TemplateConfigV2 {
             hot_init: Some(HotConfig::default()),
             sargs: ShellArgs::default(),
             browser_profile: None,
-            dbus: DbusMode::Block,
+            dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
         }
     }
@@ -1471,7 +1475,7 @@ impl TemplateConfig {
             },
             chmod: Vec::new(),
             browser_profile: None,
-            dbus: DbusMode::Block,
+            dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
         })
     }
@@ -2035,7 +2039,7 @@ pub enum MainCommand {
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         internal_dns_server: Option<bool>,
     },
-    /// Run a private per-runtime session D-Bus inside an already-up profile namespace.
+    /// Run the private `dbus-daemon` session bus for an already-up container.
     Dbus {
         /// Profile name (must have been brought up with `up` first)
         #[arg(long)]

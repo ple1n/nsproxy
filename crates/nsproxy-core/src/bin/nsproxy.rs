@@ -34,8 +34,8 @@ use nix::{
     pty::openpty,
     sched::{CloneFlags, unshare},
     unistd::{
-        ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, pipe, setgroups,
-        setpgid, setresgid, setresuid, setsid,
+        ForkResult, Gid, Pid, Uid, chdir, chown, dup2, execve, fork, getresgid, getresuid, pipe,
+        setgroups, setpgid, setresgid, setresuid, setsid,
     },
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
@@ -92,13 +92,14 @@ use std::{
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::{
-            fs::{MetadataExt, PermissionsExt, symlink},
-            net::{UnixListener, UnixStream},
+            fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
+            net::UnixStream,
+            process::CommandExt,
         },
     },
     path::{Component, Path, PathBuf},
     pin::Pin,
-    process::exit,
+    process::{Command, Stdio, exit},
     str::FromStr,
     sync::Mutex,
     sync::{
@@ -167,7 +168,7 @@ impl RawLogRingState {
 }
 
 fn profile_bus_socket(profile: &str) -> PathBuf {
-    state_paths::profile_dir(profile).join("bus.sock")
+    state_paths::profile_dir(profile).join("bus").join("session.sock")
 }
 
 fn profile_bus_address(profile: &str) -> String {
@@ -175,7 +176,49 @@ fn profile_bus_address(profile: &str) -> String {
 }
 
 fn session_bus_ready(socket_path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    if !fs::symlink_metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        return false;
+    }
+
+    let address = format!("unix:path={}", socket_path.display());
+    let mut child = match Command::new("dbus-send")
+        .arg(format!("--bus={address}"))
+        .args([
+            "--dest=org.freedesktop.DBus",
+            "--type=method_call",
+            "--print-reply",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.ListNames",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            warn!(%err, "cannot run dbus-send to check private session bus health");
+            return false;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                warn!(socket = %socket_path.display(), "private session bus health check timed out");
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(err) => {
+                warn!(%err, socket = %socket_path.display(), "private session bus health check failed");
+                return false;
+            }
+        }
+    }
 }
 
 fn dbus_mode_for_profile(ns_alive: &nsproxy_core::NsAlive) -> nsproxy_core::DbusMode {
@@ -192,7 +235,8 @@ fn maybe_session_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String>
     match dbus_mode_for_profile(ns_alive) {
         nsproxy_core::DbusMode::Block => None,
         nsproxy_core::DbusMode::Pass => std::env::var(ENV_DBUS_SESSION_BUS_ADDRESS).ok(),
-        nsproxy_core::DbusMode::Proxy => Some(profile_bus_address(profile)),
+        nsproxy_core::DbusMode::Proxy => None,
+        nsproxy_core::DbusMode::Container => Some(profile_bus_address(profile)),
     }
 }
 
@@ -200,17 +244,61 @@ fn maybe_session_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String>
 /// Must be called AFTER `shell_prefs.adjust()`:
 /// - Block: strip DBUS_SESSION_BUS_ADDRESS (adjust() captured it from parent env)
 /// - Pass:  do nothing (already inherited from parent env via adjust())
-/// - Proxy: replace with the private per-profile busd socket address
+/// - Container: replace with the private per-profile dbus-daemon socket address
 fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive) {
     match dbus_mode_for_profile(ns_alive) {
         nsproxy_core::DbusMode::Block => shell_prefs.strip_dbus_env(),
         nsproxy_core::DbusMode::Pass => {}
-        nsproxy_core::DbusMode::Proxy => {
+        // Retain the legacy config value without preserving the old incomplete
+        // proxy implementation or exposing the host bus by accident.
+        nsproxy_core::DbusMode::Proxy => shell_prefs.strip_dbus_env(),
+        nsproxy_core::DbusMode::Container => {
             if let Some(profile) = ns_alive.profile_name.as_deref() {
                 shell_prefs.set_dbus_session_bus_env(&profile_bus_address(profile));
             }
         }
     }
+}
+
+/// Run one self-contained session bus for a container.
+///
+/// Unlike `dbus-broker-launch`, `dbus-daemon` handles traditional D-Bus service
+/// activation itself, without requiring a host or nested systemd user manager.
+/// The daemon is run in the foreground so the `sp dbus` task group owns its
+/// lifetime and the UI can report it just like `sp serve`.
+fn run_container_dbus_daemon(socket_path: &Path) -> Result<()> {
+    let address = format!("unix:path={}", socket_path.display());
+    // `sp` is setuid-root, but the daemon must use the profile owner's real
+    // credentials. Otherwise it inherits a mixed real/user and effective/root
+    // identity, which can leave a socket that accepts connections but cannot
+    // complete D-Bus authentication.
+    let uid = getresuid()?.real.as_raw();
+    let gid = getresgid()?.real.as_raw();
+    let runtime_dir = socket_path
+        .parent()
+        .ok_or_else(|| anyhow!("private session-bus socket has no parent directory"))?;
+    fs::create_dir_all(runtime_dir)?;
+    chown(
+        runtime_dir,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )?;
+    fs::set_permissions(runtime_dir, Permissions::from_mode(0o700))?;
+
+    let mut command = Command::new("dbus-daemon");
+    command
+        .args(["--session", "--nofork", "--nopidfile"])
+        .arg(format!("--address={address}"))
+        .uid(uid)
+        .gid(gid)
+        // Activated services receive DBUS_STARTER_ADDRESS from the daemon.
+        // Do not preserve the host session address in their inherited env.
+        .env_remove(ENV_DBUS_SESSION_BUS_ADDRESS);
+
+    let status = command.status()?;
+    let _ = fs::remove_file(socket_path);
+    ensure!(status.success(), "dbus-daemon exited with {status}");
+    Ok(())
 }
 
 fn build_spawn_env_pairs(
@@ -1059,55 +1147,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Determine ownership for created directories
-                info!("Determining ownership for created directories...");
-                let (owner_uid, owner_gid) = if let Some(uid) = profile.sargs.uid {
-                    let gid = profile.sargs.gid.unwrap_or_else(|| {
-                        uzers::get_user_by_uid(uid)
-                            .map(|u| u.primary_group_id())
-                            .unwrap_or(uid)
-                    });
-                    (uid, gid)
-                } else {
-                    use nix::unistd::getresuid;
-                    use nsproxy_common::UID_HINT_VAR;
-
-                    let uid = if let Ok(id) = std::env::var(UID_HINT_VAR) {
-                        id.parse()?
-                    } else if let Ok(id) = std::env::var("SUDO_UID") {
-                        id.parse()?
-                    } else {
-                        let res = getresuid()?;
-                        if !res.real.is_root() {
-                            res.real.as_raw()
-                        } else {
-                            1000 // fallback
-                        }
-                    };
-
-                    let gid = uzers::get_user_by_uid(uid)
-                        .map(|u| u.primary_group_id())
-                        .unwrap_or(uid);
-                    (uid, gid)
-                };
-                info!("Using ownership: uid={}, gid={}", owner_uid, owner_gid);
-
-                info!("Creating mount source directories...");
-                for m in &profile.mounts {
-                    if !m.source.exists() {
-                        info!("  Creating: {:?}", m.source);
-                        std::fs::create_dir_all(&m.source)?;
-                        // Set ownership
-                        nix::unistd::chown(
-                            &m.source,
-                            Some(nix::unistd::Uid::from_raw(owner_uid)),
-                            Some(nix::unistd::Gid::from_raw(owner_gid)),
-                        )?;
-                        info!("  Set ownership to uid={}, gid={}", owner_uid, owner_gid);
-                    } else {
-                        info!("  Mount source exists: {:?}", m.source);
-                    }
-                }
+                create_profile_mount_sources(&profile)?;
 
                 // Copy hot config if it exists, otherwise create from hot_init or default
                 info!("Setting up hot config...");
@@ -1658,8 +1698,8 @@ fn main() -> anyhow::Result<()> {
 
             let profile_conf = TemplateConfig::load(&profile_path)?;
             ensure!(
-                profile_conf.dbus == nsproxy_core::DbusMode::Proxy,
-                "profile '{}' dbus mode is not 'proxy' in TemplateConfig",
+                profile_conf.dbus == nsproxy_core::DbusMode::Container,
+                "profile '{}' dbus mode is not 'container' in TemplateConfig",
                 profile
             );
 
@@ -1682,7 +1722,6 @@ fn main() -> anyhow::Result<()> {
             assert_mount_ns_matches(&profile_namespaces.mnt)?;
 
             let socket_path = profile_bus_socket(&profile);
-            let address = profile_bus_address(&profile);
 
             // Idempotent: if a healthy bus is already listening, nothing to do.
             if session_bus_ready(&socket_path) {
@@ -1698,21 +1737,8 @@ fn main() -> anyhow::Result<()> {
                 fs::remove_file(&socket_path)?;
             }
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async move {
-                let mut bus = busd::bus::Bus::for_address(Some(&address)).await?;
-                // The socket is created by busd as root; make it world-writable
-                // so unprivileged processes (e.g. uid 1000) can connect.
-                fs::set_permissions(
-                    &socket_path,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o666),
-                )?;
-                bus.run().await?;
-                let _ = bus.cleanup().await;
-                Ok::<(), anyhow::Error>(())
-            })?;
+            info!(profile, "starting private dbus-daemon session bus");
+            run_container_dbus_daemon(&socket_path)?;
         }
         MainCommand::Veth {
             src,
@@ -1874,6 +1900,11 @@ fn main() -> anyhow::Result<()> {
             let mut profile_conf = TemplateConfig::load(&profile_path)?;
             let instance_root = state_paths::profile_dir(&profile);
             profile_conf.expand_placeholders(&instance_root);
+
+            // The UI's older create path wrote profile.json without the CLI
+            // profile-create initialization step. Reconcile the declared source
+            // tree here too, before entering the profile mount namespace.
+            create_profile_mount_sources(&profile_conf)?;
 
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let ns_alive = read_ns_alive(&ns_meta)?;
@@ -3041,7 +3072,7 @@ async fn run_up_daemon(
     {
         let template_path = state_paths::profile_config(profile);
         let dbus_enabled = TemplateConfig::load(&template_path)
-            .map(|t| t.dbus == nsproxy_core::DbusMode::Proxy)
+            .map(|t| t.dbus == nsproxy_core::DbusMode::Container)
             .unwrap_or(false);
         let sandbox_ready = read_sandbox_status(profile)
             .is_some_and(|s| {
@@ -3054,7 +3085,7 @@ async fn run_up_daemon(
                 "sp up startup: sandbox ready and dbus enabled, spawning sp dbus"
             );
             let template = TemplateConfig::load(&state_paths::profile_config(profile))?;
-            if template.dbus == nsproxy_core::DbusMode::Proxy {
+            if template.dbus == nsproxy_core::DbusMode::Container {
                 let cli = Cli {
                     conf: None,
                     root: None,
@@ -3487,7 +3518,7 @@ async fn handle_up_client(
 
                         if !dbus_running {
                             let template = TemplateConfig::load(&state_paths::profile_config(&profile))?;
-                            if template.dbus == nsproxy_core::DbusMode::Proxy {
+                            if template.dbus == nsproxy_core::DbusMode::Container {
                                 let cli = Cli {
                                     conf: None,
                                     root: None,
@@ -4375,6 +4406,58 @@ fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
     }
 }
 
+/// Create missing mount sources declared by a newly-created profile.
+///
+/// Both CLI and root-daemon profile creation call this so UI-created profiles
+/// receive the same initialized `@` source tree as CLI-created profiles.
+fn create_profile_mount_sources(profile: &TemplateConfig) -> Result<()> {
+    info!("Determining ownership for created mount source directories...");
+    let (owner_uid, owner_gid) = if let Some(uid) = profile.sargs.uid {
+        let gid = profile.sargs.gid.unwrap_or_else(|| {
+            uzers::get_user_by_uid(uid)
+                .map(|user| user.primary_group_id())
+                .unwrap_or(uid)
+        });
+        (uid, gid)
+    } else {
+        let uid = if let Ok(id) = std::env::var(nsproxy_common::UID_HINT_VAR) {
+            id.parse()?
+        } else if let Ok(id) = std::env::var("SUDO_UID") {
+            id.parse()?
+        } else {
+            let res = nix::unistd::getresuid()?;
+            if !res.real.is_root() {
+                res.real.as_raw()
+            } else {
+                1000 // Preserve the legacy CLI profile-create fallback.
+            }
+        };
+        let gid = uzers::get_user_by_uid(uid)
+            .map(|user| user.primary_group_id())
+            .unwrap_or(uid);
+        (uid, gid)
+    };
+    info!("Using ownership: uid={}, gid={}", owner_uid, owner_gid);
+
+    info!("Creating missing mount source directories...");
+    for mount in &profile.mounts {
+        if !mount.source.exists() {
+            info!("  Creating: {:?}", mount.source);
+            std::fs::create_dir_all(&mount.source)?;
+            nix::unistd::chown(
+                &mount.source,
+                Some(nix::unistd::Uid::from_raw(owner_uid)),
+                Some(nix::unistd::Gid::from_raw(owner_gid)),
+            )?;
+            info!("  Set ownership to uid={}, gid={}", owner_uid, owner_gid);
+        } else {
+            info!("  Mount source exists: {:?}", mount.source);
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction {
     let op_id = req.op_id;
     let op_name = root_daemon_op_name(&req.op);
@@ -4519,11 +4602,15 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 if profile_dir.exists() {
                     bail!("profile '{}' already exists", profile);
                 }
+                let mut template: TemplateConfig = serde_json::from_str(&profile_content)?;
+                template.validate()?;
+                template.expand_placeholders(&profile_dir);
                 std::fs::create_dir_all(&profile_dir)?;
                 std::fs::write(&profile_path, profile_content.as_bytes())?;
                 if let Some(hot_content) = hot_content {
                     std::fs::write(&hot_path, hot_content.as_bytes())?;
                 }
+                create_profile_mount_sources(&template)?;
                 Ok(())
             })();
             RootDaemonAction::Reply(match result {

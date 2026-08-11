@@ -124,10 +124,10 @@ echo ""
 
 echo "=== Summary ==="
 if [ "$DBUS_PRESENT" -eq 1 ]; then
-    echo "Session bus is SET. Run inside the target container to test proxy/pass mode."
+    echo "Session bus is SET. Run inside the target container to test container/pass mode."
 else
     echo "Session bus NOT set. Expected in 'block' mode or outside a container."
-    echo "To test proxy mode: sp enter <profile>  (with dbus=proxy in TemplateConfig)"
+    echo "To test container mode: sp enter <profile>  (with dbus=container in TemplateConfig)"
     echo "To test pass mode:  sp enter <profile>  (with dbus=pass in TemplateConfig)"
 fi
 

@@ -89,7 +89,6 @@ nsproxy-hickory-recursor = { path = "../hickory-dns/crates/recursor" }
 nsproxy-hickory-server = { path = "../hickory-dns/crates/server" }
 nsproxy-hickory-dns = { path = "../hickory-dns/bin" }
 nsproxy-hickory-util = { path = "../hickory-dns/util" }
-busd = { path = "crates/busd" }
 
 [workspace.dependencies]
 tun-rs = { version = "2.7.2", features = ["async_io"] }
