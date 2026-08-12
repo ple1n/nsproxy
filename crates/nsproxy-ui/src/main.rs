@@ -20,8 +20,7 @@ use nsproxy_core::uplink::{
     uplink_proxy_default_udp_expected, UplinkHub, UplinkProxy, UplinkStatsState,
 };
 use nsproxy_core::{
-    state_paths, DbusMode, HotConfig, NsAlive, ProfileChmod, ProfileMount, Rootfs, SandboxMode,
-    TemplateConfig,
+    DbusMode, HotConfig, INTERNAL_RESOLV_CONF_DNS, LaunchableApp, NsAlive, ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig, default_hotconfig, state_paths,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -222,6 +221,7 @@ enum RightTab {
     ProfileEditor,
     State,
     Manage,
+    Meta,
 }
 
 // ── Manage / creation wizard ──────────────────────────────────────────────────
@@ -335,7 +335,7 @@ struct ManageWizard {
 
 impl Default for ManageWizard {
     fn default() -> Self {
-        let hot = HotConfig::default();
+        let hot = default_hotconfig();
         let hot_json = serde_json::to_string_pretty(&hot).unwrap_or_default();
         Self {
             mode: WizardMode::default(),
@@ -770,6 +770,9 @@ struct App {
     selected_profile: Option<ContainerName>,
     remove_containers_armed: bool,
     right_tab: RightTab,
+    /// UI-only presentation mode for screenshots and demonstrations.
+    /// This never changes the profile names, paths, or data sent to the supervisor.
+    demo_mode: bool,
     proxies: BTreeMap<ProxyID, ProxyItem>,
     nym_to_id: BTreeMap<String, ProxyID>,
     proxy_groups: BTreeMap<ProxyID, HashSet<GroupId>>,
@@ -845,6 +848,9 @@ struct App {
     log_panel_min_level: LogMinLevel,
     /// State for the Manage (creation wizard) tab.
     manage_wizard: ManageWizard,
+    /// Applications with an in-flight lifecycle launch request, keyed by profile and app name.
+    action_launching: Arc<Mutex<HashSet<(ContainerName, String)>>>,
+    action_status: Arc<Mutex<Option<String>>>,
 }
 
 fn fast_hash_value<T: Hash>(value: &T) -> u64 {
@@ -1032,6 +1038,7 @@ fn parse_command_line_to_spawn_args(
         gids: Vec::new(),
         args: tokens,
         ringbuf_size: None,
+        application: None,
         ns: if spawn_inside_container {
             diag::NamespaceSpawn::Inside
         } else {
@@ -1356,6 +1363,7 @@ impl App {
             selected_profile: None,
             remove_containers_armed: false,
             right_tab: RightTab::Proxies,
+            demo_mode: false,
             proxies,
             nym_to_id,
             proxy_groups,
@@ -1402,7 +1410,7 @@ impl App {
             profile_editor_create_name: String::new(),
             profile_editor_status: None,
             hotconfig_editor_target: None,
-            hotconfig_editor_value: HotConfig::default(),
+            hotconfig_editor_value: default_hotconfig(),
             hotconfig_editor_json: default_hotconfig_text(),
             hotconfig_editor_error: None,
             hotconfig_editor_status: None,
@@ -1435,6 +1443,8 @@ impl App {
             cached_log: HashMap::new(),
             log_panel_min_level: LogMinLevel::default(),
             manage_wizard: ManageWizard::default(),
+            action_launching: Arc::new(Mutex::new(HashSet::new())),
+            action_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1450,7 +1460,91 @@ impl App {
             RightTab::ProfileEditor => "ProfileEditor",
             RightTab::State => "State",
             RightTab::Manage => "Manage",
+            RightTab::Meta => "Meta",
         }
+    }
+
+    /// Returns text suitable for rendering. In demonstration mode this removes
+    /// profile names and the local home-directory prefix without touching the
+    /// underlying state or any value used for an action.
+    fn display_text(&self, text: impl AsRef<str>) -> String {
+        let mut displayed = text.as_ref().to_owned();
+        if !self.demo_mode {
+            return displayed;
+        }
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home).display().to_string();
+            if !home.is_empty() {
+                displayed = displayed.replace(&home, "/home/demo-user");
+            }
+        }
+
+        let mut profiles: Vec<_> = self.snapshot.profiles.keys().collect();
+        profiles.sort_by(|a, b| {
+            b.as_str()
+                .len()
+                .cmp(&a.as_str().len())
+                .then_with(|| a.as_str().cmp(b.as_str()))
+        });
+        for profile_name in profiles {
+            let ordinal = self
+                .snapshot
+                .profiles
+                .keys()
+                .enumerate()
+                .find_map(|(index, name)| (name == profile_name).then_some(index + 1))
+                .expect("profile name was obtained from the profile map");
+            displayed = displayed.replace(profile_name.as_str(), &format!("container-{ordinal}"));
+        }
+
+        displayed
+    }
+
+    fn display_path(&self, path: &Path) -> String {
+        self.display_text(path.display().to_string())
+    }
+
+    fn display_hotconfig(&self, hot: &HotConfig) -> HotConfig {
+        if !self.demo_mode {
+            return hot.clone();
+        }
+
+        serde_json::to_string(hot)
+            .ok()
+            .map(|json| self.display_text(json))
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_else(|| hot.clone())
+    }
+
+    fn render_meta_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Meta");
+        ui.add_space(8.0);
+        ui.label("Presentation controls that only affect text rendered by this UI.");
+        ui.add_space(8.0);
+
+        let button_text = if self.demo_mode {
+            "demo mode enabled (replace personal information)"
+        } else {
+            "demo mode (replace personal information)"
+        };
+        if ui.button(button_text).clicked() {
+            self.demo_mode = !self.demo_mode;
+        }
+
+        ui.add_space(6.0);
+        if self.demo_mode {
+            ui.colored_label(
+                Color32::LIGHT_GREEN,
+                "Enabled: container names are replaced with generic labels and home paths use /home/demo-user.",
+            );
+        } else {
+            ui.colored_label(
+                Color32::from_gray(150),
+                "Disabled: the UI shows the original values.",
+            );
+        }
+        ui.small("This mode does not modify persisted configuration, runtime state, or commands sent to containers.");
     }
 
     fn is_valid_path(path: &str) -> bool {
@@ -1617,13 +1711,32 @@ impl App {
             if let Some(snapshot) = self.snapshot.profiles.get(profile_name) {
                 self.hotconfig_editor_value = snapshot.hotconfig.clone();
             } else {
-                self.hotconfig_editor_value = HotConfig::default();
+                self.hotconfig_editor_value = default_hotconfig();
             }
         } else {
-            self.hotconfig_editor_value = HotConfig::default();
+            self.hotconfig_editor_value = default_hotconfig();
         }
         self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
             .unwrap_or_else(|_| "{}".to_string());
+    }
+
+    /// Returns the latest route reported by the profile's serve process.
+    /// `Some(HotRoute::None)` is a known live state, while `None` means no
+    /// routing state has been received yet.
+    fn live_route_for_profile(
+        &self,
+        profile_name: &ContainerName,
+    ) -> Option<nsproxy_core::HotRoute> {
+        self.snapshot
+            .profiles
+            .get(profile_name)
+            .and_then(|profile| profile.routing_state.as_ref())
+            .map(|routing| match &routing.selected_proxy {
+                Some(proxy_id) => nsproxy_core::HotRoute::SimpleProxy {
+                    proxy_id: proxy_id.clone(),
+                },
+                None => nsproxy_core::HotRoute::None,
+            })
     }
 
     fn save_hotconfig_editor(&mut self) {
@@ -1631,6 +1744,15 @@ impl App {
             self.hotconfig_editor_status = Some("Select a profile to save hotconfig.".to_string());
             return;
         };
+
+        // The proxy selector updates the running serve process immediately.
+        // Preserve that newer route when saving unrelated HotConfig edits.
+        if let Some(route) = self.live_route_for_profile(&profile_name) {
+            self.hotconfig_editor_value.route = route;
+            self.hotconfig_editor_json =
+                serde_json::to_string_pretty(&self.hotconfig_editor_value)
+                    .unwrap_or_else(|_| "{}".to_string());
+        }
 
         let content = match serde_json::to_string_pretty(&self.hotconfig_editor_value) {
             Ok(content) => content,
@@ -2422,6 +2544,55 @@ impl App {
         changed
     }
 
+    fn render_launchable_apps_list(
+        ui: &mut egui::Ui,
+        int_input: &mut IntInput,
+        apps: &mut Vec<LaunchableApp>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("applications");
+                ui.small("On-demand launch cards shown in Actions; they do not auto-start.");
+                if ui.button("+ Add").clicked() {
+                    apps.push(LaunchableApp::default());
+                    changed = true;
+                }
+            });
+
+            let mut remove_ix = None;
+            for (i, app) in apps.iter_mut().enumerate() {
+                ui.push_id((id_prefix, "application", i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}", i + 1));
+                        ui.label("name");
+                        if ui.text_edit_singleline(&mut app.name).changed() {
+                            changed = true;
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            remove_ix = Some(i);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("description");
+                        if ui.text_edit_singleline(&mut app.description).changed() {
+                            changed = true;
+                        }
+                    });
+                    if Self::render_shell_args(ui, int_input, &mut app.command, "command") {
+                        changed = true;
+                    }
+                });
+            }
+            if let Some(i) = remove_ix {
+                apps.remove(i);
+                changed = true;
+            }
+        });
+        changed
+    }
+
     fn render_hotconfig_form(
         ui: &mut egui::Ui,
         int_input: &mut IntInput,
@@ -2446,6 +2617,9 @@ impl App {
             changed = true;
         }
         if Self::render_shell_args_list(ui, int_input, &mut hot.daemons, id_prefix) {
+            changed = true;
+        }
+        if Self::render_launchable_apps_list(ui, int_input, &mut hot.applications, id_prefix) {
             changed = true;
         }
 
@@ -2523,12 +2697,51 @@ impl App {
         hot: &mut HotConfig,
         json_text: &mut String,
         json_error: &mut Option<String>,
+        demo_display: Option<(HotConfig, String)>,
     ) -> bool {
+        if let Some((mut display_hot, mut display_json)) = demo_display {
+            ui.columns(2, |columns| {
+                columns[0].heading("Form");
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{}-form-scroll", id_prefix))
+                    .min_scrolled_height(560.0)
+                    .show(&mut columns[0], |ui| {
+                        ui.add_enabled_ui(false, |ui| {
+                            Self::render_hotconfig_form(
+                                ui,
+                                int_input,
+                                id_prefix,
+                                &mut display_hot,
+                            );
+                        });
+                    });
+
+                columns[1].heading("Formatted JSON");
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{}-json-scroll", id_prefix))
+                    .min_scrolled_height(560.0)
+                    .show(&mut columns[1], |ui| {
+                        ui.add_enabled_ui(false, |ui| {
+                            CodeEditor::default()
+                                .id_source(format!("{}-json-editor", id_prefix))
+                                .with_rows(40)
+                                .with_theme(ColorTheme::GRUVBOX)
+                                .with_syntax(json_syntax())
+                                .with_numlines(true)
+                                .with_ui_fontsize(ui)
+                                .show(ui, &mut display_json);
+                        });
+                    });
+            });
+            return false;
+        }
+
         let mut changed = false;
         ui.columns(2, |columns| {
             columns[0].heading("Form");
             egui::ScrollArea::vertical()
                 .id_salt(format!("{}-form-scroll", id_prefix))
+                .min_scrolled_height(560.0)
                 .show(&mut columns[0], |ui| {
                     if Self::render_hotconfig_form(ui, int_input, id_prefix, hot) {
                         *json_text =
@@ -2541,10 +2754,11 @@ impl App {
             columns[1].heading("Formatted JSON");
             egui::ScrollArea::vertical()
                 .id_salt(format!("{}-json-scroll", id_prefix))
+                .min_scrolled_height(560.0)
                 .show(&mut columns[1], |ui| {
                     let mut editor = CodeEditor::default()
                         .id_source(format!("{}-json-editor", id_prefix))
-                        .with_rows(28)
+                        .with_rows(40)
                         .with_theme(ColorTheme::GRUVBOX)
                         .with_syntax(json_syntax())
                         .with_numlines(true)
@@ -2949,7 +3163,7 @@ impl App {
             if ui.checkbox(&mut enabled, "hot_init").changed() {
                 changed = true;
                 if enabled && self.profile_editor_template.hot_init.is_none() {
-                    self.profile_editor_template.hot_init = Some(HotConfig::default());
+                    self.profile_editor_template.hot_init = Some(default_hotconfig());
                     refresh_hot_init_json = true;
                 }
                 if !enabled {
@@ -3157,7 +3371,7 @@ impl Drop for App {
 }
 
 fn default_hotconfig_text() -> String {
-    serde_json::to_string_pretty(&HotConfig::default()).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&default_hotconfig()).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn default_profile_text() -> String {
@@ -3391,7 +3605,7 @@ fn wizard_build_pivot_template(
         None
     };
 
-    let hot = HotConfig::default();
+    let hot = default_hotconfig();
     let template = TemplateConfig {
         schema: TemplateConfig::VERSION, // [schema-bump:wizard]
         sandbox_mode: SandboxMode::Pivot,
@@ -3400,7 +3614,7 @@ fn wizard_build_pivot_template(
         env,
         inherit_env: true,
         hot: PathBuf::from("@/hot.json"),
-        hot_init: None,
+        hot_init: Some(hot.clone()),
         sargs: nsproxy_core::shell::ShellArgs::default(),
         browser_profile,
         dbus,
@@ -3657,7 +3871,7 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("No profiles found").color(egui::Color32::GRAY));
                     ui.small(format!(
                         "Create profiles in {}",
-                        state_paths::persist_root().display()
+                        self.display_path(&state_paths::persist_root())
                     ));
                 } else {
                     for (profile_name, profile_snapshot) in &self.snapshot.profiles {
@@ -3694,7 +3908,7 @@ impl eframe::App for App {
 
                         let box_resp = sidebar_box(
                             ui,
-                            profile_name.as_str(),
+                            &self.display_text(profile_name.as_str()),
                             status_text,
                             is_selected,
                             status_color,
@@ -3892,6 +4106,12 @@ impl eframe::App for App {
                     {
                         self.right_tab = RightTab::Manage;
                     }
+                    if ui
+                        .selectable_label(self.right_tab == RightTab::Meta, "Meta")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Meta;
+                    }
 
                     let profile_state = self
                         .selected_profile
@@ -3940,13 +4160,14 @@ impl eframe::App for App {
                         RightTab::Proxies => self.render_proxies_tab(ui),
                         RightTab::Daemon => self.render_daemon_tab(ui),
                         RightTab::Logs => self.render_logs_tab(ui),
-                        RightTab::Actions => personal::render_actions_tab(self, ui),
+                        RightTab::Actions => self.render_actions_tab(ui),
                         RightTab::Processes => self.render_processes_tab(ui),
                         RightTab::Traffic => self.render_traffic_tab(ui),
                         RightTab::Hotconfig => self.render_hotconfig_tab(ui),
                         RightTab::ProfileEditor => self.render_profile_editor_tab(ui),
                         RightTab::State => self.render_state_tab(ui),
                         RightTab::Manage => unreachable!(),
+                        RightTab::Meta => self.render_meta_tab(ui),
                     });
             }
         });
@@ -4008,6 +4229,163 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn render_actions_tab(&mut self, ui: &mut egui::Ui) {
+        let apps: Vec<(ContainerName, LaunchableApp)> = self
+            .snapshot
+            .profiles
+            .iter()
+            .flat_map(|(container, profile)| {
+                profile
+                    .hotconfig
+                    .applications
+                    .iter()
+                    .cloned()
+                    .map(|app| (container.clone(), app))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        ui.heading("Actions");
+        ui.label("Launch configured applications and manage their live processes across containers.");
+        ui.add_space(8.0);
+
+        if apps.is_empty() {
+            ui.colored_label(
+                Color32::from_gray(150),
+                "No launchable applications are configured. Add applications in a profile's Hotconfig tab.",
+            );
+        }
+
+        let mut launch_request: Option<(ContainerName, LaunchableApp)> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for (container, app) in &apps {
+                    let running = self
+                        .snapshot
+                        .profiles
+                        .get(container)
+                        .and_then(|profile| profile.process_list_snapshot.as_ref())
+                        .is_some_and(|list| {
+                            list.procs.values().any(|entry| {
+                                matches!(entry.status, diag::ProcessStatus::Alive)
+                                    && matches!(
+                                        &entry.meta,
+                                        diag::SpawnedEntry::Args(args)
+                                            | diag::SpawnedEntry::Pty(args)
+                                            if args.application.as_deref() == Some(app.name.as_str())
+                                    )
+                            })
+                        });
+                    let launching = self
+                        .action_launching
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&(container.clone(), app.name.clone()));
+                    let configured = !app.name.trim().is_empty()
+                        && app.command.shell.as_ref().is_some_and(|shell| !shell.trim().is_empty());
+                    // Only lifecycle state disables an Actions card. Configuration
+                    // errors are reported after a click, so an unlaunched app is
+                    // always actionable as promised by the Actions workflow.
+                    let enabled = !running && !launching;
+                    let status = if running {
+                        "Already launched"
+                    } else if launching {
+                        "Launching"
+                    } else if !configured {
+                        "Configure a command shell in Hotconfig"
+                    } else if app.description.trim().is_empty() {
+                        "Launch application"
+                    } else {
+                        app.description.as_str()
+                    };
+                    if action_app_card(ui, &app.name, container, enabled, running)
+                        .on_hover_text(status)
+                        .clicked()
+                    {
+                        launch_request = Some((container.clone(), app.clone()));
+                    }
+                }
+        });
+
+        if let Some((container, app)) = launch_request {
+            self.launch_hotconfig_application(container, app);
+        }
+        if let Some(status) = self
+            .action_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            ui.add_space(6.0);
+            ui.label(status);
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("Launched processes");
+        self.render_units_table(ui, &None);
+    }
+
+    fn launch_hotconfig_application(&mut self, profile: ContainerName, app: LaunchableApp) {
+        let name = app.name.trim().to_owned();
+        let shell = app.command.shell.clone().unwrap_or_default();
+        if name.is_empty() || shell.trim().is_empty() {
+            *self.action_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("Application requires both a name and command shell.".to_string());
+            return;
+        }
+
+        let key = (profile.clone(), name.clone());
+        self.action_launching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        let exec = which::which(&shell)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or(shell.clone());
+        let mut args = Vec::with_capacity(app.command.args.len() + 1);
+        args.push(shell.clone());
+        args.extend(app.command.args.clone());
+        let mut spawn_args = diag::SpawnArgs {
+            uid: app.command.uid,
+            gid: app.command.gid,
+            exec: Some(exec),
+            cwd: app.command.cwd,
+            gids: app.command.gids,
+            args,
+            ringbuf_size: None,
+            application: Some(name.clone()),
+            ns: diag::NamespaceSpawn::Inside,
+        };
+        apply_default_spawn_user(&mut spawn_args);
+
+        let supervisor = self.supervisor.clone();
+        let launching = self.action_launching.clone();
+        let status = self.action_status.clone();
+        let Some(runtime) = self.tokio_rt.as_ref() else {
+            launching.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("Tokio runtime is unavailable.".to_string());
+            return;
+        };
+        runtime.spawn(async move {
+            let result: anyhow::Result<u32> = async {
+                supervisor.ensure_profile_running(profile.as_str()).await?;
+                let task_pgid = supervisor
+                    .spawn_managed_process(profile.as_str(), spawn_args)
+                    .await?;
+                Ok(task_pgid)
+            }
+            .await;
+            launching.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(match result {
+                Ok(task_pgid) => format!("{} launched in {} (task PGID {}).", name, profile, task_pgid),
+                Err(err) => format!("{} failed to launch in {}: {}", name, profile, err),
+            });
+        });
+    }
+
     fn render_proxies_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Reload").clicked() {
@@ -4512,7 +4890,10 @@ impl App {
         let profile_name = self.selected_profile.clone();
 
         if let Some(profile_name) = profile_name.as_ref() {
-            ui.heading(format!("Processes - {}", profile_name.as_str()));
+            ui.heading(format!(
+                "Processes - {}",
+                self.display_text(profile_name.as_str())
+            ));
             ui.add_space(6.0);
             self.render_process_controls(ui, profile_name);
         } else {
@@ -5181,7 +5562,7 @@ impl App {
         };
 
         if rows.is_empty() {
-            ui.label("No daemon processes reported by sp up.");
+            ui.label("No managed apps running");
             return;
         }
 
@@ -5196,7 +5577,7 @@ impl App {
         TableBuilder::new(ui)
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::auto()) // Profile
+            .column(Column::auto()) // Container
             .column(Column::exact(58.0)) // PGID
             .column(Column::exact(80.0)) // State
             .column(Column::auto()) // Program
@@ -5210,7 +5591,7 @@ impl App {
             .column(Column::remainder()) // Fill remaining width
             .header(22.0, |mut header| {
                 header.col(|ui| {
-                    ui.strong("Profile");
+                    ui.strong("Container");
                 });
                 header.col(|ui| {
                     ui.strong("PGID");
@@ -5243,7 +5624,7 @@ impl App {
                     body.row(22.0, |mut row| {
                         // Profile
                         row.col(|ui| {
-                            ui.label(row_profile.as_str());
+                            ui.label(self.display_text(row_profile.as_str()));
                         });
 
                         // Managed task identity is the process-group id.
@@ -5296,7 +5677,7 @@ impl App {
                         };
 
                         row.col(|ui| {
-                            ui.label(&prog);
+                            ui.label(self.display_text(&prog));
                         });
                         row.col(|ui| {
                             ui.label(&uid_str);
@@ -5926,7 +6307,10 @@ impl App {
         ui.add_space(6.0);
         ui.colored_label(
             Color32::from_gray(130),
-            format!("live file view over {}", state_paths::logs_root().display()),
+            format!(
+                "live file view over {}",
+                self.display_path(&state_paths::logs_root())
+            ),
         );
         ui.add_space(8.0);
 
@@ -6305,7 +6689,7 @@ impl App {
 
         // Header: connection status + loop stats
         ui.horizontal(|ui| {
-            ui.heading(format!("Traffic — {}", profile_name));
+            ui.heading(format!("Traffic — {}", self.display_text(&profile_name)));
             ui.separator();
             if profile.diag_connected {
                 ui.colored_label(Color32::GREEN, "connected");
@@ -7331,7 +7715,15 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     } else {
                         Color32::from_gray(100)
                     };
-                    if sidebar_box(ui, name, subtitle, selected, status_color).clicked() {
+                    if sidebar_box(
+                        ui,
+                        &self.display_text(name),
+                        subtitle,
+                        selected,
+                        status_color,
+                    )
+                    .clicked()
+                    {
                         clone_src = Some(name.clone());
                     }
                     ui.add_space(2.0);
@@ -7343,10 +7735,15 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     match TemplateConfig::load(&profile_path) {
                         Ok(tmpl) => {
                             self.manage_wizard.template = tmpl;
-                            self.manage_wizard.hot = std::fs::read_to_string(&hot_path)
+                            let mut hot: HotConfig = std::fs::read_to_string(&hot_path)
                                 .ok()
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default();
+                            if let Some(route) = self.live_route_for_profile(&src) {
+                                hot.route = route;
+                            }
+                            self.manage_wizard.template.hot_init = Some(hot.clone());
+                            self.manage_wizard.hot = hot;
                             self.manage_wizard.hot_json =
                                 serde_json::to_string_pretty(&self.manage_wizard.hot)
                                     .unwrap_or_default();
@@ -7636,6 +8033,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
 
             if new_route != current_route {
                 self.manage_wizard.hot.route = new_route;
+                self.manage_wizard.template.hot_init = Some(self.manage_wizard.hot.clone());
                 self.manage_wizard.hot_json =
                     serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
             }
@@ -7816,6 +8214,12 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         ui.add_space(8.0);
 
         // Show the hotconfig editor (same form as the Hotconfig tab)
+        let demo_display = self.demo_mode.then(|| {
+            (
+                self.display_hotconfig(&self.manage_wizard.hot),
+                self.display_text(&self.manage_wizard.hot_json),
+            )
+        });
         let changed = Self::render_hotconfig_editor_split(
             ui,
             &mut self.int_input,
@@ -7823,6 +8227,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             &mut self.manage_wizard.hot,
             &mut self.manage_wizard.hot_json,
             &mut self.manage_wizard.hot_json_error,
+            demo_display,
         );
         if changed {
             // Sync resolv_conf_dns back to dns_mode state
@@ -7850,7 +8255,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::from_gray(160), "Template:");
                 if self.manage_wizard.mode == WizardMode::CloneExisting {
-                    ui.label(format!("Cloned from: {}", self.manage_wizard.clone_source));
+                    ui.label(format!(
+                        "Cloned from: {}",
+                        self.display_text(&self.manage_wizard.clone_source)
+                    ));
                 } else {
                     match &self.manage_wizard.template_kind {
                         WizardTemplateKind::OverlayBasic => {
@@ -7968,7 +8376,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             })
             .unwrap_or((None, None, false, DbusMode::Block));
         ui.horizontal(|ui| {
-            ui.heading(format!("Hotconfig - {}", profile_name));
+            ui.heading(format!("Hotconfig - {}", self.display_text(&profile_name)));
             if ui.button("Reload").clicked() {
                 self.supervisor
                     .send(SupervisorCommand::ReloadHotconfig(profile_name.clone()));
@@ -8040,7 +8448,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             });
         ui.add_space(8.0);
         match sandbox_status.as_ref() {
-            Some(status) => Self::render_sandbox_status_panel(ui, status),
+            Some(status) => self.render_sandbox_status_panel(ui, status),
             None => {
                 egui::Frame::none()
                     .fill(Color32::from_gray(18))
@@ -8062,6 +8470,12 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
         ui.add_space(6.0);
 
+        let demo_display = self.demo_mode.then(|| {
+            (
+                self.display_hotconfig(&self.hotconfig_editor_value),
+                self.display_text(&self.hotconfig_editor_json),
+            )
+        });
         let changed = Self::render_hotconfig_editor_split(
             ui,
             &mut self.int_input,
@@ -8069,13 +8483,14 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             &mut self.hotconfig_editor_value,
             &mut self.hotconfig_editor_json,
             &mut self.hotconfig_editor_error,
+            demo_display,
         );
         if changed {
             self.hotconfig_editor_status = None;
         }
     }
 
-    fn render_sandbox_status_panel(ui: &mut egui::Ui, status: &SandboxStatus) {
+    fn render_sandbox_status_panel(&self, ui: &mut egui::Ui, status: &SandboxStatus) {
         egui::Frame::none()
             .fill(Color32::from_gray(18))
             .inner_margin(egui::Margin::same(8))
@@ -8149,13 +8564,13 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                     let mount = &status.mounts[row.index()];
                                     row.col(|ui| {
                                         ui.label(
-                                            RichText::new(mount.target.display().to_string())
+                                            RichText::new(self.display_path(&mount.target))
                                                 .monospace(),
                                         );
                                     });
                                     row.col(|ui| {
                                         ui.label(
-                                            RichText::new(mount.source.display().to_string())
+                                            RichText::new(self.display_path(&mount.source))
                                                 .monospace(),
                                         );
                                     });
@@ -8236,7 +8651,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         let is_pivot = *sandbox_mode == SandboxMode::Pivot;
 
         // ── Header ────────────────────────────────────────────────────────────
-        ui.heading(format!("State — {}", profile_name));
+        ui.heading(format!("State — {}", self.display_text(&profile_name)));
         ui.add_space(4.0);
         egui::Frame::none()
             .fill(Color32::from_gray(22))
@@ -8395,7 +8810,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                             Color32::from_gray(110)
                                         };
                                         ui.label(
-                                            RichText::new(path.display().to_string())
+                                            RichText::new(self.display_path(path))
                                                 .monospace()
                                                 .color(color),
                                         );
@@ -8422,7 +8837,11 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 if cs.template.mounts.is_empty() {
                     ui.colored_label(Color32::from_gray(130), "No profile mounts configured.");
                 } else {
-                    Self::render_profile_mount_list(ui, &cs.template.mounts, "state-tmpl-mounts");
+                    self.render_profile_mount_list(
+                        ui,
+                        &cs.template.mounts,
+                        "state-tmpl-mounts",
+                    );
                 }
             });
 
@@ -8444,7 +8863,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 } else {
                     if has_mounts {
                         ui.label(RichText::new("mounts (structured):").italics());
-                        Self::render_profile_mount_list(
+                        self.render_profile_mount_list(
                             ui,
                             &cs.hotconfig.mounts,
                             "state-hot-mounts",
@@ -8476,13 +8895,13 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                             let (target, source) = entries[row.index()];
                                             row.col(|ui| {
                                                 ui.label(
-                                                    RichText::new(source.display().to_string())
+                                                    RichText::new(self.display_path(source))
                                                         .monospace(),
                                                 );
                                             });
                                             row.col(|ui| {
                                                 ui.label(
-                                                    RichText::new(target.display().to_string())
+                                                    RichText::new(self.display_path(target))
                                                         .monospace(),
                                                 );
                                             });
@@ -8505,7 +8924,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 );
                 ui.add_space(4.0);
                 match cs.sandbox_status.as_ref() {
-                    Some(status) => Self::render_sandbox_status_panel(ui, status),
+                    Some(status) => self.render_sandbox_status_panel(ui, status),
                     None => {
                         ui.colored_label(
                             Color32::from_gray(130),
@@ -8633,7 +9052,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                     let c = &cs.template.chmod[row.index()];
                                     row.col(|ui| {
                                         ui.label(
-                                            RichText::new(c.path.display().to_string()).monospace(),
+                                            RichText::new(self.display_path(&c.path)).monospace(),
                                         );
                                     });
                                     row.col(|ui| match c.mode {
@@ -8756,8 +9175,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("netns bind mount:").strong());
                             ui.label(
-                                RichText::new(ns_alive.bind_mount.display().to_string())
-                                    .monospace(),
+                                RichText::new(self.display_path(&ns_alive.bind_mount)).monospace(),
                             );
                         });
                     }
@@ -8765,7 +9183,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
     }
 
-    fn render_profile_mount_list(ui: &mut egui::Ui, mounts: &[ProfileMount], salt: &str) {
+    fn render_profile_mount_list(&self, ui: &mut egui::Ui, mounts: &[ProfileMount], salt: &str) {
         egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
             TableBuilder::new(ui)
                 .id_salt(format!("{}-table", salt))
@@ -8805,7 +9223,9 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                             } else {
                                 Color32::from_gray(220)
                             };
-                            let text = RichText::new(&src_str).monospace().color(color);
+                            let text = RichText::new(self.display_text(&src_str))
+                                .monospace()
+                                .color(color);
                             let resp = ui.label(text);
                             if is_managed {
                                 resp.on_hover_text(
@@ -8814,7 +9234,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                             }
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(m.target.display().to_string()).monospace());
+                            ui.label(RichText::new(self.display_path(&m.target)).monospace());
                         });
                         row.col(|ui| {
                             if m.read_only {
@@ -8847,7 +9267,9 @@ Pivot-enabled containers have URL opening handled right within the container, wh
 
         ui.horizontal(|ui| {
             match self.selected_profile.as_ref() {
-                Some(profile_name) => ui.heading(format!("Profile - {}", profile_name)),
+                Some(profile_name) => {
+                    ui.heading(format!("Profile - {}", self.display_text(profile_name)))
+                }
                 None => ui.heading("Profile - New Container"),
             };
 
@@ -10214,6 +10636,72 @@ fn wizard_nav_card(
             FontId::proportional(10.0),
             hint_color,
         );
+    }
+
+    resp
+}
+
+/// Compact launch card for an Actions application.
+/// The application name is the primary label; its container is the subtext.
+fn action_app_card(
+    ui: &mut egui::Ui,
+    app_name: &str,
+    container_name: &str,
+    enabled: bool,
+    launched: bool,
+) -> egui::Response {
+    use eframe::egui::{Align2, FontId};
+
+    let longest_label = app_name.len().max(container_name.len()) as f32;
+    let desired_width = (longest_label * 9.0 + 32.0).max(140.0).min(260.0);
+    let size = egui::vec2(desired_width, 56.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let bg = if !enabled {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+        } else if resp.is_pointer_button_down_on() {
+            let c = visuals.selection.bg_fill;
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 80)
+        } else if resp.hovered() {
+            let h = visuals.widgets.hovered.bg_fill;
+            Color32::from_rgba_unmultiplied(h.r(), h.g(), h.b(), 40)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 15)
+        };
+        ui.painter().rect_filled(rect, 6.0, bg);
+
+        let title_color = if enabled {
+            visuals.text_color()
+        } else {
+            Color32::from_gray(210)
+        };
+        let subtext_color = Color32::from_gray(if enabled { 130 } else { 170 });
+        ui.painter().text(
+            egui::pos2(rect.min.x + 10.0, rect.min.y + 10.0),
+            Align2::LEFT_TOP,
+            app_name,
+            FontId::proportional(14.0),
+            title_color,
+        );
+        ui.painter().text(
+            egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
+            Align2::LEFT_TOP,
+            container_name,
+            FontId::proportional(11.0),
+            subtext_color,
+        );
+        if launched {
+            let dot_center = rect.right_top() + egui::vec2(-11.0, 11.0);
+            ui.painter()
+                .circle_filled(dot_center, 5.0, Color32::LIGHT_GREEN);
+        }
     }
 
     resp

@@ -26,7 +26,9 @@ use nsproxy_core::cmd_common::read_ns_alive;
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_core::sandbox::{SandboxStatus, read_sandbox_status};
 use nsproxy_core::shell::ShellArgs;
-use nsproxy_core::{cli_to_inheritable_fd, to_cstr, Cli, HotConfig, MainCommand, TemplateConfig};
+use nsproxy_core::{
+    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, MainCommand, TemplateConfig,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -1374,6 +1376,30 @@ impl Supervisor {
         self.ensure_sandbox_status_watcher(profile);
     }
 
+    /// Merge the route held by the live serve process into a configuration
+    /// being persisted. This avoids overwriting a proxy selection with the
+    /// independent HotConfig editor copy.
+    fn merge_live_route_into_hotconfig(
+        &self,
+        profile: &ContainerName,
+        hotconfig: &mut HotConfig,
+    ) {
+        let Some(routing) = self
+            .diag_state
+            .get(profile)
+            .and_then(|state| state.routing_state.as_ref())
+        else {
+            return;
+        };
+
+        hotconfig.route = match &routing.selected_proxy {
+            Some(proxy_id) => HotRoute::SimpleProxy {
+                proxy_id: proxy_id.clone(),
+            },
+            None => HotRoute::None,
+        };
+    }
+
     fn spawn_sandbox_reconcile(&mut self, profile: &ContainerName, reason: &str) {
         if !self
             .ns_alive_status
@@ -1671,6 +1697,13 @@ impl Supervisor {
                 }
             }
             SupervisorCommand::SaveHotconfigPrivileged { profile, content } => {
+                let content = match serde_json::from_str::<HotConfig>(&content) {
+                    Ok(mut hotconfig) => {
+                        self.merge_live_route_into_hotconfig(&profile, &mut hotconfig);
+                        serde_json::to_string_pretty(&hotconfig).unwrap_or(content)
+                    }
+                    Err(_) => content,
+                };
                 self.queue_root_daemon_op(
                     diag::RootDaemonOp::WriteFile {
                         path: state_paths::hot_config(profile.as_str()),
@@ -2035,7 +2068,21 @@ impl Supervisor {
             }
             SupervisorCommand::Ctrl { profile, cmd } => {
                 info!(profile = profile.as_str(), cmd = ?cmd, "dispatching diag control command");
+                let selected_proxy = match &cmd {
+                    ControlCommand::SetSimpleRouting { proxy_id } => Some(proxy_id.clone()),
+                    _ => None,
+                };
+                if let Some(proxy_id) = selected_proxy.as_ref() {
+                    self.diag_state.entry(profile.clone()).or_default().routing_state = Some(
+                        diag::RoutingState {
+                            selected_proxy: Some(proxy_id.clone()),
+                        },
+                    );
+                }
                 let _ = self.send_diag_cmd(&profile, cmd);
+                if selected_proxy.is_some() {
+                    let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
+                }
             }
             SupervisorCommand::ReloadHotconfig(profile) => {
                 info!(profile = profile.as_str(), "reloading hotconfig");
@@ -3232,6 +3279,7 @@ impl Supervisor {
                         gids: args.gids,
                         args: args.args,
                         ringbuf_size: None,
+                        application: None,
                         ns: diag::NamespaceSpawn::Inside,
                     };
                     let _ = tx.send(diag::DaemonRequest::Spawn { args: spawn_args });

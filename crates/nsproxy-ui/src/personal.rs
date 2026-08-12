@@ -280,6 +280,7 @@ async fn run_llamacpp(supervisor: SupervisorHandle, state: PersonalUiState) -> R
         gids: Vec::new(),
         args: vec!["fish".to_string(), fish_command.clone()],
         ringbuf_size: None,
+        application: None,
         ns: diag::NamespaceSpawn::Inside,
     };
     crate::apply_default_spawn_user(&mut spawn_args);
@@ -311,6 +312,7 @@ async fn run_cinny(supervisor: SupervisorHandle, state: PersonalUiState) -> Resu
         gids: Vec::new(),
         args: [exec].into_iter().chain(cmd.split_whitespace().map(|s| s.to_string())).collect(),
         ringbuf_size: None,
+        application: None,
         ns: diag::NamespaceSpawn::Inside,
     };
     crate::apply_default_spawn_user(&mut spawn_args);

@@ -1453,6 +1453,9 @@ pub struct SpawnArgs {
     /// For PTY mode this is retained bytes; for output mode this is retained log entries.
     /// `None` means use the daemon default for that mode.
     pub ringbuf_size: Option<u32>,
+    /// Configured application name when this is an on-demand Actions launch.
+    #[serde(default)]
+    pub application: Option<String>,
     pub ns: NamespaceSpawn,
 }
 

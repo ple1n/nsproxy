@@ -3,7 +3,11 @@
 
 > nsproxy, network-namespace with SOCKS5 proxy
 
-![](./screen1.png)
+![](manage_landing.png)
+![](state.png)
+![](manage1.png)
+![](manage5.png)
+![](process.png)
 
 - You can run dockerd within a container, with everything proxied by a SOCK5 proxy
 - The sandbox may defend against _casual_ attackers, or otherwise unnecessary state-cross-contamination of softwares
@@ -12,5 +16,3 @@
 - It's shipped with a GUI written with EGUI, meant to daily-drive desktop with paranoia-level of network control
 - You can control the degree of isolation. In the least isolated case, only network namespace is unshared, such that no softwares break.
 - status, branch `main` is always production-ready
-
-![](./screen2.png)

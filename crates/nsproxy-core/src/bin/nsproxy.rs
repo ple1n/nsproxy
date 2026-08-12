@@ -1277,6 +1277,7 @@ fn main() -> anyhow::Result<()> {
                             gids: args.gids,
                             args: args.args,
                             ringbuf_size: None,
+                            application: None,
                             ns: args.ns,
                         };
                         diag::DaemonRequest::Spawn { args: dra }

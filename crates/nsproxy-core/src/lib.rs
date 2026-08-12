@@ -291,6 +291,7 @@ mod tests {
                 route: HotRoute::None,
                 mounts: Vec::new(),
                 daemons: Vec::new(),
+                applications: Vec::new(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -888,6 +889,20 @@ pub enum HotRoute {
 
 impl HotRoute {}
 
+/// An application that can be launched on demand from a profile's Actions UI.
+/// Unlike `daemons`, applications are never started implicitly on reload.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct LaunchableApp {
+    /// Stable, profile-local identifier shown in the Actions UI.
+    pub name: String,
+    /// Optional user-facing summary of the application.
+    #[serde(default)]
+    pub description: String,
+    /// Process command and identity used for the managed launch.
+    #[serde(default)]
+    pub command: ShellArgs,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
@@ -918,6 +933,16 @@ pub struct HotConfig {
     /// Daemon processes to run inside the container on startup or reload.
     #[serde(default)]
     pub daemons: Vec<ShellArgs>,
+    /// Applications that may be launched manually from the Actions tab.
+    #[serde(default)]
+    pub applications: Vec<LaunchableApp>,
+}
+
+pub fn default_hotconfig() -> HotConfig {
+    HotConfig {
+        resolv_conf_dns: INTERNAL_RESOLV_CONF_DNS.to_owned(),
+        ..Default::default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1222,7 +1247,9 @@ impl TemplateConfigV1 {
     const VERSION: u32 = 1;
 }
 
-fn schema_one() -> u32 { TemplateConfigV1::VERSION }
+fn schema_one() -> u32 {
+    TemplateConfigV1::VERSION
+}
 
 impl From<TemplateConfigV1> for TemplateConfigV2 {
     fn from(v1: TemplateConfigV1) -> Self {
@@ -1239,7 +1266,11 @@ impl From<TemplateConfigV1> for TemplateConfigV2 {
             browser_profile: v1.browser_profile,
             // false/absent → Pass (legacy: host bus was inherited through adjust())
             // true          → Container (private daemon is spawned)
-            dbus: if v1.dbus { DbusMode::Container } else { DbusMode::Pass },
+            dbus: if v1.dbus {
+                DbusMode::Container
+            } else {
+                DbusMode::Pass
+            },
             rootfs: v1.rootfs,
         }
     }
@@ -1281,7 +1312,7 @@ impl Default for TemplateConfigV2 {
             env: HashMap::new(),
             inherit_env: true,
             hot: PathBuf::from("@/hot.json"),
-            hot_init: Some(HotConfig::default()),
+            hot_init: Some(default_hotconfig()),
             sargs: ShellArgs::default(),
             browser_profile: None,
             dbus: DbusMode::Container,
@@ -1464,7 +1495,7 @@ impl TemplateConfig {
             env: HashMap::new(),
             inherit_env: true,
             hot: hot_path.to_path_buf(),
-            hot_init: Some(HotConfig::default()),
+            hot_init: Some(default_hotconfig()),
             sargs: ShellArgs {
                 uid: Some(uid),
                 gid: Some(gid),
@@ -1889,7 +1920,7 @@ pub enum NsInput {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum NsArg {
     Container(String),
-    This
+    This,
 }
 
 impl std::str::FromStr for NsArg {
