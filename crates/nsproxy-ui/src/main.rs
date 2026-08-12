@@ -679,6 +679,26 @@ struct StringMapEditorState {
     snapshot: Vec<(String, String)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VirtualDnsTargetKind {
+    DnsAnswer,
+    TunForward,
+    WarpFiles,
+}
+
+#[derive(Clone)]
+struct VirtualDnsRow {
+    domain: String,
+    target_kind: VirtualDnsTargetKind,
+    target: String,
+}
+
+#[derive(Clone)]
+struct VirtualDnsEditorState {
+    rows: Vec<VirtualDnsRow>,
+    snapshot: Vec<(String, VirtualDnsTargetKind, String)>,
+}
+
 #[derive(Clone)]
 struct U32MapEditorState {
     rows: Vec<(String, String)>,
@@ -1612,6 +1632,43 @@ impl App {
         pairs
     }
 
+    fn snapshot_virtual_dns(hot: &HotConfig) -> Vec<(String, VirtualDnsTargetKind, String)> {
+        let mut entries: BTreeMap<String, (VirtualDnsTargetKind, String)> = hot
+            .dns
+            .iter()
+            .map(|(domain, address)| {
+                (
+                    domain.clone(),
+                    (VirtualDnsTargetKind::DnsAnswer, address.clone()),
+                )
+            })
+            .collect();
+
+        // `derive_desired_state` applies `tun` after `dns`, so preserve that
+        // precedence when a legacy configuration contains the same domain in both.
+        for (domain, target) in &hot.tun {
+            let (target_kind, target) = match target {
+                Value::Number(port) => (
+                    VirtualDnsTargetKind::TunForward,
+                    port.as_u64()
+                        .map(|port| format!("127.0.0.1:{port}"))
+                        .unwrap_or_else(|| target.to_string()),
+                ),
+                Value::String(target) if target.parse::<std::net::SocketAddr>().is_ok() => {
+                    (VirtualDnsTargetKind::TunForward, target.clone())
+                }
+                Value::String(target) => (VirtualDnsTargetKind::WarpFiles, target.clone()),
+                _ => (VirtualDnsTargetKind::WarpFiles, target.to_string()),
+            };
+            entries.insert(domain.clone(), (target_kind, target));
+        }
+
+        entries
+            .into_iter()
+            .map(|(domain, (target_kind, target))| (domain, target_kind, target))
+            .collect()
+    }
+
     fn snapshot_u32_map(map: &HashMap<u32, u32>) -> Vec<(u32, u32)> {
         let mut pairs: Vec<(u32, u32)> = map.iter().map(|(k, v)| (*k, *v)).collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1694,6 +1751,24 @@ impl App {
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
         let response = ui.add(text_edit);
+        ui.visuals_mut().extreme_bg_color = old_bg;
+        response
+    }
+
+    fn socket_addr_text_edit_with_validation(
+        ui: &mut egui::Ui,
+        value: &mut String,
+    ) -> egui::Response {
+        let bg_color = if value.parse::<std::net::SocketAddr>().is_ok() {
+            egui::Color32::from_rgba_unmultiplied(100, 200, 100, 25)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(200, 100, 100, 25)
+        };
+
+        let visuals = ui.visuals_mut();
+        let old_bg = visuals.extreme_bg_color;
+        visuals.extreme_bg_color = bg_color;
+        let response = ui.add(egui::TextEdit::singleline(value).frame(true));
         ui.visuals_mut().extreme_bg_color = old_bg;
         response
     }
@@ -2272,6 +2347,177 @@ impl App {
         changed
     }
 
+    fn render_virtual_dns_table(
+        ui: &mut egui::Ui,
+        hot: &mut HotConfig,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+        let state_id = ui.make_persistent_id((id_prefix, "virtual-dns-editor-state"));
+        let snapshot = Self::snapshot_virtual_dns(hot);
+        let mut state = ui
+            .data_mut(|d| d.get_temp::<VirtualDnsEditorState>(state_id))
+            .unwrap_or_else(|| VirtualDnsEditorState {
+                rows: snapshot
+                    .iter()
+                    .map(|(domain, target_kind, target)| VirtualDnsRow {
+                        domain: domain.clone(),
+                        target_kind: *target_kind,
+                        target: target.clone(),
+                    })
+                    .collect(),
+                snapshot: snapshot.clone(),
+            });
+        if state.snapshot != snapshot {
+            state.rows = snapshot
+                .iter()
+                .map(|(domain, target_kind, target)| VirtualDnsRow {
+                    domain: domain.clone(),
+                    target_kind: *target_kind,
+                    target: target.clone(),
+                })
+                .collect();
+            state.snapshot = snapshot;
+        }
+
+        section_frame(ui, |ui| {
+            // Keep this header wrapped so the helper text does not push the action button off-screen in narrow panes.
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("virtual dns");
+                ui.weak("Route a domain to an address, TUN endpoint, or Warp file server.");
+                if ui.button("+ Add").clicked() {
+                    state.rows.push(VirtualDnsRow {
+                        domain: "example.test.".to_string(),
+                        target_kind: VirtualDnsTargetKind::DnsAnswer,
+                        target: "127.0.0.1".to_string(),
+                    });
+                    changed = true;
+                }
+            });
+
+            let mut remove_ix = None;
+            TableBuilder::new(ui)
+                .striped(true)
+                .column(Column::remainder())
+                .column(Column::exact(112.0))
+                .column(Column::remainder())
+                .column(Column::exact(30.0))
+                .header(20.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Domain");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Route");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Target");
+                    });
+                    header.col(|_| {});
+                })
+                .body(|mut body| {
+                    for (index, row) in state.rows.iter_mut().enumerate() {
+                        body.row(26.0, |mut table_row| {
+                            table_row.col(|ui| {
+                                if Self::domain_text_edit_with_validation(ui, &mut row.domain)
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            });
+                            table_row.col(|ui| {
+                                let before = row.target_kind;
+                                egui::ComboBox::from_id_salt((id_prefix, "virtual-dns-kind", index))
+                                    .selected_text(match row.target_kind {
+                                        VirtualDnsTargetKind::DnsAnswer => "DNS answer",
+                                        VirtualDnsTargetKind::TunForward => "TUN forward",
+                                        VirtualDnsTargetKind::WarpFiles => "Warp files",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut row.target_kind,
+                                            VirtualDnsTargetKind::DnsAnswer,
+                                            "DNS answer",
+                                        );
+                                        ui.selectable_value(
+                                            &mut row.target_kind,
+                                            VirtualDnsTargetKind::TunForward,
+                                            "TUN forward",
+                                        );
+                                        ui.selectable_value(
+                                            &mut row.target_kind,
+                                            VirtualDnsTargetKind::WarpFiles,
+                                            "Warp files",
+                                        );
+                                    });
+                                if row.target_kind != before {
+                                    row.target = match row.target_kind {
+                                        VirtualDnsTargetKind::DnsAnswer => "127.0.0.1".to_string(),
+                                        VirtualDnsTargetKind::TunForward => {
+                                            "127.0.0.1:8080".to_string()
+                                        }
+                                        VirtualDnsTargetKind::WarpFiles => "/path/to/files".to_string(),
+                                    };
+                                    changed = true;
+                                }
+                            });
+                            table_row.col(|ui| {
+                                let response = match row.target_kind {
+                                    VirtualDnsTargetKind::DnsAnswer => {
+                                        Self::ip_text_edit_with_validation(ui, &mut row.target)
+                                    }
+                                    VirtualDnsTargetKind::TunForward => {
+                                        Self::socket_addr_text_edit_with_validation(
+                                            ui,
+                                            &mut row.target,
+                                        )
+                                    }
+                                    VirtualDnsTargetKind::WarpFiles => {
+                                        Self::path_text_edit_with_validation(ui, &mut row.target)
+                                    }
+                                };
+                                if response.changed() {
+                                    changed = true;
+                                }
+                            });
+                            table_row.col(|ui| {
+                                if ui.small_button("×").clicked() {
+                                    remove_ix = Some(index);
+                                }
+                            });
+                        });
+                    }
+                });
+
+            if let Some(index) = remove_ix {
+                state.rows.remove(index);
+                changed = true;
+            }
+            ui.small("DNS answer returns an IPv4 address. TUN forward expects host:port. Warp files serves the selected directory over the intercepted domain.");
+        });
+
+        if changed {
+            hot.dns.clear();
+            hot.tun.clear();
+            for row in &state.rows {
+                if row.domain.trim().is_empty() || row.target.trim().is_empty() {
+                    continue;
+                }
+                match row.target_kind {
+                    VirtualDnsTargetKind::DnsAnswer => {
+                        hot.dns.insert(row.domain.clone(), row.target.clone());
+                    }
+                    VirtualDnsTargetKind::TunForward | VirtualDnsTargetKind::WarpFiles => {
+                        hot.tun
+                            .insert(row.domain.clone(), Value::String(row.target.clone()));
+                    }
+                }
+            }
+            state.snapshot = Self::snapshot_virtual_dns(hot);
+        }
+        ui.data_mut(|d| d.insert_temp(state_id, state));
+        changed
+    }
+
     fn render_u32_map(
         ui: &mut egui::Ui,
         title: &str,
@@ -2554,7 +2800,6 @@ impl App {
         section_frame(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("applications");
-                ui.small("On-demand launch cards shown in Actions; they do not auto-start.");
                 if ui.button("+ Add").clicked() {
                     apps.push(LaunchableApp::default());
                     changed = true;
@@ -2601,7 +2846,7 @@ impl App {
     ) -> bool {
         let mut changed = false;
 
-        if Self::render_string_map(ui, "dns", &mut hot.dns, id_prefix) {
+        if Self::render_virtual_dns_table(ui, hot, id_prefix) {
             changed = true;
         }
         if Self::render_string_map(ui, "devs", &mut hot.devs, id_prefix) {
@@ -2851,18 +3096,80 @@ impl App {
                 }
             });
 
-            let mut args_text = sargs.args.join(" ");
+            if Self::render_args_array_editor(ui, &mut sargs.args, "shell-args") {
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// Renders `args` as an argv array rather than a shell-parsed string.
+    /// This preserves empty arguments and arguments containing whitespace.
+    fn render_args_array_editor(
+        ui: &mut egui::Ui,
+        args: &mut Vec<String>,
+        id_prefix: &str,
+    ) -> bool {
+        let mut changed = false;
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("arguments");
+            ui.weak("argv array; one item per field");
+        });
+
+        let mut remove_ix = None;
+        for (index, arg) in args.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.label("args");
-                if ui.text_edit_singleline(&mut args_text).changed() {
-                    sargs.args = args_text
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
+                ui.label(
+                    egui::RichText::new(format!("[{index}]"))
+                        .monospace()
+                        .weak()
+                        .size(11.0),
+                );
+                if ui
+                    .add(egui::TextEdit::singleline(arg).desired_width(ui.available_width() - 44.0))
+                    .changed()
+                {
                     changed = true;
                 }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(regular::X)
+                                .size(11.0)
+                                .color(Color32::from_rgb(200, 100, 100)),
+                        )
+                        .small()
+                        .frame(false),
+                    )
+                    .on_hover_text("Remove argument")
+                    .clicked()
+                {
+                    remove_ix = Some(index);
+                }
             });
+        }
+
+        if let Some(index) = remove_ix {
+            args.remove(index);
+            changed = true;
+        }
+
+        ui.push_id((id_prefix, "add-arg"), |ui| {
+            if ui
+                .add(egui::Button::new("+ Add argument").small())
+                .clicked()
+            {
+                args.push(String::new());
+                changed = true;
+            }
         });
+
+        if args.is_empty() {
+            ui.colored_label(Color32::from_rgb(220, 170, 90), "No arguments configured.");
+        }
+
         changed
     }
 
@@ -2875,16 +3182,18 @@ impl App {
     ) -> bool {
         let mut changed = false;
         section_frame(ui, |ui| {
-            // Header row: title + user-preset buttons flush right
             ui.horizontal(|ui| {
-                ui.strong("SpawnArgs");
+                ui.vertical(|ui| {
+                    ui.strong("Spawn arguments");
+                    ui.weak("Process identity, execution context, and argv.");
+                });
                 if !read_only {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut uid_gid_value_changed = false;
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("root").monospace().size(11.0),
+                                    egui::RichText::new("Root").monospace().size(11.0),
                                 )
                                 .small(),
                             )
@@ -2900,7 +3209,7 @@ impl App {
                         ui.add_space(4.0);
                         if ui
                             .add(
-                                egui::Button::new(egui::RichText::new("default user").size(11.0))
+                                egui::Button::new(egui::RichText::new("Current user").size(11.0))
                                     .small(),
                             )
                             .on_hover_text("Reset uid/gid to current user")
@@ -2954,19 +3263,36 @@ impl App {
                 .data_mut(|d| d.remove_temp::<bool>(egui::Id::new((id_prefix, "uid_gid_changed"))))
                 .unwrap_or(false);
 
-            ui.add_space(4.0);
-
-            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid, uid_gid_value_changed)
-            {
-                changed = true;
-            }
-            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid, uid_gid_value_changed)
-            {
-                changed = true;
-            }
-            if Self::render_optional_text(ui, "exec", &mut args.exec) {
-                changed = true;
-            }
+            ui.add_space(6.0);
+            egui::Grid::new((id_prefix, "spawn-options-grid"))
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    if Self::render_optional_u32(
+                        ui,
+                        int_input,
+                        "uid",
+                        &mut args.uid,
+                        uid_gid_value_changed,
+                    ) {
+                        changed = true;
+                    }
+                    ui.end_row();
+                    if Self::render_optional_u32(
+                        ui,
+                        int_input,
+                        "gid",
+                        &mut args.gid,
+                        uid_gid_value_changed,
+                    ) {
+                        changed = true;
+                    }
+                    ui.end_row();
+                    if Self::render_optional_text(ui, "exec", &mut args.exec) {
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
 
             let mut cwd_text = args
                 .cwd
@@ -3033,53 +3359,8 @@ impl App {
                 changed = true;
             }
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.weak("argv (args)");
-            });
-            let mut remove_ix: Option<usize> = None;
-            for i in 0..args.args.len() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("[{i}]"))
-                            .monospace()
-                            .weak()
-                            .size(11.0),
-                    );
-                    if ui.text_edit_singleline(&mut args.args[i]).changed() {
-                        changed = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(regular::X)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(200, 100, 100)),
-                            )
-                            .small()
-                            .frame(false),
-                        )
-                        .on_hover_text("Remove")
-                        .clicked()
-                    {
-                        remove_ix = Some(i);
-                    }
-                });
-            }
-            if let Some(ix) = remove_ix {
-                args.args.remove(ix);
+            if Self::render_args_array_editor(ui, &mut args.args, id_prefix) {
                 changed = true;
-            }
-            if ui.add(egui::Button::new("+ Add arg").small()).clicked() {
-                args.args.push(String::new());
-                changed = true;
-            }
-
-            if args.args.is_empty() {
-                ui.colored_label(
-                    Color32::from_rgb(220, 170, 90),
-                    "argv is empty; argv[0] is typically the executable name",
-                );
             }
 
             ui.push_id((id_prefix, "spawnargs-json"), |ui| {
