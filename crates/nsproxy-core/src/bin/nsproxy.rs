@@ -49,7 +49,10 @@ use nsproxy_core::{
         apply_ns_env, check_proxy_mode, enter_ns, enter_ns_sandboxed, read_ns_alive,
         read_ns_alive_opt, report_clone3_err, update_ns_alive,
     },
-    env::{ENV_DBUS_SESSION_BUS_ADDRESS, ENV_NS, args_deduce_mount, name_to_mount_path},
+    env::{
+        ENV_DBUS_SESSION_BUS_ADDRESS, ENV_DBUS_SYSTEM_BUS_ADDRESS, ENV_NS,
+        args_deduce_mount, name_to_mount_path,
+    },
     hot_reload::{VethIps, sync_links, watch_hot},
     sandbox::{
         apply_chmod, apply_mounts, assert_mount_ns_matches, collect_sandbox_status,
@@ -175,6 +178,14 @@ fn profile_bus_address(profile: &str) -> String {
     format!("unix:path={}", profile_bus_socket(profile).display())
 }
 
+fn profile_system_bus_socket(profile: &str) -> PathBuf {
+    state_paths::profile_dir(profile).join("bus").join("system.sock")
+}
+
+fn profile_system_bus_address(profile: &str) -> String {
+    format!("unix:path={}", profile_system_bus_socket(profile).display())
+}
+
 fn session_bus_ready(socket_path: &Path) -> bool {
     if !fs::symlink_metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
         return false;
@@ -240,6 +251,16 @@ fn maybe_session_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String>
     }
 }
 
+fn maybe_system_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String> {
+    let profile = ns_alive.profile_name.as_deref()?;
+    match dbus_mode_for_profile(ns_alive) {
+        nsproxy_core::DbusMode::Block => None,
+        nsproxy_core::DbusMode::Pass => std::env::var(ENV_DBUS_SYSTEM_BUS_ADDRESS).ok(),
+        nsproxy_core::DbusMode::Proxy => None,
+        nsproxy_core::DbusMode::Container => Some(profile_system_bus_address(profile)),
+    }
+}
+
 /// Apply the correct D-Bus environment to `shell_prefs` based on the profile's DbusMode.
 /// Must be called AFTER `shell_prefs.adjust()`:
 /// - Block: strip DBUS_SESSION_BUS_ADDRESS (adjust() captured it from parent env)
@@ -255,6 +276,7 @@ fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive
         nsproxy_core::DbusMode::Container => {
             if let Some(profile) = ns_alive.profile_name.as_deref() {
                 shell_prefs.set_dbus_session_bus_env(&profile_bus_address(profile));
+                shell_prefs.set_dbus_system_bus_env(&profile_system_bus_address(profile));
             }
         }
     }
@@ -266,7 +288,7 @@ fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive
 /// activation itself, without requiring a host or nested systemd user manager.
 /// The daemon is run in the foreground so the `sp dbus` task group owns its
 /// lifetime and the UI can report it just like `sp serve`.
-fn run_container_dbus_daemon(socket_path: &Path) -> Result<()> {
+fn run_container_dbus_daemon(socket_path: &Path, system: bool) -> Result<()> {
     let address = format!("unix:path={}", socket_path.display());
     // `sp` is setuid-root, but the daemon must use the profile owner's real
     // credentials. Otherwise it inherits a mixed real/user and effective/root
@@ -286,14 +308,20 @@ fn run_container_dbus_daemon(socket_path: &Path) -> Result<()> {
     fs::set_permissions(runtime_dir, Permissions::from_mode(0o700))?;
 
     let mut command = Command::new("dbus-daemon");
+    let dbus_args = if system {
+        ["--system", "--nofork", "--nopidfile"]
+    } else {
+        ["--session", "--nofork", "--nopidfile"]
+    };
     command
-        .args(["--session", "--nofork", "--nopidfile"])
+        .args(dbus_args)
         .arg(format!("--address={address}"))
         .uid(uid)
         .gid(gid)
         // Activated services receive DBUS_STARTER_ADDRESS from the daemon.
-        // Do not preserve the host session address in their inherited env.
+        // Do not preserve the host bus addresses in their inherited env.
         .env_remove(ENV_DBUS_SESSION_BUS_ADDRESS);
+    command.env_remove(ENV_DBUS_SYSTEM_BUS_ADDRESS);
 
     let status = command.status()?;
     let _ = fs::remove_file(socket_path);
@@ -303,7 +331,8 @@ fn run_container_dbus_daemon(socket_path: &Path) -> Result<()> {
 
 fn build_spawn_env_pairs(
     ns_alive: &nsproxy_core::NsAlive,
-    dbus_address: Option<&str>,
+    dbus_session_address: Option<&str>,
+    dbus_system_address: Option<&str>,
 ) -> Vec<(String, String)> {
     let container_val = ns_alive
         .profile_name
@@ -323,12 +352,16 @@ fn build_spawn_env_pairs(
 
     let mut env_pairs: Vec<(String, String)> = std::env::vars().collect();
     env_pairs.retain(|(k, _)| {
-        k != ENV_CONTAINER && k != ENV_PROFILE && k != ENV_NS && k != ENV_DBUS_SESSION_BUS_ADDRESS
+        k != ENV_CONTAINER
+            && k != ENV_PROFILE
+            && k != ENV_NS
+            && k != ENV_DBUS_SESSION_BUS_ADDRESS
+            && k != ENV_DBUS_SYSTEM_BUS_ADDRESS
     });
     env_pairs.push((ENV_CONTAINER.to_string(), container_val));
     env_pairs.push((ENV_PROFILE.to_string(), profile_val));
     env_pairs.push((ENV_NS.to_string(), ns_val));
-    if let Some(address) = dbus_address {
+    if let Some(address) = dbus_session_address {
         unsafe {
             std::env::set_var(ENV_DBUS_SESSION_BUS_ADDRESS, address);
         }
@@ -337,14 +370,24 @@ fn build_spawn_env_pairs(
             address.to_string(),
         ));
     }
+    if let Some(address) = dbus_system_address {
+        unsafe {
+            std::env::set_var(ENV_DBUS_SYSTEM_BUS_ADDRESS, address);
+        }
+        env_pairs.push((
+            ENV_DBUS_SYSTEM_BUS_ADDRESS.to_string(),
+            address.to_string(),
+        ));
+    }
     env_pairs
 }
 
 fn build_spawn_env_cstrings(
     ns_alive: &nsproxy_core::NsAlive,
-    dbus_address: Option<&str>,
+    dbus_session_address: Option<&str>,
+    dbus_system_address: Option<&str>,
 ) -> Result<Vec<std::ffi::CString>> {
-    build_spawn_env_pairs(ns_alive, dbus_address)
+    build_spawn_env_pairs(ns_alive, dbus_session_address, dbus_system_address)
         .into_iter()
         .map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)))
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1722,24 +1765,48 @@ fn main() -> anyhow::Result<()> {
             // This prevents any fs ops from touching the host tree.
             assert_mount_ns_matches(&profile_namespaces.mnt)?;
 
-            let socket_path = profile_bus_socket(&profile);
+            let session_socket = profile_bus_socket(&profile);
+            let system_socket = profile_system_bus_socket(&profile);
 
-            // Idempotent: if a healthy bus is already listening, nothing to do.
-            if session_bus_ready(&socket_path) {
+            let session_ready = session_bus_ready(&session_socket);
+            let system_ready = session_bus_ready(&system_socket);
+
+            // Idempotent: if both healthy buses are already listening, nothing to do.
+            if session_ready && system_ready {
                 info!(
-                    "private session bus already running at {}",
-                    socket_path.display()
+                    session = %session_socket.display(),
+                    system = %system_socket.display(),
+                    "private session and system dbus buses already running"
                 );
                 return Ok(());
             }
 
-            // Remove a stale socket left by a previous (crashed) daemon run.
-            if socket_path.exists() {
-                fs::remove_file(&socket_path)?;
+            if !session_ready && session_socket.exists() {
+                fs::remove_file(&session_socket)?;
+            }
+            if !system_ready && system_socket.exists() {
+                fs::remove_file(&system_socket)?;
             }
 
-            info!(profile, "starting private dbus-daemon session bus");
-            run_container_dbus_daemon(&socket_path)?;
+            let mut joins = Vec::new();
+            if !session_ready {
+                let socket_path = session_socket.clone();
+                joins.push(std::thread::spawn(move || {
+                    info!("starting private dbus-daemon session bus");
+                    run_container_dbus_daemon(&socket_path, false)
+                }));
+            }
+            if !system_ready {
+                let socket_path = system_socket.clone();
+                joins.push(std::thread::spawn(move || {
+                    info!("starting private dbus-daemon system bus");
+                    run_container_dbus_daemon(&socket_path, true)
+                }));
+            }
+
+            for join in joins {
+                join.join().map_err(|_| anyhow!("dbus daemon thread panicked"))??;
+            }
         }
         MainCommand::Veth {
             src,
@@ -4285,8 +4352,13 @@ fn spawn_cli_process(
                 enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
-            let dbus_address = if matches!(ns, diag::NamespaceSpawn::Inside) {
+            let dbus_session_address = if matches!(ns, diag::NamespaceSpawn::Inside) {
                 maybe_session_bus_address(ns_alive)
+            } else {
+                None
+            };
+            let dbus_system_address = if matches!(ns, diag::NamespaceSpawn::Inside) {
+                maybe_system_bus_address(ns_alive)
             } else {
                 None
             };
@@ -4294,7 +4366,11 @@ fn spawn_cli_process(
             let fd_str = fd.to_string();
             let exe_s = exe.to_string_lossy();
             let argv = [to_cstr(exe_s.as_ref()), to_cstr(&fd_str)];
-            let envs = build_spawn_env_cstrings(ns_alive, dbus_address.as_deref())?;
+            let envs = build_spawn_env_cstrings(
+                ns_alive,
+                dbus_session_address.as_deref(),
+                dbus_system_address.as_deref(),
+            )?;
 
             let _ = execve(&to_cstr(exe_s.as_ref()), &argv, &envs);
             exit_with_warn(127, "cli memfd handoff exec failed in child");
@@ -4844,12 +4920,21 @@ fn spawn_daemon_process(
                 enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
-            let dbus_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+            let dbus_session_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
                 maybe_session_bus_address(ns_alive)
             } else {
                 None
             };
-            let env_c = build_spawn_env_cstrings(ns_alive, dbus_address.as_deref())?;
+            let dbus_system_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+                maybe_system_bus_address(ns_alive)
+            } else {
+                None
+            };
+            let env_c = build_spawn_env_cstrings(
+                ns_alive,
+                dbus_session_address.as_deref(),
+                dbus_system_address.as_deref(),
+            )?;
 
             if !args.gids.is_empty() {
                 setgroups(
@@ -4938,12 +5023,21 @@ fn spawn_pty_process(
                 enter_ns_sandboxed(ns_alive, sandbox_status, &ns_alive.bind_mount)?;
             }
 
-            let dbus_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+            let dbus_session_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
                 maybe_session_bus_address(ns_alive)
             } else {
                 None
             };
-            let env_c = build_spawn_env_cstrings(ns_alive, dbus_address.as_deref())?;
+            let dbus_system_address = if matches!(args.ns, diag::NamespaceSpawn::Inside) {
+                maybe_system_bus_address(ns_alive)
+            } else {
+                None
+            };
+            let env_c = build_spawn_env_cstrings(
+                ns_alive,
+                dbus_session_address.as_deref(),
+                dbus_system_address.as_deref(),
+            )?;
 
             if !args.gids.is_empty() {
                 setgroups(

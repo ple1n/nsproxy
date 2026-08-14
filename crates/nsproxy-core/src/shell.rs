@@ -20,7 +20,10 @@ use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
 
 use crate::{
-    env::{CommandEnv, ENV_CONTAINER, ENV_DBUS_SESSION_BUS_ADDRESS, ENV_NS, ENV_PROFILE},
+    env::{
+        CommandEnv, ENV_CONTAINER, ENV_DBUS_SESSION_BUS_ADDRESS, ENV_DBUS_SYSTEM_BUS_ADDRESS,
+        ENV_NS, ENV_PROFILE,
+    },
     prelude::*,
     sys::{Clone3Result, NSEnter, clone3},
 };
@@ -185,7 +188,24 @@ impl ShellPrefs {
         );
     }
 
-    /// Remove DBUS_SESSION_BUS_ADDRESS from the spawn environment.
+    pub fn set_dbus_system_bus_env(&mut self, address: &str) {
+        unsafe {
+            std::env::set_var(ENV_DBUS_SYSTEM_BUS_ADDRESS, address);
+        }
+        self.env.retain(|env_entry| {
+            if let Ok(s) = env_entry.to_str() {
+                !s.starts_with(&format!("{}=", ENV_DBUS_SYSTEM_BUS_ADDRESS))
+            } else {
+                true
+            }
+        });
+        self.env.push_front(
+            CString::from_str(&format!("{}={}", ENV_DBUS_SYSTEM_BUS_ADDRESS, address))
+                .unwrap(),
+        );
+    }
+
+    /// Remove DBUS_*_BUS_ADDRESS from the spawn environment.
     /// Call this after `adjust()` to enforce Block mode — `adjust()` captures
     /// the parent env (which may include the host bus address) before we can
     /// check the profile's DbusMode.
@@ -193,12 +213,14 @@ impl ShellPrefs {
         self.env.retain(|env_entry| {
             if let Ok(s) = env_entry.to_str() {
                 !s.starts_with(&format!("{}=", ENV_DBUS_SESSION_BUS_ADDRESS))
+                    && !s.starts_with(&format!("{}=", ENV_DBUS_SYSTEM_BUS_ADDRESS))
             } else {
                 true
             }
         });
         unsafe {
             std::env::remove_var(ENV_DBUS_SESSION_BUS_ADDRESS);
+            std::env::remove_var(ENV_DBUS_SYSTEM_BUS_ADDRESS);
         }
     }
     /// Preferences are fetched from processes up the tree as early as possible, before subsequent operations
