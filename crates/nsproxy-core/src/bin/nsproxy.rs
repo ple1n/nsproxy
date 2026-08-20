@@ -1543,7 +1543,10 @@ fn main() -> anyhow::Result<()> {
                         if profile_conf.sandbox_mode == SandboxMode::Pivot {
                             let sandbox_status_path = state_paths::sandbox_status(&profile);
                             // read_sandbox_status purges stale (previous-boot) state automatically.
-                            let prior_state = read_sandbox_status(profile.as_str())
+                            let prior_state = nsproxy_core::sandbox::read_sandbox_status_for_mnt(
+                                profile.as_str(),
+                                &child_mnt.unique,
+                            )
                                 .map(|s| s.detected_state);
                             match prior_state {
                                 Some(nsproxy_core::sandbox::SandboxState::Pivoted) => {

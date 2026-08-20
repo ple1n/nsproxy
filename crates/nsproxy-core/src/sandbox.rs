@@ -415,6 +415,11 @@ pub struct SandboxStatus {
     /// status was written. Used to detect and purge stale state from a previous boot.
     #[serde(default)]
     pub boot_id: Option<String>,
+    /// Mount namespace (device,inode) in which this status was collected.
+    /// A status from another profile instance must not be trusted, even when
+    /// it was written during the current boot.
+    #[serde(default)]
+    pub mnt_namespace: Option<UniqueFile>,
     pub configured_mode: SandboxMode,
     pub detected_state: SandboxState,
     pub pivot_dir_status: SandboxPathStatus,
@@ -566,6 +571,9 @@ pub fn collect_sandbox_status(
             .unwrap_or_default()
             .as_secs(),
         boot_id: current_boot_id().ok(),
+        mnt_namespace: ExactNS::from_source((PidPath::Selfproc, "mnt"))
+            .map(|ns| ns.unique)
+            .ok(),
         configured_mode,
         detected_state,
         pivot_dir_status: inspect_path(Path::new("/pivot")),
@@ -588,9 +596,9 @@ pub fn write_sandbox_status(profile_name: &str, status: &SandboxStatus) -> Resul
 
 /// Read and return the persisted sandbox status for `profile_name`.
 ///
-/// If the stored status was written during a different boot (detected via
-/// `/proc/stat btime`), the file is deleted and `None` is returned.  Stale
-/// sandbox state is always wrong and must never be acted on.
+/// If the stored status was written during a different boot, the file is
+/// deleted and `None` is returned. Mount-namespace validation is deliberately
+/// separate because UI readers run outside the profile namespace.
 pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
     let path = crate::state_paths::sandbox_status(profile_name);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -604,7 +612,7 @@ pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
 
     // Purge unless the stored boot ID is present and matches the running boot.
     // A missing boot_id means the file predates this field — treat as stale.
-    let purge = match (&status.boot_id, current_boot_id()) {
+    let mut purge = match (&status.boot_id, current_boot_id()) {
         (Some(stored_id), Ok(ref current_id)) if stored_id == current_id => false,
         (None, _) => {
             warn!(
@@ -630,6 +638,7 @@ pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
             true
         }
     };
+
     if purge {
         if let Err(err) = std::fs::remove_file(&path) {
             warn!(path = %path.display(), "failed to delete stale sandbox_status.json: {err}");
@@ -638,6 +647,34 @@ pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
     }
 
     Some(status)
+}
+/// Read status only when it belongs to the supplied mount namespace identity.
+/// The caller may obtain this identity from the daemon/keeper PID before it
+/// enters that namespace.
+pub fn read_sandbox_status_for_mnt(
+    profile_name: &str,
+    expected_mnt: &UniqueFile,
+) -> Option<SandboxStatus> {
+    let status = read_sandbox_status(profile_name)?;
+    match status.mnt_namespace {
+        Some(stored) if &stored == expected_mnt => Some(status),
+        Some(stored) => {
+            warn!(
+                profile = profile_name,
+                stored_mnt_namespace = %stored,
+                expected_mnt_namespace = %expected_mnt,
+                "sandbox_status.json belongs to a different mount namespace"
+            );
+            None
+        }
+        None => {
+            warn!(
+                profile = profile_name,
+                "sandbox_status.json has no mount namespace identity"
+            );
+            None
+        }
+    }
 }
 
 /// Check whether the current process is in the expected profile mount namespace.
