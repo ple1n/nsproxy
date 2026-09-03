@@ -5,8 +5,8 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use polling::{Event as PollingEvent, PollMode, Poller};
@@ -19,13 +19,13 @@ use winit::window::WindowId;
 use alacritty_terminal::event::{Event as TerminalEvent, OnResize, WindowSize};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 
-use crate::PtyIpc;
 use crate::cli::Options;
 use crate::clipboard::Clipboard;
 use crate::config::{self, UiConfig};
 use crate::event::{Event, EventSender, EventType};
 use crate::scheduler::Scheduler;
 use crate::window_context::WindowContext;
+use crate::PtyIpc;
 
 const PTY_READ_WRITE_TOKEN: usize = 0;
 const SESSION_RESET_SEQUENCE: &[u8] = b"\x1bc";
@@ -59,7 +59,10 @@ impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
         }
     }
 
-    fn create_initial_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
+    fn create_initial_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<(), Box<dyn Error>> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
@@ -100,7 +103,11 @@ impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
     fn handle_user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match (event.payload(), event.window_id()) {
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
-                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                if let Some(window) = self
+                    .window
+                    .as_mut()
+                    .filter(|window| window.id() == window_id)
+                {
                     window.dirty = true;
                     if window.display.window.has_frame {
                         window.display.window.request_redraw();
@@ -118,7 +125,11 @@ impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
                 }
             }
             (EventType::Frame, Some(window_id)) => {
-                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                if let Some(window) = self
+                    .window
+                    .as_mut()
+                    .filter(|window| window.id() == window_id)
+                {
                     window.display.window.has_frame = true;
                     if window.dirty {
                         window.display.window.request_redraw();
@@ -126,7 +137,11 @@ impl<I: PtyIpc + Send + Sync + 'static> StandaloneRuntime<I> {
                 }
             }
             (payload, Some(window_id)) => {
-                if let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) {
+                if let Some(window) = self
+                    .window
+                    .as_mut()
+                    .filter(|window| window.id() == window_id)
+                {
                     window.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
@@ -180,7 +195,11 @@ impl<I: PtyIpc + Send + Sync + 'static> ApplicationHandler<Event> for Standalone
         let close_requested = matches!(event, WindowEvent::CloseRequested);
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
 
-        let Some(window) = self.window.as_mut().filter(|window| window.id() == window_id) else {
+        let Some(window) = self
+            .window
+            .as_mut()
+            .filter(|window| window.id() == window_id)
+        else {
             return;
         };
 
@@ -242,18 +261,17 @@ pub fn run_standalone_window<I: PtyIpc + Send + Sync + 'static>(
 
     tty::setup_env();
     for (key, value) in config.env.iter() {
-        unsafe { env::set_var(key, value); }
+        unsafe {
+            env::set_var(key, value);
+        }
     }
 
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     event_loop.listen_device_events(DeviceEvents::Never);
 
     let sender = EventSender::from_winit_proxy(event_loop.create_proxy());
-    let mut runtime = StandaloneRuntime::new(
-        sender,
-        Rc::new(config),
-        PendingWindow { ipc, pid, closed },
-    );
+    let mut runtime =
+        StandaloneRuntime::new(sender, Rc::new(config), PendingWindow { ipc, pid, closed });
 
     let result = event_loop.run_app(&mut runtime);
     if let Some(err) = runtime.initial_error.take() {

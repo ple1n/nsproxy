@@ -172,11 +172,11 @@ impl Atlas {
                     } else {
                         (gl::RGB, Cow::Borrowed(buffer))
                     }
-                },
+                }
                 BitmapBuffer::Rgba(buffer) => {
                     multicolor = true;
                     (gl::RGBA, Cow::Borrowed(buffer))
-                },
+                }
             };
 
             gl::TexSubImage2D(
@@ -270,7 +270,7 @@ impl Atlas {
                     atlas.push(new);
                 }
                 Atlas::load_glyph(active_tex, atlas, current_atlas, rasterized)
-            },
+            }
             Err(AtlasInsertError::GlyphTooLarge) => Glyph {
                 tex_id: atlas[*current_atlas].id,
                 multicolor: false,

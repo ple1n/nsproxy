@@ -20,7 +20,10 @@ pub struct Allocator<IP: IPOps> {
 
 impl<IP: IPOps> PoolAllocator<IP> for Allocator<IP> {
     fn allocate(&self) -> IP {
-        IP::cast(&self.interval, self.counter.fetch_add(1, Ordering::SeqCst).into())
+        IP::cast(
+            &self.interval,
+            self.counter.fetch_add(1, Ordering::SeqCst).into(),
+        )
     }
 }
 

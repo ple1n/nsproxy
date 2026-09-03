@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use nsproxy_core::{NsAlive, state_paths};
+use nsproxy_core::{state_paths, NsAlive};
 use serde::{Deserialize, Serialize};
 
 /// Runtime profile information loaded from the persistent config root

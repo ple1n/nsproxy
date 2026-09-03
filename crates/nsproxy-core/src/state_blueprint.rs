@@ -81,11 +81,7 @@ impl StateNode {
     }
 
     fn render_into(&self, prefix: &str, last: bool, out: &mut Vec<String>) {
-        let connector = if last {
-            "└── "
-        } else {
-            "├── "
-        };
+        let connector = if last { "└── " } else { "├── " };
 
         out.push(format!(
             "{}{}{}: {}",
@@ -116,38 +112,27 @@ pub fn global_state_tree() -> StateNode {
         vec![
             StateNode::leaf("namespaces_registry", state_paths::namespaces_registry()),
             StateNode::leaf("constants", state_paths::constants_config()),
-            StateNode::leaf(
-                "wrapped_binaries",
-                state_paths::wrapped_binaries_config(),
-            ),
+            StateNode::leaf("wrapped_binaries", state_paths::wrapped_binaries_config()),
             StateNode::branch(
                 "config",
                 state_paths::config_root(),
-                vec![
-                    StateNode::branch(
-                        "profile (template)",
-                        state_paths::profile_dir("{profile}"),
-                        vec![
-                            StateNode::leaf(
-                                "profile_config",
-                                state_paths::profile_config("{profile}"),
-                            ),
-                            StateNode::leaf("hot_config", state_paths::hot_config("{profile}")),
-                            StateNode::leaf(
-                                "profile_netns_bind",
-                                state_paths::profile_netns_bind("{profile}"),
-                            ),
-                            StateNode::leaf(
-                                "profile_ns_meta",
-                                state_paths::profile_ns_meta("{profile}"),
-                            ),
-                            StateNode::leaf(
-                                "sandbox_status",
-                                state_paths::sandbox_status("{profile}"),
-                            ),
-                        ],
-                    ),
-                ],
+                vec![StateNode::branch(
+                    "profile (template)",
+                    state_paths::profile_dir("{profile}"),
+                    vec![
+                        StateNode::leaf("profile_config", state_paths::profile_config("{profile}")),
+                        StateNode::leaf("hot_config", state_paths::hot_config("{profile}")),
+                        StateNode::leaf(
+                            "profile_netns_bind",
+                            state_paths::profile_netns_bind("{profile}"),
+                        ),
+                        StateNode::leaf(
+                            "profile_ns_meta",
+                            state_paths::profile_ns_meta("{profile}"),
+                        ),
+                        StateNode::leaf("sandbox_status", state_paths::sandbox_status("{profile}")),
+                    ],
+                )],
             ),
             StateNode::branch(
                 "rootfs",
@@ -155,7 +140,10 @@ pub fn global_state_tree() -> StateNode {
                 vec![StateNode::branch(
                     "profile rootfs",
                     state_paths::profile_rootfs_dir("{profile}"),
-                    vec![StateNode::leaf("pivot_root", state_paths::pivot_root("{profile}"))],
+                    vec![StateNode::leaf(
+                        "pivot_root",
+                        state_paths::pivot_root("{profile}"),
+                    )],
                 )],
             ),
             StateNode::branch(

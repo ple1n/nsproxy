@@ -1,18 +1,22 @@
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell;
-use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::term::{self, test::TermSize, Term};
+use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use egui::epaint::{Galley, RectShape};
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Shape, Vec2, Widget};
+use egui::{
+    Color32, CornerRadius, FontId, Key, Painter, Pos2, Rect, Response, Shape, Vec2, Widget,
+};
 use std::sync::{Arc, Mutex};
 
 pub mod render_pipeline;
 
 pub use render_pipeline::{RenderPipeline, SizeInfo};
 
+#[cfg(feature = "alacritty-opengl")]
+mod alacritty_runtime;
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/cli.rs"]
 pub mod cli;
@@ -34,6 +38,9 @@ pub mod event;
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/input/mod.rs"]
 pub mod input;
+#[cfg(all(feature = "alacritty-opengl", unix))]
+#[path = "alacritty_port/ipc.rs"]
+pub mod ipc;
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/logging.rs"]
 pub mod logging;
@@ -43,9 +50,6 @@ pub mod message_bar;
 #[cfg(all(feature = "alacritty-opengl", windows))]
 #[path = "alacritty_port/panic.rs"]
 pub mod panic;
-#[cfg(all(feature = "alacritty-opengl", unix))]
-#[path = "alacritty_port/ipc.rs"]
-pub mod ipc;
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/renderer/mod.rs"]
 pub mod renderer;
@@ -58,8 +62,6 @@ pub mod string;
 #[cfg(feature = "alacritty-opengl")]
 #[path = "alacritty_port/window_context.rs"]
 pub mod window_context;
-#[cfg(feature = "alacritty-opengl")]
-mod alacritty_runtime;
 #[cfg(feature = "alacritty-opengl")]
 pub use alacritty_runtime::run_standalone_window;
 
@@ -271,7 +273,8 @@ impl TermSession {
         let cols = cols.max(2);
         let rows = rows.max(2);
         self.last_size = (cols, rows);
-        self.term.resize(TermSize::new(cols as usize, rows as usize));
+        self.term
+            .resize(TermSize::new(cols as usize, rows as usize));
         // Resize invalidates all cached row positions and content.
         let r = rows as usize;
         let c = cols as usize;
@@ -372,7 +375,7 @@ impl<'a> TermView<'a> {
                     key,
                     pressed: true,
                     modifiers,
-                    ..  
+                    ..
                 } => {
                     // Ctrl+letter sequences
                     if modifiers.ctrl {
@@ -395,34 +398,34 @@ impl<'a> TermView<'a> {
                     }
                     let bytes: &[u8] = match key {
                         Key::Backspace if modifiers.ctrl => &[0x17],
-                        Key::Enter    => &[b'\r'],
+                        Key::Enter => &[b'\r'],
                         Key::Backspace => &[0x7f],
-                        Key::Tab      => &[b'\t'],
-                        Key::Escape   => &[0x1b],
-                        Key::ArrowUp    if is_app_cursor => b"\x1bOA",
-                        Key::ArrowDown  if is_app_cursor => b"\x1bOB",
+                        Key::Tab => &[b'\t'],
+                        Key::Escape => &[0x1b],
+                        Key::ArrowUp if is_app_cursor => b"\x1bOA",
+                        Key::ArrowDown if is_app_cursor => b"\x1bOB",
                         Key::ArrowRight if is_app_cursor => b"\x1bOC",
-                        Key::ArrowLeft  if is_app_cursor => b"\x1bOD",
-                        Key::ArrowUp    => b"\x1b[A",
-                        Key::ArrowDown  => b"\x1b[B",
+                        Key::ArrowLeft if is_app_cursor => b"\x1bOD",
+                        Key::ArrowUp => b"\x1b[A",
+                        Key::ArrowDown => b"\x1b[B",
                         Key::ArrowRight => b"\x1b[C",
-                        Key::ArrowLeft  => b"\x1b[D",
+                        Key::ArrowLeft => b"\x1b[D",
                         Key::Home if is_app_cursor => b"\x1bOH",
-                        Key::End  if is_app_cursor => b"\x1bOF",
-                        Key::Home  => b"\x1b[H",
-                        Key::End   => b"\x1b[F",
-                        Key::Delete   => b"\x1b[3~",
-                        Key::PageUp   => b"\x1b[5~",
+                        Key::End if is_app_cursor => b"\x1bOF",
+                        Key::Home => b"\x1b[H",
+                        Key::End => b"\x1b[F",
+                        Key::Delete => b"\x1b[3~",
+                        Key::PageUp => b"\x1b[5~",
                         Key::PageDown => b"\x1b[6~",
-                        Key::F1  => b"\x1bOP",
-                        Key::F2  => b"\x1bOQ",
-                        Key::F3  => b"\x1bOR",
-                        Key::F4  => b"\x1bOS",
-                        Key::F5  => b"\x1b[15~",
-                        Key::F6  => b"\x1b[17~",
-                        Key::F7  => b"\x1b[18~",
-                        Key::F8  => b"\x1b[19~",
-                        Key::F9  => b"\x1b[20~",
+                        Key::F1 => b"\x1bOP",
+                        Key::F2 => b"\x1bOQ",
+                        Key::F3 => b"\x1bOR",
+                        Key::F4 => b"\x1bOS",
+                        Key::F5 => b"\x1b[15~",
+                        Key::F6 => b"\x1b[17~",
+                        Key::F7 => b"\x1b[18~",
+                        Key::F8 => b"\x1b[19~",
+                        Key::F9 => b"\x1b[20~",
                         Key::F10 => b"\x1b[21~",
                         Key::F11 => b"\x1b[23~",
                         Key::F12 => b"\x1b[24~",
@@ -457,7 +460,10 @@ impl<'a> TermView<'a> {
             return dims;
         }
         let dims = ctx.fonts_mut(|f| {
-            (f.glyph_width(&session.cached_font_id, 'm'), f.row_height(&session.cached_font_id))
+            (
+                f.glyph_width(&session.cached_font_id, 'm'),
+                f.row_height(&session.cached_font_id),
+            )
         });
         session.cached_cell_dims = Some(dims);
         dims
@@ -527,7 +533,12 @@ impl<'a> TermView<'a> {
                 continue;
             }
             // Only process if the slot needs rebuilding.
-            if self.session.row_cache.get(vrow).map_or(true, |s| s.is_none()) {
+            if self
+                .session
+                .row_cache
+                .get(vrow)
+                .map_or(true, |s| s.is_none())
+            {
                 let mut fg = color_to_egui(indexed.fg, Color32::LIGHT_GRAY);
                 let mut bg_cell = color_to_egui(indexed.bg, BG_DEFAULT);
                 if indexed.cell.flags.contains(cell::Flags::INVERSE) {
@@ -554,7 +565,11 @@ impl<'a> TermView<'a> {
         let bg_rect_buf = &mut self.session.bg_rect_buf;
         let seg_text = &mut self.session.seg_text_buf;
 
-        for (vrow, cells) in dirty_row_cells.iter().enumerate().filter(|(_, c)| !c.is_empty()) {
+        for (vrow, cells) in dirty_row_cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_empty())
+        {
             bg_rect_buf.clear();
 
             // Reset cell_buf slice to defaults (re-use allocation).
@@ -600,11 +615,15 @@ impl<'a> TermView<'a> {
                     let (c, fg) = cell_buf[col];
                     if fg != seg_color {
                         if !seg_text.is_empty() {
-                            job.append(seg_text, 0.0, TextFormat {
-                                font_id: font_id.clone(),
-                                color: seg_color,
-                                ..Default::default()
-                            });
+                            job.append(
+                                seg_text,
+                                0.0,
+                                TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: seg_color,
+                                    ..Default::default()
+                                },
+                            );
                             seg_text.clear();
                         }
                         seg_color = fg;
@@ -612,11 +631,15 @@ impl<'a> TermView<'a> {
                     seg_text.push(c);
                 }
                 if !seg_text.is_empty() {
-                    job.append(seg_text, 0.0, TextFormat {
-                        font_id: font_id.clone(),
-                        color: seg_color,
-                        ..Default::default()
-                    });
+                    job.append(
+                        seg_text,
+                        0.0,
+                        TextFormat {
+                            font_id: font_id.clone(),
+                            color: seg_color,
+                            ..Default::default()
+                        },
+                    );
                     seg_text.clear();
                 }
 
@@ -706,12 +729,17 @@ impl Widget for TermView<'_> {
         // focus-navigation paths.
         if layout.has_focus() {
             let id = layout.id;
-            ui.memory_mut(|mem| mem.set_focus_lock_filter(id, egui::EventFilter {
-                tab: true,
-                horizontal_arrows: true,
-                vertical_arrows: true,
-                escape: true,  // must be true: false causes Esc to defocus the terminal
-            }));
+            ui.memory_mut(|mem| {
+                mem.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true, // must be true: false causes Esc to defocus the terminal
+                    },
+                )
+            });
         }
 
         // Measure font — hits cache after first frame (font is fixed, never changes).

@@ -52,16 +52,20 @@ impl List {
         self[NamedColor::BrightMagenta] = colors.bright.magenta;
         self[NamedColor::BrightCyan] = colors.bright.cyan;
         self[NamedColor::BrightWhite] = colors.bright.white;
-        self[NamedColor::BrightForeground] =
-            colors.primary.bright_foreground.unwrap_or(colors.primary.foreground);
+        self[NamedColor::BrightForeground] = colors
+            .primary
+            .bright_foreground
+            .unwrap_or(colors.primary.foreground);
 
         // Foreground and background.
         self[NamedColor::Foreground] = colors.primary.foreground;
         self[NamedColor::Background] = colors.primary.background;
 
         // Dims.
-        self[NamedColor::DimForeground] =
-            colors.primary.dim_foreground.unwrap_or(colors.primary.foreground * DIM_FACTOR);
+        self[NamedColor::DimForeground] = colors
+            .primary
+            .dim_foreground
+            .unwrap_or(colors.primary.foreground * DIM_FACTOR);
         match colors.dim {
             Some(ref dim) => {
                 trace!("Using config-provided dim colors");
@@ -73,7 +77,7 @@ impl List {
                 self[NamedColor::DimMagenta] = dim.magenta;
                 self[NamedColor::DimCyan] = dim.cyan;
                 self[NamedColor::DimWhite] = dim.white;
-            },
+            }
             None => {
                 trace!("Deriving dim colors from normal colors");
                 self[NamedColor::DimBlack] = colors.normal.black * DIM_FACTOR;
@@ -84,7 +88,7 @@ impl List {
                 self[NamedColor::DimMagenta] = colors.normal.magenta * DIM_FACTOR;
                 self[NamedColor::DimCyan] = colors.normal.cyan * DIM_FACTOR;
                 self[NamedColor::DimWhite] = colors.normal.white * DIM_FACTOR;
-            },
+            }
         }
     }
 
@@ -95,8 +99,10 @@ impl List {
             for g in 0..6 {
                 for b in 0..6 {
                     // Override colors 16..232 with the config (if present).
-                    if let Some(indexed_color) =
-                        colors.indexed_colors.iter().find(|ic| ic.index() == index as u8)
+                    if let Some(indexed_color) = colors
+                        .indexed_colors
+                        .iter()
+                        .find(|ic| ic.index() == index as u8)
                     {
                         self[index] = indexed_color.color;
                     } else {
@@ -122,8 +128,10 @@ impl List {
             let color_index = 16 + 216 + i;
 
             // Override colors 232..256 with the config (if present).
-            if let Some(indexed_color) =
-                colors.indexed_colors.iter().find(|ic| ic.index() == color_index)
+            if let Some(indexed_color) = colors
+                .indexed_colors
+                .iter()
+                .find(|ic| ic.index() == color_index)
             {
                 self[index] = indexed_color.color;
                 index += 1;
@@ -300,7 +308,7 @@ impl FromStr for Rgb {
                 color >>= 8;
                 let r = color as u8;
                 Ok(Rgb::new(r, g, b))
-            },
+            }
             Err(_) => Err(()),
         }
     }
@@ -358,11 +366,15 @@ impl<'de> Deserialize<'de> for CellRgb {
                 }
 
                 Rgb::from_str(value).map(CellRgb::Rgb).map_err(|_| {
-                    E::custom(format!("failed to parse color {value}; expected {EXPECTING}"))
+                    E::custom(format!(
+                        "failed to parse color {value}; expected {EXPECTING}"
+                    ))
                 })
             }
         }
 
-        deserializer.deserialize_str(CellRgbVisitor).map_err(D::Error::custom)
+        deserializer
+            .deserialize_str(CellRgbVisitor)
+            .map_err(D::Error::custom)
     }
 }

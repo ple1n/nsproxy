@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use crate::{
     PathExpansionState, ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig,
     sys::{
-        MountInfo, ensure_mountpoint, mount_bind_ro_explicit, mount_bind_rw_explicit,
-        mount_tmpfs, pivot_root_into, write_resolv_conf_explicit,
+        MountInfo, ensure_mountpoint, mount_bind_ro_explicit, mount_bind_rw_explicit, mount_tmpfs,
+        pivot_root_into, write_resolv_conf_explicit,
     },
 };
 
@@ -210,7 +210,9 @@ fn populate_writable_etc(new_root: &Path) -> Result<()> {
 /// merged-usr symlinks (or bind-mounts them for non-merged distros),
 /// bind-mounts /nsp3/config and /dev read-write, and mounts fresh proc/sys/tmp/run.
 pub fn build_skeleton(new_root: &Path) -> Result<()> {
-    for d in &["usr", "etc", "dev", "proc", "sys", "tmp", "run", "home", "root"] {
+    for d in &[
+        "usr", "etc", "dev", "proc", "sys", "tmp", "run", "home", "root",
+    ] {
         info!("create_dir_all({:?})", new_root.join(d));
         std::fs::create_dir_all(new_root.join(d))?;
     }
@@ -494,7 +496,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        path.push(format!("nsproxy-sandbox-test-{nanos}-{}", std::process::id()));
+        path.push(format!(
+            "nsproxy-sandbox-test-{nanos}-{}",
+            std::process::id()
+        ));
         path
     }
 
@@ -531,7 +536,10 @@ mod tests {
         fs::symlink(root.join("missing-target"), &link).expect("symlink should be created");
 
         assert!(path_exists_no_follow(&link).expect("lstat should succeed"));
-        assert!(!link.exists(), "broken symlink should not be followed by Path::exists");
+        assert!(
+            !link.exists(),
+            "broken symlink should not be followed by Path::exists"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -605,7 +613,10 @@ pub fn read_sandbox_status(profile_name: &str) -> Option<SandboxStatus> {
     let status: SandboxStatus = match serde_json::from_str(&content) {
         Ok(s) => s,
         Err(err) => {
-            warn!(profile = profile_name, "invalid sandbox_status.json, ignoring: {err}");
+            warn!(
+                profile = profile_name,
+                "invalid sandbox_status.json, ignoring: {err}"
+            );
             return None;
         }
     };

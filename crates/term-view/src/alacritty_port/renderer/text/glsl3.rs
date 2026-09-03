@@ -6,14 +6,14 @@ use log::info;
 
 use alacritty_terminal::term::cell::Flags;
 
-use crate::display::SizeInfo;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl;
 use crate::gl::types::*;
-use crate::renderer::Error;
 use crate::renderer::shader::{ShaderProgram, ShaderVersion};
+use crate::renderer::Error;
 
-use super::atlas::{ATLAS_SIZE, Atlas};
+use super::atlas::{Atlas, ATLAS_SIZE};
 use super::{
     Glyph, LoadGlyph, LoaderApi, RenderingGlyphFlags, RenderingPass, TextRenderApi,
     TextRenderBatch, TextRenderer, TextShader,
@@ -247,7 +247,8 @@ impl TextRenderApi<Batch> for RenderApi<'_> {
                 ptr::null(),
                 self.batch.len() as GLsizei,
             );
-            self.program.set_rendering_pass(RenderingPass::SubpixelPass1);
+            self.program
+                .set_rendering_pass(RenderingPass::SubpixelPass1);
             gl::DrawElementsInstanced(
                 gl::TRIANGLES,
                 6,
@@ -346,7 +347,10 @@ impl TextRenderBatch for Batch {
 
         let mut cell_flags = RenderingGlyphFlags::empty();
         cell_flags.set(RenderingGlyphFlags::COLORED, glyph.multicolor);
-        cell_flags.set(RenderingGlyphFlags::WIDE_CHAR, cell.flags.contains(Flags::WIDE_CHAR));
+        cell_flags.set(
+            RenderingGlyphFlags::WIDE_CHAR,
+            cell.flags.contains(Flags::WIDE_CHAR),
+        );
 
         self.instances.push(InstanceData {
             col: cell.point.column.0 as u16,
@@ -378,7 +382,10 @@ impl TextRenderBatch for Batch {
 impl Batch {
     #[inline]
     pub fn new() -> Self {
-        Self { tex: 0, instances: Vec::with_capacity(BATCH_MAX) }
+        Self {
+            tex: 0,
+            instances: Vec::with_capacity(BATCH_MAX),
+        }
     }
 
     #[inline]

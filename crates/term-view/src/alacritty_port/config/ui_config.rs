@@ -14,11 +14,10 @@ use winit::keyboard::{Key, ModifiersState};
 
 use alacritty_config::SerdeReplace;
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
-use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::search::RegexSearch;
+use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::tty::{Options as PtyOptions, Shell};
 
-use crate::config::LOG_TARGET_CONFIG;
 use crate::config::bell::BellConfig;
 use crate::config::bindings::{
     self, Action, Binding, BindingKey, KeyBinding, KeyLocation, ModeWrapper, ModsWrapper,
@@ -34,6 +33,7 @@ use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
 use crate::config::terminal::Terminal;
 use crate::config::window::WindowConfig;
+use crate::config::LOG_TARGET_CONFIG;
 
 /// Regex used for the default URL hint.
 #[rustfmt::skip]
@@ -129,9 +129,16 @@ impl UiConfig {
 
     /// Derive [`PtyOptions`] from the config.
     pub fn pty_config(&self) -> PtyOptions {
-        let shell = self.terminal.shell.clone().or_else(|| self.shell.clone()).map(Into::into);
-        let working_directory =
-            self.working_directory.clone().or_else(|| self.general.working_directory.clone());
+        let shell = self
+            .terminal
+            .shell
+            .clone()
+            .or_else(|| self.shell.clone())
+            .map(Into::into);
+        let working_directory = self
+            .working_directory
+            .clone()
+            .or_else(|| self.general.working_directory.clone());
         PtyOptions {
             working_directory,
             shell,
@@ -159,7 +166,8 @@ impl UiConfig {
 
     #[inline]
     pub fn live_config_reload(&self) -> bool {
-        self.live_config_reload.unwrap_or(self.general.live_config_reload)
+        self.live_config_reload
+            .unwrap_or(self.general.live_config_reload)
     }
 
     #[cfg(unix)]
@@ -213,7 +221,7 @@ where
             Ok(binding) => bindings.push(binding),
             Err(err) => {
                 error!(target: LOG_TARGET_CONFIG, "Config error: {err}; ignoring binding");
-            },
+            }
         }
     }
 
@@ -269,7 +277,10 @@ impl Default for Hints {
                 action,
                 persist: false,
                 post_processing: true,
-                mouse: Some(HintMouse { enabled: true, mods: Default::default() }),
+                mouse: Some(HintMouse {
+                    enabled: true,
+                    mods: Default::default(),
+                }),
                 binding: Some(HintBinding {
                     key: BindingKey::Keycode {
                         key: Key::Character("o".into()),
@@ -419,7 +430,7 @@ impl<'de> Deserialize<'de> for HintContent {
                                     target: LOG_TARGET_CONFIG,
                                     "Config error: hint's regex: {err}"
                                 );
-                            },
+                            }
                         },
                         "hyperlinks" => match bool::deserialize(value) {
                             Ok(hyperlink) => content.hyperlinks = hyperlink,
@@ -428,7 +439,7 @@ impl<'de> Deserialize<'de> for HintContent {
                                     target: LOG_TARGET_CONFIG,
                                     "Config error: hint's hyperlinks: {err}"
                                 );
-                            },
+                            }
                         },
                         "command" | "action" => (),
                         key => warn!(target: LOG_TARGET_CONFIG, "Unrecognized hint field: {key}"),
@@ -567,7 +578,7 @@ impl LazyRegexVariant {
                 error!("could not compile hint regex: {err}");
                 *self = Self::Uncompilable(regex);
                 return None;
-            },
+            }
         };
         *self = Self::Compiled(regex, Box::new(regex_search));
 

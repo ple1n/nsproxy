@@ -3,8 +3,8 @@ use crossfont::{GlyphKey, RasterizedGlyph};
 
 use alacritty_terminal::term::cell::Flags;
 
-use crate::display::SizeInfo;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl;
 use crate::gl::types::*;
 
@@ -152,16 +152,21 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
             cell.character = ' ';
         }
 
-        let mut glyph_key =
-            GlyphKey { font_key, size: glyph_cache.font_size, character: cell.character };
+        let mut glyph_key = GlyphKey {
+            font_key,
+            size: glyph_cache.font_size,
+            character: cell.character,
+        };
 
         // Add cell to batch.
         let glyph = glyph_cache.get(glyph_key, self, true);
         self.add_render_item(&cell, &glyph, size_info);
 
         // Render visible zero-width characters.
-        if let Some(zerowidth) =
-            cell.extra.as_mut().and_then(|extra| extra.zerowidth.take().filter(|_| !hidden))
+        if let Some(zerowidth) = cell
+            .extra
+            .as_mut()
+            .and_then(|extra| extra.zerowidth.take().filter(|_| !hidden))
         {
             for character in zerowidth {
                 glyph_key.character = character;

@@ -13,8 +13,8 @@ use std::{
 use anyhow::{anyhow, bail};
 use nix::sched::CloneFlags;
 use nix::unistd::{Gid, chdir, execve, getegid, getresuid, setgroups, setresgid, setresuid};
-use nsproxy_common::UID_HINT_VAR;
 use nsproxy_common::NSSource;
+use nsproxy_common::UID_HINT_VAR;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uzers::{Group, os::unix::UserExt};
@@ -103,10 +103,13 @@ impl ShellPrefs {
         // Auto-set HOME if not explicitly provided and we have a uid
         if !env.contains_key("HOME") && self.uid.is_some() {
             if let Some(user) = uzers::get_user_by_uid(self.uid.unwrap()) {
-                env.insert("HOME".to_string(), user.home_dir().to_string_lossy().to_string());
+                env.insert(
+                    "HOME".to_string(),
+                    user.home_dir().to_string_lossy().to_string(),
+                );
             }
         }
-        
+
         let mut vec: VecDeque<CString> = Default::default();
         for (k, v) in env {
             vec.push_back(CString::new(format!("{}={}", k, v))?);
@@ -114,17 +117,20 @@ impl ShellPrefs {
         self.env = vec;
         Ok(())
     }
-    
+
     /// Set environment with inheritance - apply env as overrides to existing environment
     pub fn set_env_with_inheritance(&mut self, overrides: HashMap<String, String>) -> Result<()> {
         // Auto-set HOME if not explicitly provided and we have a uid
         let mut final_overrides = overrides;
         if !final_overrides.contains_key("HOME") && self.uid.is_some() {
             if let Some(user) = uzers::get_user_by_uid(self.uid.unwrap()) {
-                final_overrides.insert("HOME".to_string(), user.home_dir().to_string_lossy().to_string());
+                final_overrides.insert(
+                    "HOME".to_string(),
+                    user.home_dir().to_string_lossy().to_string(),
+                );
             }
         }
-        
+
         // Apply overrides to existing environment
         for (k, v) in final_overrides {
             // Remove any existing entry for this key
@@ -153,14 +159,16 @@ impl ShellPrefs {
             .push_front(CString::from_str(&format!("{}={}", ENV_PROFILE, val)).unwrap());
     }
     pub fn set_container_env(&mut self, profile_name: Option<&str>) {
-        warn!("setting env variable for container profile {:?}", &profile_name);
+        warn!(
+            "setting env variable for container profile {:?}",
+            &profile_name
+        );
         let val = profile_name.unwrap_or("UNSPEC");
         unsafe {
             std::env::set_var(ENV_CONTAINER, val);
         }
-        self.env.push_front(
-            CString::from_str(&format!("{}={}", ENV_CONTAINER, val)).unwrap(),
-        );
+        self.env
+            .push_front(CString::from_str(&format!("{}={}", ENV_CONTAINER, val)).unwrap());
     }
     pub fn set_ns_env(&mut self, ns: Option<&str>) {
         warn!("setting env variable for netns {:?}", &ns);
@@ -183,8 +191,7 @@ impl ShellPrefs {
             }
         });
         self.env.push_front(
-            CString::from_str(&format!("{}={}", ENV_DBUS_SESSION_BUS_ADDRESS, address))
-                .unwrap(),
+            CString::from_str(&format!("{}={}", ENV_DBUS_SESSION_BUS_ADDRESS, address)).unwrap(),
         );
     }
 
@@ -200,8 +207,7 @@ impl ShellPrefs {
             }
         });
         self.env.push_front(
-            CString::from_str(&format!("{}={}", ENV_DBUS_SYSTEM_BUS_ADDRESS, address))
-                .unwrap(),
+            CString::from_str(&format!("{}={}", ENV_DBUS_SYSTEM_BUS_ADDRESS, address)).unwrap(),
         );
     }
 
@@ -324,7 +330,11 @@ impl ShellPrefs {
         }
     }
 
-    pub fn spawn_in_ns(mut self, ns_alive: &crate::NsAlive, fallback_netns: &Path) -> Result<Clone3Result> {
+    pub fn spawn_in_ns(
+        mut self,
+        ns_alive: &crate::NsAlive,
+        fallback_netns: &Path,
+    ) -> Result<Clone3Result> {
         if let Some(name) = &self.prefer_shell {
             self.shell = Some(which::which(name)?);
         }
@@ -355,7 +365,11 @@ impl ShellPrefs {
 
                     execve(cmd.as_c_str(), &self.args, self.env.make_contiguous());
                 }
-                Clone3Result::Parent { child_pid, child_pidfd, tx } => {
+                Clone3Result::Parent {
+                    child_pid,
+                    child_pidfd,
+                    tx,
+                } => {
                     let _ = (child_pid, child_pidfd, tx);
                 }
             }

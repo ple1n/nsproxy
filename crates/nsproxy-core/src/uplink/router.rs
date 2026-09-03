@@ -8,7 +8,6 @@ use std::{
 use anyhow::{Result, bail};
 use bytes::BytesMut;
 use diag::{ConnId, ControlCommand, DiagEvent, DiagServer, StreamKind, Timestamp, next_conn_id};
-use tokio::sync::mpsc;
 use futures::SinkExt;
 use ipstack::{
     IpStack, IpStackConfig, TUNDev,
@@ -18,6 +17,7 @@ use nsproxy_common::routing::{
     DropReason, ProxyID, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled, VDNSRES,
 };
 use socks5_impl::protocol::WireAddress;
+use tokio::sync::mpsc;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -404,12 +404,7 @@ impl Router {
 
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
-                            TrojanAdapter::connect_tcp(
-                                p,
-                                target.clone(),
-                                p.server_addr.ip(),
-                            )
-                            .await
+                            TrojanAdapter::connect_tcp(p, target.clone(), p.server_addr.ip()).await
                         }
                         UplinkProxy::Remote(p) => {
                             RemoteAdapter::connect_tcp(p, target.clone()).await
@@ -817,12 +812,7 @@ impl Router {
 
                     let conn_result = match &proxy {
                         UplinkProxy::Trojan(p) => {
-                            TrojanAdapter::connect_udp(
-                                p,
-                                target.clone(),
-                                p.server_addr.ip(),
-                            )
-                            .await
+                            TrojanAdapter::connect_udp(p, target.clone(), p.server_addr.ip()).await
                         }
                         UplinkProxy::Remote(p) => RemoteAdapter::connect_udp(p).await,
                         _ => unreachable!(),

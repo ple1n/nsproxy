@@ -47,7 +47,10 @@ pub struct Font {
 impl Font {
     /// Get a font clone with a size modification.
     pub fn with_size(self, size: FontSize) -> Font {
-        Font { size: Size(size), ..self }
+        Font {
+            size: Size(size),
+            ..self
+        }
     }
 
     #[inline]
@@ -123,7 +126,10 @@ pub struct SecondaryFontDescription {
 impl SecondaryFontDescription {
     pub fn desc(&self, fallback: &FontDescription) -> FontDescription {
         FontDescription {
-            family: self.family.clone().unwrap_or_else(|| fallback.family.clone()),
+            family: self
+                .family
+                .clone()
+                .unwrap_or_else(|| fallback.family.clone()),
             style: self.style.clone(),
         }
     }

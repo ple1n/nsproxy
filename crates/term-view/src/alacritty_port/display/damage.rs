@@ -92,13 +92,20 @@ impl DamageTracker {
     /// Get shaped frame damage for the active frame.
     pub fn shape_frame_damage(&self, size_info: SizeInfo<u32>) -> Vec<Rect> {
         if self.frames[0].full {
-            vec![Rect::new(0, 0, size_info.width() as i32, size_info.height() as i32)]
+            vec![Rect::new(
+                0,
+                0,
+                size_info.width() as i32,
+                size_info.height() as i32,
+            )]
         } else {
             let lines_damage = RenderDamageIterator::new(
                 TermDamageIterator::new(&self.frames[0].lines, 0),
                 &size_info,
             );
-            lines_damage.chain(self.frames[0].rects.iter().copied()).collect()
+            lines_damage
+                .chain(self.frames[0].rects.iter().copied())
+                .collect()
         }
     }
 
@@ -177,7 +184,12 @@ impl FrameDamage {
         height: i32,
     ) {
         let y = viewport_y_to_damage_y(size_info, y, height);
-        self.rects.push(Rect { x, y, width, height });
+        self.rects.push(Rect {
+            x,
+            y,
+            width,
+            height,
+        });
     }
 
     fn reset(&mut self, num_lines: usize, num_cols: usize) {
@@ -220,7 +232,10 @@ struct RenderDamageIterator<'a> {
 
 impl<'a> RenderDamageIterator<'a> {
     pub fn new(damaged_lines: TermDamageIterator<'a>, size_info: &'a SizeInfo<u32>) -> Self {
-        Self { damaged_lines: damaged_lines.peekable(), size_info }
+        Self {
+            damaged_lines: damaged_lines.peekable(),
+            size_info,
+        }
     }
 
     #[inline]
@@ -230,7 +245,12 @@ impl<'a> RenderDamageIterator<'a> {
         let x = size_info.padding_x() + line_damage.left as u32 * size_info.cell_width();
         let y = y_top - (line_damage.line + 1) as u32 * size_info.cell_height();
         let width = (line_damage.right - line_damage.left + 1) as u32 * size_info.cell_width();
-        Rect::new(x as i32, y as i32, width as i32, size_info.cell_height() as i32)
+        Rect::new(
+            x as i32,
+            y as i32,
+            width as i32,
+            size_info.cell_height() as i32,
+        )
     }
 
     // Make sure to damage near cells to include wide chars.
@@ -322,13 +342,21 @@ mod tests {
         // Test min clamping.
         let rect = Rect::new(0, 0, rect_side, rect_side);
         let rect = RenderDamageIterator::overdamage(&size_info, rect);
-        assert_eq!(Rect::new(0, 0, rect_side + 2 * cell_size, 10 + cell_size), rect);
+        assert_eq!(
+            Rect::new(0, 0, rect_side + 2 * cell_size, 10 + cell_size),
+            rect
+        );
 
         // Test max clamping.
         let rect = Rect::new(bound, bound, rect_side, rect_side);
         let rect = RenderDamageIterator::overdamage(&size_info, rect);
         assert_eq!(
-            Rect::new(bound - cell_size, bound - cell_size / 2, cell_size, cell_size / 2),
+            Rect::new(
+                bound - cell_size,
+                bound - cell_size / 2,
+                cell_size,
+                cell_size / 2
+            ),
             rect
         );
 
@@ -348,7 +376,10 @@ mod tests {
         // Test out of bounds coord clamping.
         let rect = Rect::new(bound * 2, bound * 2, rect_side, rect_side);
         let rect = RenderDamageIterator::overdamage(&size_info, rect);
-        assert_eq!(Rect::new(bound * 2 - cell_size, bound * 2 - cell_size / 2, 0, 0), rect);
+        assert_eq!(
+            Rect::new(bound * 2 - cell_size, bound * 2 - cell_size / 2, 0, 0),
+            rect
+        );
     }
 
     #[test]
@@ -361,13 +392,22 @@ mod tests {
         let width = 10;
         let size_info = SizeInfo::new(viewport_height, viewport_height, 5., 5., 0., 0., true);
         frame_damage.add_viewport_rect(&size_info, x, y, width, height);
-        assert_eq!(frame_damage.rects[0], Rect {
-            x,
-            y: viewport_height as i32 - y - height,
-            width,
-            height
-        });
-        assert_eq!(frame_damage.rects[0].y, viewport_y_to_damage_y(&size_info, y, height));
-        assert_eq!(damage_y_to_viewport_y(&size_info, &frame_damage.rects[0]), y);
+        assert_eq!(
+            frame_damage.rects[0],
+            Rect {
+                x,
+                y: viewport_height as i32 - y - height,
+                width,
+                height
+            }
+        );
+        assert_eq!(
+            frame_damage.rects[0].y,
+            viewport_y_to_damage_y(&size_info, y, height)
+        );
+        assert_eq!(
+            damage_y_to_viewport_y(&size_info, &frame_damage.rects[0]),
+            y
+        );
     }
 }

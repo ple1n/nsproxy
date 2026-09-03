@@ -10,7 +10,7 @@
 use nix::sched::CloneFlags;
 
 #[cfg(feature = "egui-client")]
-use nsproxy_common::{NsAlive, state_paths};
+use nsproxy_common::{state_paths, NsAlive};
 
 #[cfg(feature = "egui-client")]
 use std::fs::File;
@@ -60,8 +60,7 @@ fn main() -> eframe::Result<()> {
     let connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conn_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ping_state: Arc<Mutex<PingState>> = Arc::new(Mutex::new(PingState::default()));
-    let mass_ping_state: Arc<Mutex<MassPingState>> =
-        Arc::new(Mutex::new(MassPingState::default()));
+    let mass_ping_state: Arc<Mutex<MassPingState>> = Arc::new(Mutex::new(MassPingState::default()));
     let burst_test_state: Arc<Mutex<BurstTestState>> =
         Arc::new(Mutex::new(BurstTestState::default()));
     let burst_test_stats: Arc<Mutex<BurstTestStats>> =
@@ -121,10 +120,12 @@ fn main() -> eframe::Result<()> {
                                 test_sizes.push(size);
                                 power += 1;
                             }
-                            if test_sizes.is_empty() || *test_sizes.last().unwrap() != max_batch_size {
+                            if test_sizes.is_empty()
+                                || *test_sizes.last().unwrap() != max_batch_size
+                            {
                                 test_sizes.push(max_batch_size);
                             }
-                            
+
                             let mut threshold_found = false;
 
                             for size in test_sizes {
@@ -137,9 +138,9 @@ fn main() -> eframe::Result<()> {
                                 let mut tasks = FuturesUnordered::new();
                                 for domain in domains {
                                     let dns = dns_addr.clone();
-                                    tasks.push(async move {
-                                        send_dns_ping_async(&dns, domain).await
-                                    });
+                                    tasks.push(
+                                        async move { send_dns_ping_async(&dns, domain).await },
+                                    );
                                 }
 
                                 let mut errs = 0u64;
@@ -204,17 +205,19 @@ fn main() -> eframe::Result<()> {
                                 let mut burst = burst_state_bg.lock().unwrap();
                                 burst.running = false;
                                 burst.finished_ts = Some(finished);
-                                
+
                                 // Update burst statistics
-                                let duration_ms = (finished.saturating_sub(started as u64)) as f64 / 1000.0;
+                                let duration_ms =
+                                    (finished.saturating_sub(started as u64)) as f64 / 1000.0;
                                 let overall_failure_rate = if !burst.results.is_empty() {
-                                    burst.results.iter().map(|r| r.failure_rate).sum::<f64>() / burst.results.len() as f64
+                                    burst.results.iter().map(|r| r.failure_rate).sum::<f64>()
+                                        / burst.results.len() as f64
                                 } else {
                                     0.0
                                 };
                                 let hit_threshold = burst.threshold_size.is_some();
                             }
-                            
+
                             // Stats are updated in the UI thread when displayed
                         }
                         PingRequest::Batch(domains, dns_addr) => {
@@ -222,9 +225,7 @@ fn main() -> eframe::Result<()> {
                             let mut tasks = FuturesUnordered::new();
                             for domain in domains {
                                 let dns = dns_addr.clone();
-                                tasks.push(async move {
-                                    send_dns_ping_async(&dns, domain).await
-                                });
+                                tasks.push(async move { send_dns_ping_async(&dns, domain).await });
                             }
                             let mut errs = 0u64;
                             let mut done = 0u64;
@@ -287,7 +288,8 @@ fn main() -> eframe::Result<()> {
                                         if let Some(c) = acc.conns.get(id) {
                                             let mut ping = ping_bg.lock().unwrap();
                                             if let Some(ref last) = ping.last_domain {
-                                                if normalize_domain(last) == normalize_domain(query) {
+                                                if normalize_domain(last) == normalize_domain(query)
+                                                {
                                                     if let Some(sent_us) = ping.last_sent_us {
                                                         let accept_us = c.accept_ts.0;
                                                         ping.last_accept_delta_us =
@@ -378,7 +380,7 @@ fn main() -> eframe::Result<()> {
                         let mut dns_addr = dns_config.lock().unwrap();
                         ui.text_edit_singleline(&mut *dns_addr);
                     }
-                    
+
                     if ui.button("Random IP").clicked() {
                         use rand::Rng;
                         let mut rng = rand::thread_rng();
@@ -392,7 +394,7 @@ fn main() -> eframe::Result<()> {
                         *dns_config.lock().unwrap() = ip;
                     }
                 });
-                
+
                 ui.horizontal(|ui| {
                     if ui.button("DNS ping").clicked() {
                         let now_us = now_epoch_us();
@@ -415,33 +417,45 @@ fn main() -> eframe::Result<()> {
                         ui.label("Max batch:");
                         let mut burst = burst_test_state.lock().unwrap();
                         let mut log_value = (burst.max_batch_size as f64).log2();
-                        if ui.add(egui::Slider::new(&mut log_value, 4.0..=20.0)
-                            .custom_formatter(|n, _| {
-                                let val = 2_f64.powf(n).round() as u64;
-                                if val >= 1_048_576 {
-                                    format!("{}M", val / 1_048_576)
-                                } else if val >= 1_024 {
-                                    format!("{}k", val / 1_024)
-                                } else {
-                                    format!("{}", val)
-                                }
-                            })
-                            .custom_parser(|s| {
-                                let s = s.trim().to_lowercase();
-                                if let Some(s) = s.strip_suffix('m') {
-                                    s.parse::<f64>().ok().map(|v| (v * 1_048_576.0).log2())
-                                } else if let Some(s) = s.strip_suffix('k') {
-                                    s.parse::<f64>().ok().map(|v| (v * 1_024.0).log2())
-                                } else {
-                                    s.parse::<f64>().ok().map(|v| v.log2())
-                                }
-                            })).changed() {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut log_value, 4.0..=20.0)
+                                    .custom_formatter(|n, _| {
+                                        let val = 2_f64.powf(n).round() as u64;
+                                        if val >= 1_048_576 {
+                                            format!("{}M", val / 1_048_576)
+                                        } else if val >= 1_024 {
+                                            format!("{}k", val / 1_024)
+                                        } else {
+                                            format!("{}", val)
+                                        }
+                                    })
+                                    .custom_parser(|s| {
+                                        let s = s.trim().to_lowercase();
+                                        if let Some(s) = s.strip_suffix('m') {
+                                            s.parse::<f64>().ok().map(|v| (v * 1_048_576.0).log2())
+                                        } else if let Some(s) = s.strip_suffix('k') {
+                                            s.parse::<f64>().ok().map(|v| (v * 1_024.0).log2())
+                                        } else {
+                                            s.parse::<f64>().ok().map(|v| v.log2())
+                                        }
+                                    }),
+                            )
+                            .changed()
+                        {
                             burst.max_batch_size = 2_f64.powf(log_value).round() as u64;
                         }
                         let max_batch = burst.max_batch_size;
                         drop(burst);
-                        
-                        if ui.button("Burst Test").on_hover_text(format!("Test burst sizes (log scale up to {}) to find >5% failure rate", max_batch)).clicked() {
+
+                        if ui
+                            .button("Burst Test")
+                            .on_hover_text(format!(
+                                "Test burst sizes (log scale up to {}) to find >5% failure rate",
+                                max_batch
+                            ))
+                            .clicked()
+                        {
                             let dns_addr = dns_config.lock().unwrap().clone();
                             let _ = ping_tx.send(PingRequest::BurstTest(dns_addr));
                         }
@@ -545,19 +559,21 @@ fn main() -> eframe::Result<()> {
                             let finished = burst.finished_ts.unwrap_or(0);
                             let started = burst.started_ts.unwrap_or(0);
                             let duration_ms = (finished.saturating_sub(started)) as f64 / 1000.0;
-                            let overall_failure_rate = burst.results.iter().map(|r| r.failure_rate).sum::<f64>() / burst.results.len() as f64;
+                            let overall_failure_rate =
+                                burst.results.iter().map(|r| r.failure_rate).sum::<f64>()
+                                    / burst.results.len() as f64;
                             let hit_threshold = burst.threshold_size.is_some();
-                            
+
                             let mut stats = burst_test_stats.lock().unwrap();
                             if stats.test_count < burst.results.len() as u64 {
                                 stats.add_test(overall_failure_rate, duration_ms, hit_threshold);
                             }
                         }
                         drop(burst);
-                        
+
                         ui.label("Burst test results:");
                         let burst = burst_test_state.lock().unwrap();
-                        
+
                         egui::Grid::new("burst_results_grid")
                             .striped(true)
                             .show(ui, |ui| {
@@ -569,11 +585,15 @@ fn main() -> eframe::Result<()> {
                                 ui.label("Avg RTT");
                                 ui.label("Max RTT");
                                 ui.end_row();
-                                
+
                                 for result in &burst.results {
                                     ui.label(format!("n={}", result.size));
-                                    ui.label(format!("{}/{}", result.completed.saturating_sub(result.errors), result.requested));
-                                    
+                                    ui.label(format!(
+                                        "{}/{}",
+                                        result.completed.saturating_sub(result.errors),
+                                        result.requested
+                                    ));
+
                                     let color = if result.failure_rate > 5.0 {
                                         egui::Color32::RED
                                     } else if result.failure_rate > 1.0 {
@@ -582,7 +602,7 @@ fn main() -> eframe::Result<()> {
                                         egui::Color32::GREEN
                                     };
                                     ui.colored_label(color, format!("{:.1}%", result.failure_rate));
-                                    
+
                                     use diag::summary::format_duration_us;
                                     ui.label(format_duration_us(result.latency_us_min as f64));
                                     ui.label(format_duration_us(result.latency_us_avg as f64));
@@ -590,30 +610,39 @@ fn main() -> eframe::Result<()> {
                                     ui.end_row();
                                 }
                             });
-                        
+
                         if let Some(threshold) = burst.threshold_size {
                             ui.colored_label(
                                 egui::Color32::RED,
                                 format!("⚠ Threshold: >5% failures at n={}", threshold),
                             );
                         } else {
-                            ui.colored_label(egui::Color32::GREEN, "✓ All tests passed (<5% failures)");
+                            ui.colored_label(
+                                egui::Color32::GREEN,
+                                "✓ All tests passed (<5% failures)",
+                            );
                         }
-                        
+
                         let last_error = burst.last_error.clone();
-                        
+
                         // Display statistics
                         let stats = burst_test_stats.lock().unwrap();
                         if stats.test_count > 0 {
                             ui.vertical(|ui| {
                                 ui.label(format!("Total tests: {}", stats.test_count));
-                                ui.label(format!("Avg failure rate: {:.2}%", stats.avg_failure_rate()));
-                                ui.label(format!("Max failure rate: {:.2}%", stats.max_failure_rate));
+                                ui.label(format!(
+                                    "Avg failure rate: {:.2}%",
+                                    stats.avg_failure_rate()
+                                ));
+                                ui.label(format!(
+                                    "Max failure rate: {:.2}%",
+                                    stats.max_failure_rate
+                                ));
                                 ui.label(format!("Avg duration: {:.1}ms", stats.avg_duration_ms()));
                                 ui.label(format!("Threshold hits: {}", stats.threshold_hits));
                             });
                         }
-                        
+
                         if let Some(err) = last_error {
                             ui.colored_label(egui::Color32::RED, &err);
                         }
@@ -651,7 +680,10 @@ fn main() -> eframe::Result<()> {
                         if let Some(ref err) = c.error {
                             ui.colored_label(egui::Color32::RED, format!("error: {}", err));
                         }
-                        ui.label(format!("bytes_up: {:.0}  bytes_down: {:.0}", c.bytes_up, c.bytes_down));
+                        ui.label(format!(
+                            "bytes_up: {:.0}  bytes_down: {:.0}",
+                            c.bytes_up, c.bytes_down
+                        ));
                     } else {
                         ui.label("Selected connection not found");
                     }
@@ -714,7 +746,10 @@ fn main() -> eframe::Result<()> {
                                 if let Some(c) = acc.conns.get(conn_id) {
                                     row.col(|ui| {
                                         let is_selected = selected == Some(c.id);
-                                        if ui.selectable_label(is_selected, format!("{}", c.id.0)).clicked() {
+                                        if ui
+                                            .selectable_label(is_selected, format!("{}", c.id.0))
+                                            .clicked()
+                                        {
                                             *selected_conn.lock().unwrap() = Some(c.id);
                                         }
                                     });
@@ -733,16 +768,14 @@ fn main() -> eframe::Result<()> {
                                         ui.label(&dest_label);
                                     });
 
-                                    row.col(|ui| {
-                                        match (&c.dns_query, &c.dns_response) {
-                                            (Some(q), Some(r)) => {
-                                                ui.label(format!("{} -> {}", q, r));
-                                            }
-                                            (Some(q), None) => {
-                                                ui.label(format!("{} -> …", q));
-                                            }
-                                            _ => {}
+                                    row.col(|ui| match (&c.dns_query, &c.dns_response) {
+                                        (Some(q), Some(r)) => {
+                                            ui.label(format!("{} -> {}", q, r));
                                         }
+                                        (Some(q), None) => {
+                                            ui.label(format!("{} -> …", q));
+                                        }
+                                        _ => {}
                                     });
 
                                     row.col(|ui| {
@@ -756,7 +789,10 @@ fn main() -> eframe::Result<()> {
                                         } else {
                                             egui::Color32::GREEN
                                         };
-                                        ui.colored_label(color, format_duration_us(c.dispatch_us as f64));
+                                        ui.colored_label(
+                                            color,
+                                            format_duration_us(c.dispatch_us as f64),
+                                        );
                                     });
 
                                     row.col(|ui| {
@@ -808,7 +844,10 @@ fn main() -> eframe::Result<()> {
                                                 if resp.starts_with("err:") {
                                                     ui.colored_label(egui::Color32::RED, "error");
                                                 } else {
-                                                    ui.colored_label(egui::Color32::GREEN, "resolved");
+                                                    ui.colored_label(
+                                                        egui::Color32::GREEN,
+                                                        "resolved",
+                                                    );
                                                 }
                                             }
                                             // If no response yet, show nothing (pending).
@@ -954,9 +993,9 @@ impl BurstTestStats {
 }
 
 enum PingRequest {
-    Single(String, String),  // domain, dns_address
-    Batch(Vec<String>, String),  // domains, dns_address
-    BurstTest(String),  // dns_address
+    Single(String, String),     // domain, dns_address
+    Batch(Vec<String>, String), // domains, dns_address
+    BurstTest(String),          // dns_address
 }
 
 fn now_epoch_us() -> u64 {

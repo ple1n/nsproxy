@@ -3,14 +3,14 @@ use winit::raw_window_handle::RawDisplayHandle;
 
 use alacritty_terminal::term::ClipboardType;
 
-#[cfg(any(feature = "x11", target_os = "macos", windows))]
-use copypasta::ClipboardContext;
-use copypasta::ClipboardProvider;
 use copypasta::nop_clipboard::NopClipboardContext;
 #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
 use copypasta::wayland_clipboard;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use copypasta::x11_clipboard::{Primary as X11SelectionClipboard, X11ClipboardContext};
+#[cfg(any(feature = "x11", target_os = "macos", windows))]
+use copypasta::ClipboardContext;
+use copypasta::ClipboardProvider;
 
 pub struct Clipboard {
     clipboard: Box<dyn ClipboardProvider>,
@@ -25,8 +25,11 @@ impl Clipboard {
                 let (selection, clipboard) = unsafe {
                     wayland_clipboard::create_clipboards_from_external(display.display.as_ptr())
                 };
-                Self { clipboard: Box::new(clipboard), selection: Some(Box::new(selection)) }
-            },
+                Self {
+                    clipboard: Box::new(clipboard),
+                    selection: Some(Box::new(selection)),
+                }
+            }
             _ => Self::default(),
         }
     }
@@ -34,19 +37,27 @@ impl Clipboard {
     /// Used for tests, to handle missing clipboard provider when built without the `x11`
     /// feature, and as default clipboard value.
     pub fn new_nop() -> Self {
-        Self { clipboard: Box::new(NopClipboardContext::new().unwrap()), selection: None }
+        Self {
+            clipboard: Box::new(NopClipboardContext::new().unwrap()),
+            selection: None,
+        }
     }
 }
 
 impl Default for Clipboard {
     fn default() -> Self {
         #[cfg(any(target_os = "macos", windows))]
-        return Self { clipboard: Box::new(ClipboardContext::new().unwrap()), selection: None };
+        return Self {
+            clipboard: Box::new(ClipboardContext::new().unwrap()),
+            selection: None,
+        };
 
         #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
         return Self {
             clipboard: Box::new(ClipboardContext::new().unwrap()),
-            selection: Some(Box::new(X11ClipboardContext::<X11SelectionClipboard>::new().unwrap())),
+            selection: Some(Box::new(
+                X11ClipboardContext::<X11SelectionClipboard>::new().unwrap(),
+            )),
         };
 
         #[cfg(not(any(feature = "x11", target_os = "macos", windows)))]
@@ -77,7 +88,7 @@ impl Clipboard {
             Err(err) => {
                 debug!("Unable to load text from clipboard: {err}");
                 String::new()
-            },
+            }
             Ok(text) => text,
         }
     }

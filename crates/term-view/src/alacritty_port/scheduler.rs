@@ -47,7 +47,10 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(event_proxy: EventSender) -> Self {
-        Self { timers: VecDeque::new(), event_proxy }
+        Self {
+            timers: VecDeque::new(),
+            event_proxy,
+        }
     }
 
     /// Process all pending timers.
@@ -85,7 +88,15 @@ impl Scheduler {
         // Set the automatic event repeat rate.
         let interval = if repeat { Some(interval) } else { None };
 
-        self.timers.insert(index, Timer { interval, deadline, event, id: timer_id });
+        self.timers.insert(
+            index,
+            Timer {
+                interval,
+                deadline,
+                event,
+                id: timer_id,
+            },
+        );
     }
 
     /// Cancel a scheduled event.

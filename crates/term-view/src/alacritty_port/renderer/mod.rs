@@ -1,24 +1,24 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::{fmt, ptr};
 
 use ahash::RandomState;
 use crossfont::Metrics;
 use glutin::context::{ContextApi, GlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
-use log::{LevelFilter, debug, info};
+use log::{debug, info, LevelFilter};
 use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 
 use crate::config::debug::RendererPreference;
-use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
@@ -59,10 +59,10 @@ impl fmt::Display for Error {
         match self {
             Error::Shader(err) => {
                 write!(f, "There was an error initializing the shaders: {err}")
-            },
+            }
             Error::Other(err) => {
                 write!(f, "{err}")
-            },
+            }
         }
     }
 }
@@ -102,10 +102,10 @@ fn gl_get_string(
         match gl::GetError() {
             gl::NO_ERROR if !string_ptr.is_null() => {
                 Ok(CStr::from_ptr(string_ptr as *const _).to_string_lossy())
-            },
+            }
             gl::INVALID_ENUM => {
                 Err(format!("OpenGL error requesting {description}: invalid enum").into())
-            },
+            }
             error_id => Err(format!("OpenGL error {error_id} requesting {description}").into()),
         }
     }
@@ -171,7 +171,11 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self {
+            text_renderer,
+            rect_renderer,
+            robustness,
+        })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -183,10 +187,10 @@ impl Renderer {
         match &mut self.text_renderer {
             TextRendererProvider::Gles2(renderer) => {
                 renderer.draw_cells(size_info, glyph_cache, cells)
-            },
+            }
             TextRendererProvider::Glsl3(renderer) => {
                 renderer.draw_cells(size_info, glyph_cache, cells)
-            },
+            }
         }
     }
 
@@ -249,7 +253,12 @@ impl Renderer {
         unsafe {
             // Remove padding from viewport.
             gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
-            gl::BlendFuncSeparate(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA, gl::SRC_ALPHA, gl::ONE);
+            gl::BlendFuncSeparate(
+                gl::SRC_ALPHA,
+                gl::ONE_MINUS_SRC_ALPHA,
+                gl::SRC_ALPHA,
+                gl::ONE,
+            );
         }
 
         self.rect_renderer.draw(size_info, metrics, rects);
@@ -305,7 +314,10 @@ impl Renderer {
         let mut notification_strategy = 0;
         if GlExtensions::contains("GL_KHR_robustness") {
             unsafe {
-                gl::GetIntegerv(gl::RESET_NOTIFICATION_STRATEGY_KHR, &mut notification_strategy);
+                gl::GetIntegerv(
+                    gl::RESET_NOTIFICATION_STRATEGY_KHR,
+                    &mut notification_strategy,
+                );
             }
         } else {
             notification_strategy = gl::NO_RESET_NOTIFICATION_KHR as gl::types::GLint;
@@ -358,7 +370,9 @@ impl GlExtensions {
     fn contains(extension: &str) -> bool {
         static OPENGL_EXTENSIONS: OnceLock<HashSet<&'static str, RandomState>> = OnceLock::new();
 
-        OPENGL_EXTENSIONS.get_or_init(Self::load_extensions).contains(extension)
+        OPENGL_EXTENSIONS
+            .get_or_init(Self::load_extensions)
+            .contains(extension)
     }
 
     /// Load available OpenGL extensions.

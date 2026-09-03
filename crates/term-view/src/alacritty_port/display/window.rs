@@ -10,8 +10,8 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use {
-    winit::platform::x11::{WindowAttributesExtX11, ActiveEventLoopExtX11},
     glutin::platform::x11::X11VisualInfo,
+    winit::platform::x11::{ActiveEventLoopExtX11, WindowAttributesExtX11},
 };
 
 use std::fmt::{self, Display, Formatter};
@@ -37,8 +37,8 @@ use winit::window::{
 use alacritty_terminal::index::Point;
 
 use crate::cli::WindowOptions;
-use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
+use crate::config::UiConfig;
 use crate::display::SizeInfo;
 
 /// Window errors.
@@ -187,7 +187,10 @@ impl Window {
 
         let scale_factor = window.scale_factor();
         log::info!("Window scale factor: {scale_factor}");
-        let is_x11 = matches!(window.window_handle().unwrap().as_raw(), RawWindowHandle::Xlib(_));
+        let is_x11 = matches!(
+            window.window_handle().unwrap().as_raw(),
+            RawWindowHandle::Xlib(_)
+        );
 
         Ok(Self {
             hold: options.terminal_options.hold,
@@ -288,7 +291,8 @@ impl Window {
 
     #[cfg(windows)]
     pub fn get_platform_window(_: &Identity, window_config: &WindowConfig) -> WindowAttributes {
-        WinitWindow::default_attributes().with_decorations(window_config.decorations != Decorations::None)
+        WinitWindow::default_attributes()
+            .with_decorations(window_config.decorations != Decorations::None)
     }
 
     #[cfg(target_os = "macos")]
@@ -320,7 +324,11 @@ impl Window {
     }
 
     pub fn set_urgent(&self, is_urgent: bool) {
-        let attention = if is_urgent { Some(UserAttentionType::Critical) } else { None };
+        let attention = if is_urgent {
+            Some(UserAttentionType::Critical)
+        } else {
+            None
+        };
 
         self.window.request_user_attention(attention);
     }
@@ -382,7 +390,8 @@ impl Window {
 
     pub fn set_fullscreen(&self, fullscreen: bool) {
         if fullscreen {
-            self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            self.window
+                .set_fullscreen(Some(Fullscreen::Borderless(None)));
         } else {
             self.window.set_fullscreen(None);
         }
@@ -434,7 +443,7 @@ impl Window {
             RawWindowHandle::AppKit(handle) => {
                 assert!(MainThreadMarker::new().is_some());
                 unsafe { handle.ns_view.cast::<NSView>().as_ref() }
-            },
+            }
             _ => return,
         };
 
@@ -477,11 +486,13 @@ fn use_srgb_color_space(window: &WinitWindow) {
         RawWindowHandle::AppKit(handle) => {
             assert!(MainThreadMarker::new().is_some());
             unsafe { handle.ns_view.cast::<NSView>().as_ref() }
-        },
+        }
         _ => return,
     };
 
     unsafe {
-        view.window().unwrap().setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+        view.window()
+            .unwrap()
+            .setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
     }
 }

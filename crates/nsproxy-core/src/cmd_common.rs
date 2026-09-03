@@ -1,12 +1,19 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
+use fs4::fs_std::FileExt;
 use nix::sched::CloneFlags;
 use nix::unistd::getresuid;
 use nsproxy_common::{NSSource, current_boot_time_secs};
+use std::io::Write;
 use tracing::warn;
 
-use crate::{NsAlive, SandboxMode, WrappedBinariesConfig, sandbox::{SandboxState, SandboxStatus}, shell::ShellPrefs, sys::NSEnter};
+use crate::{
+    NsAlive, SandboxMode, WrappedBinariesConfig,
+    sandbox::{SandboxState, SandboxStatus},
+    shell::ShellPrefs,
+    sys::NSEnter,
+};
 
 fn sanitize_ns_alive_for_current_boot(ns_meta: &Path, mut ns_alive: NsAlive) -> NsAlive {
     let current_boot = match current_boot_time_secs() {
@@ -60,7 +67,7 @@ pub fn read_ns_alive(ns_meta: &Path) -> Result<NsAlive> {
     std::fs::read_to_string(ns_meta)
         .ok()
         .and_then(|content| serde_json::from_str::<NsAlive>(&content).ok())
-    .map(|ns_alive| sanitize_ns_alive_for_current_boot(ns_meta, ns_alive))
+        .map(|ns_alive| sanitize_ns_alive_for_current_boot(ns_meta, ns_alive))
         .ok_or_else(|| anyhow!("NS data not found at {:?}", ns_meta))
 }
 
@@ -82,6 +89,18 @@ pub fn update_ns_alive<F>(ns_meta: &Path, update_fn: F) -> Result<()>
 where
     F: FnOnce(&mut NsAlive),
 {
+    if let Some(parent) = ns_meta.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = ns_meta.with_extension("json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+
     // Load existing state or use default
     let mut ns_alive = read_ns_alive_opt(ns_meta).unwrap_or_default();
 
@@ -101,9 +120,13 @@ where
         }
     }
 
-    // Persist back to disk
+    // Replace the file atomically so readers never observe partial JSON.
     let json = serde_json::to_string_pretty(&ns_alive)?;
-    std::fs::write(ns_meta, json)?;
+    let temp_path = ns_meta.with_extension("json.tmp");
+    let mut temp = std::fs::File::create(&temp_path)?;
+    temp.write_all(json.as_bytes())?;
+    temp.sync_all()?;
+    std::fs::rename(temp_path, ns_meta)?;
 
     Ok(())
 }

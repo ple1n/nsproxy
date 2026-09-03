@@ -36,4 +36,3 @@ fn merge_domains(dst: &mut DomainsSolved, src: &DomainsSolved) {
         }
     }
 }
-

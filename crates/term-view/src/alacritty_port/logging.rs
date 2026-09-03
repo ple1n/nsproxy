@@ -40,8 +40,9 @@ fn extra_log_targets() -> &'static [String] {
     static EXTRA_LOG_TARGETS: OnceLock<Vec<String>> = OnceLock::new();
 
     EXTRA_LOG_TARGETS.get_or_init(|| {
-        env::var(ALACRITTY_EXTRA_LOG_TARGETS_ENV)
-            .map_or(Vec::new(), |targets| targets.split(';').map(ToString::to_string).collect())
+        env::var(ALACRITTY_EXTRA_LOG_TARGETS_ENV).map_or(Vec::new(), |targets| {
+            targets.split(';').map(ToString::to_string).collect()
+        })
     })
 }
 
@@ -82,7 +83,12 @@ impl Logger {
         let logfile = Mutex::new(OnDemandLogFile::new());
         let stdout = Mutex::new(LineWriter::new(io::stdout()));
 
-        Logger { logfile, stdout, event_proxy: Mutex::new(event_proxy), start: Instant::now() }
+        Logger {
+            logfile,
+            stdout,
+            event_proxy: Mutex::new(event_proxy),
+            start: Instant::now(),
+        }
     }
 
     fn file_path(&self) -> Option<PathBuf> {
@@ -130,7 +136,10 @@ impl log::Log for Logger {
 
     fn log(&self, record: &log::Record<'_>) {
         // Get target crate.
-        let index = record.target().find(':').unwrap_or_else(|| record.target().len());
+        let index = record
+            .target()
+            .find(':')
+            .unwrap_or_else(|| record.target().len());
         let target = &record.target()[..index];
 
         // Only log our own crates, except when logging at Level::Trace.
@@ -162,7 +171,13 @@ fn create_log_message(record: &log::Record<'_>, target: &str, start: Instant) ->
     let runtime = start.elapsed();
     let secs = runtime.as_secs();
     let nanos = runtime.subsec_nanos();
-    let mut message = format!("[{}.{:0>9}s] [{:<5}] [{}] ", secs, nanos, record.level(), target);
+    let mut message = format!(
+        "[{}.{:0>9}s] [{:<5}] [{}] ",
+        secs,
+        nanos,
+        record.level(),
+        target
+    );
 
     // Alignment for the lines after the first new line character in the payload. We don't deal
     // with fullwidth/unicode chars here, so just `message.len()` is sufficient.
@@ -202,7 +217,11 @@ impl OnDemandLogFile {
         // Set log path as an environment variable.
         unsafe { env::set_var(ALACRITTY_LOG_ENV, path.as_os_str()) };
 
-        OnDemandLogFile { path, file: None, created: Arc::new(AtomicBool::new(false)) }
+        OnDemandLogFile {
+            path,
+            file: None,
+            created: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn file(&mut self) -> Result<&mut LineWriter<File>, io::Error> {
@@ -213,19 +232,25 @@ impl OnDemandLogFile {
 
         // Create the file if it doesn't exist yet.
         if self.file.is_none() {
-            let file = OpenOptions::new().append(true).create_new(true).open(&self.path);
+            let file = OpenOptions::new()
+                .append(true)
+                .create_new(true)
+                .open(&self.path);
 
             match file {
                 Ok(file) => {
                     self.file = Some(io::LineWriter::new(file));
                     self.created.store(true, Ordering::Relaxed);
-                    let _ =
-                        writeln!(io::stdout(), "Created log file at \"{}\"", self.path.display());
-                },
+                    let _ = writeln!(
+                        io::stdout(),
+                        "Created log file at \"{}\"",
+                        self.path.display()
+                    );
+                }
                 Err(e) => {
                     let _ = writeln!(io::stdout(), "Unable to create log file: {e}");
                     return Err(e);
-                },
+                }
             }
         }
 

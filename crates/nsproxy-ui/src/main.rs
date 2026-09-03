@@ -20,12 +20,12 @@ use nsproxy_core::uplink::{
     uplink_proxy_default_udp_expected, UplinkHub, UplinkProxy, UplinkStatsState,
 };
 use nsproxy_core::{
-    DbusMode, HotConfig, INTERNAL_RESOLV_CONF_DNS, LaunchableApp, NsAlive, ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig, default_hotconfig, state_paths,
+    default_hotconfig, state_paths, DbusMode, HotConfig, HotVeth, LaunchableApp, NsAlive,
+    ProfileChmod, ProfileMount, Rootfs, SandboxMode, TemplateConfig, INTERNAL_RESOLV_CONF_DNS,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -33,10 +33,136 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const PROCESS_LOG_EDITOR_MAX_BYTES: usize = 64 * 1024;
+const PROCESS_LOG_EDITOR_COMPACT_AFTER_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct ProcessLogTextBuffer {
+    text: String,
+    visible_start: usize,
+}
+
+impl ProcessLogTextBuffer {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.visible_start = 0;
+    }
+
+    fn append_line(&mut self, content: &str) {
+        if self.visible_start < self.text.len() {
+            self.text.push('\n');
+        }
+        let mut remaining = content;
+        while !remaining.is_empty() {
+            match remaining.find('\x1b') {
+                Some(0) if remaining.starts_with("\x1b[") => {
+                    let rest = &remaining[2..];
+                    if let Some(m_pos) = rest.find('m') {
+                        remaining = &rest[m_pos + 1..];
+                    } else {
+                        break;
+                    }
+                }
+                Some(0) => remaining = &remaining[1..],
+                Some(esc_pos) => {
+                    self.append_visible_text(&remaining[..esc_pos]);
+                    remaining = &remaining[esc_pos..];
+                }
+                None => {
+                    self.append_visible_text(remaining);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn append_visible_text(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        if content.len() >= PROCESS_LOG_EDITOR_MAX_BYTES {
+            let mut content_start = content.len() - PROCESS_LOG_EDITOR_MAX_BYTES;
+            while !content.is_char_boundary(content_start) {
+                content_start += 1;
+            }
+            self.clear();
+            self.text.push_str(&content[content_start..]);
+            return;
+        }
+        self.text.push_str(content);
+
+        if self.text.len() - self.visible_start > PROCESS_LOG_EDITOR_MAX_BYTES {
+            self.visible_start = self.text.len() - PROCESS_LOG_EDITOR_MAX_BYTES;
+            while !self.text.is_char_boundary(self.visible_start) {
+                self.visible_start += 1;
+            }
+        }
+        if self.visible_start >= PROCESS_LOG_EDITOR_COMPACT_AFTER_BYTES {
+            self.text.drain(..self.visible_start);
+            self.visible_start = 0;
+        }
+    }
+
+    fn visible_text(&self) -> &str {
+        &self.text[self.visible_start..]
+    }
+}
+
+impl egui::TextBuffer for ProcessLogTextBuffer {
+    fn is_mutable(&self) -> bool {
+        false
+    }
+
+    fn as_str(&self) -> &str {
+        self.visible_text()
+    }
+
+    fn insert_text(&mut self, _text: &str, _char_index: usize) -> usize {
+        0
+    }
+
+    fn delete_char_range(&mut self, _char_range: std::ops::Range<usize>) {}
+
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<Self>()
+    }
+}
+
+#[cfg(test)]
+mod process_log_text_buffer_tests {
+    use super::{ProcessLogTextBuffer, PROCESS_LOG_EDITOR_MAX_BYTES};
+
+    #[test]
+    fn appends_lines_in_place() {
+        let mut buffer = ProcessLogTextBuffer::default();
+        buffer.append_line("first");
+        buffer.append_line("second");
+
+        assert_eq!(buffer.visible_text(), "first\nsecond");
+    }
+
+    #[test]
+    fn oversized_utf8_line_keeps_a_bounded_valid_suffix() {
+        let mut buffer = ProcessLogTextBuffer::default();
+        let oversized = format!("é{}", "x".repeat(PROCESS_LOG_EDITOR_MAX_BYTES));
+        buffer.append_line(&oversized);
+
+        assert_eq!(buffer.visible_text().len(), PROCESS_LOG_EDITOR_MAX_BYTES);
+        assert!(buffer.visible_text().bytes().all(|byte| byte == b'x'));
+    }
+
+    #[test]
+    fn parses_ansi_sgr_sequences_before_display() {
+        let mut buffer = ProcessLogTextBuffer::default();
+        buffer.append_line("\x1b[31mred\x1b[0m plain");
+
+        assert_eq!(buffer.visible_text(), "red plain");
+    }
+}
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use twox_hash::XxHash3_64;
 use which;
 
 mod alacritty_window;
@@ -367,14 +493,19 @@ enum TrafficSubview {
     Logs,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum LogMinLevel {
     Trace,
     Debug,
-    #[default]
     Info,
     Warn,
     Error,
+}
+
+impl Default for LogMinLevel {
+    fn default() -> Self {
+        Self::Warn
+    }
 }
 
 impl LogMinLevel {
@@ -831,11 +962,15 @@ struct App {
     hotconfig_editor_json: String,
     hotconfig_editor_error: Option<String>,
     hotconfig_editor_status: Option<String>,
+    hotconfig_veth_drafts: HashMap<ContainerName, Vec<VethDraft>>,
     selected_traffic_conn: Option<diag::ConnId>,
     traffic_subview: TrafficSubview,
     traffic_subscription_profile: Option<ContainerName>,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
+    process_log_editor_target: Option<(ContainerName, u32)>,
+    process_log_editor_next_seq: Option<u64>,
+    process_log_editor_text: ProcessLogTextBuffer,
     selected_persisted_log_file: Option<PathBuf>,
     persisted_logs_snapshot: PersistedLogsSnapshot,
     last_persisted_logs_refresh: Instant,
@@ -847,7 +982,6 @@ struct App {
     last_auto_open_logs_token: u64,
     /// Which process's SpawnArgs are currently being inspected (profile, slot-pid).
     selected_process_spawn_args: Option<(ContainerName, u32)>,
-    raw_log_show_details: bool,
     pty_sessions: HashMap<(ContainerName, u32), TermSession>,
     // Viewer sub-view state (ported from nsp-diag viewer.rs)
     viewer_ping_tx: flume::Sender<ViewerPingRequest>,
@@ -863,8 +997,6 @@ struct App {
     fps_window_start: Instant,
     fps_window_count: u32,
     last_fps: f32,
-    /// ANSI-render cache for raw process logs keyed by a fast collision-tolerant hash.
-    cached_log: HashMap<u64, Vec<egui::RichText>>,
     log_panel_min_level: LogMinLevel,
     /// State for the Manage (creation wizard) tab.
     manage_wizard: ManageWizard,
@@ -873,10 +1005,31 @@ struct App {
     action_status: Arc<Mutex<Option<String>>>,
 }
 
-fn fast_hash_value<T: Hash>(value: &T) -> u64 {
-    let mut hasher = XxHash3_64::default();
-    value.hash(&mut hasher);
-    hasher.finish()
+#[derive(Clone, Debug)]
+struct VethDraft {
+    peer: String,
+    basis_namespace: bool,
+    name: String,
+    src_ip4: String,
+    dst_ip4: String,
+    prefix_len: String,
+    add_on_start: bool,
+    submitted: bool,
+}
+
+impl Default for VethDraft {
+    fn default() -> Self {
+        Self {
+            peer: String::new(),
+            basis_namespace: false,
+            name: String::new(),
+            src_ip4: String::new(),
+            dst_ip4: String::new(),
+            prefix_len: "30".to_owned(),
+            add_on_start: false,
+            submitted: false,
+        }
+    }
 }
 
 fn load_proxies_from_persisted() -> ProxySnapshot {
@@ -1088,11 +1241,6 @@ fn refresh_run_command_preview(run_command: &mut RunCommandDraft) {
 impl App {
     fn should_refresh_persisted_logs(&self) -> bool {
         self.right_tab == RightTab::Logs
-            || (self.right_tab == RightTab::Processes
-                && self
-                    .selected_process_logs
-                    .as_ref()
-                    .is_some_and(|_| !self.selected_process_is_pty()))
     }
 
     fn request_persisted_logs_refresh(&mut self) {
@@ -1105,9 +1253,7 @@ impl App {
                     .as_ref()
                     .and_then(|(_, pid)| (!self.selected_process_is_pty()).then_some(*pid)),
                 logs_tab_visible: self.right_tab == RightTab::Logs,
-                process_logs_visible: self.right_tab == RightTab::Processes
-                    && self.selected_process_logs.is_some()
-                    && !self.selected_process_is_pty(),
+                process_logs_visible: false,
             });
         self.last_persisted_logs_refresh = Instant::now();
     }
@@ -1401,6 +1547,7 @@ impl App {
             snapshot: supervisor::SupervisorSnapshot {
                 profiles: BTreeMap::new(),
                 ui_ns: supervisor::NamespaceIndicator::default(),
+                namespace_warning: None,
                 root_daemon_connection: supervisor::ConnectionState::Disconnected,
                 root_daemon_error: None,
                 hotconfig_editor_status: None,
@@ -1434,10 +1581,14 @@ impl App {
             hotconfig_editor_json: default_hotconfig_text(),
             hotconfig_editor_error: None,
             hotconfig_editor_status: None,
+            hotconfig_veth_drafts: HashMap::new(),
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
             traffic_subscription_profile: None,
             selected_process_logs: None,
+            process_log_editor_target: None,
+            process_log_editor_next_seq: None,
+            process_log_editor_text: ProcessLogTextBuffer::default(),
             selected_persisted_log_file: None,
             persisted_logs_snapshot: PersistedLogsSnapshot::default(),
             last_persisted_logs_refresh: Instant::now() - Duration::from_secs(60),
@@ -1445,7 +1596,6 @@ impl App {
             dedicated_term_windows: HashMap::new(),
             last_auto_open_logs_token: 0,
             selected_process_spawn_args: None,
-            raw_log_show_details: false,
             pty_sessions: HashMap::new(),
             viewer_ping_tx,
             viewer_dns_config,
@@ -1460,7 +1610,6 @@ impl App {
             fps_window_start: Instant::now(),
             fps_window_count: 0,
             last_fps: 0.0,
-            cached_log: HashMap::new(),
             log_panel_min_level: LogMinLevel::default(),
             manage_wizard: ManageWizard::default(),
             action_launching: Arc::new(Mutex::new(HashSet::new())),
@@ -1791,6 +1940,27 @@ impl App {
         } else {
             self.hotconfig_editor_value = default_hotconfig();
         }
+        self.hotconfig_veth_drafts.insert(
+            self.selected_profile.clone().unwrap_or_default(),
+            self.hotconfig_editor_value
+                .veth
+                .iter()
+                .map(|veth| VethDraft {
+                    peer: if veth.dst == "this" {
+                        String::new()
+                    } else {
+                        veth.dst.clone()
+                    },
+                    basis_namespace: veth.dst == "basis",
+                    name: veth.veth_name.clone().unwrap_or_default(),
+                    src_ip4: veth.src_ip4.map(|ip| ip.to_string()).unwrap_or_default(),
+                    dst_ip4: veth.dst_ip4.map(|ip| ip.to_string()).unwrap_or_default(),
+                    prefix_len: veth.prefix_len.to_string(),
+                    add_on_start: true,
+                    submitted: false,
+                })
+                .collect(),
+        );
         self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
             .unwrap_or_else(|_| "{}".to_string());
     }
@@ -1824,9 +1994,8 @@ impl App {
         // Preserve that newer route when saving unrelated HotConfig edits.
         if let Some(route) = self.live_route_for_profile(&profile_name) {
             self.hotconfig_editor_value.route = route;
-            self.hotconfig_editor_json =
-                serde_json::to_string_pretty(&self.hotconfig_editor_value)
-                    .unwrap_or_else(|_| "{}".to_string());
+            self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
+                .unwrap_or_else(|_| "{}".to_string());
         }
 
         let content = match serde_json::to_string_pretty(&self.hotconfig_editor_value) {
@@ -2023,7 +2192,10 @@ impl App {
                 }
             }
             if let Some(text) = value.as_mut() {
-                if ui.text_edit_singleline(text).changed() {
+                if ui
+                    .add(egui::TextEdit::singleline(text).desired_width(ui.available_width()))
+                    .changed()
+                {
                     changed = true;
                 }
             }
@@ -2097,6 +2269,70 @@ impl App {
         );
 
         resp.on_hover_text("Enable Ctrl+D to remove the selected container")
+    }
+
+    fn remove_icon_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+        let color = if response.hovered() {
+            Color32::from_rgb(255, 135, 135)
+        } else {
+            Color32::from_rgb(190, 115, 115)
+        };
+
+        if response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(220, 75, 75, 65),
+            );
+        }
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            regular::X,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+
+        response.on_hover_text(tooltip)
+    }
+
+    fn validation_icon(ui: &mut egui::Ui, valid: bool, tooltip: &str) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+        let color = if valid {
+            if response.hovered() {
+                Color32::from_rgb(155, 255, 175)
+            } else {
+                Color32::LIGHT_GREEN
+            }
+        } else {
+            if response.hovered() {
+                Color32::from_rgb(255, 140, 140)
+            } else {
+                Color32::LIGHT_RED
+            }
+        };
+        if response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                if valid {
+                    Color32::from_rgba_unmultiplied(65, 205, 105, 55)
+                } else {
+                    Color32::from_rgba_unmultiplied(220, 75, 75, 65)
+                },
+            );
+        }
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if valid { regular::CHECK } else { regular::X },
+            egui::FontId::proportional(12.0),
+            color,
+        );
+        response.on_hover_text(tooltip)
     }
 
     fn render_mount_list(ui: &mut egui::Ui, mounts: &mut Vec<ProfileMount>, title: &str) -> bool {
@@ -2347,11 +2583,7 @@ impl App {
         changed
     }
 
-    fn render_virtual_dns_table(
-        ui: &mut egui::Ui,
-        hot: &mut HotConfig,
-        id_prefix: &str,
-    ) -> bool {
+    fn render_virtual_dns_table(ui: &mut egui::Ui, hot: &mut HotConfig, id_prefix: &str) -> bool {
         let mut changed = false;
         let state_id = ui.make_persistent_id((id_prefix, "virtual-dns-editor-state"));
         let snapshot = Self::snapshot_virtual_dns(hot);
@@ -2426,36 +2658,42 @@ impl App {
                             });
                             table_row.col(|ui| {
                                 let before = row.target_kind;
-                                egui::ComboBox::from_id_salt((id_prefix, "virtual-dns-kind", index))
-                                    .selected_text(match row.target_kind {
-                                        VirtualDnsTargetKind::DnsAnswer => "DNS answer",
-                                        VirtualDnsTargetKind::TunForward => "TUN forward",
-                                        VirtualDnsTargetKind::WarpFiles => "Warp files",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut row.target_kind,
-                                            VirtualDnsTargetKind::DnsAnswer,
-                                            "DNS answer",
-                                        );
-                                        ui.selectable_value(
-                                            &mut row.target_kind,
-                                            VirtualDnsTargetKind::TunForward,
-                                            "TUN forward",
-                                        );
-                                        ui.selectable_value(
-                                            &mut row.target_kind,
-                                            VirtualDnsTargetKind::WarpFiles,
-                                            "Warp files",
-                                        );
-                                    });
+                                egui::ComboBox::from_id_salt((
+                                    id_prefix,
+                                    "virtual-dns-kind",
+                                    index,
+                                ))
+                                .selected_text(match row.target_kind {
+                                    VirtualDnsTargetKind::DnsAnswer => "DNS answer",
+                                    VirtualDnsTargetKind::TunForward => "TUN forward",
+                                    VirtualDnsTargetKind::WarpFiles => "Warp files",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut row.target_kind,
+                                        VirtualDnsTargetKind::DnsAnswer,
+                                        "DNS answer",
+                                    );
+                                    ui.selectable_value(
+                                        &mut row.target_kind,
+                                        VirtualDnsTargetKind::TunForward,
+                                        "TUN forward",
+                                    );
+                                    ui.selectable_value(
+                                        &mut row.target_kind,
+                                        VirtualDnsTargetKind::WarpFiles,
+                                        "Warp files",
+                                    );
+                                });
                                 if row.target_kind != before {
                                     row.target = match row.target_kind {
                                         VirtualDnsTargetKind::DnsAnswer => "127.0.0.1".to_string(),
                                         VirtualDnsTargetKind::TunForward => {
                                             "127.0.0.1:8080".to_string()
                                         }
-                                        VirtualDnsTargetKind::WarpFiles => "/path/to/files".to_string(),
+                                        VirtualDnsTargetKind::WarpFiles => {
+                                            "/path/to/files".to_string()
+                                        }
                                     };
                                     changed = true;
                                 }
@@ -2480,7 +2718,8 @@ impl App {
                                 }
                             });
                             table_row.col(|ui| {
-                                if ui.small_button("×").clicked() {
+                                if Self::remove_icon_button(ui, "Remove virtual DNS route").clicked()
+                                {
                                     remove_ix = Some(index);
                                 }
                             });
@@ -2773,7 +3012,7 @@ impl App {
                 ui.push_id((id_prefix, "daemon", i), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("#{}", i + 1));
-                        if ui.button("Remove").clicked() {
+                        if Self::remove_icon_button(ui, "Remove daemon").clicked() {
                             remove_ix = Some(i);
                         }
                     });
@@ -2815,7 +3054,7 @@ impl App {
                         if ui.text_edit_singleline(&mut app.name).changed() {
                             changed = true;
                         }
-                        if ui.small_button("Remove").clicked() {
+                        if Self::remove_icon_button(ui, "Remove application").clicked() {
                             remove_ix = Some(i);
                         }
                     });
@@ -2952,12 +3191,7 @@ impl App {
                     .min_scrolled_height(560.0)
                     .show(&mut columns[0], |ui| {
                         ui.add_enabled_ui(false, |ui| {
-                            Self::render_hotconfig_form(
-                                ui,
-                                int_input,
-                                id_prefix,
-                                &mut display_hot,
-                            );
+                            Self::render_hotconfig_form(ui, int_input, id_prefix, &mut display_hot);
                         });
                     });
 
@@ -3133,19 +3367,7 @@ impl App {
                 {
                     changed = true;
                 }
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(regular::X)
-                                .size(11.0)
-                                .color(Color32::from_rgb(200, 100, 100)),
-                        )
-                        .small()
-                        .frame(false),
-                    )
-                    .on_hover_text("Remove argument")
-                    .clicked()
-                {
+                if Self::remove_icon_button(ui, "Remove argument").clicked() {
                     remove_ix = Some(index);
                 }
             });
@@ -4067,11 +4289,31 @@ impl eframe::App for App {
             drained_snapshots += 1;
             self.snapshot = snapshot;
         }
+
+        while let Some(update) = self.supervisor.try_recv_process_raw_log() {
+            let target = (update.profile, update.task_pgid);
+            if self.process_log_editor_target.as_ref() != Some(&target) {
+                continue;
+            }
+
+            let current_seq = self.process_log_editor_next_seq.unwrap_or_default();
+            if update.reset {
+                self.process_log_editor_text.clear();
+            }
+            let first_new = if update.reset {
+                0
+            } else {
+                current_seq.saturating_sub(update.start_seq) as usize
+            };
+            for entry in update.logs.into_iter().skip(first_new) {
+                self.process_log_editor_text.append_line(&entry.content);
+            }
+            self.process_log_editor_next_seq = Some(update.next_seq);
+        }
         if drained_snapshots > 0 {
             if let Some(target) = self.snapshot.auto_open_logs_target.as_ref() {
                 if target.token > self.last_auto_open_logs_token {
                     self.selected_process_logs = Some((target.profile.clone(), target.pid));
-                    self.request_process_logs(&target.profile, target.pid);
                     self.last_auto_open_logs_token = target.token;
                 }
             }
@@ -4087,7 +4329,10 @@ impl eframe::App for App {
                 .as_ref()
                 .is_some_and(|(profile, _)| !self.snapshot.profiles.contains_key(profile))
             {
-                self.selected_process_logs = None;
+                if let Some((profile, pid)) = self.selected_process_logs.take() {
+                    self.supervisor
+                        .send(SupervisorCommand::StopQueryRawLogs { profile, pid });
+                }
             }
             info!(
                 frame = self.ui_frame_seq,
@@ -4220,6 +4465,15 @@ impl eframe::App for App {
                     });
 
                     ui.add_space(4.0);
+
+                    if let Some(warning) = &self.snapshot.namespace_warning {
+                        ui.label(
+                            egui::RichText::new(warning)
+                                .small()
+                                .color(Color32::from_rgb(220, 170, 70)),
+                        );
+                        ui.add_space(4.0);
+                    }
 
                     render_namespace_indicator_row(
                         ui,
@@ -4527,7 +4781,9 @@ impl App {
             .collect();
 
         ui.heading("Actions");
-        ui.label("Launch configured applications and manage their live processes across containers.");
+        ui.label(
+            "Launch configured applications and manage their live processes across containers.",
+        );
         ui.add_space(8.0);
 
         if apps.is_empty() {
@@ -4541,51 +4797,55 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             for (container, app) in &apps {
-                    let running = self
-                        .snapshot
-                        .profiles
-                        .get(container)
-                        .and_then(|profile| profile.process_list_snapshot.as_ref())
-                        .is_some_and(|list| {
-                            list.procs.values().any(|entry| {
-                                matches!(entry.status, diag::ProcessStatus::Alive)
-                                    && matches!(
-                                        &entry.meta,
-                                        diag::SpawnedEntry::Args(args)
-                                            | diag::SpawnedEntry::Pty(args)
-                                            if args.application.as_deref() == Some(app.name.as_str())
-                                    )
-                            })
-                        });
-                    let launching = self
-                        .action_launching
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains(&(container.clone(), app.name.clone()));
-                    let configured = !app.name.trim().is_empty()
-                        && app.command.shell.as_ref().is_some_and(|shell| !shell.trim().is_empty());
-                    // Only lifecycle state disables an Actions card. Configuration
-                    // errors are reported after a click, so an unlaunched app is
-                    // always actionable as promised by the Actions workflow.
-                    let enabled = !running && !launching;
-                    let status = if running {
-                        "Already launched"
-                    } else if launching {
-                        "Launching"
-                    } else if !configured {
-                        "Configure a command shell in Hotconfig"
-                    } else if app.description.trim().is_empty() {
-                        "Launch application"
-                    } else {
-                        app.description.as_str()
-                    };
-                    if action_app_card(ui, &app.name, container, enabled, running)
-                        .on_hover_text(status)
-                        .clicked()
-                    {
-                        launch_request = Some((container.clone(), app.clone()));
-                    }
+                let running = self
+                    .snapshot
+                    .profiles
+                    .get(container)
+                    .and_then(|profile| profile.process_list_snapshot.as_ref())
+                    .is_some_and(|list| {
+                        list.procs.values().any(|entry| {
+                            matches!(entry.status, diag::ProcessStatus::Alive)
+                                && matches!(
+                                    &entry.meta,
+                                    diag::SpawnedEntry::Args(args)
+                                        | diag::SpawnedEntry::Pty(args)
+                                        if args.application.as_deref() == Some(app.name.as_str())
+                                )
+                        })
+                    });
+                let launching = self
+                    .action_launching
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&(container.clone(), app.name.clone()));
+                let configured = !app.name.trim().is_empty()
+                    && app
+                        .command
+                        .shell
+                        .as_ref()
+                        .is_some_and(|shell| !shell.trim().is_empty());
+                // Only lifecycle state disables an Actions card. Configuration
+                // errors are reported after a click, so an unlaunched app is
+                // always actionable as promised by the Actions workflow.
+                let enabled = !running && !launching;
+                let status = if running {
+                    "Already launched"
+                } else if launching {
+                    "Launching"
+                } else if !configured {
+                    "Configure a command shell in Hotconfig"
+                } else if app.description.trim().is_empty() {
+                    "Launch application"
+                } else {
+                    app.description.as_str()
+                };
+                if action_app_card(ui, &app.name, container, enabled, running)
+                    .on_hover_text(status)
+                    .clicked()
+                {
+                    launch_request = Some((container.clone(), app.clone()));
                 }
+            }
         });
 
         if let Some((container, app)) = launch_request {
@@ -4645,7 +4905,10 @@ impl App {
         let launching = self.action_launching.clone();
         let status = self.action_status.clone();
         let Some(runtime) = self.tokio_rt.as_ref() else {
-            launching.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            launching
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             *status.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some("Tokio runtime is unavailable.".to_string());
             return;
@@ -4659,9 +4922,15 @@ impl App {
                 Ok(task_pgid)
             }
             .await;
-            launching.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            launching
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(match result {
-                Ok(task_pgid) => format!("{} launched in {} (task PGID {}).", name, profile, task_pgid),
+                Ok(task_pgid) => format!(
+                    "{} launched in {} (task PGID {}).",
+                    name, profile, task_pgid
+                ),
                 Err(err) => format!("{} failed to launch in {}: {}", name, profile, err),
             });
         });
@@ -6012,19 +6281,21 @@ impl App {
                             }
                         });
 
-                        // Logs button
+                        // Raw logs are available only for stdout/stderr processes.
                         row.col(|ui| {
-                            let is_selected = self
-                                .selected_process_logs
-                                .as_ref()
-                                .map(|(p, pid)| p == row_profile && *pid == *slot_pid)
-                                .unwrap_or(false);
-                            let btn_text = if is_selected { "Close" } else { "Logs" };
-                            if ui.small_button(btn_text).clicked() {
-                                if is_selected {
-                                    self.selected_process_logs = None;
-                                } else {
-                                    logs_request = Some((row_profile.clone(), *slot_pid));
+                            if !matches!(&entry.meta, diag::SpawnedEntry::Pty(_)) {
+                                let is_selected = self
+                                    .selected_process_logs
+                                    .as_ref()
+                                    .map(|(p, pid)| p == row_profile && *pid == *slot_pid)
+                                    .unwrap_or(false);
+                                let btn_text = if is_selected { "Close" } else { "Logs" };
+                                if ui.small_button(btn_text).clicked() {
+                                    if is_selected {
+                                        self.selected_process_logs = None;
+                                    } else {
+                                        logs_request = Some((row_profile.clone(), *slot_pid));
+                                    }
                                 }
                             }
                         });
@@ -6091,8 +6362,7 @@ impl App {
             self.selected_process_spawn_args = Some((profile, pid));
         }
         if let Some((profile, pid)) = logs_request {
-            self.selected_process_logs = Some((profile.clone(), pid));
-            self.request_process_logs(&profile, pid);
+            self.selected_process_logs = Some((profile, pid));
         }
         if let Some((profile, pid, title)) = open_dedicated_pty_request {
             self.open_dedicated_pty_window(profile, pid, title);
@@ -6207,6 +6477,11 @@ impl App {
                 profile: profile.clone(),
                 pid,
                 limit: self.process_ringbuf_limit(profile, pid),
+                after_seq: self
+                    .process_log_editor_target
+                    .as_ref()
+                    .filter(|target| target.0 == *profile && target.1 == pid)
+                    .and(self.process_log_editor_next_seq),
             });
         }
     }
@@ -6352,17 +6627,13 @@ impl App {
         };
         let profile = selected_profile.clone();
         let slot_pid = *selected_slot_pid;
-        let persisted_logs = self
-            .persisted_logs_snapshot
-            .entries_by_pid
-            .get(&slot_pid)
-            .cloned()
-            .unwrap_or_default();
-        let visible_persisted_logs = persisted_logs
-            .iter()
-            .filter(|entry| self.log_panel_min_level.matches(&entry.log.level))
-            .collect::<Vec<_>>();
-
+        let target = (profile.clone(), slot_pid);
+        if self.process_log_editor_target.as_ref() != Some(&target) {
+            self.process_log_editor_target = Some(target);
+            self.process_log_editor_next_seq = None;
+            self.process_log_editor_text.clear();
+            self.request_process_logs(&profile, slot_pid);
+        }
         ui.add_space(8.0);
         ui.add_space(4.0);
 
@@ -6370,204 +6641,43 @@ impl App {
             ui.heading(format!("Output — PID {slot_pid}"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Close").clicked() {
+                    self.supervisor.send(SupervisorCommand::StopQueryRawLogs {
+                        profile: profile.clone(),
+                        pid: slot_pid,
+                    });
                     self.selected_process_logs = None;
                     return;
                 }
                 if Self::refresh_button(ui, "Refresh").clicked() {
                     self.request_process_logs(&profile, slot_pid);
-                    self.request_persisted_logs_refresh();
-                }
-                let details_label = if self.raw_log_show_details {
-                    "Hide details"
-                } else {
-                    "Details"
-                };
-                if ui.small_button(details_label).clicked() {
-                    self.raw_log_show_details = !self.raw_log_show_details;
                 }
             });
         });
-
-        let show_details = self.raw_log_show_details;
-        let logs_guard = self
-            .snapshot
-            .profiles
-            .get(&profile)
-            .map(|p| p.process_raw_logs.read().unwrap_or_else(|e| e.into_inner()));
-        let cached_log = &mut self.cached_log;
 
         egui::Frame::none()
             .fill(Color32::from_gray(15))
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
-                ui.set_min_size(egui::Vec2::new(ui.available_width(), 200.0));
-                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-                let total = logs_guard
-                    .as_ref()
-                    .and_then(|logs| logs.get(&slot_pid).map(Vec::len))
-                    .unwrap_or(0);
-                egui::ScrollArea::vertical()
-                    .id_salt(format!("raw_logs_{}_{}", profile, slot_pid))
-                    .max_height(400.0)
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show_rows(ui, row_h, total, |ui, row_range| {
-                        if total == 0 {
-                            ui.colored_label(
-                                Color32::from_gray(100),
-                                "no output captured yet — click Refresh",
-                            );
-                            return;
-                        }
-                        for i in row_range {
-                            let Some(entry) = logs_guard
-                                .as_ref()
-                                .and_then(|logs| logs.get(&slot_pid))
-                                .and_then(|logs| logs.get(i))
-                            else {
-                                continue;
-                            };
-                            ui.horizontal(|ui| {
-                                if show_details {
-                                    ui.colored_label(
-                                        Color32::from_gray(90),
-                                        format_timestamp_age(entry.ts),
-                                    );
-                                    // Stream badge
-                                    let (badge, badge_color) = match entry.kind {
-                                        diag::RawLogKind::Stdout => {
-                                            ("out", Color32::from_rgb(140, 200, 140))
-                                        }
-                                        diag::RawLogKind::Stderr => {
-                                            ("err", Color32::from_rgb(220, 130, 80))
-                                        }
-                                    };
-                                    ui.colored_label(badge_color, badge);
-                                };
-                                cached_log
-                                    .entry(fast_hash_value(&entry.content))
-                                    .or_insert_with(|| egui_sgr::ansi_to_rich_text(&entry.content));
-                                if let Some(ansi_parts) =
-                                    cached_log.get(&fast_hash_value(&entry.content))
-                                {
-                                    for part in ansi_parts {
-                                        ui.label(part.clone());
-                                    }
-                                }
-                            });
-                        }
-                    });
+                ui.set_min_size(egui::vec2(ui.available_width(), 400.0));
+                let editor_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(editor_width, 388.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_height(388.0);
+                        let mut editor = CodeEditor::default()
+                            .id_source(format!("raw_logs_editor_{}_{}", profile, slot_pid))
+                            .with_rows(1)
+                            .with_theme(ColorTheme::GRUVBOX)
+                            .with_syntax(Syntax::new("text"))
+                            .with_numlines(false)
+                            .with_ui_fontsize(ui)
+                            .stick_to_bottom(true);
+                        let _ = editor.show(ui, &mut self.process_log_editor_text);
+                    },
+                );
             });
 
-        ui.add_space(10.0);
-
-        egui::Frame::none()
-            .fill(Color32::from_gray(18))
-            .inner_margin(egui::Margin::same(6))
-            .show(ui, |ui| {
-                ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
-
-                ui.horizontal(|ui| {
-                    ui.heading(format!("Saved logs — PID {slot_pid}"));
-                    ui.add_space(8.0);
-                    ui.label("Min level");
-                    egui::ComboBox::from_id_salt(("saved_log_panel_min_level", &profile, slot_pid))
-                        .selected_text(self.log_panel_min_level.label())
-                        .show_ui(ui, |ui| {
-                            for level in LogMinLevel::ALL {
-                                ui.selectable_value(
-                                    &mut self.log_panel_min_level,
-                                    level,
-                                    level.label(),
-                                );
-                            }
-                        });
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        Color32::from_gray(130),
-                        format!(
-                            "showing {} / {}",
-                            visible_persisted_logs.len(),
-                            persisted_logs.len()
-                        ),
-                    );
-                });
-
-                ui.add_space(6.0);
-
-                if persisted_logs.is_empty() {
-                    ui.colored_label(
-                        Color32::from_gray(110),
-                        "no persisted structured logs found for this pid",
-                    );
-                    return;
-                }
-
-                if visible_persisted_logs.is_empty() {
-                    ui.colored_label(
-                        Color32::from_gray(110),
-                        format!(
-                            "no saved logs at or above {}",
-                            self.log_panel_min_level.label()
-                        ),
-                    );
-                    return;
-                }
-
-                let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                egui::ScrollArea::vertical()
-                    .id_salt(format!("saved_logs_{}_{}", profile, slot_pid))
-                    .max_height(320.0)
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show_rows(ui, row_h, visible_persisted_logs.len(), |ui, row_range| {
-                        for row_index in row_range {
-                            let Some(entry) = visible_persisted_logs.get(row_index) else {
-                                continue;
-                            };
-
-                            ui.horizontal(|ui| {
-                                ui.colored_label(Color32::from_rgb(140, 140, 220), "saved");
-
-                                let level_color = match entry.log.level.as_str() {
-                                    "ERROR" => Color32::from_rgb(220, 80, 80),
-                                    "WARN" => Color32::from_rgb(210, 160, 60),
-                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                    _ => Color32::from_gray(200),
-                                };
-                                ui.colored_label(level_color, &entry.log.level);
-
-                                ui.colored_label(
-                                    Color32::from_gray(90),
-                                    format_timestamp_age(entry.log.ts),
-                                );
-
-                                ui.colored_label(
-                                    Color32::from_rgb(140, 140, 220),
-                                    format!("[{}]", entry.source_label),
-                                );
-
-                                ui.colored_label(
-                                    Color32::from_gray(100),
-                                    format!("[{}]", entry.log.target),
-                                );
-
-                                for part in egui_sgr::ansi_to_rich_text(&entry.log.message) {
-                                    ui.label(part);
-                                }
-
-                                for field in &entry.log.fields {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(
-                                        Color32::from_gray(110),
-                                        format!("{}=", field.name),
-                                    );
-                                    ui.monospace(&field.value);
-                                }
-                            });
-                        }
-                    });
-            });
     }
 
     fn render_logs_tab(&mut self, ui: &mut egui::Ui) {
@@ -8251,19 +8361,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             for (container_port, host_port) in &locals {
                 ui.horizontal(|ui| {
                     ui.label(format!("container:{} → host:{}", container_port, host_port));
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(regular::X)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(200, 100, 100)),
-                            )
-                            .small()
-                            .frame(false),
-                        )
-                        .on_hover_text("Remove")
-                        .clicked()
-                    {
+                    if Self::remove_icon_button(ui, "Remove port mapping").clicked() {
                         to_remove = Some(*container_port);
                     }
                 });
@@ -8634,6 +8732,202 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
     }
 
+    fn render_veth_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &ContainerName,
+        hot: &mut HotConfig,
+    ) -> bool {
+        let mut changed = false;
+        let known_profiles = self.snapshot.profiles.keys().cloned().collect::<HashSet<_>>();
+        let veth_status = self
+            .snapshot
+            .profiles
+            .get(profile)
+            .map(|state| state.veth_status.clone())
+            .unwrap_or_default();
+        let drafts = self
+            .hotconfig_veth_drafts
+            .entry(profile.clone())
+            .or_default();
+
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("veth pairs");
+                if ui.button("+ Add veth").clicked() {
+                    drafts.push(VethDraft {
+                        add_on_start: true,
+                        ..Default::default()
+                    });
+                    changed = true;
+                }
+                if ui.button("+ Add temp veth").clicked() {
+                    drafts.push(VethDraft::default());
+                }
+            });
+            ui.small("Create a pair between this profile and another running profile.");
+            ui.add_space(4.0);
+
+            let mut remove_ix = None;
+            for (index, draft) in drafts.iter_mut().enumerate() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.push_id(("veth-card", index), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Veth pair {}", index + 1));
+                            if ui.checkbox(&mut draft.add_on_start, "on container creation").changed() {
+                                changed = true;
+                            }
+                            if Self::remove_icon_button(ui, "Remove veth pair").clicked() {
+                                remove_ix = Some(index);
+                                changed |= draft.add_on_start;
+                            }
+                        });
+                        if let Some(status) = veth_status.get(index) {
+                            ui.colored_label(
+                                if status.success {
+                                    Color32::LIGHT_GREEN
+                                } else {
+                                    Color32::LIGHT_RED
+                                },
+                                format!(
+                                    "veth {}: {}",
+                                    if status.success { "ready" } else { "failed" },
+                                    status.detail
+                                ),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("connect to");
+                            let mut peer_changed = false;
+                            ui.add_enabled_ui(!draft.basis_namespace, |ui| {
+                                peer_changed = ui.text_edit_singleline(&mut draft.peer).changed();
+                            });
+                            if peer_changed {
+                                draft.submitted = false;
+                                changed |= draft.add_on_start;
+                            }
+                            if ui
+                                .checkbox(&mut draft.basis_namespace, "basis namespace")
+                                .changed()
+                            {
+                                draft.submitted = false;
+                                changed |= draft.add_on_start;
+                            }
+                            let peer = draft.peer.trim();
+                            let valid_peer = draft.basis_namespace
+                                || (!peer.is_empty()
+                                    && peer != profile.as_str()
+                                    && known_profiles.contains(peer));
+                            Self::validation_icon(
+                                ui,
+                                valid_peer,
+                                if valid_peer {
+                                    if draft.basis_namespace {
+                                        "Connect to the basis namespace"
+                                    } else {
+                                        "Valid target container"
+                                    }
+                                } else {
+                                    "Target must be another running container"
+                                },
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Pair name");
+                            if ui.text_edit_singleline(&mut draft.name).changed() {
+                                draft.submitted = false;
+                                changed |= draft.add_on_start;
+                            }
+                            ui.small("optional; defaults to profile names");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("IPv4 addresses");
+                            ui.text_edit_singleline(&mut draft.src_ip4);
+                            ui.label(RichText::new(regular::ARROW_RIGHT).size(12.0));
+                            ui.text_edit_singleline(&mut draft.dst_ip4);
+                            ui.small("optional; blank uses auto allocation");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Prefix length");
+                            if ui.text_edit_singleline(&mut draft.prefix_len).changed() {
+                                draft.submitted = false;
+                                changed |= draft.add_on_start;
+                            }
+                        });
+                        let peer = draft.peer.trim();
+                        let valid_peer = draft.basis_namespace
+                            || (!peer.is_empty()
+                                && peer != profile.as_str()
+                                && known_profiles.contains(peer));
+                        let valid_name = draft.name.trim().is_empty()
+                            || (draft.name.len() <= 15
+                                && draft
+                                    .name
+                                    .chars()
+                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+                        let ready = valid_peer && valid_name;
+                        let fixed_ips = draft.src_ip4.trim().is_empty()
+                            && draft.dst_ip4.trim().is_empty()
+                            || (draft.src_ip4.trim().parse::<std::net::Ipv4Addr>().is_ok()
+                                && draft.dst_ip4.trim().parse::<std::net::Ipv4Addr>().is_ok());
+                        let valid_prefix = draft.prefix_len.trim().parse::<u8>().is_ok_and(|p| p > 0 && p < 32);
+                        let ready = ready && fixed_ips && valid_prefix;
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Create veth pair"))
+                            .clicked()
+                        {
+                            self.supervisor.send(SupervisorCommand::CreateVeth {
+                                profile: profile.clone(),
+                                peer: if draft.basis_namespace {
+                                    "basis".to_string()
+                                } else {
+                                    peer.to_string()
+                                },
+                                veth_name: (!draft.name.trim().is_empty())
+                                    .then(|| draft.name.trim().to_string()),
+                            });
+                            draft.submitted = true;
+                        }
+                        if draft.submitted {
+                            ui.colored_label(Color32::LIGHT_BLUE, "Creation requested; see Logs for result.");
+                        }
+                        if draft.add_on_start {
+                            ui.small("Saved to hotconfig; retried when this container starts.");
+                        } else {
+                            ui.small("Temporary; applies only when you click Create veth pair.");
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(index) = remove_ix {
+                drafts.remove(index);
+            }
+        });
+
+        let persisted = drafts
+            .iter()
+            .filter(|draft| draft.add_on_start)
+            .map(|draft| HotVeth {
+                src: profile.clone(),
+                dst: if draft.basis_namespace {
+                    "basis".to_owned()
+                } else {
+                    draft.peer.trim().to_string()
+                },
+                veth_name: (!draft.name.trim().is_empty()).then(|| draft.name.trim().to_string()),
+                src_ip4: draft.src_ip4.trim().parse().ok(),
+                dst_ip4: draft.dst_ip4.trim().parse().ok(),
+                prefix_len: draft.prefix_len.trim().parse().unwrap_or(30),
+            })
+            .collect::<Vec<_>>();
+        if hot.veth != persisted {
+            hot.veth = persisted;
+            changed = true;
+        }
+        changed
+    }
+
     fn render_hotconfig_tab(&mut self, ui: &mut egui::Ui) {
         self.refresh_hotconfig_editor_target();
 
@@ -8643,6 +8937,12 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
 
         let profile_name = self.selected_profile.clone().unwrap_or_default();
+        let hotconfig_unsaved = self.hotconfig_editor_error.is_some()
+            || self
+                .snapshot
+                .profiles
+                .get(&profile_name)
+                .map_or(true, |profile| self.hotconfig_editor_value != profile.hotconfig);
         let (dns_state, sandbox_status, child_alive, dbus_mode) = self
             .snapshot
             .profiles
@@ -8673,6 +8973,12 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     profile: profile_name.clone(),
                     reason: "manual hotconfig action".to_string(),
                 });
+            }
+            if hotconfig_unsaved {
+                ui.colored_label(
+                    Color32::from_rgb(235, 175, 65),
+                    RichText::new("unsaved").strong(),
+                );
             }
         });
         if let Some(status) = self.effective_hotconfig_status(&profile_name) {
@@ -8751,6 +9057,11 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
         ui.add_space(6.0);
 
+        let mut hotconfig_for_veth = std::mem::take(&mut self.hotconfig_editor_value);
+        let veth_changed = self.render_veth_editor(ui, &profile_name, &mut hotconfig_for_veth);
+        self.hotconfig_editor_value = hotconfig_for_veth;
+        ui.add_space(6.0);
+
         let demo_display = self.demo_mode.then(|| {
             (
                 self.display_hotconfig(&self.hotconfig_editor_value),
@@ -8766,7 +9077,9 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             &mut self.hotconfig_editor_error,
             demo_display,
         );
-        if changed {
+        if veth_changed || changed {
+            self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
+                .unwrap_or_else(|_| "{}".to_string());
             self.hotconfig_editor_status = None;
         }
     }
@@ -9118,11 +9431,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 if cs.template.mounts.is_empty() {
                     ui.colored_label(Color32::from_gray(130), "No profile mounts configured.");
                 } else {
-                    self.render_profile_mount_list(
-                        ui,
-                        &cs.template.mounts,
-                        "state-tmpl-mounts",
-                    );
+                    self.render_profile_mount_list(ui, &cs.template.mounts, "state-tmpl-mounts");
                 }
             });
 

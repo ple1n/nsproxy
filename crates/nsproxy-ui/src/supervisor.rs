@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
 use std::{
@@ -17,17 +18,17 @@ use eframe::egui;
 use libc;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{execve, fork, ForkResult, Pid};
+use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, Watcher};
 use nsproxy_common::routing::ProxyID;
 use nsproxy_common::state_paths;
 use nsproxy_common::stats::ProxyStats;
 use nsproxy_common::NsAlive;
-use nsproxy_common::{ExactNS, NSFrom, PidPath};
+use nsproxy_common::{ExactNS, Inode, NSFrom, PidPath};
 use nsproxy_core::cmd_common::read_ns_alive;
-use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use nsproxy_core::sandbox::{SandboxStatus, read_sandbox_status};
+use nsproxy_core::sandbox::{read_sandbox_status, SandboxStatus};
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{
-    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, MainCommand, TemplateConfig,
+    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, HotVeth, MainCommand, TemplateConfig,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -185,8 +186,15 @@ impl LevelLogView {
 }
 
 pub type SharedLevelLogRings = Arc<RwLock<LevelLogView>>;
-pub type ProcessRawLogs = HashMap<u32, Vec<diag::RawLog>>;
-pub type SharedProcessRawLogs = Arc<RwLock<ProcessRawLogs>>;
+
+pub struct ProcessRawLogUpdate {
+    pub profile: ContainerName,
+    pub task_pgid: u32,
+    pub reset: bool,
+    pub start_seq: u64,
+    pub next_seq: u64,
+    pub logs: Vec<diag::RawLog>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NamespaceIndicator {
@@ -238,18 +246,23 @@ pub struct ContainerState {
     /// Used by the Traffic tab Connections sub-view.
     #[serde(skip)]
     pub conns_state: diag::ConnsState,
-    /// Raw stdout/stderr captured from managed processes, keyed by slot PID.
-    #[serde(skip)]
-    pub process_raw_logs: SharedProcessRawLogs,
     /// Raw PTY bytes received since the previous snapshot, keyed by slot PID.
     #[serde(skip)]
     pub pty_streams: HashMap<u32, Vec<u8>>,
+    pub veth_status: Vec<VethStatus>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VethStatus {
+    pub success: bool,
+    pub detail: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SupervisorSnapshot {
     pub profiles: BTreeMap<ContainerName, ContainerState>,
     pub ui_ns: NamespaceIndicator,
+    pub namespace_warning: Option<String>,
     pub root_daemon_connection: ConnectionState,
     pub root_daemon_error: Option<String>,
     pub hotconfig_editor_status: Option<EditorStatus>,
@@ -340,6 +353,11 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         args: diag::SpawnArgs,
     },
+    CreateVeth {
+        profile: ContainerName,
+        peer: ContainerName,
+        veth_name: Option<String>,
+    },
     SaveHotconfigPrivileged {
         profile: ContainerName,
         content: String,
@@ -382,12 +400,16 @@ pub enum SupervisorCommand {
         profile: ContainerName,
         task_pgid: u32,
     },
-    /// Request the most-recent raw stdout/stderr lines for a managed process.
-    /// The response is stored in `ContainerState::process_raw_logs[pid]`.
+    /// Request raw stdout/stderr lines appended after `after_seq`.
     QueryRawLogs {
         profile: ContainerName,
         pid: u32,
         limit: usize,
+        after_seq: Option<u64>,
+    },
+    StopQueryRawLogs {
+        profile: ContainerName,
+        pid: u32,
     },
     AttachPty {
         profile: ContainerName,
@@ -502,6 +524,7 @@ type SharedPtyViewportId = Arc<Mutex<Option<egui::ViewportId>>>;
 pub struct SupervisorHandle {
     cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
     snapshot_rx: std::sync::Arc<std::sync::Mutex<tokio::sync::watch::Receiver<SupervisorSnapshot>>>,
+    process_raw_log_rx: Arc<Mutex<std_mpsc::Receiver<ProcessRawLogUpdate>>>,
     pty_buf: SharedPtyBuf,
     pty_wake_state: SharedPtyWakeState,
     pty_viewport_id: SharedPtyViewportId,
@@ -513,6 +536,7 @@ impl SupervisorHandle {
         let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(SupervisorSnapshot {
             profiles: BTreeMap::new(),
             ui_ns: NamespaceIndicator::default(),
+            namespace_warning: None,
             root_daemon_connection: ConnectionState::Disconnected,
             root_daemon_error: None,
             hotconfig_editor_status: None,
@@ -524,6 +548,7 @@ impl SupervisorHandle {
             auto_open_logs_target: None,
             generated_at: SystemTime::now(),
         });
+        let (process_raw_log_tx, process_raw_log_rx) = std_mpsc::channel();
 
         let pty_buf: SharedPtyBuf = Arc::new(Mutex::new(HashMap::new()));
         let pty_wake_state: SharedPtyWakeState = Arc::new(PtyWakeState::new());
@@ -533,6 +558,7 @@ impl SupervisorHandle {
             Self {
                 cmd_tx: cmd_tx_for_self,
                 snapshot_rx: std::sync::Arc::new(std::sync::Mutex::new(snapshot_rx)),
+                process_raw_log_rx: Arc::new(Mutex::new(process_raw_log_rx)),
                 pty_buf: pty_buf.clone(),
                 pty_wake_state: pty_wake_state.clone(),
                 pty_viewport_id: pty_viewport_id.clone(),
@@ -541,6 +567,7 @@ impl SupervisorHandle {
                 cmd_tx,
                 cmd_rx,
                 snapshot_tx,
+                process_raw_log_tx,
                 ectx,
                 pty_buf,
                 pty_wake_state,
@@ -567,6 +594,10 @@ impl SupervisorHandle {
         } else {
             None
         }
+    }
+
+    pub fn try_recv_process_raw_log(&self) -> Option<ProcessRawLogUpdate> {
+        self.process_raw_log_rx.lock().ok()?.try_recv().ok()
     }
 
     pub fn current_snapshot(&self) -> Option<SupervisorSnapshot> {
@@ -605,7 +636,12 @@ impl SupervisorHandle {
     }
 
     pub async fn ensure_profile_running(&self, profile: &str) -> Result<()> {
-        if self.current_snapshot().as_ref().and_then(|snapshot| snapshot.profiles.get(profile)).is_some_and(|state| state.child_alive && state.up_connected) {
+        if self
+            .current_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.profiles.get(profile))
+            .is_some_and(|state| state.child_alive && state.up_connected)
+        {
             return Ok(());
         }
         self.send(SupervisorCommand::StartUp {
@@ -622,11 +658,7 @@ impl SupervisorHandle {
         Ok(())
     }
 
-    pub async fn spawn_managed_process(
-        &self,
-        profile: &str,
-        args: diag::SpawnArgs,
-    ) -> Result<u32> {
+    pub async fn spawn_managed_process(&self, profile: &str, args: diag::SpawnArgs) -> Result<u32> {
         let existing_slots = self
             .current_snapshot()
             .and_then(|snapshot| snapshot.profiles.get(profile).cloned())
@@ -659,18 +691,21 @@ impl SupervisorHandle {
             .get(profile)
             .and_then(|state| state.process_list_snapshot.as_ref())
             .and_then(|plist| {
-                plist.procs.iter().filter(|(task_pgid, entry)| {
-                    !existing_slots.contains(task_pgid)
-                        && matches!(entry.status, diag::ProcessStatus::Alive)
-                })
-                .max_by_key(|(_, entry)| {
-                    entry
-                        .spawned_at
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|delta| delta.as_micros())
-                        .unwrap_or(0)
-                })
-                .map(|(task_pgid, _)| *task_pgid)
+                plist
+                    .procs
+                    .iter()
+                    .filter(|(task_pgid, entry)| {
+                        !existing_slots.contains(task_pgid)
+                            && matches!(entry.status, diag::ProcessStatus::Alive)
+                    })
+                    .max_by_key(|(_, entry)| {
+                        entry
+                            .spawned_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|delta| delta.as_micros())
+                            .unwrap_or(0)
+                    })
+                    .map(|(task_pgid, _)| *task_pgid)
             })
             .context("managed process spawned but no new task pgid was observed")
     }
@@ -740,6 +775,7 @@ pub struct SupervisorTask {
     cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
     cmd_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
     snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
+    process_raw_log_tx: std_mpsc::Sender<ProcessRawLogUpdate>,
     ectx: egui::Context,
     pty_buf: SharedPtyBuf,
     pty_wake_state: SharedPtyWakeState,
@@ -753,6 +789,7 @@ impl SupervisorTask {
             self.cmd_tx.clone(),
             self.cmd_rx,
             self.snapshot_tx,
+            self.process_raw_log_tx,
             self.ectx,
             self.pty_buf,
             self.pty_wake_state,
@@ -793,6 +830,7 @@ struct CachedProfileConfig {
 
 #[derive(Debug, Clone)]
 enum PendingRootDaemonOp {
+    InitializeBasisNamespace,
     SaveHotconfig { profile: ContainerName },
     SaveProfile { profile: ContainerName },
     SaveConstants,
@@ -846,6 +884,7 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StartServe { .. } => "StartServe",
         SupervisorCommand::StopServe { .. } => "StopServe",
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
+        SupervisorCommand::CreateVeth { .. } => "CreateVeth",
         SupervisorCommand::SaveHotconfigPrivileged { .. } => "SaveHotconfigPrivileged",
         SupervisorCommand::SaveProfilePrivileged { .. } => "SaveProfilePrivileged",
         SupervisorCommand::SaveConstantsPrivileged { .. } => "SaveConstantsPrivileged",
@@ -859,6 +898,7 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::KillContainer { .. } => "KillContainer",
         SupervisorCommand::KillManagedProcess { .. } => "KillManagedProcess",
         SupervisorCommand::QueryRawLogs { .. } => "QueryRawLogs",
+        SupervisorCommand::StopQueryRawLogs { .. } => "StopQueryRawLogs",
         SupervisorCommand::AttachPty { .. } => "AttachPty",
         SupervisorCommand::DetachPty { .. } => "DetachPty",
         SupervisorCommand::PtyInput { .. } => "PtyInput",
@@ -893,10 +933,12 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::StartHotconfigDaemons { profile }
         | SupervisorCommand::OnTabOpen { profile, .. } => Some(profile.as_str()),
         SupervisorCommand::StartDaemon { profile, .. }
+        | SupervisorCommand::CreateVeth { profile, .. }
         | SupervisorCommand::RunSandbox { profile, .. }
         | SupervisorCommand::SpawnPty { profile, .. }
         | SupervisorCommand::KillManagedProcess { profile, .. }
         | SupervisorCommand::QueryRawLogs { profile, .. }
+        | SupervisorCommand::StopQueryRawLogs { profile, .. }
         | SupervisorCommand::AttachPty { profile, .. }
         | SupervisorCommand::DetachPty { profile, .. }
         | SupervisorCommand::PtyInput { profile, .. }
@@ -960,6 +1002,8 @@ struct Supervisor {
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
     event_rx: mpsc::UnboundedReceiver<SupervisorEvent>,
     snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
+    process_raw_log_tx: std_mpsc::Sender<ProcessRawLogUpdate>,
+    process_raw_log_subscription: Option<(ContainerName, u32, usize, Option<u64>)>,
     ectx: egui::Context,
     nsproxy_path: PathBuf,
     known_profiles: HashSet<ContainerName>,
@@ -974,6 +1018,8 @@ struct Supervisor {
     root_daemon_connection: ConnectionStatus,
     root_daemon_attempt: Arc<Mutex<ConnectionBackoff>>,
     pending_root_daemon_ops: HashMap<u64, PendingRootDaemonOp>,
+    initialize_basis_namespace_pending: bool,
+    namespace_warning: Option<String>,
     next_root_daemon_op_id: u64,
     hotconfig_editor_status: Option<EditorStatus>,
     profile_editor_status: Option<EditorStatus>,
@@ -984,6 +1030,7 @@ struct Supervisor {
     diag_state: HashMap<ContainerName, DiagState>,
     ns_alive_status: HashMap<ContainerName, NsAliveStatus>,
     up_logs: HashMap<ContainerName, SharedLevelLogRings>,
+    veth_status: HashMap<ContainerName, Vec<VethStatus>>,
     container_lifecycle: HashMap<ContainerName, ContainerLifecycleState>,
     up_attempt: HashMap<ContainerName, Arc<Mutex<ConnectionBackoff>>>,
     diag_attempt: HashMap<ContainerName, Arc<Mutex<ConnectionBackoff>>>,
@@ -995,8 +1042,6 @@ struct Supervisor {
     profile_ns_cache: HashMap<ContainerName, ProfileNamespaceState>,
     /// Cached namespace indicators for the UI process itself.
     ui_ns_cache: NamespaceIndicator,
-    /// Per-process raw stdout/stderr log ring (profile -> pid -> lines).
-    process_raw_logs: HashMap<ContainerName, SharedProcessRawLogs>,
     /// Shared PTY byte buffer — written here, drained by UI thread.
     pty_buf: SharedPtyBuf,
     /// Event-driven wake state for PTY readers waiting on new bytes.
@@ -1104,7 +1149,8 @@ impl Supervisor {
                     spawned.stderr_r,
                     self.event_tx.clone(),
                 );
-                self.up_start_time.insert(profile.clone(), SystemTime::now());
+                self.up_start_time
+                    .insert(profile.clone(), SystemTime::now());
                 info!(
                     profile = profile.as_str(),
                     pid = spawned.pid.as_raw(),
@@ -1136,6 +1182,7 @@ impl Supervisor {
         message: impl Into<String>,
     ) {
         let profile = match op {
+            PendingRootDaemonOp::InitializeBasisNamespace => None,
             PendingRootDaemonOp::SaveHotconfig { profile }
             | PendingRootDaemonOp::SaveProfile { profile } => Some(profile.clone()),
             PendingRootDaemonOp::SaveConstants | PendingRootDaemonOp::LoadConstants => None,
@@ -1148,6 +1195,7 @@ impl Supervisor {
             message: message.into(),
         };
         match op {
+            PendingRootDaemonOp::InitializeBasisNamespace => {}
             PendingRootDaemonOp::SaveHotconfig { .. } => {
                 self.hotconfig_editor_status = Some(status);
             }
@@ -1164,6 +1212,10 @@ impl Supervisor {
         let message = message.as_ref().to_string();
         let ops = std::mem::take(&mut self.pending_root_daemon_ops);
         for (_op_id, op) in ops {
+            if matches!(op, PendingRootDaemonOp::InitializeBasisNamespace) {
+                self.namespace_warning = Some(message.clone());
+                continue;
+            }
             let token = self.next_editor_status_token();
             self.publish_editor_status(&op, false, token, message.clone());
         }
@@ -1173,6 +1225,7 @@ impl Supervisor {
         _cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
         cmd_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
         snapshot_tx: tokio::sync::watch::Sender<SupervisorSnapshot>,
+        process_raw_log_tx: std_mpsc::Sender<ProcessRawLogUpdate>,
         ectx: egui::Context,
         pty_buf: SharedPtyBuf,
         pty_wake_state: SharedPtyWakeState,
@@ -1186,6 +1239,8 @@ impl Supervisor {
             event_tx,
             event_rx,
             snapshot_tx,
+            process_raw_log_tx,
+            process_raw_log_subscription: None,
             ectx,
             nsproxy_path: which::which("sproxy").unwrap(),
             known_profiles: HashSet::new(),
@@ -1200,6 +1255,8 @@ impl Supervisor {
             root_daemon_connection: ConnectionStatus::default(),
             root_daemon_attempt: Arc::new(Mutex::new(ConnectionBackoff::default())),
             pending_root_daemon_ops: HashMap::new(),
+            initialize_basis_namespace_pending: false,
+            namespace_warning: None,
             next_root_daemon_op_id: 1,
             hotconfig_editor_status: None,
             profile_editor_status: None,
@@ -1210,6 +1267,7 @@ impl Supervisor {
             diag_state: HashMap::new(),
             ns_alive_status: HashMap::new(),
             up_logs: HashMap::new(),
+            veth_status: HashMap::new(),
             container_lifecycle: HashMap::new(),
             up_attempt: HashMap::new(),
             diag_attempt: HashMap::new(),
@@ -1217,7 +1275,6 @@ impl Supervisor {
             ns_alive_cache: HashMap::new(),
             profile_ns_cache: HashMap::new(),
             ui_ns_cache: probe_namespace_indicator(std::process::id() as i32).unwrap_or_default(),
-            process_raw_logs: HashMap::new(),
             pty_buf,
             pty_wake_state,
             pty_viewport_id,
@@ -1310,17 +1367,21 @@ impl Supervisor {
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             // Watch the parent directory so we also catch the initial create.
-            let watch_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
+            let watch_dir = path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.clone());
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
             let mut watcher = match RecommendedWatcher::new(
                 move |res: std::result::Result<Event, notify::Error>| {
                     if let Ok(ev) = res {
-                        let relevant = matches!(
-                            ev.kind,
-                            EventKind::Modify(ModifyKind::Data(_))
-                                | EventKind::Create(_)
-                                | EventKind::Remove(_)
-                        ) && ev.paths.iter().any(|p| p.ends_with("sandbox_status.json"));
+                        let relevant =
+                            matches!(
+                                ev.kind,
+                                EventKind::Modify(ModifyKind::Data(_))
+                                    | EventKind::Create(_)
+                                    | EventKind::Remove(_)
+                            ) && ev.paths.iter().any(|p| p.ends_with("sandbox_status.json"));
                         if relevant {
                             let _ = tx.try_send(());
                         }
@@ -1330,12 +1391,18 @@ impl Supervisor {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    warn!(profile = profile.as_str(), "sandbox_status watcher init failed: {e}");
+                    warn!(
+                        profile = profile.as_str(),
+                        "sandbox_status watcher init failed: {e}"
+                    );
                     return;
                 }
             };
             if let Err(e) = watcher.watch(&watch_dir, notify::RecursiveMode::NonRecursive) {
-                warn!(profile = profile.as_str(), "sandbox_status watcher start failed: {e}");
+                warn!(
+                    profile = profile.as_str(),
+                    "sandbox_status watcher start failed: {e}"
+                );
                 return;
             }
             while rx.recv().await.is_some() {
@@ -1379,11 +1446,7 @@ impl Supervisor {
     /// Merge the route held by the live serve process into a configuration
     /// being persisted. This avoids overwriting a proxy selection with the
     /// independent HotConfig editor copy.
-    fn merge_live_route_into_hotconfig(
-        &self,
-        profile: &ContainerName,
-        hotconfig: &mut HotConfig,
-    ) {
+    fn merge_live_route_into_hotconfig(&self, profile: &ContainerName, hotconfig: &mut HotConfig) {
         let Some(routing) = self
             .diag_state
             .get(profile)
@@ -1413,9 +1476,7 @@ impl Supervisor {
                 plain_log_entry(
                     "INFO",
                     "supervisor",
-                    format!(
-                        "Skipping sandbox reconcile ({reason}): container is not running yet"
-                    ),
+                    format!("Skipping sandbox reconcile ({reason}): container is not running yet"),
                 ),
             );
             return;
@@ -1504,6 +1565,87 @@ impl Supervisor {
         }
     }
 
+    fn spawn_veth(
+        &mut self,
+        profile: &ContainerName,
+        spec: HotVeth,
+        reason: &str,
+    ) {
+        let cli = Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: None,
+            cmd: MainCommand::Veth {
+                src: spec.src.parse().unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
+                dst: spec.dst.parse().unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
+                veth_name: spec.veth_name,
+                src_ip4: spec.src_ip4,
+                dst_ip4: spec.dst_ip4,
+                prefix_len: spec.prefix_len,
+                log: None,
+            },
+        };
+        self.veth_status.insert(
+            profile.clone(),
+            vec![VethStatus {
+                success: true,
+                detail: format!("creation requested ({reason})"),
+            }],
+        );
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+            Ok(spawned) => {
+                spawn_child_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stdout,
+                    spawned.stdout_r,
+                    self.event_tx.clone(),
+                    |profile, stream, line| SupervisorEvent::VethProcessLog {
+                        profile,
+                        stream,
+                        line,
+                    },
+                );
+                spawn_child_log_reader(
+                    profile.clone(),
+                    BootstrapLogStream::Stderr,
+                    spawned.stderr_r,
+                    self.event_tx.clone(),
+                    |profile, stream, line| SupervisorEvent::VethProcessLog {
+                        profile,
+                        stream,
+                        line,
+                    },
+                );
+                spawn_child_waiter(
+                    profile.clone(),
+                    spawned.pid,
+                    self.event_tx.clone(),
+                    |profile, success, detail| SupervisorEvent::VethFinished {
+                        profile,
+                        success,
+                        detail,
+                    },
+                );
+            }
+            Err(err) => {
+                let detail = format!("failed to start veth command: {err}");
+                self.veth_status.insert(
+                    profile.clone(),
+                    vec![VethStatus {
+                        success: false,
+                        detail: detail.clone(),
+                    }],
+                );
+                push_up_log(
+                    &mut self.up_logs,
+                    profile,
+                    plain_log_entry("WARN", "veth", detail),
+                );
+            }
+        }
+    }
+
     /// Send `EnsureDbus` to sp up for `profile` if:
     /// - the profile has `dbus: container` in TemplateConfig
     /// - the persisted sandbox status shows the sandbox is already `Pivoted`
@@ -1573,6 +1715,9 @@ impl Supervisor {
                 }
             });
         }
+        let mut process_raw_log_poll = tokio::time::interval(std::time::Duration::from_secs(1));
+        process_raw_log_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        process_raw_log_poll.tick().await;
         loop {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -1582,7 +1727,10 @@ impl Supervisor {
                     // coalescing pty_repaint_notify task via repaint_pty_target()).
                     let needs_snapshot = !matches!(
                         cmd,
-                        SupervisorCommand::PtyInput { .. } | SupervisorCommand::PtyResize { .. }
+                        SupervisorCommand::PtyInput { .. }
+                            | SupervisorCommand::PtyResize { .. }
+                            | SupervisorCommand::QueryRawLogs { .. }
+                            | SupervisorCommand::StopQueryRawLogs { .. }
                     );
                     self.handle_command(cmd).await;
                     if needs_snapshot {
@@ -1596,11 +1744,27 @@ impl Supervisor {
                         self.emit_snapshot();
                     }
                 }
+                _ = process_raw_log_poll.tick(), if self.process_raw_log_subscription.is_some() => {
+                    self.poll_process_raw_logs();
+                }
                 else => break,
             }
         }
         info!("supervisor run loop exiting");
         Ok(())
+    }
+
+    fn poll_process_raw_logs(&self) {
+        let Some((profile, pid, limit, after_seq)) = &self.process_raw_log_subscription else {
+            return;
+        };
+        if let Some(tx) = self.up_cmd.get(profile) {
+            let _ = tx.send(diag::DaemonRequest::QueryRawLogs {
+                task_pgid: *pid,
+                limit: *limit,
+                after_seq: *after_seq,
+            });
+        }
     }
 
     async fn handle_command(&mut self, cmd: SupervisorCommand) {
@@ -1696,6 +1860,24 @@ impl Supervisor {
                     let _ = tx.send(diag::DaemonRequest::Spawn { args });
                 }
             }
+            SupervisorCommand::CreateVeth {
+                profile,
+                peer,
+                veth_name,
+            } => {
+                self.spawn_veth(
+                    &profile,
+                    HotVeth {
+                        src: profile.clone(),
+                        dst: peer,
+                        veth_name,
+                        src_ip4: None,
+                        dst_ip4: None,
+                        prefix_len: 30,
+                    },
+                    "temporary",
+                );
+            }
             SupervisorCommand::SaveHotconfigPrivileged { profile, content } => {
                 let content = match serde_json::from_str::<HotConfig>(&content) {
                     Ok(mut hotconfig) => {
@@ -1765,7 +1947,10 @@ impl Supervisor {
                 );
             }
             SupervisorCommand::RunSandbox { profile, reason } => {
-                info!(profile = profile.as_str(), reason, "running sandbox reconcile");
+                info!(
+                    profile = profile.as_str(),
+                    reason, "running sandbox reconcile"
+                );
                 self.known_profiles.insert(profile.clone());
                 self.refresh_profile_status(&profile);
                 self.spawn_sandbox_reconcile(&profile, &reason);
@@ -1779,7 +1964,10 @@ impl Supervisor {
                 }
             }
             SupervisorCommand::DeleteContainer { profile } => {
-                info!(profile = profile.as_str(), "deleting container via sp down --rm");
+                info!(
+                    profile = profile.as_str(),
+                    "deleting container via sp down --rm"
+                );
                 push_up_log(
                     &mut self.up_logs,
                     &profile,
@@ -1829,17 +2017,18 @@ impl Supervisor {
                             profile,
                             spawned.pid,
                             self.event_tx.clone(),
-                            |profile, success, detail| {
-                                SupervisorEvent::DeleteContainerFinished {
-                                    profile,
-                                    success,
-                                    detail,
-                                }
+                            |profile, success, detail| SupervisorEvent::DeleteContainerFinished {
+                                profile,
+                                success,
+                                detail,
                             },
                         );
                     }
                     Err(err) => {
-                        warn!(profile = profile.as_str(), "failed to spawn sp down: {err:?}");
+                        warn!(
+                            profile = profile.as_str(),
+                            "failed to spawn sp down: {err:?}"
+                        );
                         push_up_log(
                             &mut self.up_logs,
                             &profile,
@@ -2010,10 +2199,16 @@ impl Supervisor {
                 self.refresh_profile_status(&profile);
             }
             SupervisorCommand::KillManagedProcess { profile, task_pgid } => {
-                info!(profile = profile.as_str(), task_pgid, "killing managed task");
+                info!(
+                    profile = profile.as_str(),
+                    task_pgid, "killing managed task"
+                );
                 if let Some(tx) = self.up_cmd.get(&profile) {
                     if tx.send(diag::DaemonRequest::Kill { task_pgid }).is_err() {
-                        warn!("failed to send kill request for {} task pgid {}", profile, task_pgid);
+                        warn!(
+                            "failed to send kill request for {} task pgid {}",
+                            profile, task_pgid
+                        );
                     }
                 }
                 self.refresh_profile_status(&profile);
@@ -2022,12 +2217,18 @@ impl Supervisor {
                 profile,
                 pid,
                 limit,
+                after_seq,
             } => {
-                if let Some(tx) = self.up_cmd.get(&profile) {
-                    let _ = tx.send(diag::DaemonRequest::QueryRawLogs {
-                        task_pgid: pid,
-                        limit,
-                    });
+                self.process_raw_log_subscription = Some((profile, pid, limit, after_seq));
+                self.poll_process_raw_logs();
+            }
+            SupervisorCommand::StopQueryRawLogs { profile, pid } => {
+                if self
+                    .process_raw_log_subscription
+                    .as_ref()
+                    .is_some_and(|active| active.0 == profile && active.1 == pid)
+                {
+                    self.process_raw_log_subscription = None;
                 }
             }
             SupervisorCommand::AttachPty { profile, pid } => {
@@ -2073,11 +2274,12 @@ impl Supervisor {
                     _ => None,
                 };
                 if let Some(proxy_id) = selected_proxy.as_ref() {
-                    self.diag_state.entry(profile.clone()).or_default().routing_state = Some(
-                        diag::RoutingState {
-                            selected_proxy: Some(proxy_id.clone()),
-                        },
-                    );
+                    self.diag_state
+                        .entry(profile.clone())
+                        .or_default()
+                        .routing_state = Some(diag::RoutingState {
+                        selected_proxy: Some(proxy_id.clone()),
+                    });
                 }
                 let _ = self.send_diag_cmd(&profile, cmd);
                 if selected_proxy.is_some() {
@@ -2128,11 +2330,17 @@ impl Supervisor {
             SupervisorCommand::Init => {
                 info!("initializing supervisor profiles from disk");
                 self.ensure_root_daemon_client();
+                self.initialize_basis_namespace_pending = true;
+                if self.root_daemon_connection.state == ConnectionState::Connected {
+                    self.initialize_basis_namespace_pending = false;
+                    self.queue_root_daemon_op(
+                        diag::RootDaemonOp::InitializeBasisNamespace,
+                        PendingRootDaemonOp::InitializeBasisNamespace,
+                    );
+                }
                 if let Ok(profile_infos) = crate::profile_loader::list_profiles() {
-                    let discovered: HashSet<_> = profile_infos
-                        .iter()
-                        .map(|info| info.name.clone())
-                        .collect();
+                    let discovered: HashSet<_> =
+                        profile_infos.iter().map(|info| info.name.clone()).collect();
                     let existing: Vec<_> = self.known_profiles.iter().cloned().collect();
                     for profile in existing {
                         if !discovered.contains(&profile) {
@@ -2398,7 +2606,8 @@ impl Supervisor {
                 // the 50 ms check fires right as the process disappears.
                 if target == ConnectionTarget::Up && state == ConnectionState::Disconnected {
                     if profile == "basic" {
-                        self.personal_runtime_state = diag::personal::PersonalRuntimeState::default();
+                        self.personal_runtime_state =
+                            diag::personal::PersonalRuntimeState::default();
                     }
                     let lc = self.container_lifecycle(&profile);
                     if matches!(
@@ -2456,17 +2665,35 @@ impl Supervisor {
                         LogSource::Up,
                         entries,
                     );
-                } else if let diag::DaemonEvent::RawLogs { task_pgid, logs } = event {
-                    self.process_raw_logs
-                        .entry(profile.clone())
-                        .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(task_pgid, logs);
+                } else if let diag::DaemonEvent::RawLogs {
+                    task_pgid,
+                    reset,
+                    start_seq,
+                    next_seq,
+                    logs,
+                } = event
+                {
+                    let _ = self.process_raw_log_tx.send(ProcessRawLogUpdate {
+                        profile: profile.clone(),
+                        task_pgid,
+                        reset,
+                        start_seq,
+                        next_seq,
+                        logs,
+                    });
+                    if let Some(active) = self.process_raw_log_subscription.as_mut() {
+                        if active.0 == profile && active.1 == task_pgid {
+                            active.3 = Some(next_seq);
+                        }
+                    }
+                    self.ectx.request_repaint();
                 } else if let diag::DaemonEvent::PtyScrollback { task_pgid, data } = event {
                     {
                         let mut guard = self.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.entry(profile.clone()).or_default().insert(task_pgid, data);
+                        guard
+                            .entry(profile.clone())
+                            .or_default()
+                            .insert(task_pgid, data);
                     }
                     self.pty_wake_state.notify_pty_data(&profile, task_pgid);
                     self.repaint_pty_target();
@@ -2480,7 +2707,7 @@ impl Supervisor {
                             .or_default()
                             .extend(data);
                     }
-                            self.pty_wake_state.notify_pty_data(&profile, task_pgid);
+                    self.pty_wake_state.notify_pty_data(&profile, task_pgid);
                     self.repaint_pty_target();
                 } else if let diag::DaemonEvent::ProcessExit { task_pgid } = event {
                     if let Some(snapshot) = self.process_list_snapshot.get_mut(&profile) {
@@ -2493,7 +2720,10 @@ impl Supervisor {
                             status.serve_alive = false;
                         }
                     }
-                } else if let diag::DaemonEvent::Personal(diag::personal::PersonalDaemonEvent::State(state)) = event {
+                } else if let diag::DaemonEvent::Personal(
+                    diag::personal::PersonalDaemonEvent::State(state),
+                ) = event
+                {
                     self.personal_runtime_state = state;
                 } else if let diag::DaemonEvent::ProcessListSnapshot(mut snapshot) = event {
                     if let Some(status) = self.ns_alive_status.get_mut(&profile) {
@@ -2502,8 +2732,7 @@ impl Supervisor {
                         let (new_serve_pid, new_serve_alive) = if snapshot.serve != 0 {
                             match snapshot.procs.get(&snapshot.serve).map(|e| &e.status) {
                                 Some(
-                                    diag::ProcessStatus::Alive
-                                    | diag::ProcessStatus::Terminating,
+                                    diag::ProcessStatus::Alive | diag::ProcessStatus::Terminating,
                                 ) => (Some(snapshot.serve as i32), true),
                                 Some(diag::ProcessStatus::Killed) | None => {
                                     (Some(snapshot.serve as i32), false)
@@ -2617,12 +2846,21 @@ impl Supervisor {
             SupervisorEvent::RootDaemonConnectionUpdate { state, error } => {
                 self.root_daemon_connection.state = state;
                 self.root_daemon_connection.last_error = error.clone();
+                if state == ConnectionState::Connected
+                    && self.initialize_basis_namespace_pending
+                {
+                    self.initialize_basis_namespace_pending = false;
+                    self.queue_root_daemon_op(
+                        diag::RootDaemonOp::InitializeBasisNamespace,
+                            PendingRootDaemonOp::InitializeBasisNamespace,
+                    );
+                }
                 if state != ConnectionState::Connected {
                     let detail = error.unwrap_or_else(|| "root daemon disconnected".to_string());
                     self.fail_inflight_root_daemon_ops(detail);
                 }
             }
-            SupervisorEvent::RootDaemonEvent { event } => {
+                    SupervisorEvent::RootDaemonEvent { event } => {
                 let pending = self.pending_root_daemon_ops.remove(&event.op_id);
                 match event.result {
                     diag::RootDaemonResult::Pong { version } => {
@@ -2638,13 +2876,27 @@ impl Supervisor {
                     diag::RootDaemonResult::ReadFile { content, .. } => {
                         self.constants_editor_content = Some(content);
                         if let Some(op) = pending.as_ref() {
-                            self.publish_editor_status(op, true, event.op_id, "loaded constants.json");
+                            self.publish_editor_status(
+                                op,
+                                true,
+                                event.op_id,
+                                "loaded constants.json",
+                            );
                         }
                     }
-                    diag::RootDaemonResult::Ok { message, profile, .. } => {
+                    diag::RootDaemonResult::NamespaceInitialized {
+                        current, basis_ns, ..
+                    } => {
+                        self.namespace_warning = (!current.ino_eq(&basis_ns))
+                            .then(|| "UI namespace differs from recorded basis".to_owned());
+                    }
+                    diag::RootDaemonResult::Ok {
+                        message, profile, ..
+                    } => {
                         if let Some(op) = pending.as_ref() {
                             self.publish_editor_status(op, true, event.op_id, message.clone());
                             match op {
+                                PendingRootDaemonOp::InitializeBasisNamespace => {}
                                 PendingRootDaemonOp::SaveHotconfig { profile } => {
                                     self.refresh_config_cache(profile);
                                     self.refresh_profile_status(profile);
@@ -2665,9 +2917,15 @@ impl Supervisor {
                             }
                         }
                     }
-                    diag::RootDaemonResult::Error { message, profile, .. } => {
+                    diag::RootDaemonResult::Error {
+                        message, profile, ..
+                    } => {
                         if let Some(op) = pending.as_ref() {
-                            self.publish_editor_status(op, false, event.op_id, message);
+                            if matches!(op, PendingRootDaemonOp::InitializeBasisNamespace) {
+                                self.namespace_warning = Some(message);
+                            } else {
+                                self.publish_editor_status(op, false, event.op_id, message);
+                            }
                         }
                     }
                 }
@@ -2807,7 +3065,10 @@ impl Supervisor {
                     );
                     self.finalize_deleted_profile_view(profile.as_str());
                 } else {
-                    warn!(profile = profile.as_str(), "container delete failed: {detail}");
+                    warn!(
+                        profile = profile.as_str(),
+                        "container delete failed: {detail}"
+                    );
                     push_up_log(
                         &mut self.up_logs,
                         &profile,
@@ -2852,6 +3113,43 @@ impl Supervisor {
                     self.maybe_ensure_dbus(&profile);
                 }
             }
+            SupervisorEvent::VethProcessLog {
+                profile,
+                stream: _stream,
+                line,
+            } => {
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    plain_log_entry("INFO", "veth", line),
+                );
+            }
+            SupervisorEvent::VethFinished {
+                profile,
+                success,
+                detail,
+            } => {
+                self.veth_status.insert(
+                    profile.clone(),
+                    vec![VethStatus {
+                        success,
+                        detail: detail.clone(),
+                    }],
+                );
+                push_up_log(
+                    &mut self.up_logs,
+                    &profile,
+                    plain_log_entry(
+                        if success { "INFO" } else { "WARN" },
+                        "veth",
+                        if success {
+                            format!("Veth creation finished ({detail})")
+                        } else {
+                            format!("Veth creation failed ({detail})")
+                        },
+                    ),
+                );
+            }
         }
     }
 
@@ -2872,7 +3170,6 @@ impl Supervisor {
         self.config_cache.remove(profile);
         self.ns_alive_cache.remove(profile);
         self.profile_ns_cache.remove(profile);
-        self.process_raw_logs.remove(profile);
         self.pending_auto_open_logs.remove(profile);
         self.sandbox_in_flight.remove(profile);
         self.pending_start_sandbox.remove(profile);
@@ -2916,7 +3213,6 @@ impl Supervisor {
         self.set_container_lifecycle(&profile.to_string(), ContainerLifecycleState::Stopped);
         self.ns_alive_cache.remove(profile);
         self.profile_ns_cache.remove(profile);
-        self.process_raw_logs.remove(profile);
         self.pending_auto_open_logs.remove(profile);
         self.up_start_time.remove(profile);
         self.spawned_daemons
@@ -2955,6 +3251,10 @@ impl Supervisor {
             }
             | SupervisorEvent::UpEvent {
                 event: diag::DaemonEvent::PtyScrollback { .. },
+                ..
+            }
+            | SupervisorEvent::UpEvent {
+                event: diag::DaemonEvent::RawLogs { .. },
                 ..
             } => false,
             SupervisorEvent::DiagEvent { profile, event } => {
@@ -3061,7 +3361,10 @@ impl Supervisor {
                         ts: diag::Timestamp::now(),
                         level: "WARN".to_string(),
                         target: "supervisor".to_string(),
-                        message: format!("{} upgrade rejected — no further retries", target.label()),
+                        message: format!(
+                            "{} upgrade rejected — no further retries",
+                            target.label()
+                        ),
                         fields: Vec::new(),
                     },
                 ),
@@ -3243,7 +3546,12 @@ impl Supervisor {
                 self.root_daemon_connection.last_error =
                     Some("root daemon channel unavailable".to_string());
                 let token = self.next_editor_status_token();
-                self.publish_editor_status(&pending, false, token, "root daemon channel unavailable");
+                self.publish_editor_status(
+                    &pending,
+                    false,
+                    token,
+                    "root daemon channel unavailable",
+                );
             }
         }
     }
@@ -3296,23 +3604,29 @@ impl Supervisor {
             // Use cached config to avoid per-event disk reads.
             // A default is produced inline when the cache entry is absent (first frame
             // before an explicit Load command populates it).
-            let (hotconfig, hotconfig_value, template, template_value, sandbox_status, template_error) =
-                if let Some(c) = self.config_cache.get(profile) {
-                    (
-                        c.hotconfig.clone(),
-                        c.hotconfig_value.clone(),
-                        c.template.clone(),
-                        c.template_value.clone(),
-                        c.sandbox_status.clone(),
-                        c.template_error.clone(),
-                    )
-                } else {
-                    let hc = HotConfig::default();
-                    let hv = serde_json::json!({});
-                    let tc = TemplateConfig::default();
-                    let tv = serde_json::json!({});
-                    (hc, hv, tc, tv, None, None)
-                };
+            let (
+                hotconfig,
+                hotconfig_value,
+                template,
+                template_value,
+                sandbox_status,
+                template_error,
+            ) = if let Some(c) = self.config_cache.get(profile) {
+                (
+                    c.hotconfig.clone(),
+                    c.hotconfig_value.clone(),
+                    c.template.clone(),
+                    c.template_value.clone(),
+                    c.sandbox_status.clone(),
+                    c.template_error.clone(),
+                )
+            } else {
+                let hc = HotConfig::default();
+                let hv = serde_json::json!({});
+                let tc = TemplateConfig::default();
+                let tv = serde_json::json!({});
+                (hc, hv, tc, tv, None, None)
+            };
 
             let ns_status = self
                 .ns_alive_status
@@ -3390,11 +3704,12 @@ impl Supervisor {
                     } else {
                         diag::ConnsState::default()
                     },
-                    process_raw_logs: self
-                        .process_raw_logs
+                    veth_status: self
+                        .veth_status
                         .get(profile)
                         .cloned()
-                        .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new()))),
+                        .or_else(|| load_veth_status_from_disk(profile))
+                        .unwrap_or_default(),
                     pty_streams: HashMap::new(),
                 },
             );
@@ -3403,6 +3718,7 @@ impl Supervisor {
         let _ = self.snapshot_tx.send(SupervisorSnapshot {
             profiles,
             ui_ns: self.ui_ns_cache.clone(),
+            namespace_warning: self.namespace_warning.clone(),
             root_daemon_connection: self.root_daemon_connection.state,
             root_daemon_error: self.root_daemon_connection.last_error.clone(),
             hotconfig_editor_status: self.hotconfig_editor_status.clone(),
@@ -3481,7 +3797,9 @@ enum SupervisorEvent {
     },
     /// `sp up` process has been confirmed dead by `kill(0)`; lifecycle transitions to Stopped.
     /// Sub-processes (sp serve, sandbox child) are owned by sp up and need no separate tracking.
-    UpDaemonExited { profile: ContainerName },
+    UpDaemonExited {
+        profile: ContainerName,
+    },
     /// Bootstrap stderr/stdout captured directly from spawned `sp up` before
     /// the up-daemon socket stream is connected.
     BootstrapUpLog {
@@ -3505,6 +3823,16 @@ enum SupervisorEvent {
         detail: String,
     },
     SandboxFinished {
+        profile: ContainerName,
+        success: bool,
+        detail: String,
+    },
+    VethProcessLog {
+        profile: ContainerName,
+        stream: BootstrapLogStream,
+        line: String,
+    },
+    VethFinished {
         profile: ContainerName,
         success: bool,
         detail: String,
@@ -4043,18 +4371,20 @@ async fn root_daemon_client_loop(
                             }
                             Ok(false) => {
                                 backoff.lock().unwrap().record_disconnect();
-                                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
-                                    state: ConnectionState::NoRetry,
-                                    error: Some(message),
-                                });
+                                let _ =
+                                    event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                        state: ConnectionState::NoRetry,
+                                        error: Some(message),
+                                    });
                                 return;
                             }
                             Err(err) => {
                                 backoff.lock().unwrap().record_disconnect();
-                                let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
-                                    state: ConnectionState::NoRetry,
-                                    error: Some(format!("failed to restart sp daemon: {err}")),
-                                });
+                                let _ =
+                                    event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
+                                        state: ConnectionState::NoRetry,
+                                        error: Some(format!("failed to restart sp daemon: {err}")),
+                                    });
                                 return;
                             }
                         }
@@ -4063,8 +4393,9 @@ async fn root_daemon_client_loop(
                     Err(err) => {
                         let err_text = err.to_string();
                         if !ROOT_DAEMON_START_ATTEMPTED.load(Ordering::Relaxed) {
-                            let restart_message =
-                                format!("root daemon initial handshake failed: {err_text}; restarting once");
+                            let restart_message = format!(
+                                "root daemon initial handshake failed: {err_text}; restarting once"
+                            );
                             let _ = event_tx.send(SupervisorEvent::RootDaemonConnectionUpdate {
                                 state: ConnectionState::Connecting,
                                 error: Some(restart_message),
@@ -4253,7 +4584,10 @@ async fn up_client_loop(
                 // record a terminal NoRetry state so we stop frantic reconnect attempts.
                 let err_str = err.to_string();
                 if err_str.contains("build hash mismatch") {
-                    info!(profile = profile.as_str(), "up daemon upgrade rejected: build hash mismatch; stopping retries");
+                    info!(
+                        profile = profile.as_str(),
+                        "up daemon upgrade rejected: build hash mismatch; stopping retries"
+                    );
                     report_connection_update(
                         &event_tx,
                         &profile,
@@ -4651,8 +4985,7 @@ fn spawn_child_log_reader<F>(
     fd: i32,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
     event_builder: F,
-)
-where
+) where
     F: Fn(ContainerName, BootstrapLogStream, String) -> SupervisorEvent + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
@@ -4688,8 +5021,7 @@ fn spawn_child_waiter<F>(
     pid: Pid,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
     event_builder: F,
-)
-where
+) where
     F: FnOnce(ContainerName, bool, String) -> SupervisorEvent + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
@@ -4744,6 +5076,21 @@ fn load_hotconfig_from_disk(profile: &ContainerName) -> Option<HotConfig> {
 
 fn load_sandbox_status_from_disk(profile: &ContainerName) -> Option<SandboxStatus> {
     read_sandbox_status(profile.as_str())
+}
+
+fn load_veth_status_from_disk(profile: &ContainerName) -> Option<Vec<VethStatus>> {
+    let content = std::fs::read_to_string(state_paths::veth_status(profile.as_str())).ok()?;
+    let snapshot = serde_json::from_str::<nsproxy_core::VethStatusSnapshot>(&content).ok()?;
+    Some(
+        snapshot
+            .entries
+            .into_iter()
+            .map(|entry| VethStatus {
+                success: entry.success,
+                detail: entry.detail,
+            })
+            .collect(),
+    )
 }
 
 fn pid_exists(pid: u32) -> bool {

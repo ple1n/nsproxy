@@ -13,31 +13,21 @@ use futures::{StreamExt, channel::mpsc, stream::TryStreamExt};
 use hardware_address::MacAddr;
 use ipnetwork::IpNetwork;
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
-use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec};
 use rtnetlink::packet_route::link::LinkAttribute;
+use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec};
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select, sync,
 };
-use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use serde::{Deserialize, Serialize};
-use tun2socks5::{
-    dns::{VirtDNSHandle},
-    flume,
-    ipstack::stream::IpStackTcpStream,
-};
+use tun2socks5::{dns::VirtDNSHandle, flume, ipstack::stream::IpStackTcpStream};
 use warp::server::accept::Accept;
 
-use crate::{
-    HotConfig,
-    HotRoute,
-    ProfileMount,
-    shell::ShellArgs,
-    tokio_netlink_conn,
-};
-use nsproxy_common::routing::{DropReason, RoutingDecision};
+use crate::{HotConfig, HotRoute, ProfileMount, shell::ShellArgs, tokio_netlink_conn};
 use diag::{DiagEvent, DiagServer, Timestamp};
+use nsproxy_common::routing::{DropReason, RoutingDecision};
 
 #[derive(Clone)]
 pub enum HotReloadTrigger {
@@ -128,9 +118,15 @@ enum ConfigChange {
     Mnt(HashMap<PathBuf, PathBuf>),
     Mounts(Vec<ProfileMount>),
     Daemons(Vec<ShellArgs>),
-    Vdns { domain: String, desired: VdnsDesired },
+    Vdns {
+        domain: String,
+        desired: VdnsDesired,
+    },
     WarpPath(PathBuf),
-    LocalForward { in_port: u32, dst_port: u32 },
+    LocalForward {
+        in_port: u32,
+        dst_port: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -218,7 +214,10 @@ async fn handle_tcp_forward_local(fd: OwnedFd, port: u32, dst_port: u32) {
     }
 }
 
-fn spawn_warp_server(path: PathBuf, acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>) -> JoinHandle<()> {
+fn spawn_warp_server(
+    path: PathBuf,
+    acceptor: flume::Receiver<(PathBuf, IpStackTcpStream)>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let filter = warp::fs::dir(path.clone());
         let wa = WarpAcceptor { path, rx: acceptor };
@@ -285,7 +284,10 @@ fn into_applied_state(desired: &DesiredHotState) -> AppliedHotState {
     }
 }
 
-fn calculate_hot_diff(current: Option<&AppliedHotState>, desired: &DesiredHotState) -> Vec<ConfigDelta> {
+fn calculate_hot_diff(
+    current: Option<&AppliedHotState>,
+    desired: &DesiredHotState,
+) -> Vec<ConfigDelta> {
     let mut ops = Vec::new();
 
     if let Some(current) = current {
@@ -561,9 +563,8 @@ async fn apply_hot_config(
 
     for delta in ops {
         if !child_apply_done && delta_requires_child_apply(&delta) {
-            refreshed_locals = Some(
-                request_local_forwarders(tx, desired_config, &requested_local_ports).await?,
-            );
+            refreshed_locals =
+                Some(request_local_forwarders(tx, desired_config, &requested_local_ports).await?);
             child_apply_done = true;
         }
 
@@ -647,7 +648,9 @@ async fn apply_hot_config(
                 change: ConfigChange::LocalForward { in_port, dst_port },
             } => {
                 if let Some(new_locals) = &mut refreshed_locals
-                    && let Some(index) = new_locals.iter().position(|(port, _, target)| *port == in_port && *target == dst_port)
+                    && let Some(index) = new_locals
+                        .iter()
+                        .position(|(port, _, target)| *port == in_port && *target == dst_port)
                 {
                     let (_, fd, dst_port) = new_locals.swap_remove(index);
                     let task = tokio::spawn(handle_tcp_forward_local(fd, in_port, dst_port));
@@ -854,7 +857,11 @@ pub async fn sync_links(child_pid: Option<u32>, devs: &HashMap<String, String>) 
 
                                     let _ = handle
                                         .link()
-                                        .set(LinkUnspec::new_with_index(msg.header.index).up().build())
+                                        .set(
+                                            LinkUnspec::new_with_index(msg.header.index)
+                                                .up()
+                                                .build(),
+                                        )
                                         .execute()
                                         .await;
                                 }

@@ -107,7 +107,11 @@ impl GlyphCache {
         // Need to load at least one glyph for the face before calling metrics.
         // The glyph requested here ('m' at the time of writing) has no special
         // meaning.
-        rasterizer.get_glyph(GlyphKey { font_key: key, character: 'm', size: font.size() })?;
+        rasterizer.get_glyph(GlyphKey {
+            font_key: key,
+            character: 'm',
+            size: font.size(),
+        })?;
 
         let mut metrics = rasterizer.metrics(key, font.size())?;
         metrics.strikeout_position += font.glyph_offset.y as f32;
@@ -119,7 +123,15 @@ impl GlyphCache {
 
         // Cache all ascii characters.
         for i in 32u8..=126u8 {
-            self.get(GlyphKey { font_key: font, character: i as char, size }, loader, true);
+            self.get(
+                GlyphKey {
+                    font_key: font,
+                    character: i as char,
+                    size,
+                },
+                loader,
+                true,
+            );
         }
     }
 
@@ -175,7 +187,7 @@ impl GlyphCache {
                 let fallback_desc =
                     Self::make_desc(Font::default().normal(), Slant::Normal, Weight::Normal);
                 rasterizer.load_font(&fallback_desc, size)
-            },
+            }
         }
     }
 
@@ -226,7 +238,10 @@ impl GlyphCache {
             // Load fallback glyph.
             Err(RasterizerError::MissingGlyph(rasterized)) if show_missing => {
                 // Use `\0` as "missing" glyph to cache it only once.
-                let missing_key = GlyphKey { character: '\0', ..glyph_key };
+                let missing_key = GlyphKey {
+                    character: '\0',
+                    ..glyph_key
+                };
                 if let Some(glyph) = self.cache.get(&missing_key) {
                     *glyph
                 } else {
@@ -236,7 +251,7 @@ impl GlyphCache {
 
                     glyph
                 }
-            },
+            }
             Err(_) => self.load_glyph(loader, Default::default()),
         };
 

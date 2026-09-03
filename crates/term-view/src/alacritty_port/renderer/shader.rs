@@ -34,10 +34,18 @@ impl ShaderProgram {
         vertex_shader: &'static str,
         fragment_shader: &'static str,
     ) -> Result<Self, ShaderError> {
-        let vertex_shader =
-            Shader::new(shader_version, shader_header, gl::VERTEX_SHADER, vertex_shader)?;
-        let fragment_shader =
-            Shader::new(shader_version, shader_header, gl::FRAGMENT_SHADER, fragment_shader)?;
+        let vertex_shader = Shader::new(
+            shader_version,
+            shader_header,
+            gl::VERTEX_SHADER,
+            vertex_shader,
+        )?;
+        let fragment_shader = Shader::new(
+            shader_version,
+            shader_header,
+            gl::FRAGMENT_SHADER,
+            fragment_shader,
+        )?;
 
         let program = unsafe { Self(gl::CreateProgram()) };
 
@@ -146,7 +154,12 @@ fn get_program_info_log(program: GLuint) -> String {
     let mut actual_length: GLint = 0;
     let mut buf: Vec<u8> = Vec::with_capacity(max_length as usize);
     unsafe {
-        gl::GetProgramInfoLog(program, max_length, &mut actual_length, buf.as_mut_ptr() as *mut _);
+        gl::GetProgramInfoLog(
+            program,
+            max_length,
+            &mut actual_length,
+            buf.as_mut_ptr() as *mut _,
+        );
     }
 
     // Build a string.
@@ -168,7 +181,12 @@ fn get_shader_info_log(shader: GLuint) -> String {
     let mut actual_length: GLint = 0;
     let mut buf: Vec<u8> = Vec::with_capacity(max_length as usize);
     unsafe {
-        gl::GetShaderInfoLog(shader, max_length, &mut actual_length, buf.as_mut_ptr() as *mut _);
+        gl::GetShaderInfoLog(
+            shader,
+            max_length,
+            &mut actual_length,
+            buf.as_mut_ptr() as *mut _,
+        );
     }
 
     // Build a string.

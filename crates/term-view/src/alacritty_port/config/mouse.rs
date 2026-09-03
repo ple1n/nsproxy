@@ -26,6 +26,9 @@ impl<'de> Deserialize<'de> for MouseBindings {
     where
         D: Deserializer<'de>,
     {
-        Ok(Self(ui_config::deserialize_bindings(deserializer, Self::default().0)?))
+        Ok(Self(ui_config::deserialize_bindings(
+            deserializer,
+            Self::default().0,
+        )?))
     }
 }

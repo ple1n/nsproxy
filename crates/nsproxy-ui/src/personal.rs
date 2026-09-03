@@ -310,7 +310,10 @@ async fn run_cinny(supervisor: SupervisorHandle, state: PersonalUiState) -> Resu
         exec: Some(exec.clone()),
         cwd: Some(cinny_cwd.clone()),
         gids: Vec::new(),
-        args: [exec].into_iter().chain(cmd.split_whitespace().map(|s| s.to_string())).collect(),
+        args: [exec]
+            .into_iter()
+            .chain(cmd.split_whitespace().map(|s| s.to_string()))
+            .collect(),
         ringbuf_size: None,
         application: None,
         ns: diag::NamespaceSpawn::Inside,
@@ -322,7 +325,10 @@ async fn run_cinny(supervisor: SupervisorHandle, state: PersonalUiState) -> Resu
     let task_pgid = supervisor
         .spawn_managed_process("basic", spawn_args)
         .await?;
-    state.set_cinny_task_pgid(Some(task_pgid), format!("cinny running as task pgid {}", task_pgid));
+    state.set_cinny_task_pgid(
+        Some(task_pgid),
+        format!("cinny running as task pgid {}", task_pgid),
+    );
     Ok(())
 }
 

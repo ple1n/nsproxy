@@ -68,8 +68,16 @@ impl<T: Eq> Binding<T> {
             return false;
         }
 
-        let selfmode = if self.mode.is_empty() { BindingMode::all() } else { self.mode };
-        let bindingmode = if binding.mode.is_empty() { BindingMode::all() } else { binding.mode };
+        let selfmode = if self.mode.is_empty() {
+            BindingMode::all()
+        } else {
+            self.mode
+        };
+        let bindingmode = if binding.mode.is_empty() {
+            BindingMode::all()
+        } else {
+            binding.mode
+        };
 
         if !selfmode.intersects(bindingmode) {
             return false;
@@ -400,11 +408,33 @@ macro_rules! bindings {
 }
 
 macro_rules! trigger {
-    (KeyBinding, $key:literal, $location:expr) => {{ BindingKey::Keycode { key: Key::Character($key.into()), location: $location } }};
-    (KeyBinding, $key:literal,) => {{ BindingKey::Keycode { key: Key::Character($key.into()), location: KeyLocation::Any } }};
-    (KeyBinding, $key:ident, $location:expr) => {{ BindingKey::Keycode { key: Key::Named(NamedKey::$key), location: $location } }};
-    (KeyBinding, $key:ident,) => {{ BindingKey::Keycode { key: Key::Named(NamedKey::$key), location: KeyLocation::Any } }};
-    (MouseBinding, $base:ident::$button:ident,) => {{ $base::$button }};
+    (KeyBinding, $key:literal, $location:expr) => {{
+        BindingKey::Keycode {
+            key: Key::Character($key.into()),
+            location: $location,
+        }
+    }};
+    (KeyBinding, $key:literal,) => {{
+        BindingKey::Keycode {
+            key: Key::Character($key.into()),
+            location: KeyLocation::Any,
+        }
+    }};
+    (KeyBinding, $key:ident, $location:expr) => {{
+        BindingKey::Keycode {
+            key: Key::Named(NamedKey::$key),
+            location: $location,
+        }
+    }};
+    (KeyBinding, $key:ident,) => {{
+        BindingKey::Keycode {
+            key: Key::Named(NamedKey::$key),
+            location: KeyLocation::Any,
+        }
+    }};
+    (MouseBinding, $base:ident::$button:ident,) => {{
+        $base::$button
+    }};
 }
 
 pub fn default_mouse_bindings() -> Vec<MouseBinding> {
@@ -670,7 +700,10 @@ impl<'a> Deserialize<'a> for BindingKey {
             Err(_) => {
                 let keycode = String::deserialize(value.clone()).map_err(D::Error::custom)?;
                 let (key, location) = if keycode.chars().count() == 1 {
-                    (Key::Character(keycode.to_lowercase().into()), KeyLocation::Any)
+                    (
+                        Key::Character(keycode.to_lowercase().into()),
+                        KeyLocation::Any,
+                    )
                 } else {
                     // Translate legacy winit codes into their modern counterparts.
                     match keycode.as_str() {
@@ -726,9 +759,10 @@ impl<'a> Deserialize<'a> for BindingKey {
                         "Numpad8" => (Key::Character("8".into()), KeyLocation::Numpad),
                         "Numpad9" => (Key::Character("9".into()), KeyLocation::Numpad),
                         "Numpad0" => (Key::Character("0".into()), KeyLocation::Numpad),
-                        _ if keycode.starts_with("Dead") => {
-                            (Key::deserialize(value).map_err(D::Error::custom)?, KeyLocation::Any)
-                        },
+                        _ if keycode.starts_with("Dead") => (
+                            Key::deserialize(value).map_err(D::Error::custom)?,
+                            KeyLocation::Any,
+                        ),
                         _ => (
                             Key::Named(NamedKey::deserialize(value).map_err(D::Error::custom)?),
                             KeyLocation::Any,
@@ -737,7 +771,7 @@ impl<'a> Deserialize<'a> for BindingKey {
                 };
 
                 Ok(BindingKey::Keycode { key, location })
-            },
+            }
         }
     }
 }
@@ -784,7 +818,10 @@ impl BindingMode {
 
 impl Default for ModeWrapper {
     fn default() -> Self {
-        Self { mode: BindingMode::empty(), not_mode: BindingMode::empty() }
+        Self {
+            mode: BindingMode::empty(),
+            not_mode: BindingMode::empty(),
+        }
     }
 }
 
@@ -808,8 +845,10 @@ impl<'a> Deserialize<'a> for ModeWrapper {
             where
                 E: de::Error,
             {
-                let mut res =
-                    ModeWrapper { mode: BindingMode::empty(), not_mode: BindingMode::empty() };
+                let mut res = ModeWrapper {
+                    mode: BindingMode::empty(),
+                    not_mode: BindingMode::empty(),
+                };
 
                 for modifier in value.split('|') {
                     match modifier.trim().to_lowercase().as_str() {
@@ -1026,27 +1065,27 @@ impl<'a> Deserialize<'a> for RawBinding {
                                         key = Some(BindingKey::Scancode(KeyCode::from_scancode(
                                             scancode,
                                         )))
-                                    },
+                                    }
                                     Err(_) => {
                                         return Err(<V::Error as Error>::custom(format!(
                                             "Invalid key binding, scancode is too big: {scancode}"
                                         )));
-                                    },
+                                    }
                                 },
                                 None => {
                                     key = Some(
                                         BindingKey::deserialize(value).map_err(V::Error::custom)?,
                                     )
-                                },
+                                }
                             }
-                        },
+                        }
                         Field::Mods => {
                             if mods.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("mods"));
                             }
 
                             mods = Some(map.next_value::<ModsWrapper>()?.into_inner());
-                        },
+                        }
                         Field::Mode => {
                             if mode.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("mode"));
@@ -1055,7 +1094,7 @@ impl<'a> Deserialize<'a> for RawBinding {
                             let mode_deserializer = map.next_value::<ModeWrapper>()?;
                             mode = Some(mode_deserializer.mode);
                             not_mode = Some(mode_deserializer.not_mode);
-                        },
+                        }
                         Field::Action => {
                             if action.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("action"));
@@ -1086,31 +1125,31 @@ impl<'a> Deserialize<'a> for RawBinding {
                                         return Err(V::Error::custom(format!(
                                             "unknown keyboard action `{value}`"
                                         )));
-                                    },
+                                    }
                                 }
                             };
-                        },
+                        }
                         Field::Chars => {
                             if chars.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("chars"));
                             }
 
                             chars = Some(map.next_value()?);
-                        },
+                        }
                         Field::Mouse => {
                             if mouse.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("mouse"));
                             }
 
                             mouse = Some(map.next_value::<MouseButtonWrapper>()?.into_inner());
-                        },
+                        }
                         Field::Command => {
                             if command.is_some() {
                                 return Err(<V::Error as Error>::duplicate_field("command"));
                             }
 
                             command = Some(map.next_value::<Program>()?);
-                        },
+                        }
                     }
                 }
 
@@ -1129,7 +1168,7 @@ impl<'a> Deserialize<'a> for RawBinding {
                             )));
                         }
                         action
-                    },
+                    }
                     (Some(action), None, None) => action,
                     (None, Some(chars), None) => Action::Esc(chars),
                     (None, None, Some(cmd)) => Action::Command(cmd),
@@ -1137,14 +1176,21 @@ impl<'a> Deserialize<'a> for RawBinding {
                         return Err(V::Error::custom(
                             "must specify exactly one of chars, action or command",
                         ));
-                    },
+                    }
                 };
 
                 if mouse.is_none() && key.is_none() {
                     return Err(V::Error::custom("bindings require mouse button or key"));
                 }
 
-                Ok(RawBinding { mode, notmode: not_mode, action, key, mouse, mods })
+                Ok(RawBinding {
+                    mode,
+                    notmode: not_mode,
+                    action,
+                    key,
+                    mouse,
+                    mods,
+                })
             }
         }
 
@@ -1272,8 +1318,10 @@ mod tests {
     #[test]
     fn binding_matches_different_action() {
         let binding = MockBinding::default();
-        let different_action =
-            MockBinding { action: Action::ClearHistory, ..MockBinding::default() };
+        let different_action = MockBinding {
+            action: Action::ClearHistory,
+            ..MockBinding::default()
+        };
 
         assert!(binding.triggers_match(&different_action));
         assert!(different_action.triggers_match(&binding));
@@ -1281,8 +1329,14 @@ mod tests {
 
     #[test]
     fn mods_binding_requires_strict_match() {
-        let superset_mods = MockBinding { mods: ModifiersState::all(), ..MockBinding::default() };
-        let subset_mods = MockBinding { mods: ModifiersState::ALT, ..MockBinding::default() };
+        let superset_mods = MockBinding {
+            mods: ModifiersState::all(),
+            ..MockBinding::default()
+        };
+        let subset_mods = MockBinding {
+            mods: ModifiersState::ALT,
+            ..MockBinding::default()
+        };
 
         assert!(!superset_mods.triggers_match(&subset_mods));
         assert!(!subset_mods.triggers_match(&superset_mods));
@@ -1290,8 +1344,14 @@ mod tests {
 
     #[test]
     fn binding_matches_identical_mode() {
-        let b1 = MockBinding { mode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
-        let b2 = MockBinding { mode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
+        let b1 = MockBinding {
+            mode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
+        let b2 = MockBinding {
+            mode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
 
         assert!(b1.triggers_match(&b2));
         assert!(b2.triggers_match(&b1));
@@ -1328,7 +1388,10 @@ mod tests {
             mode: BindingMode::ALT_SCREEN | BindingMode::APP_KEYPAD,
             ..MockBinding::default()
         };
-        let b2 = MockBinding { mode: BindingMode::APP_KEYPAD, ..MockBinding::default() };
+        let b2 = MockBinding {
+            mode: BindingMode::APP_KEYPAD,
+            ..MockBinding::default()
+        };
 
         assert!(b1.triggers_match(&b2));
         assert!(b2.triggers_match(&b1));
@@ -1351,8 +1414,14 @@ mod tests {
 
     #[test]
     fn binding_mismatches_notmode() {
-        let b1 = MockBinding { mode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
-        let b2 = MockBinding { notmode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
+        let b1 = MockBinding {
+            mode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
+        let b2 = MockBinding {
+            notmode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
 
         assert!(!b1.triggers_match(&b2));
         assert!(!b2.triggers_match(&b1));
@@ -1360,8 +1429,14 @@ mod tests {
 
     #[test]
     fn binding_mismatches_unrelated() {
-        let b1 = MockBinding { mode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
-        let b2 = MockBinding { mode: BindingMode::APP_KEYPAD, ..MockBinding::default() };
+        let b1 = MockBinding {
+            mode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
+        let b2 = MockBinding {
+            mode: BindingMode::APP_KEYPAD,
+            ..MockBinding::default()
+        };
 
         assert!(!b1.triggers_match(&b2));
         assert!(!b2.triggers_match(&b1));
@@ -1373,8 +1448,10 @@ mod tests {
             notmode: BindingMode::VI | BindingMode::APP_CURSOR,
             ..MockBinding::default()
         };
-        let superset_notmodes =
-            MockBinding { notmode: BindingMode::APP_CURSOR, ..MockBinding::default() };
+        let superset_notmodes = MockBinding {
+            notmode: BindingMode::APP_CURSOR,
+            ..MockBinding::default()
+        };
 
         assert!(subset_notmodes.triggers_match(&superset_notmodes));
         assert!(superset_notmodes.triggers_match(&subset_notmodes));
@@ -1387,7 +1464,10 @@ mod tests {
             notmode: BindingMode::APP_CURSOR,
             ..MockBinding::default()
         };
-        let b2 = MockBinding { notmode: BindingMode::APP_CURSOR, ..MockBinding::default() };
+        let b2 = MockBinding {
+            notmode: BindingMode::APP_CURSOR,
+            ..MockBinding::default()
+        };
 
         assert!(b1.triggers_match(&b2));
         assert!(b2.triggers_match(&b1));
@@ -1395,7 +1475,10 @@ mod tests {
 
     #[test]
     fn binding_trigger_input() {
-        let binding = MockBinding { trigger: 13, ..MockBinding::default() };
+        let binding = MockBinding {
+            trigger: 13,
+            ..MockBinding::default()
+        };
 
         let mods = binding.mods;
         let mode = binding.mode;
@@ -1424,7 +1507,10 @@ mod tests {
 
     #[test]
     fn binding_trigger_modes() {
-        let binding = MockBinding { mode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
+        let binding = MockBinding {
+            mode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
 
         let t = binding.trigger;
         let mods = binding.mods;
@@ -1436,7 +1522,10 @@ mod tests {
 
     #[test]
     fn binding_trigger_notmodes() {
-        let binding = MockBinding { notmode: BindingMode::ALT_SCREEN, ..MockBinding::default() };
+        let binding = MockBinding {
+            notmode: BindingMode::ALT_SCREEN,
+            ..MockBinding::default()
+        };
 
         let t = binding.trigger;
         let mods = binding.mods;

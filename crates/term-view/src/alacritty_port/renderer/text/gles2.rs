@@ -6,17 +6,17 @@ use log::info;
 
 use alacritty_terminal::term::cell::Flags;
 
-use crate::display::SizeInfo;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl;
 use crate::gl::types::*;
 use crate::renderer::shader::{ShaderProgram, ShaderVersion};
 use crate::renderer::{Error, GlExtensions};
 
-use super::atlas::{ATLAS_SIZE, Atlas};
+use super::atlas::{Atlas, ATLAS_SIZE};
 use super::{
-    Glyph, LoadGlyph, LoaderApi, RenderingGlyphFlags, RenderingPass, TextRenderApi,
-    TextRenderBatch, TextRenderer, TextShader, glsl3,
+    glsl3, Glyph, LoadGlyph, LoaderApi, RenderingGlyphFlags, RenderingPass, TextRenderApi,
+    TextRenderBatch, TextRenderer, TextShader,
 };
 
 // Shader source.
@@ -232,7 +232,10 @@ pub struct Batch {
 
 impl Batch {
     fn new() -> Self {
-        Self { tex: 0, vertices: Vec::with_capacity(BATCH_MAX) }
+        Self {
+            tex: 0,
+            vertices: Vec::with_capacity(BATCH_MAX),
+        }
     }
 
     #[inline]
@@ -291,7 +294,11 @@ impl TextRenderBatch for Batch {
             RenderingGlyphFlags::empty()
         };
 
-        let is_wide = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        let is_wide = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
 
         let mut vertex = TextVertex {
             x,
@@ -397,7 +404,8 @@ impl TextRenderApi<Batch> for RenderApi<'_> {
             gl::BlendFunc(gl::ONE, gl::ZERO);
             gl::DrawElements(gl::TRIANGLES, num_indices, gl::UNSIGNED_SHORT, ptr::null());
 
-            self.program.set_rendering_pass(RenderingPass::SubpixelPass1);
+            self.program
+                .set_rendering_pass(RenderingPass::SubpixelPass1);
             if self.dual_source_blending {
                 // Text rendering pass.
                 gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
@@ -407,12 +415,14 @@ impl TextRenderApi<Batch> for RenderApi<'_> {
                 gl::DrawElements(gl::TRIANGLES, num_indices, gl::UNSIGNED_SHORT, ptr::null());
 
                 // Second text rendering pass.
-                self.program.set_rendering_pass(RenderingPass::SubpixelPass2);
+                self.program
+                    .set_rendering_pass(RenderingPass::SubpixelPass2);
                 gl::BlendFuncSeparate(gl::ONE_MINUS_DST_ALPHA, gl::ONE, gl::ZERO, gl::ONE);
                 gl::DrawElements(gl::TRIANGLES, num_indices, gl::UNSIGNED_SHORT, ptr::null());
 
                 // Third text rendering pass.
-                self.program.set_rendering_pass(RenderingPass::SubpixelPass3);
+                self.program
+                    .set_rendering_pass(RenderingPass::SubpixelPass3);
                 gl::BlendFuncSeparate(gl::ONE, gl::ONE, gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
             }
 
@@ -476,8 +486,11 @@ pub struct TextShaderProgram {
 
 impl TextShaderProgram {
     pub fn new(shader_version: ShaderVersion, dual_source_blending: bool) -> Result<Self, Error> {
-        let fragment_shader =
-            if dual_source_blending { &glsl3::TEXT_SHADER_F } else { &TEXT_SHADER_F };
+        let fragment_shader = if dual_source_blending {
+            &glsl3::TEXT_SHADER_F
+        } else {
+            &TEXT_SHADER_F
+        };
 
         let program = ShaderProgram::new(shader_version, None, TEXT_SHADER_V, fragment_shader)?;
 

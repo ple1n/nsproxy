@@ -83,7 +83,7 @@ impl<'a> StrShortener<'a> {
                         // The match is exact, consume shortener.
                         let _ = shortener.take();
                     }
-                },
+                }
                 Ordering::Less => (),
             }
 
@@ -102,7 +102,14 @@ impl<'a> StrShortener<'a> {
 
         let chars = text.chars().skip(skip_chars);
 
-        Self { chars, accumulated_len: 0, text_action, max_width, direction, shortener }
+        Self {
+            chars,
+            accumulated_len: 0,
+            text_action,
+            max_width,
+            direction,
+            shortener,
+        }
     }
 }
 
@@ -114,11 +121,11 @@ impl Iterator for StrShortener<'_> {
             TextAction::Spacer => {
                 self.text_action = TextAction::Char;
                 Some(' ')
-            },
+            }
             TextAction::Terminate => {
                 // We've reached the termination state.
                 None
-            },
+            }
             TextAction::Shortener => {
                 // When we shorten from the left we yield the shortener first and process the rest.
                 self.text_action = if self.direction == ShortenDirection::Left {
@@ -129,7 +136,7 @@ impl Iterator for StrShortener<'_> {
 
                 // Consume the shortener to avoid yielding it later when shortening left.
                 self.shortener.take()
-            },
+            }
             TextAction::Char => {
                 let ch = self.chars.next()?;
                 let ch_width = ch.width().unwrap_or(1);
@@ -156,7 +163,7 @@ impl Iterator for StrShortener<'_> {
                 }
 
                 Some(ch)
-            },
+            }
         }
     }
 }
@@ -250,14 +257,20 @@ mod tests {
     #[test]
     fn into_shortened_without_shortener() {
         let s = "Hello";
-        assert_eq!("", StrShortener::new("", 1, ShortenDirection::Left, None).collect::<String>());
+        assert_eq!(
+            "",
+            StrShortener::new("", 1, ShortenDirection::Left, None).collect::<String>()
+        );
 
         assert_eq!(
             "H",
             &StrShortener::new(s, 1, ShortenDirection::Right, None).collect::<String>()
         );
 
-        assert_eq!("o", &StrShortener::new(s, 1, ShortenDirection::Left, None).collect::<String>());
+        assert_eq!(
+            "o",
+            &StrShortener::new(s, 1, ShortenDirection::Left, None).collect::<String>()
+        );
 
         assert_eq!(
             "He",
@@ -281,16 +294,25 @@ mod tests {
 
         let s = "こJんにちはP";
         let len = 2 + 1 + 2 + 2 + 2 + 2 + 1;
-        assert_eq!("", &StrShortener::new(s, 1, ShortenDirection::Right, None).collect::<String>());
+        assert_eq!(
+            "",
+            &StrShortener::new(s, 1, ShortenDirection::Right, None).collect::<String>()
+        );
 
-        assert_eq!("P", &StrShortener::new(s, 1, ShortenDirection::Left, None).collect::<String>());
+        assert_eq!(
+            "P",
+            &StrShortener::new(s, 1, ShortenDirection::Left, None).collect::<String>()
+        );
 
         assert_eq!(
             "こ ",
             &StrShortener::new(s, 2, ShortenDirection::Right, None).collect::<String>()
         );
 
-        assert_eq!("P", &StrShortener::new(s, 2, ShortenDirection::Left, None).collect::<String>());
+        assert_eq!(
+            "P",
+            &StrShortener::new(s, 2, ShortenDirection::Left, None).collect::<String>()
+        );
 
         assert_eq!(
             "こ J",

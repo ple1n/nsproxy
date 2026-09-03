@@ -33,7 +33,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::{ffi::{OsStrExt, OsStringExt}, net::UnixStream},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            net::UnixStream,
+        },
     },
     path::{Path, PathBuf},
     process::{ExitStatus, exit},
@@ -356,7 +359,14 @@ pub fn mount_ns(source: &Path, dst: &Path) -> Result<()> {
     }
 
     warn!("bind mounting {:?} onto {:?}", source, dst);
-    mount(Some(source), dst, None::<&str>, MsFlags::MS_BIND, None::<&str>).map_err(|e| {
+    mount(
+        Some(source),
+        dst,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| {
         anyhow::anyhow!(
             "mount_ns: bind mount failed source={:?} dst={:?}: {}",
             source,
@@ -695,7 +705,10 @@ pub fn write_resolv_conf_explicit(target: &Path, nameserver: &str) -> Result<()>
     }
     std::fs::write(target, content.as_bytes())?;
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o644))?;
-    info!("wrote resolv.conf at {:?} with nameserver: {}", target, nameserver);
+    info!(
+        "wrote resolv.conf at {:?} with nameserver: {}",
+        target, nameserver
+    );
     Ok(())
 }
 

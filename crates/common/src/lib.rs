@@ -15,8 +15,8 @@ use std::str::FromStr;
 use std::sync::{LazyLock, RwLock};
 use std::{borrow::Cow, os::fd::AsRawFd, path::PathBuf};
 
-use anyhow::{Context, ensure};
 use anyhow::Result;
+use anyhow::{ensure, Context};
 use derive_new::new;
 use fs4::fs_std::FileExt;
 use fully_pub::fully_pub as public;
@@ -94,10 +94,20 @@ pub mod state_paths {
         profile_dir(name).join("sandbox_status.json")
     }
 
+    /// Runtime veth reconciliation results for a named profile.
+    pub fn veth_status(name: &str) -> PathBuf {
+        profile_dir(name).join("veth_status.json")
+    }
+
     /// Get namespace bind mount path inside profile instance dir
     /// Returns /nsp3/config/{name}/net
     pub fn profile_netns_bind(name: &str) -> PathBuf {
         profile_dir(name).join("net")
+    }
+
+    /// Get a persistent namespace bind mount path for the basis namespace.
+    pub fn basis_ns_bind(namespace: &str) -> PathBuf {
+        profile_dir("basis").join(namespace)
     }
 
     /// Get namespace metadata JSON path inside profile instance dir
@@ -212,7 +222,9 @@ pub fn current_boot_time_secs() -> Result<u64> {
 /// Returns the kernel boot ID from `/proc/sys/kernel/random/boot_id`.
 /// This is a UUID that changes on every boot, suitable for cache/state invalidation.
 pub fn current_boot_id() -> Result<String> {
-    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+    Ok(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string())
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
@@ -242,13 +254,55 @@ pub struct ProfileNamespaces {
     pub pid: ExactNS,
 }
 
+impl Inode for ProfileNamespaces {
+    fn ino_eq(&self, other: &Self) -> bool {
+        self.mnt.ino_eq(&other.mnt)
+            && self.net.ino_eq(&other.net)
+            && self.pid.ino_eq(&other.pid)
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
 pub struct NamespacesRegistry {
     #[serde(default)]
     pub profiles: HashMap<String, ProfileNamespaces>,
+    /// Namespace set recorded as the basis host/UI namespace.
+    #[serde(default, alias = "default_ns")]
+    pub basis_ns: Option<ProfileNamespaces>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct NamespaceRegistryInit {
+    pub current: ProfileNamespaces,
+    pub basis_ns: ProfileNamespaces,
+    pub initialized: bool,
 }
 
 impl NamespacesRegistry {
+    /// Record the current process namespaces as the basis if none exists.
+    pub fn initialize_basis(
+        current: ProfileNamespaces,
+        force: bool,
+    ) -> Result<NamespaceRegistryInit> {
+        let mut initialized = false;
+        let basis_ns = Self::update_locked_recover(|registry| {
+            if force || registry.basis_ns.is_none() {
+                registry.basis_ns = Some(current.clone());
+                initialized = true;
+            }
+            Ok(registry
+                .basis_ns
+                .clone()
+                .expect("basis namespace was set"))
+        })?;
+
+        Ok(NamespaceRegistryInit {
+            current,
+            basis_ns,
+            initialized,
+        })
+    }
+
     pub fn load_locked() -> Result<Self> {
         let path = state_paths::namespaces_registry();
         let lock = Self::open_lock_file()?;
@@ -265,6 +319,28 @@ impl NamespacesRegistry {
             .context("failed to acquire exclusive namespaces registry lock")?;
 
         let mut registry = Self::read_or_default(&path)?;
+        let result = update(&mut registry)?;
+        Self::write_atomic(&path, &registry)?;
+        Ok(result)
+    }
+
+    fn update_locked_recover<T>(update: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let path = state_paths::namespaces_registry();
+        let lock = Self::open_lock_file()?;
+        lock.lock_exclusive()
+            .context("failed to acquire exclusive namespaces registry lock")?;
+
+        let mut registry = match Self::read_or_default(&path) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::warn!(
+                    path = ?path,
+                    %error,
+                    "incompatible namespaces registry; replacing it"
+                );
+                Self::default()
+            }
+        };
         let result = update(&mut registry)?;
         Self::write_atomic(&path, &registry)?;
         Ok(result)
@@ -318,12 +394,22 @@ impl NamespacesRegistry {
 }
 
 /// Represents an NS anchored to a process, or a file
-/// Equality iff .unique equals
+/// `Inode::ino_eq` compares namespace identity; `Eq` also compares the source.
 #[public]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct ExactNS {
     unique: UniqueFile,
     source: NSSource,
+}
+
+pub trait Inode {
+    fn ino_eq(&self, other: &Self) -> bool;
+}
+
+impl Inode for ExactNS {
+    fn ino_eq(&self, other: &Self) -> bool {
+        self.unique.ino_eq(&other.unique)
+    }
 }
 
 impl Display for ExactNS {
@@ -345,6 +431,12 @@ impl Display for ExactNS {
 struct UniqueFile {
     ino: u64,
     dev: u64,
+}
+
+impl Inode for UniqueFile {
+    fn ino_eq(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 impl From<stat> for UniqueFile {
@@ -674,6 +766,35 @@ fn test_f() {
     let rx = unsafe { pidfd::PidFd::open(65532, 0) };
     let ox = rx.err().unwrap();
     let _ = dbg!(ox.raw_os_error());
+}
+
+#[test]
+fn initialize_basis_replaces_incompatible_registry() {
+    let previous_root = state_paths::persist_root();
+    let root = std::env::temp_dir().join(format!(
+        "nsproxy-common-namespace-registry-{}",
+        getpid()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    state_paths::set_persist_root(&root);
+
+    let path = state_paths::namespaces_registry();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{\"basis_ns\": invalid}").unwrap();
+
+    let current = ProfileNamespaces {
+        mnt: ExactNS::from_source((PidPath::Selfproc, "mnt")).unwrap(),
+        net: ExactNS::from_source((PidPath::Selfproc, "net")).unwrap(),
+        pid: ExactNS::from_source((PidPath::Selfproc, "pid")).unwrap(),
+    };
+    let init = NamespacesRegistry::initialize_basis(current, false).unwrap();
+
+    assert!(init.initialized);
+    let registry = NamespacesRegistry::load_locked().unwrap();
+    assert_eq!(registry.basis_ns, Some(init.current));
+
+    let _ = std::fs::remove_dir_all(root);
+    state_paths::set_persist_root(previous_root);
 }
 
 pub macro forever() {

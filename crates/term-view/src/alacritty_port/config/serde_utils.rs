@@ -11,10 +11,10 @@ pub fn merge(base: Value, replacement: Value) -> Value {
         (Value::Array(mut base), Value::Array(mut replacement)) => {
             base.append(&mut replacement);
             Value::Array(base)
-        },
+        }
         (Value::Table(base), Value::Table(replacement)) => {
             Value::Table(merge_tables(base, replacement))
-        },
+        }
         (_, value) => value,
     }
 }

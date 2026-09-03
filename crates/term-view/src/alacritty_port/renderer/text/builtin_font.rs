@@ -7,12 +7,28 @@ use crossfont::{BitmapBuffer, Metrics, RasterizedGlyph};
 use crate::config::ui_config::Delta;
 
 // Colors which are used for filling shade variants.
-const COLOR_FILL_ALPHA_STEP_1: Pixel = Pixel { _r: 192, _g: 192, _b: 192 };
-const COLOR_FILL_ALPHA_STEP_2: Pixel = Pixel { _r: 128, _g: 128, _b: 128 };
-const COLOR_FILL_ALPHA_STEP_3: Pixel = Pixel { _r: 64, _g: 64, _b: 64 };
+const COLOR_FILL_ALPHA_STEP_1: Pixel = Pixel {
+    _r: 192,
+    _g: 192,
+    _b: 192,
+};
+const COLOR_FILL_ALPHA_STEP_2: Pixel = Pixel {
+    _r: 128,
+    _g: 128,
+    _b: 128,
+};
+const COLOR_FILL_ALPHA_STEP_3: Pixel = Pixel {
+    _r: 64,
+    _g: 64,
+    _b: 64,
+};
 
 /// Default color used for filling.
-const COLOR_FILL: Pixel = Pixel { _r: 255, _g: 255, _b: 255 };
+const COLOR_FILL: Pixel = Pixel {
+    _r: 255,
+    _g: 255,
+    _b: 255,
+};
 
 const POWERLINE_TRIANGLE_LTR: char = '\u{e0b0}';
 const POWERLINE_ARROW_LTR: char = '\u{e0b1}';
@@ -30,11 +46,11 @@ pub fn builtin_glyph(
         // Box drawing characters and block elements.
         '\u{2500}'..='\u{259f}' | '\u{1fb00}'..='\u{1fb3b}' => {
             box_drawing(character, metrics, offset)
-        },
+        }
         // Powerline symbols: '','','',''
         POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL => {
             powerline_drawing(character, metrics, offset)?
-        },
+        }
         _ => return None,
     };
 
@@ -103,7 +119,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 buffer,
                 advance: (width as i32, height as i32),
             };
-        },
+        }
         _ => Canvas::new(width, height),
     };
 
@@ -121,14 +137,16 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             };
 
             let dash_gap_len = cmp::max(width / 8, 1);
-            let dash_len =
-                cmp::max(width.saturating_sub(dash_gap_len * num_gaps) / (num_gaps + 1), 1);
+            let dash_len = cmp::max(
+                width.saturating_sub(dash_gap_len * num_gaps) / (num_gaps + 1),
+                1,
+            );
             let y = canvas.y_center();
             for gap in 0..=num_gaps {
                 let x = cmp::min(gap * (dash_len + dash_gap_len), width);
                 canvas.draw_h_line(x as f32, y, dash_len as f32, stroke_size);
             }
-        },
+        }
         // Vertical dashes: '┆', '┇', '┊', '┋', '╎', '╏'.
         '\u{2506}' | '\u{2507}' | '\u{250a}' | '\u{250b}' | '\u{254e}' | '\u{254f}' => {
             let (num_gaps, stroke_size) = match character {
@@ -142,14 +160,16 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             };
 
             let dash_gap_len = cmp::max(height / 8, 1);
-            let dash_len =
-                cmp::max(height.saturating_sub(dash_gap_len * num_gaps) / (num_gaps + 1), 1);
+            let dash_len = cmp::max(
+                height.saturating_sub(dash_gap_len * num_gaps) / (num_gaps + 1),
+                1,
+            );
             let x = canvas.x_center();
             for gap in 0..=num_gaps {
                 let y = cmp::min(gap * (dash_len + dash_gap_len), height);
                 canvas.draw_v_line(x, y as f32, dash_len as f32, stroke_size);
             }
-        },
+        }
         // Horizontal lines: '─', '━', '╴', '╶', '╸', '╺'.
         // Vertical lines: '│', '┃', '╵', '╷', '╹', '╻'.
         // Light and heavy line box components:
@@ -240,7 +260,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             canvas.draw_v_line(x_v, 0., size_v1, stroke_size_v1);
             // Bottom vertical line.
             canvas.draw_v_line(x_v, y_v, size_v2, stroke_size_v2);
-        },
+        }
         // Light and double line box components:
         // '═','║','╒','╓','╔','╕','╖','╗','╘','╙','╚','╛','╜','╝','╞','╟','╠','╡','╢','╣','╤','╥',
         // '╦','╧','╨','╩','╪','╫','╬'.
@@ -254,7 +274,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                     let right_line = cmp::min(v_line_bounds.1 as i32 + 1, width as i32) as f32;
 
                     (left_line, right_line)
-                },
+                }
             };
             let h_lines = match character {
                 '\u{2553}' | '\u{2556}' | '\u{2559}' | '\u{255c}' | '\u{255f}' | '\u{2562}'
@@ -265,7 +285,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                     let bottom_line = cmp::min(h_line_bounds.1 as i32 + 1, height as i32) as f32;
 
                     (top_line, bottom_line)
-                },
+                }
             };
 
             // Get bounds for each double line we could have.
@@ -284,7 +304,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 '\u{255b}'..='\u{255d}' => (v_left_bounds.1, v_right_bounds.1),
                 '\u{2561}'..='\u{2563}' | '\u{256a}' | '\u{256c}' => {
                     (v_left_bounds.1, v_left_bounds.1)
-                },
+                }
                 '\u{2564}'..='\u{2568}' => (canvas.x_center(), v_left_bounds.1),
                 '\u{2569}'..='\u{2569}' => (v_left_bounds.1, canvas.x_center()),
                 _ => (0., 0.),
@@ -294,12 +314,12 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             let (top_right_x, bot_right_x, right_size) = match character {
                 '\u{2550}' | '\u{2565}' | '\u{256b}' => {
                     (canvas.x_center(), canvas.x_center(), width)
-                },
+                }
                 '\u{2552}'..='\u{2554}' | '\u{2568}' => (v_left_bounds.0, v_right_bounds.0, width),
                 '\u{2558}'..='\u{255a}' => (v_right_bounds.0, v_left_bounds.0, width),
                 '\u{255e}'..='\u{2560}' | '\u{256a}' | '\u{256c}' => {
                     (v_right_bounds.0, v_right_bounds.0, width)
-                },
+                }
                 '\u{2564}' | '\u{2566}' => (canvas.x_center(), v_right_bounds.0, width),
                 '\u{2567}' | '\u{2569}' => (v_right_bounds.0, canvas.x_center(), width),
                 _ => (0., 0., 0.),
@@ -314,7 +334,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 '\u{2561}'..='\u{2563}' => (h_top_bounds.1, canvas.y_center()),
                 '\u{2567}' | '\u{2569}' | '\u{256b}' | '\u{256c}' => {
                     (h_top_bounds.1, h_top_bounds.1)
-                },
+                }
                 _ => (0., 0.),
             };
 
@@ -327,7 +347,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 '\u{2561}'..='\u{2563}' => (h_bot_bounds.0, canvas.y_center(), height),
                 '\u{2564}'..='\u{2566}' | '\u{256b}' | '\u{256c}' => {
                     (h_bot_bounds.0, h_bot_bounds.0, height)
-                },
+                }
                 _ => (0., 0., 0.),
             };
 
@@ -346,7 +366,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             // Bottom vertical line.
             canvas.draw_v_line(v_lines.0, left_bot_y, bottom_size, stroke_size);
             canvas.draw_v_line(v_lines.1, right_bot_y, bottom_size, stroke_size);
-        },
+        }
         // Arcs: '╭', '╮', '╯', '╰'.
         '\u{256d}' | '\u{256e}' | '\u{256f}' | '\u{2570}' => {
             canvas.draw_rounded_corner(stroke_size);
@@ -390,7 +410,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                     }
                 }
             }
-        },
+        }
         // Parts of full block: '▀', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '▔', '▉', '▊', '▋', '▌',
         // '▍', '▎', '▏', '▐', '▕'.
         '\u{2580}'..='\u{2587}' | '\u{2589}'..='\u{2590}' | '\u{2594}' | '\u{2595}' => {
@@ -437,7 +457,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             };
 
             canvas.draw_rect(x, y, rect_width, rect_height, COLOR_FILL);
-        },
+        }
         // Shades: '░', '▒', '▓', '█'.
         '\u{2588}' | '\u{2591}' | '\u{2592}' | '\u{2593}' => {
             let color = match character {
@@ -448,7 +468,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 _ => unreachable!(),
             };
             canvas.fill(color);
-        },
+        }
         // Quadrants: '▖', '▗', '▘', '▙', '▚', '▛', '▜', '▝', '▞', '▟'.
         '\u{2596}'..='\u{259F}' => {
             let x_center = canvas.x_center().round().max(1.);
@@ -457,25 +477,25 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             let (w_second, h_second) = match character {
                 '\u{2598}' | '\u{2599}' | '\u{259a}' | '\u{259b}' | '\u{259c}' => {
                     (x_center, y_center)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_first, h_first) = match character {
                 '\u{259b}' | '\u{259c}' | '\u{259d}' | '\u{259e}' | '\u{259f}' => {
                     (x_center, y_center)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_third, h_third) = match character {
                 '\u{2596}' | '\u{2599}' | '\u{259b}' | '\u{259e}' | '\u{259f}' => {
                     (x_center, y_center)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_fourth, h_fourth) = match character {
                 '\u{2597}' | '\u{2599}' | '\u{259a}' | '\u{259c}' | '\u{259f}' => {
                     (x_center, y_center)
-                },
+                }
                 _ => (0., 0.),
             };
 
@@ -487,7 +507,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             canvas.draw_rect(0., y_center, w_third, h_third, COLOR_FILL);
             // Fourth quadrant.
             canvas.draw_rect(x_center, y_center, w_fourth, h_fourth, COLOR_FILL);
-        },
+        }
         // Sextants: '🬀', '🬁', '🬂', '🬃', '🬄', '🬅', '🬆', '🬇', '🬈', '🬉', '🬊', '🬋', '🬌', '🬍', '🬎',
         // '🬏', '🬐', '🬑', '🬒', '🬓', '🬔', '🬕', '🬖', '🬗', '🬘', '🬙', '🬚', '🬛', '🬜', '🬝', '🬞', '🬟',
         // '🬠', '🬡', '🬢', '🬣', '🬤', '🬥', '🬦', '🬧', '🬨', '🬩', '🬪', '🬫', '🬬', '🬭', '🬮', '🬯', '🬰',
@@ -505,7 +525,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb28}' | '\u{1fb2a}' | '\u{1fb2c}' | '\u{1fb2e}' | '\u{1fb30}'
                 | '\u{1fb32}' | '\u{1fb34}' | '\u{1fb36}' | '\u{1fb38}' | '\u{1fb3a}' => {
                     (x_center, y_third)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_top_right, h_top_right) = match character {
@@ -516,7 +536,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb28}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb2f}' | '\u{1fb30}'
                 | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb3b}' => {
                     (x_center, y_third)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_mid_left, h_mid_left) = match character {
@@ -527,7 +547,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb2a}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb31}' | '\u{1fb32}'
                 | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
                     (x_center, y_third)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_mid_right, h_mid_right) = match character {
@@ -538,7 +558,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb2a}' | '\u{1fb2b}' | '\u{1fb2c}' | '\u{1fb35}' | '\u{1fb36}'
                 | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
                     (x_center, y_third)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_bottom_left, h_bottom_left) = match character {
@@ -549,7 +569,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb32}' | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb35}' | '\u{1fb36}'
                 | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
                     (x_center, y_last_third)
-                },
+                }
                 _ => (0., 0.),
             };
             let (w_bottom_right, h_bottom_right) = match character {
@@ -560,7 +580,7 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
                 | '\u{1fb32}' | '\u{1fb33}' | '\u{1fb34}' | '\u{1fb35}' | '\u{1fb36}'
                 | '\u{1fb37}' | '\u{1fb38}' | '\u{1fb39}' | '\u{1fb3a}' | '\u{1fb3b}' => {
                     (x_center, y_last_third)
-                },
+                }
                 _ => (0., 0.),
             };
 
@@ -569,8 +589,14 @@ fn box_drawing(character: char, metrics: &Metrics, offset: &Delta<i8>) -> Raster
             canvas.draw_rect(0., y_third, w_mid_left, h_mid_left, COLOR_FILL);
             canvas.draw_rect(x_center, y_third, w_mid_right, h_mid_right, COLOR_FILL);
             canvas.draw_rect(0., y_third * 2., w_bottom_left, h_bottom_left, COLOR_FILL);
-            canvas.draw_rect(x_center, y_third * 2., w_bottom_right, h_bottom_right, COLOR_FILL);
-        },
+            canvas.draw_rect(
+                x_center,
+                y_third * 2.,
+                w_bottom_right,
+                h_bottom_right,
+                COLOR_FILL,
+            );
+        }
         _ => unreachable!(),
     }
 
@@ -670,7 +696,11 @@ struct Pixel {
 
 impl Pixel {
     fn gray(color: u8) -> Self {
-        Self { _r: color, _g: color, _b: color }
+        Self {
+            _r: color,
+            _g: color,
+            _b: color,
+        }
     }
 }
 
@@ -724,7 +754,11 @@ impl Canvas {
     /// Builds new `Canvas` for line drawing with the given `width` and `height` with default color.
     fn new(width: usize, height: usize) -> Self {
         let buffer = vec![Pixel::default(); width * height];
-        Self { width, height, buffer }
+        Self {
+            width,
+            height,
+            buffer,
+        }
     }
 
     /// Vertical center of the `Canvas`.
@@ -819,7 +853,11 @@ impl Canvas {
 
         let delta_x = to_x - from_x;
         let delta_y = to_y - from_y;
-        let gradient = if delta_x.abs() <= f32::EPSILON { 1. } else { delta_y / delta_x };
+        let gradient = if delta_x.abs() <= f32::EPSILON {
+            1.
+        } else {
+            delta_y / delta_x
+        };
 
         let x_end = f32::round(from_x);
         let y_end = from_y + gradient * (x_end - from_x);
@@ -889,7 +927,11 @@ impl Canvas {
         } else {
             (&self.width, &self.height, &mut x_offset)
         };
-        let distance_bias = if short_side % 2 == stroke_size % 2 { 0. } else { 0.5 };
+        let distance_bias = if short_side % 2 == stroke_size % 2 {
+            0.
+        } else {
+            0.5
+        };
         *offset = *long_side as f32 / 2. - radius + stroke_size_f / 2.;
         if (self.width % 2 != self.height % 2) && (long_side % 2 == stroke_size % 2) {
             *offset += 1.;

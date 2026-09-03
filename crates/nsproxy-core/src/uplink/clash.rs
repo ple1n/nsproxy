@@ -210,16 +210,9 @@ impl TrojanProxy {
         dest: WireAddress,
     ) -> Result<TrojanConnection> {
         let stream = self
-            .connect_with_command(
-                server_ip,
-                &dest,
-                TrojanCommand::TcpConnect,
-            )
+            .connect_with_command(server_ip, &dest, TrojanCommand::TcpConnect)
             .await?;
-        Ok(TrojanConnection::TcpConnect(
-            TrojanTcpStream(stream),
-            dest,
-        ))
+        Ok(TrojanConnection::TcpConnect(TrojanTcpStream(stream), dest))
     }
 
     /// Create a Trojan UDP tunnel (UDP ASSOCIATE)
@@ -233,11 +226,7 @@ impl TrojanProxy {
         dest: WireAddress,
     ) -> Result<TrojanConnection> {
         let stream = self
-            .connect_with_command(
-                server_ip,
-                &dest,
-                TrojanCommand::UdpAssociate,
-            )
+            .connect_with_command(server_ip, &dest, TrojanCommand::UdpAssociate)
             .await?;
         Ok(TrojanConnection::UdpAssociate(
             TrojanUdpTunnel(stream),
@@ -292,18 +281,32 @@ impl TrojanProxy {
         let (host_bytes_buf, address) = match dest {
             WireAddress::DomainAddress(host, port) => {
                 let buf = host.clone().into_bytes();
-                let addr = AddressRef { host: HostRef::Domain(&[]), port: *port };
+                let addr = AddressRef {
+                    host: HostRef::Domain(&[]),
+                    port: *port,
+                };
                 (Some(buf), addr)
             }
-            WireAddress::SocketAddress(std::net::SocketAddr::V4(addr)) => {
-                (None, AddressRef { host: HostRef::Ipv4(addr.ip().octets()), port: addr.port() })
-            }
-            WireAddress::SocketAddress(std::net::SocketAddr::V6(addr)) => {
-                (None, AddressRef { host: HostRef::Ipv6(addr.ip().octets()), port: addr.port() })
-            }
+            WireAddress::SocketAddress(std::net::SocketAddr::V4(addr)) => (
+                None,
+                AddressRef {
+                    host: HostRef::Ipv4(addr.ip().octets()),
+                    port: addr.port(),
+                },
+            ),
+            WireAddress::SocketAddress(std::net::SocketAddr::V6(addr)) => (
+                None,
+                AddressRef {
+                    host: HostRef::Ipv6(addr.ip().octets()),
+                    port: addr.port(),
+                },
+            ),
         };
         let address = if let Some(ref buf) = host_bytes_buf {
-            AddressRef { host: HostRef::Domain(buf.as_slice()), port: address.port }
+            AddressRef {
+                host: HostRef::Domain(buf.as_slice()),
+                port: address.port,
+            }
         } else {
             address
         };
@@ -764,9 +767,9 @@ impl ClashState {
         let scrub = |domains: &mut DomainsSolved| {
             domains.retain(|_, responses| {
                 responses.retain(|_, response| {
-                    response.ips.retain(|addr| {
-                        !matches!(addr, IpAddr::V6(ip6) if virt.contains(*ip6))
-                    });
+                    response
+                        .ips
+                        .retain(|addr| !matches!(addr, IpAddr::V6(ip6) if virt.contains(*ip6)));
                     !response.ips.is_empty()
                 });
                 !responses.is_empty()
@@ -778,7 +781,10 @@ impl ClashState {
             scrub(&mut group.tier2_cache);
         }
 
-        info!("Removed virtual DNS IPs from clash state subnet={}", VIRT_IP6_NET);
+        info!(
+            "Removed virtual DNS IPs from clash state subnet={}",
+            VIRT_IP6_NET
+        );
     }
 
     pub fn append_profile_to_group(
@@ -1357,12 +1363,9 @@ impl ClashState {
                     let resolved_ip = trojan.server_addr.ip();
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
-                            let mut conn = TrojanAdapter::connect_udp(
-                                trojan,
-                                dns_server.clone(),
-                                resolved_ip,
-                            )
-                            .await?;
+                            let mut conn =
+                                TrojanAdapter::connect_udp(trojan, dns_server.clone(), resolved_ip)
+                                    .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
                                     super::proxy_dns::query_via_udp(
@@ -1379,12 +1382,9 @@ impl ClashState {
                             }
                         }
                         DNSProtocol::TCP => {
-                            let mut conn = TrojanAdapter::connect_tcp(
-                                trojan,
-                                dns_server.clone(),
-                                resolved_ip,
-                            )
-                            .await?;
+                            let mut conn =
+                                TrojanAdapter::connect_tcp(trojan, dns_server.clone(), resolved_ip)
+                                    .await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {
                                     super::proxy_dns::query_via_tcp(
@@ -1411,8 +1411,7 @@ impl ClashState {
                     return match &endpoint.proto {
                         DNSProtocol::UDP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, dns_server.clone())
-                                    .await?;
+                                RemoteAdapter::connect_tcp(remote, dns_server.clone()).await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Udp(tunnel) => {
                                     super::proxy_dns::query_via_udp(
@@ -1430,8 +1429,7 @@ impl ClashState {
                         }
                         DNSProtocol::TCP => {
                             let mut conn =
-                                RemoteAdapter::connect_tcp(remote, dns_server.clone())
-                                    .await?;
+                                RemoteAdapter::connect_tcp(remote, dns_server.clone()).await?;
                             match &mut conn {
                                 super::proxy_adapters::ProxyConnection::Tcp(stream) => {
                                     super::proxy_dns::query_via_tcp(

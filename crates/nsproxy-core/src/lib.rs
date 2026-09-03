@@ -292,6 +292,7 @@ mod tests {
                 mounts: Vec::new(),
                 daemons: Vec::new(),
                 applications: Vec::new(),
+                veth: Vec::new(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -936,6 +937,46 @@ pub struct HotConfig {
     /// Applications that may be launched manually from the Actions tab.
     #[serde(default)]
     pub applications: Vec<LaunchableApp>,
+    /// Veth pairs to create whenever this profile's container starts.
+    #[serde(default)]
+    pub veth: Vec<HotVeth>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct HotVeth {
+    #[serde(default = "default_veth_source")]
+    pub src: String,
+    #[serde(alias = "peer")]
+    pub dst: String,
+    #[serde(default, alias = "name")]
+    pub veth_name: Option<String>,
+    #[serde(default)]
+    pub src_ip4: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub dst_ip4: Option<Ipv4Addr>,
+    #[serde(default = "default_veth_prefix_len")]
+    pub prefix_len: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VethStatus {
+    pub spec: HotVeth,
+    pub success: bool,
+    pub detail: String,
+    pub updated_at_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct VethStatusSnapshot {
+    pub entries: Vec<VethStatus>,
+}
+
+fn default_veth_source() -> String {
+    "basis".to_owned()
+}
+
+fn default_veth_prefix_len() -> u8 {
+    30
 }
 
 pub fn default_hotconfig() -> HotConfig {
@@ -1919,6 +1960,7 @@ pub enum NsInput {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum NsArg {
+    Basis,
     Container(String),
     This,
 }
@@ -1931,7 +1973,9 @@ impl std::str::FromStr for NsArg {
         if trimmed.is_empty() {
             return Err("namespace argument must not be empty".to_string());
         }
-        if trimmed.eq_ignore_ascii_case("this") {
+        if trimmed.eq_ignore_ascii_case("basis") {
+            Ok(NsArg::Basis)
+        } else if trimmed.eq_ignore_ascii_case("this") {
             Ok(NsArg::This)
         } else {
             Ok(NsArg::Container(trimmed.to_string()))
@@ -1975,6 +2019,12 @@ pub enum MainCommand {
     Netlink,
     /// Generates an empty config file
     Gen { save_to: PathBuf },
+    /// Record the current process namespaces as the basis namespace set.
+    Init {
+        /// Replace the recorded basis and recreate its namespace mounts.
+        #[arg(long)]
+        force: bool,
+    },
     /// Identify current net-ns
     #[command(alias = "i")]
     Id {
@@ -2078,15 +2128,24 @@ pub enum MainCommand {
     },
     /// Create a veth pair between host and an already-up profile namespace.
     Veth {
-        /// Source namespace endpoint (`this` or a profile name)
+        /// Source namespace endpoint (`this`, `default`, or a profile name)
         #[arg(long)]
         src: NsArg,
-        /// Destination namespace endpoint (`this` or a profile name)
+        /// Destination namespace endpoint (`this`, `default`, or a profile name)
         #[arg(long)]
         dst: NsArg,
         /// Veth pair base name (produces {name}_src and {name}_dst)
         #[arg(long)]
         veth_name: Option<String>,
+        /// Fixed source IPv4 address; omit together with dst_ip4 for auto allocation.
+        #[arg(long)]
+        src_ip4: Option<Ipv4Addr>,
+        /// Fixed destination IPv4 address; omit together with src_ip4 for auto allocation.
+        #[arg(long)]
+        dst_ip4: Option<Ipv4Addr>,
+        /// Prefix length used for fixed or automatically allocated addresses.
+        #[arg(long, default_value_t = 30)]
+        prefix_len: u8,
         #[arg(short, long)]
         #[serde(with = "level_filter_serde")]
         log: Option<LevelFilter>,
@@ -2410,6 +2469,9 @@ mod cli_fd_tests {
                 src: NsArg::This,
                 dst: NsArg::Container("p1".into()),
                 veth_name: None,
+                src_ip4: None,
+                dst_ip4: None,
+                prefix_len: 30,
                 log: None,
             },
         });
@@ -2426,6 +2488,9 @@ mod cli_fd_tests {
                 src: NsArg::Container("p2".into()),
                 dst: NsArg::Container("p3".into()),
                 veth_name: Some("v_custom".into()),
+                src_ip4: None,
+                dst_ip4: None,
+                prefix_len: 30,
                 log: Some(LevelFilter::WARN),
             },
         });
@@ -2434,6 +2499,7 @@ mod cli_fd_tests {
     #[test]
     fn parse_ns_arg_this_and_container() {
         assert_eq!("this".parse::<NsArg>().unwrap(), NsArg::This);
+        assert_eq!("basis".parse::<NsArg>().unwrap(), NsArg::Basis);
         assert_eq!(
             "demo".parse::<NsArg>().unwrap(),
             NsArg::Container("demo".to_string())

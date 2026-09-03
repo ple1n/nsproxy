@@ -26,13 +26,11 @@ pub struct ConnStats {
 
 impl ConnStats {
     pub fn connect_latency(&self) -> Option<Duration> {
-        self.connected_ts
-            .map(|c| c.elapsed_since(self.accept_ts))
+        self.connected_ts.map(|c| c.elapsed_since(self.accept_ts))
     }
 
     pub fn total_duration(&self) -> Option<Duration> {
-        self.finished_ts
-            .map(|f| f.elapsed_since(self.accept_ts))
+        self.finished_ts.map(|f| f.elapsed_since(self.accept_ts))
     }
 
     pub fn dns_resolve_latency(&self) -> Option<Duration> {
@@ -122,7 +120,13 @@ impl DiagAccumulator {
 
     pub fn ingest(&mut self, event: &DiagEvent) {
         match event {
-            DiagEvent::Accept { id, ts, kind, src, dst } => {
+            DiagEvent::Accept {
+                id,
+                ts,
+                kind,
+                src,
+                dst,
+            } => {
                 let stats = ConnStats {
                     id: *id,
                     kind: format!("{:?}", kind),
@@ -159,7 +163,13 @@ impl DiagAccumulator {
                     c.connected_ts = Some(*ts);
                 }
             }
-            DiagEvent::Finished { id, ts, error, bytes_up, bytes_down } => {
+            DiagEvent::Finished {
+                id,
+                ts,
+                error,
+                bytes_up,
+                bytes_down,
+            } => {
                 if let Some(c) = self.conns.get_mut(id) {
                     c.finished_ts = Some(*ts);
                     c.error = error.clone();
@@ -173,7 +183,13 @@ impl DiagAccumulator {
                 }
                 self.loop_stats.push(*dispatch_us);
             }
-            DiagEvent::DnsResolved { id, ts, domain, result, .. } => {
+            DiagEvent::DnsResolved {
+                id,
+                ts,
+                domain,
+                result,
+                ..
+            } => {
                 if let Some(c) = self.conns.get_mut(id) {
                     if c.dns_query.is_none() {
                         c.dns_query = Some(domain.clone());

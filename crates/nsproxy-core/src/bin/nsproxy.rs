@@ -40,7 +40,8 @@ use nix::{
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{
-    ExactNS, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile, forever,
+    ExactNS, Inode, NSFrom, NSSource, NamespacesRegistry, PidPath, ProfileNamespaces, UniqueFile,
+    forever,
 };
 use nsproxy_core::{
     BasisCommand, Cli, DaemonCliRequest, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths,
@@ -50,8 +51,8 @@ use nsproxy_core::{
         read_ns_alive_opt, report_clone3_err, update_ns_alive,
     },
     env::{
-        ENV_DBUS_SESSION_BUS_ADDRESS, ENV_DBUS_SYSTEM_BUS_ADDRESS, ENV_NS,
-        args_deduce_mount, name_to_mount_path,
+        ENV_DBUS_SESSION_BUS_ADDRESS, ENV_DBUS_SYSTEM_BUS_ADDRESS, ENV_NS, args_deduce_mount,
+        name_to_mount_path,
     },
     hot_reload::{VethIps, sync_links, watch_hot},
     sandbox::{
@@ -109,7 +110,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{select, sync};
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -126,10 +127,17 @@ use uzers::os::unix::UserExt;
 use nsproxy_core::HotRoute;
 
 #[derive(Debug, Clone)]
+enum VethNamespaceTarget {
+    Pid(u32),
+    Fd(Arc<fs::File>),
+}
+
+#[derive(Debug, Clone)]
 struct VethEndpoint {
     arg: NsArg,
     label: String,
-    pid: u32,
+    target: VethNamespaceTarget,
+    source: NSSource,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +166,7 @@ impl PtyScrollbackState {
 
 struct RawLogRingState {
     cap: usize,
+    next_seq: u64,
     ring: VecDeque<diag::RawLog>,
 }
 
@@ -165,13 +174,16 @@ impl RawLogRingState {
     fn new(cap: usize) -> Self {
         Self {
             cap,
+            next_seq: 0,
             ring: VecDeque::with_capacity(cap),
         }
     }
 }
 
 fn profile_bus_socket(profile: &str) -> PathBuf {
-    state_paths::profile_dir(profile).join("bus").join("session.sock")
+    state_paths::profile_dir(profile)
+        .join("bus")
+        .join("session.sock")
 }
 
 fn profile_bus_address(profile: &str) -> String {
@@ -179,7 +191,9 @@ fn profile_bus_address(profile: &str) -> String {
 }
 
 fn profile_system_bus_socket(profile: &str) -> PathBuf {
-    state_paths::profile_dir(profile).join("bus").join("system.sock")
+    state_paths::profile_dir(profile)
+        .join("bus")
+        .join("system.sock")
 }
 
 fn profile_system_bus_address(profile: &str) -> String {
@@ -374,10 +388,7 @@ fn build_spawn_env_pairs(
         unsafe {
             std::env::set_var(ENV_DBUS_SYSTEM_BUS_ADDRESS, address);
         }
-        env_pairs.push((
-            ENV_DBUS_SYSTEM_BUS_ADDRESS.to_string(),
-            address.to_string(),
-        ));
+        env_pairs.push((ENV_DBUS_SYSTEM_BUS_ADDRESS.to_string(), address.to_string()));
     }
     env_pairs
 }
@@ -392,6 +403,89 @@ fn build_spawn_env_cstrings(
         .map(|(k, v)| std::ffi::CString::new(format!("{}={}", k, v)))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Outcome of checking a recorded basis-namespace entry against the namespaces
+/// we currently observe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BasisValidity {
+    /// No basis entry is recorded at all.
+    Empty,
+    /// Entry is recorded but one or more namespace identities no longer match.
+    Invalid(String),
+    /// Entry is recorded and still matches the current namespaces.
+    Valid,
+}
+
+/// Compare a recorded basis entry against the namespaces we currently observe.
+/// `Inode::ino_eq` compares namespace identity only (dev/ino), not the source.
+fn validate_recorded_basis(
+    recorded: &ProfileNamespaces,
+    current: &ProfileNamespaces,
+) -> BasisValidity {
+    if recorded.ino_eq(current) {
+        return BasisValidity::Valid;
+    }
+    let mut drifted = Vec::new();
+    if !recorded.mnt.ino_eq(&current.mnt) {
+        drifted.push("mnt");
+    }
+    if !recorded.net.ino_eq(&current.net) {
+        drifted.push("net");
+    }
+    if !recorded.pid.ino_eq(&current.pid) {
+        drifted.push("pid");
+    }
+    BasisValidity::Invalid(drifted.join(", "))
+}
+
+fn initialize_basis_namespace(
+    force: bool,
+) -> anyhow::Result<nsproxy_common::NamespaceRegistryInit> {
+    let current = ProfileNamespaces {
+        // Mount namespaces are recorded via a /proc path source since they are
+        // not bind-mounted to a stable file path like net/pid.
+        mnt: ExactNS::from_source((PidPath::N(1), "mnt"))?,
+        net: ExactNS::from_source((PidPath::Selfproc, "net"))?,
+        pid: ExactNS::from_source((PidPath::Selfproc, "pid"))?,
+    };
+    // Always check the recorded entry, regardless of --force.
+    let validity = match NamespacesRegistry::load_locked()
+        .ok()
+        .and_then(|registry| registry.basis_ns)
+    {
+        Some(recorded) => validate_recorded_basis(&recorded, &current),
+        None => BasisValidity::Empty,
+    };
+    match &validity {
+        BasisValidity::Empty => println!(
+            "basis namespace empty: nothing recorded, recording current namespace"
+        ),
+        BasisValidity::Invalid(drifted) => println!(
+            "basis namespace invalid: {} identity no longer matches current, updating record",
+            drifted
+        ),
+        BasisValidity::Valid => println!("basis namespace valid: recorded identity matches current"),
+    }
+    let replace = force || matches!(validity, BasisValidity::Empty | BasisValidity::Invalid(_));
+    let basis = if replace {
+        let mut mounted = current;
+        for (name, namespace) in [("net", "net"), ("pid", "pid")] {
+            let source = PathBuf::from(format!("/proc/self/ns/{namespace}"));
+            let target = state_paths::basis_ns_bind(name);
+            mount_ns(&source, &target)?;
+            let exact = ExactNS::from_source(target)?;
+            match name {
+                "net" => mounted.net = exact,
+                "pid" => mounted.pid = exact,
+                _ => unreachable!(),
+            }
+        }
+        mounted
+    } else {
+        current
+    };
+    Ok(NamespacesRegistry::initialize_basis(basis, replace)?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -808,8 +902,13 @@ fn main() -> anyhow::Result<()> {
             if let Some(path) = resolved_path {
                 if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
                     let profile = ns_alive.profile_name.as_deref().unwrap_or(target.as_str());
-                    let sandbox_status = read_sandbox_status(profile)
-                        .ok_or_else(|| anyhow!("no valid sandbox status for '{}' — run 'sp sandbox {}' first", profile, profile))?;
+                    let sandbox_status = read_sandbox_status(profile).ok_or_else(|| {
+                        anyhow!(
+                            "no valid sandbox status for '{}' — run 'sp sandbox {}' first",
+                            profile,
+                            profile
+                        )
+                    })?;
                     enter_ns_sandboxed(&ns_alive, &sandbox_status, &path)?;
                     apply_ns_env(&mut shell_prefs, &ns_alive);
                     apply_dbus_env(&mut shell_prefs, &ns_alive);
@@ -929,6 +1028,14 @@ fn main() -> anyhow::Result<()> {
             let json = serde_json::to_string_pretty(&conf)?;
 
             std::fs::write(&save_to, json)?;
+        }
+        MainCommand::Init { force } => {
+            let init = initialize_basis_namespace(force)?;
+            if init.initialized {
+                println!("basis namespace recorded");
+            } else {
+                println!("basis namespace already recorded");
+            }
         }
         MainCommand::Netlink => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1547,7 +1654,7 @@ fn main() -> anyhow::Result<()> {
                                 profile.as_str(),
                                 &child_mnt.unique,
                             )
-                                .map(|s| s.detected_state);
+                            .map(|s| s.detected_state);
                             match prior_state {
                                 Some(nsproxy_core::sandbox::SandboxState::Pivoted) => {
                                     warn!(
@@ -1593,6 +1700,8 @@ fn main() -> anyhow::Result<()> {
                                 "wrote sandbox_status.json for overlay container"
                             );
                         }
+
+                        reconcile_configured_veths(&profile);
 
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -1760,8 +1869,13 @@ fn main() -> anyhow::Result<()> {
                 anyhow!("profile namespace registry entry missing for {}", profile)
             })?;
 
-            let sandbox_status = read_sandbox_status(&profile)
-                .ok_or_else(|| anyhow!("no valid sandbox status for '{}' — run 'sp sandbox {}' first", profile, profile))?;
+            let sandbox_status = read_sandbox_status(&profile).ok_or_else(|| {
+                anyhow!(
+                    "no valid sandbox status for '{}' — run 'sp sandbox {}' first",
+                    profile,
+                    profile
+                )
+            })?;
             enter_ns_sandboxed(&ns_alive, &sandbox_status, &bind_mount)?;
 
             // Refuse to run if we are not in the expected mount namespace.
@@ -1808,105 +1922,15 @@ fn main() -> anyhow::Result<()> {
             }
 
             for join in joins {
-                join.join().map_err(|_| anyhow!("dbus daemon thread panicked"))??;
+                join.join()
+                    .map_err(|_| anyhow!("dbus daemon thread panicked"))??;
             }
         }
-        MainCommand::Veth {
-            src,
-            dst,
-            veth_name,
-            log,
-        } => {
-            // Todo, update virtual DNS too
-
-            let src_endpoint = resolve_veth_endpoint(&src)?;
-            let dst_endpoint = resolve_veth_endpoint(&dst)?;
-
-            let vname = veth_name
-                .unwrap_or_else(|| format!("{}_{}", src_endpoint.label, dst_endpoint.label));
-            let v_src = veth_interface_name(&vname, "src");
-            let v_dst = veth_interface_name(&vname, "dst");
-            let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
-            let host_bits = 2;
-            let subnet_prefix = 32 - host_bits;
-
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+        MainCommand::Veth { src, dst, veth_name, src_ip4, dst_ip4, prefix_len, log } => {
             if let Some(log) = log {
                 reload_handle.modify(|k| *k.filter_mut() = log)?;
             }
-
-            rt.block_on(async move {
-                let nl = tokio_netlink_conn()?;
-                warn!(
-                    src = ?src_endpoint.arg,
-                    dst = ?dst_endpoint.arg,
-                    src_if = %v_src,
-                    dst_if = %v_dst,
-                    "attempting to add veth pair"
-                );
-
-                remove_link_if_exists_in_namespace(src_endpoint.pid, &v_src).await?;
-                remove_link_if_exists_in_namespace(dst_endpoint.pid, &v_dst).await?;
-                nl.remove_link_if_exists(&v_src).await?;
-                nl.remove_link_if_exists(&v_dst).await?;
-
-                let mut used = fetch_ipv4_in_namespace(std::process::id()).await?;
-                if src_endpoint.pid != std::process::id() {
-                    used.extend(fetch_ipv4_in_namespace(src_endpoint.pid).await?);
-                }
-                if dst_endpoint.pid != std::process::id() && dst_endpoint.pid != src_endpoint.pid {
-                    used.extend(fetch_ipv4_in_namespace(dst_endpoint.pid).await?);
-                }
-
-                let subnet = find_vacant_ipv4_subnet(used, veth_net, host_bits)
-                    .ok_or_else(|| anyhow!("cannot find any vacant ip"))?;
-
-                warn!(
-                    src_if = %v_src,
-                    dst_if = %v_dst,
-                    src_ip = %veth_addr_for(subnet, host_bits, true),
-                    dst_ip = %veth_addr_for(subnet, host_bits, false),
-                    subnet = %subnet,
-                    "selected veth endpoints"
-                );
-
-                nl.add_veth(&v_src, &v_dst).await?;
-
-                if src_endpoint.pid != std::process::id() {
-                    let src_link = nl.fetch_link_by_name(v_src.clone()).await?;
-                    let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
-                        .index(src_link.header.index)
-                        .setns_by_pid(src_endpoint.pid);
-                    nl.link().set(msg.build()).execute().await?;
-                }
-
-                if dst_endpoint.pid != std::process::id() {
-                    let dst_link = nl.fetch_link_by_name(v_dst.clone()).await?;
-                    let msg: LinkMessageBuilder<LinkVeth> = LinkMessageBuilder::default()
-                        .index(dst_link.header.index)
-                        .setns_by_pid(dst_endpoint.pid);
-                    nl.link().set(msg.build()).execute().await?;
-                }
-
-                configure_veth_endpoint(
-                    src_endpoint.pid,
-                    v_src,
-                    veth_addr_for(subnet, host_bits, true),
-                    subnet_prefix,
-                )
-                .await?;
-                configure_veth_endpoint(
-                    dst_endpoint.pid,
-                    v_dst,
-                    veth_addr_for(subnet, host_bits, false),
-                    subnet_prefix,
-                )
-                .await?;
-
-                aok!()
-            })?;
+            create_veth_pair(src, dst, veth_name, src_ip4, dst_ip4, prefix_len)?;
         }
         MainCommand::Basis { cmd } => match cmd {
             BasisCommand::Mount {} => {
@@ -1923,17 +1947,13 @@ fn main() -> anyhow::Result<()> {
                 shell_prefs.take_args(sargs);
                 shell_prefs.adjust();
 
-                let bind_mount = state_paths::profile_netns_bind("basis");
-                let nsdata = state_paths::profile_ns_meta("basis");
-
-                if let Some(ns_alive) = read_ns_alive_opt(&nsdata) {
-                    enter_ns(&ns_alive, &bind_mount)?;
-                    apply_ns_env(&mut shell_prefs, &ns_alive);
-                    apply_dbus_env(&mut shell_prefs, &ns_alive);
-                } else {
-                    let ns = NSSource::Path(bind_mount.clone());
-                    ns.enter(CloneFlags::CLONE_NEWNET)?;
-                    shell_prefs.set_ns_env(Some(&bind_mount.to_string_lossy()));
+                let registry = NamespacesRegistry::load_locked()?;
+                let basis = registry.basis_ns.ok_or_else(|| {
+                    anyhow!("basis namespace is not recorded; run 'sp init' first")
+                })?;
+                basis.net.enter(CloneFlags::CLONE_NEWNET)?;
+                if let NSSource::Path(path) = &basis.net.source {
+                    shell_prefs.set_ns_env(Some(&path.to_string_lossy()));
                 }
 
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -2152,6 +2172,146 @@ fn load_hot_config_from_disk_or_default(path: &Path) -> HotConfig {
                 path, e
             );
             HotConfig::default()
+        }
+    }
+}
+
+fn create_veth_pair(
+    src: NsArg,
+    dst: NsArg,
+    veth_name: Option<String>,
+    src_ip4: Option<Ipv4Addr>,
+    dst_ip4: Option<Ipv4Addr>,
+    prefix_len: u8,
+) -> Result<()> {
+    warn!("make veth {:?} -> {:?}", src, dst);
+    let src_endpoint = resolve_veth_endpoint(&src)?;
+    let dst_endpoint = resolve_veth_endpoint(&dst)?;
+    let vname = veth_name
+        .unwrap_or_else(|| format!("{}_{}", src_endpoint.label, dst_endpoint.label));
+    let v_src = veth_interface_name(&vname, "src");
+    let v_dst = veth_interface_name(&vname, "dst");
+    let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
+    if prefix_len == 0 || prefix_len >= 32 {
+        bail!("veth prefix length must be between 1 and 31");
+    }
+    if src_ip4.is_some() != dst_ip4.is_some() {
+        bail!("src_ip4 and dst_ip4 must be supplied together");
+    }
+    let host_bits = 32 - prefix_len;
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let nl = tokio_netlink_conn()?;
+        remove_link_if_exists_in_namespace(src_endpoint.source.clone(), &v_src).await?;
+        remove_link_if_exists_in_namespace(dst_endpoint.source.clone(), &v_dst).await?;
+        nl.remove_link_if_exists(&v_src).await?;
+        nl.remove_link_if_exists(&v_dst).await?;
+
+        let mut used = fetch_ipv4_in_namespace(NSSource::Pid(std::process::id() as i32)).await?;
+        if !veth_endpoint_is_current(&src_endpoint) {
+            used.extend(fetch_ipv4_in_namespace(src_endpoint.source.clone()).await?);
+        }
+        if !veth_endpoint_is_current(&dst_endpoint) && dst_endpoint.source != src_endpoint.source {
+            used.extend(fetch_ipv4_in_namespace(dst_endpoint.source.clone()).await?);
+        }
+
+        let (src_addr, dst_addr) = match (src_ip4, dst_ip4) {
+            (Some(src_addr), Some(dst_addr)) => {
+                if used.contains(&src_addr) || used.contains(&dst_addr) {
+                    bail!("requested veth address is already occupied");
+                }
+                (src_addr, dst_addr)
+            }
+            (None, None) => {
+                let subnet = find_vacant_ipv4_subnet(used, veth_net, host_bits)
+                    .ok_or_else(|| anyhow!("cannot find any vacant ip"))?;
+                (veth_addr_for(subnet, host_bits, true), veth_addr_for(subnet, host_bits, false))
+            }
+            _ => unreachable!(),
+        };
+
+        nl.add_veth(&v_src, &v_dst).await?;
+        if !veth_endpoint_is_current(&src_endpoint) {
+            let src_link = nl.fetch_link_by_name(v_src.clone()).await?;
+            let mut msg: LinkMessageBuilder<LinkVeth> =
+                LinkMessageBuilder::default().index(src_link.header.index);
+            msg = match &src_endpoint.target {
+                VethNamespaceTarget::Pid(pid) => msg.setns_by_pid(*pid),
+                VethNamespaceTarget::Fd(fd) => msg.setns_by_fd(fd.as_raw_fd()),
+            };
+            nl.link().set(msg.build()).execute().await?;
+        }
+        if !veth_endpoint_is_current(&dst_endpoint) {
+            let dst_link = nl.fetch_link_by_name(v_dst.clone()).await?;
+            let mut msg: LinkMessageBuilder<LinkVeth> =
+                LinkMessageBuilder::default().index(dst_link.header.index);
+            msg = match &dst_endpoint.target {
+                VethNamespaceTarget::Pid(pid) => msg.setns_by_pid(*pid),
+                VethNamespaceTarget::Fd(fd) => msg.setns_by_fd(fd.as_raw_fd()),
+            };
+            nl.link().set(msg.build()).execute().await?;
+        }
+        configure_veth_endpoint(src_endpoint.source, v_src, src_addr, prefix_len).await?;
+        configure_veth_endpoint(dst_endpoint.source, v_dst, dst_addr, prefix_len).await?;
+        Ok(())
+    })
+}
+
+fn reconcile_configured_veths(profile: &str) {
+    let hot = load_hot_config_from_disk_or_default(&state_paths::hot_config(profile));
+    let mut snapshot = VethStatusSnapshot::default();
+    let basis_source = match NamespacesRegistry::load_locked()
+        .ok()
+        .and_then(|registry| registry.basis_ns)
+        .map(|namespaces| namespaces.net.source)
+    {
+        Some(source) => source,
+        None => {
+            let detail = "basis namespace is not recorded; run 'sp init' first".to_string();
+            for spec in hot.veth {
+                snapshot.entries.push(VethStatus {
+                    spec,
+                    success: false,
+                    detail: detail.clone(),
+                    updated_at_secs: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+            }
+            if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
+                if let Err(err) = std::fs::write(state_paths::veth_status(profile), content) {
+                    warn!(profile, %err, "failed to persist veth status");
+                }
+            }
+            return;
+        }
+    };
+    for spec in hot.veth {
+        let result = run_in_netns_clone3_source(
+            basis_source.clone(),
+            || {
+                create_veth_pair(
+                    spec.src.parse().map_err(|e: String| anyhow!(e))?,
+                    spec.dst.parse().map_err(|e: String| anyhow!(e))?,
+                    spec.veth_name.clone(),
+                    spec.src_ip4,
+                    spec.dst_ip4,
+                    spec.prefix_len,
+                )
+            },
+        );
+        snapshot.entries.push(VethStatus {
+            spec,
+            success: result.is_ok(),
+            detail: result.map(|_| "veth ready".to_string()).unwrap_or_else(|e| e.to_string()),
+            updated_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        });
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
+        if let Err(err) = std::fs::write(state_paths::veth_status(profile), content) {
+            warn!(profile, %err, "failed to persist veth status");
         }
     }
 }
@@ -3145,11 +3305,10 @@ async fn run_up_daemon(
         let dbus_enabled = TemplateConfig::load(&template_path)
             .map(|t| t.dbus == nsproxy_core::DbusMode::Container)
             .unwrap_or(false);
-        let sandbox_ready = read_sandbox_status(profile)
-            .is_some_and(|s| {
-                s.detected_state == nsproxy_core::sandbox::SandboxState::Pivoted
-                    || s.configured_mode == SandboxMode::Overlay
-            });
+        let sandbox_ready = read_sandbox_status(profile).is_some_and(|s| {
+            s.detected_state == nsproxy_core::sandbox::SandboxState::Pivoted
+                || s.configured_mode == SandboxMode::Overlay
+        });
         if dbus_enabled && sandbox_ready {
             info!(
                 profile,
@@ -3170,9 +3329,12 @@ async fn run_up_daemon(
                 let ns_alive = read_ns_alive(&ns_meta)?;
                 let sandbox_status = read_sandbox_status(&profile)
                     .ok_or_else(|| anyhow!("no valid sandbox status for '{}'", profile))?;
-                if let Some((task_pgid, stdout_r, stderr_r)) =
-                    spawn_cli_process(&cli, &ns_alive, &sandbox_status, diag::NamespaceSpawn::Outside)?
-                {
+                if let Some((task_pgid, stdout_r, stderr_r)) = spawn_cli_process(
+                    &cli,
+                    &ns_alive,
+                    &sandbox_status,
+                    diag::NamespaceSpawn::Outside,
+                )? {
                     let mut new = (*state.load_full()).clone();
                     new.process_list.processes.insert(
                         task_pgid,
@@ -3290,12 +3452,14 @@ fn spawn_pipe_reader(
                             .or_insert_with(|| RawLogRingState::new(raw_log_cap));
                         if state.cap == 0 {
                             state.ring.clear();
+                            state.next_seq = state.next_seq.saturating_add(1);
                             continue;
                         }
                         if state.ring.len() >= state.cap {
                             state.ring.pop_front();
                         }
                         state.ring.push_back(entry);
+                        state.next_seq = state.next_seq.saturating_add(1);
                     }
                 }
                 Err(_) => break,
@@ -3998,17 +4162,44 @@ async fn handle_up_client(
                         let evt = diag::DaemonEvent::RecentLogs(entries);
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
-                    diag::DaemonRequest::QueryRawLogs { task_pgid, limit } => {
-                        let logs = {
+                    diag::DaemonRequest::QueryRawLogs {
+                        task_pgid,
+                        limit,
+                        after_seq,
+                    } => {
+                        let (reset, start_seq, next_seq, logs) = {
                             let guard = raw_logs.lock().unwrap_or_else(|e| e.into_inner());
                             guard.get(&task_pgid)
                                 .map(|state| {
-                                    let skip = state.ring.len().saturating_sub(limit);
-                                    state.ring.iter().skip(skip).cloned().collect::<Vec<_>>()
+                                    let first_seq = state
+                                        .next_seq
+                                        .saturating_sub(state.ring.len() as u64);
+                                    let reset = after_seq.is_none_or(|seq| {
+                                        seq < first_seq || seq > state.next_seq
+                                    });
+                                    let start_seq = if reset {
+                                        state.next_seq.saturating_sub(limit as u64).max(first_seq)
+                                    } else {
+                                        after_seq.unwrap_or(first_seq)
+                                    };
+                                    let skip = start_seq.saturating_sub(first_seq) as usize;
+                                    let logs = state
+                                        .ring
+                                        .iter()
+                                        .skip(skip)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    (reset, start_seq, state.next_seq, logs)
                                 })
-                                .unwrap_or_default()
+                                .unwrap_or((after_seq.is_none(), 0, 0, Vec::new()))
                         };
-                        let evt = diag::DaemonEvent::RawLogs { task_pgid, logs };
+                        let evt = diag::DaemonEvent::RawLogs {
+                            task_pgid,
+                            reset,
+                            start_seq,
+                            next_seq,
+                            logs,
+                        };
                         write_up_unstable_frame(&mut write_half, &evt).await?;
                     }
                 }
@@ -4479,6 +4670,7 @@ fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
     match op {
         diag::RootDaemonOp::Ping => "ping",
         diag::RootDaemonOp::Stop => "stop",
+        diag::RootDaemonOp::InitializeBasisNamespace => "initialize_basis_namespace",
         diag::RootDaemonOp::CreateDirAll { .. } => "create_dir_all",
         diag::RootDaemonOp::ReadFile { .. } => "read_file",
         diag::RootDaemonOp::WriteFile { .. } => "write_file",
@@ -4548,6 +4740,9 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
         diag::RootDaemonOp::Stop => {
             info!(op_id, op = op_name, "root daemon op received");
         }
+        diag::RootDaemonOp::InitializeBasisNamespace => {
+            info!(op_id, op = op_name, "root daemon op received");
+        }
         diag::RootDaemonOp::CreateDirAll { path } => {
             info!(op_id, op = op_name, path = %path.display(), "root daemon op received");
         }
@@ -4600,6 +4795,19 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 None,
             ))
         }
+        diag::RootDaemonOp::InitializeBasisNamespace => RootDaemonAction::Reply(
+            match initialize_basis_namespace(false) {
+                Ok(init) => diag::RootDaemonEvent {
+                    op_id,
+                    result: diag::RootDaemonResult::NamespaceInitialized {
+                        current: init.current,
+                        basis_ns: init.basis_ns,
+                        initialized: init.initialized,
+                    },
+                },
+                Err(err) => daemon_err(op_id, err.to_string(), None, None),
+            },
+        ),
         diag::RootDaemonOp::CreateDirAll { path } => RootDaemonAction::Reply(
             match ensure_daemon_path_allowed(&path)
                 .and_then(|_| std::fs::create_dir_all(&path).map_err(anyhow::Error::from))
@@ -5159,7 +5367,12 @@ fn configured_sandbox_root(profile: &str) -> Option<PathBuf> {
         return Some(state_paths::pivot_root(profile));
     }
     let conf = TemplateConfig::load(&profile_path)
-        .map_err(|e| warn!("could not read profile config for rootfs path, skipping rootfs cleanup: {}", e))
+        .map_err(|e| {
+            warn!(
+                "could not read profile config for rootfs path, skipping rootfs cleanup: {}",
+                e
+            )
+        })
         .ok()?;
     Some(match conf.rootfs {
         Rootfs::Default => state_paths::pivot_root(profile),
@@ -5313,24 +5526,49 @@ fn resolve_veth_endpoint(arg: &NsArg) -> Result<VethEndpoint> {
         NsArg::This => Ok(VethEndpoint {
             arg: NsArg::This,
             label: "this".to_string(),
-            pid: std::process::id(),
+            target: VethNamespaceTarget::Pid(std::process::id()),
+            source: NSSource::Pid(std::process::id() as i32),
         }),
-        NsArg::Container(profile) => {
-            let ns_meta = state_paths::profile_ns_meta(profile);
-            let ns_alive = read_ns_alive(&ns_meta)?;
-            let child_pid = ns_alive
-                .child_pid
-                .ok_or_else(|| anyhow!("ns_alive has no child_pid for profile {}", profile))?;
+        NsArg::Basis | NsArg::Container(_) => {
+            let registry = NamespacesRegistry::load_locked()?;
+            let (label, namespaces) = match arg {
+                NsArg::Basis => ("basis".to_string(), registry.basis_ns.ok_or_else(|| {
+                    anyhow!("basis namespace is not recorded; run 'sp init' first")
+                })?),
+                NsArg::Container(profile) => (
+                    sanitize_veth_label(profile),
+                    registry.profiles.get(profile).cloned().ok_or_else(|| {
+                        anyhow!("namespace for profile {} is not recorded", profile)
+                    })?,
+                ),
+                NsArg::This => unreachable!(),
+            };
+            let source = namespaces.net.source;
+            let target = match &source {
+                NSSource::Pid(pid) => VethNamespaceTarget::Pid(u32::try_from(*pid)
+                    .map_err(|_| anyhow!("recorded {} namespace has invalid pid {}", label, pid))?),
+                NSSource::Path(path) => {
+                    VethNamespaceTarget::Fd(Arc::new(fs::File::open(path)?))
+                }
+                NSSource::Unavail(_) => {
+                    bail!("recorded {} namespace has no usable process or namespace file", label)
+                }
+            };
             Ok(VethEndpoint {
-                arg: NsArg::Container(profile.clone()),
-                label: sanitize_veth_label(profile),
-                pid: child_pid,
+                arg: arg.clone(),
+                label,
+                target,
+                source,
             })
         }
     }
 }
 
-fn run_in_netns_clone3<T, F>(pid: u32, op: F) -> Result<T>
+fn veth_endpoint_is_current(endpoint: &VethEndpoint) -> bool {
+    matches!(&endpoint.target, VethNamespaceTarget::Pid(pid) if *pid == std::process::id())
+}
+
+fn run_in_netns_clone3_source<T, F>(source: NSSource, op: F) -> Result<T>
 where
     T: Serialize + serde::de::DeserializeOwned,
     F: FnOnce() -> Result<T>,
@@ -5338,8 +5576,7 @@ where
     match nsproxy_core::sys::clone3::<false>(false, false) {
         Ok(Clone3Result::IsChild { mut tx }) => {
             let outcome = match (|| -> Result<T> {
-                let ns_source = NSSource::Pid(pid as i32);
-                ns_source.enter(CloneFlags::CLONE_NEWNET)?;
+                source.enter(CloneFlags::CLONE_NEWNET)?;
                 op()
             })() {
                 Ok(value) => NetnsChildResult::Ok(value),
@@ -5369,8 +5606,8 @@ where
     }
 }
 
-async fn fetch_ipv4_in_namespace(pid: u32) -> Result<Vec<Ipv4Addr>> {
-    if pid == std::process::id() {
+async fn fetch_ipv4_in_namespace(source: NSSource) -> Result<Vec<Ipv4Addr>> {
+    if matches!(&source, NSSource::Pid(pid) if *pid == std::process::id() as i32) {
         let nl = tokio_netlink_conn()?;
         let addrs = nl.fetch_all_ip_addrs().await?;
         Ok(addrs
@@ -5381,7 +5618,7 @@ async fn fetch_ipv4_in_namespace(pid: u32) -> Result<Vec<Ipv4Addr>> {
             })
             .collect())
     } else {
-        run_in_netns_clone3(pid, move || {
+        run_in_netns_clone3_source(source, move || {
             run_tokio_on_fresh_thread(move || async move {
                 let nl = tokio_netlink_conn()?;
                 let addrs = nl.fetch_all_ip_addrs().await?;
@@ -5399,13 +5636,13 @@ async fn fetch_ipv4_in_namespace(pid: u32) -> Result<Vec<Ipv4Addr>> {
     }
 }
 
-async fn remove_link_if_exists_in_namespace(pid: u32, name: &str) -> Result<()> {
-    if pid == std::process::id() {
+async fn remove_link_if_exists_in_namespace(source: NSSource, name: &str) -> Result<()> {
+    if matches!(&source, NSSource::Pid(pid) if *pid == std::process::id() as i32) {
         let nl = tokio_netlink_conn()?;
         nl.remove_link_if_exists(name).await
     } else {
         let name = name.to_string();
-        run_in_netns_clone3(pid, move || {
+        run_in_netns_clone3_source(source, move || {
             run_tokio_on_fresh_thread(move || async move {
                 let nl = tokio_netlink_conn()?;
                 nl.remove_link_if_exists(&name).await?;
@@ -5416,12 +5653,12 @@ async fn remove_link_if_exists_in_namespace(pid: u32, name: &str) -> Result<()> 
 }
 
 async fn configure_veth_endpoint(
-    pid: u32,
+    source: NSSource,
     if_name: String,
     ip: Ipv4Addr,
     prefix: u8,
 ) -> Result<()> {
-    if pid == std::process::id() {
+    if matches!(&source, NSSource::Pid(pid) if *pid == std::process::id() as i32) {
         let nl = tokio_netlink_conn()?;
         nl.up_lo().await?;
         let dev = nl.fetch_link_by_name(if_name).await?;
@@ -5440,7 +5677,7 @@ async fn configure_veth_endpoint(
             .await?;
         Ok(())
     } else {
-        run_in_netns_clone3(pid, move || {
+        run_in_netns_clone3_source(source, move || {
             run_tokio_on_fresh_thread(move || async move {
                 let nl = tokio_netlink_conn()?;
                 nl.up_lo().await?;

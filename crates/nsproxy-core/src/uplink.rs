@@ -62,11 +62,11 @@ use std::{
 use anyhow::{Context, Result};
 use nsproxy_common::crdt::CRDT;
 use nsproxy_common::routing::{
-    DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol, RoutingResovled,
-    VDNSRES,
+    DropReason, ProxyID, ProxyNym, RoutingContext, RoutingDecision, RoutingProtocol,
+    RoutingResovled, VDNSRES,
 };
 use nsproxy_common::stats::{
-    default_udp_expectation, ChronoData, ProxyProtocol, ProxyStats, Timestamp,
+    ChronoData, ProxyProtocol, ProxyStats, Timestamp, default_udp_expectation,
 };
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
@@ -76,8 +76,8 @@ use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 
 use crate::{state_blueprint::PersistentState, state_paths};
 
-pub mod router;
 pub mod backup;
+pub mod router;
 
 /// Maximum number of concurrent virtual DNS entries (mirrors tun2socks5 default)
 const POOL_SIZE: usize = 65_535;
@@ -412,15 +412,19 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
                 id: id.clone(),
             },
             // VirtDNS decoded to a domain — use hostname so the proxy resolves it, preserving privacy
-            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => RoutingResovled::ProxyResovled {
-                target: WireAddress::DomainAddress(host.clone(), ctx.target_port),
-                id: id.clone(),
-            },
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => {
+                RoutingResovled::ProxyResovled {
+                    target: WireAddress::DomainAddress(host.clone(), ctx.target_port),
+                    id: id.clone(),
+                }
+            }
             // VirtDNS decoded to a concrete socket — proxy to that socket directly
-            VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => RoutingResovled::ProxyResovled {
-                target: WireAddress::SocketAddress(*sock),
-                id: id.clone(),
-            },
+            VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => {
+                RoutingResovled::ProxyResovled {
+                    target: WireAddress::SocketAddress(*sock),
+                    id: id.clone(),
+                }
+            }
             VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => RoutingResovled::NATByTUN(*sock),
             VDNSRES::Opine(RoutingDecision::Direct(sock)) => RoutingResovled::Direct(*sock),
             VDNSRES::Opine(RoutingDecision::File(path)) => RoutingResovled::ProxyResovled {
@@ -428,9 +432,9 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
                 id: ProxyID::for_file(path.as_path()),
             },
             VDNSRES::Opine(RoutingDecision::Drop(reason)) => RoutingResovled::Drop(reason.clone()),
-            VDNSRES::ERR => RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
-                "vdns error",
-            ))),
+            VDNSRES::ERR => {
+                RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed("vdns error")))
+            }
         }
     })
 }
@@ -674,7 +678,7 @@ impl UplinkHub {
     /// Make a routing decision for the given context, resolving all intermediate variants
     /// using hub state (proxy registry, etc.) into a concrete `RoutingResovled`.
     pub fn route(&self, ctx: &RoutingContext) -> RoutingResovled {
-        (self.routing_fn)(ctx, self) 
+        (self.routing_fn)(ctx, self)
     }
 
     /// Set a new routing function
@@ -786,11 +790,7 @@ impl UplinkHub {
                 };
 
                 // Prefer domain-based ProxyID for stable identity across DNS changes
-                let id = ProxyID::for_trojan_domain(
-                    &cfg.server,
-                    cfg.port,
-                    &cfg.password,
-                );
+                let id = ProxyID::for_trojan_domain(&cfg.server, cfg.port, &cfg.password);
                 self.add_proxy(id, UplinkProxy::Trojan(runtime));
                 count += 1;
             }
@@ -799,7 +799,6 @@ impl UplinkHub {
         Ok(count)
     }
 }
-
 
 /// Serializable snapshot of all per-proxy link stats, stored at uplink/stats.json.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1613,9 +1612,7 @@ pub mod proxy_adapters {
                 "Trojan TCP connection to {} via {} ({})",
                 dest, proxy.server_name, proxy_ip
             );
-            let conn = proxy
-                .connect_tcp(proxy_ip, dest)
-                .await?;
+            let conn = proxy.connect_tcp(proxy_ip, dest).await?;
             match conn {
                 clash::TrojanConnection::TcpConnect(stream, _target) => {
                     Ok(ProxyConnection::Tcp(Box::new(TrojanTcpConn {
@@ -1641,9 +1638,7 @@ pub mod proxy_adapters {
                 "Trojan UDP-associate to {} via {} ({})",
                 dest, proxy.server_name, resolved_ip
             );
-            let conn = proxy
-                .connect_udp(resolved_ip, dest)
-                .await?;
+            let conn = proxy.connect_udp(resolved_ip, dest).await?;
             match conn {
                 clash::TrojanConnection::UdpAssociate(tunnel, _target) => {
                     Ok(ProxyConnection::Udp(Box::new(TrojanUdpConn {
@@ -1931,37 +1926,64 @@ mod tests {
 
         // Serialize to JSON
         let json = serde_json::to_string_pretty(&state).expect("Failed to serialize");
-        
+
         // Verify JSON structure: keys should be hex strings
         println!("Serialized JSON:\n{}", json);
-        
+
         // Parse as generic JSON to verify keys are strings
         let json_value: serde_json::Value = serde_json::from_str(&json).expect("Invalid JSON");
         let stats_obj = json_value.get("stats").expect("Missing stats field");
         let stats_map = stats_obj.as_object().expect("stats should be an object");
-        
+
         // Verify we have 3 entries
         assert_eq!(stats_map.len(), 3, "Should have 3 proxy stats entries");
-        
+
         // Verify keys are hex strings (64 characters for 32 bytes)
         for (key, _) in stats_map {
-            assert_eq!(key.len(), 64, "ProxyID should serialize as 64-char hex string");
-            assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "Key should be valid hex: {}", key);
+            assert_eq!(
+                key.len(),
+                64,
+                "ProxyID should serialize as 64-char hex string"
+            );
+            assert!(
+                key.chars().all(|c| c.is_ascii_hexdigit()),
+                "Key should be valid hex: {}",
+                key
+            );
         }
 
         // Deserialize back
-        let deserialized: UplinkStatsState = serde_json::from_str(&json)
-            .expect("Failed to deserialize");
+        let deserialized: UplinkStatsState =
+            serde_json::from_str(&json).expect("Failed to deserialize");
 
         // Verify deserialized data
-        assert_eq!(deserialized.stats.len(), 3, "Should have 3 entries after deserialization");
-        assert!(deserialized.stats.contains_key(&trojan_id), "Should contain trojan proxy");
-        assert!(deserialized.stats.contains_key(&remote_id), "Should contain remote proxy");
-        assert!(deserialized.stats.contains_key(&file_id), "Should contain file proxy");
+        assert_eq!(
+            deserialized.stats.len(),
+            3,
+            "Should have 3 entries after deserialization"
+        );
+        assert!(
+            deserialized.stats.contains_key(&trojan_id),
+            "Should contain trojan proxy"
+        );
+        assert!(
+            deserialized.stats.contains_key(&remote_id),
+            "Should contain remote proxy"
+        );
+        assert!(
+            deserialized.stats.contains_key(&file_id),
+            "Should contain file proxy"
+        );
 
         // Verify stats data is preserved (check one entry in detail)
-        let trojan_stats = deserialized.stats.get(&trojan_id).expect("Trojan stats missing");
-        assert!(!trojan_stats.minute_data.is_empty(), "Trojan stats should have data");
+        let trojan_stats = deserialized
+            .stats
+            .get(&trojan_id)
+            .expect("Trojan stats missing");
+        assert!(
+            !trojan_stats.minute_data.is_empty(),
+            "Trojan stats should have data"
+        );
     }
 
     #[test]
@@ -1971,17 +1993,17 @@ mod tests {
         let id = ProxyID::for_remote(addr);
 
         let json = serde_json::to_string(&id).expect("Failed to serialize ProxyID");
-        
+
         // Should be a quoted hex string
         assert!(json.starts_with('"'), "Should be a JSON string");
         assert!(json.ends_with('"'), "Should be a JSON string");
-        
+
         let hex_value = json.trim_matches('"');
         assert_eq!(hex_value.len(), 64, "Should be 64 hex characters");
 
-        let deserialized: ProxyID = serde_json::from_str(&json)
-            .expect("Failed to deserialize ProxyID");
-        
+        let deserialized: ProxyID =
+            serde_json::from_str(&json).expect("Failed to deserialize ProxyID");
+
         assert_eq!(id, deserialized, "ProxyID should round-trip correctly");
     }
 
@@ -1989,22 +2011,22 @@ mod tests {
     fn test_proxy_id_as_json_object_key() {
         // Demonstrate that ProxyID works as a JSON object key
         let mut map: HashMap<ProxyID, String> = HashMap::new();
-        
+
         let id1 = ProxyID::for_remote("127.0.0.1:1080".parse().unwrap());
         let id2 = ProxyID::for_remote("127.0.0.1:1081".parse().unwrap());
-        
+
         map.insert(id1.clone(), "proxy1".to_string());
         map.insert(id2.clone(), "proxy2".to_string());
 
         let json = serde_json::to_string(&map).expect("Failed to serialize map");
-        
+
         // JSON object keys must be strings - verify it's an object, not an array
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value.is_object(), "Should serialize as JSON object");
-        
-        let deserialized: HashMap<ProxyID, String> = serde_json::from_str(&json)
-            .expect("Failed to deserialize");
-        
+
+        let deserialized: HashMap<ProxyID, String> =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
         assert_eq!(deserialized.get(&id1), Some(&"proxy1".to_string()));
         assert_eq!(deserialized.get(&id2), Some(&"proxy2".to_string()));
     }

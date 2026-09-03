@@ -25,7 +25,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let files = collect_hash_inputs(&local_pkgs, metadata.workspace_root.as_std_path());
     let lock_path = metadata.workspace_root.as_std_path().join("Cargo.lock");
     let registry_inputs = lock_registry_inputs(&closure, &metadata.packages, &lock_path)?;
-    let tree_hash = hash_inputs(&files, &registry_inputs, metadata.workspace_root.as_std_path())?;
+    let tree_hash = hash_inputs(
+        &files,
+        &registry_inputs,
+        metadata.workspace_root.as_std_path(),
+    )?;
 
     for file in &files {
         println!("cargo:rerun-if-changed={}", file.display());
@@ -63,7 +67,11 @@ impl DepClosure {
                 local.push(*pkg);
             }
         }
-        local.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.manifest_path.cmp(&b.manifest_path)));
+        local.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.manifest_path.cmp(&b.manifest_path))
+        });
         local
     }
 }
@@ -205,7 +213,11 @@ fn lock_registry_inputs(
         }
 
         let source = pkg.source.as_ref().map(|s| s.to_string());
-        let key = (pkg.name.to_string(), pkg.version.to_string(), source.clone());
+        let key = (
+            pkg.name.to_string(),
+            pkg.version.to_string(),
+            source.clone(),
+        );
         let lock_match = by_name_ver_source.get(&key);
 
         let checksum = lock_match

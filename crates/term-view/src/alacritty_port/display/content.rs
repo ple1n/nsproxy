@@ -13,7 +13,7 @@ use alacritty_terminal::term::{self, RenderableContent as TerminalContent, Term,
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::config::UiConfig;
-use crate::display::color::{CellRgb, DIM_FACTOR, List, Rgb};
+use crate::display::color::{CellRgb, List, Rgb, DIM_FACTOR};
 use crate::display::hint::{self, HintState};
 use crate::display::{Display, SizeInfo};
 use crate::event::SearchState;
@@ -44,7 +44,9 @@ impl<'a> RenderableContent<'a> {
         term: &'a Term<T>,
         search_state: &'a mut SearchState,
     ) -> Self {
-        let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
+        let search = search_state
+            .dfas()
+            .map(|dfas| HintMatches::visible_regex_matches(term, dfas));
         let focused_match = search_state.focused_match();
         let terminal_content = term.renderable_content();
 
@@ -102,7 +104,9 @@ impl<'a> RenderableContent<'a> {
 
     /// Get the RGB value for a color index.
     pub fn color(&self, color: usize) -> Rgb {
-        self.terminal_content.colors[color].map(Rgb).unwrap_or(self.colors[color])
+        self.terminal_content.colors[color]
+            .map(Rgb)
+            .unwrap_or(self.colors[color])
     }
 
     pub fn selection_range(&self) -> Option<SelectionRange> {
@@ -262,12 +266,24 @@ impl RenderableCell {
                 bg = content.color(NamedColor::Foreground as usize);
                 bg_alpha = 1.0;
             }
-        } else if content.search.as_mut().is_some_and(|search| search.advance(cell.point)) {
-            let focused = content.focused_match.is_some_and(|fm| fm.contains(&cell.point));
+        } else if content
+            .search
+            .as_mut()
+            .is_some_and(|search| search.advance(cell.point))
+        {
+            let focused = content
+                .focused_match
+                .is_some_and(|fm| fm.contains(&cell.point));
             let (config_fg, config_bg) = if focused {
-                (colors.search.focused_match.foreground, colors.search.focused_match.background)
+                (
+                    colors.search.focused_match.foreground,
+                    colors.search.focused_match.background,
+                )
             } else {
-                (colors.search.matches.foreground, colors.search.matches.background)
+                (
+                    colors.search.matches.foreground,
+                    colors.search.matches.background,
+                )
             };
             Self::compute_cell_rgb(&mut fg, &mut bg, &mut bg_alpha, config_fg, config_bg);
         }
@@ -281,9 +297,9 @@ impl RenderableCell {
         let cell_point = cell.point;
         let point = term::point_to_viewport(display_offset, cell_point).unwrap();
 
-        let underline = cell
-            .underline_color()
-            .map_or(fg, |underline| Self::compute_fg_rgb(content, underline, flags));
+        let underline = cell.underline_color().map_or(fg, |underline| {
+            Self::compute_fg_rgb(content, underline, flags)
+        });
 
         let zerowidth = cell.zerowidth();
         let hyperlink = cell.hyperlink();
@@ -295,7 +311,16 @@ impl RenderableCell {
             })
         });
 
-        RenderableCell { flags, character, bg_alpha, point, fg, bg, underline, extra }
+        RenderableCell {
+            flags,
+            character,
+            bg_alpha,
+            point,
+            fg,
+            bg,
+            underline,
+            extra,
+        }
     }
 
     /// Check if cell contains any renderable content.
@@ -303,7 +328,9 @@ impl RenderableCell {
         self.bg_alpha == 0.
             && self.character == ' '
             && self.extra.is_none()
-            && !self.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            && !self
+                .flags
+                .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
     }
 
     /// Apply [`CellRgb`] colors to the cell's colors.
@@ -330,28 +357,31 @@ impl RenderableCell {
                 Flags::DIM => {
                     let rgb: Rgb = rgb.into();
                     rgb * DIM_FACTOR
-                },
+                }
                 _ => rgb.into(),
             },
             Color::Named(ansi) => {
-                match (config.colors.draw_bold_text_with_bright_colors, flags & Flags::DIM_BOLD) {
+                match (
+                    config.colors.draw_bold_text_with_bright_colors,
+                    flags & Flags::DIM_BOLD,
+                ) {
                     // If no bright foreground is set, treat it like the BOLD flag doesn't exist.
                     (_, Flags::DIM_BOLD)
                         if ansi == NamedColor::Foreground
                             && config.colors.primary.bright_foreground.is_none() =>
                     {
                         content.color(NamedColor::DimForeground as usize)
-                    },
+                    }
                     // Draw bold text in bright colors *and* contains bold flag.
                     (true, Flags::BOLD) => content.color(ansi.to_bright() as usize),
                     // Cell is marked as dim and not bold.
                     (_, Flags::DIM) | (false, Flags::DIM_BOLD) => {
                         content.color(ansi.to_dim() as usize)
-                    },
+                    }
                     // None of the above, keep original color..
                     _ => content.color(ansi as usize),
                 }
-            },
+            }
             Color::Indexed(idx) => {
                 let idx = match (
                     config.colors.draw_bold_text_with_bright_colors,
@@ -365,7 +395,7 @@ impl RenderableCell {
                 };
 
                 content.color(idx)
-            },
+            }
         }
     }
 
@@ -413,7 +443,13 @@ impl RenderableCursor {
         let text_color = Rgb::default();
         let width = NonZeroU32::new(1).unwrap();
         let point = Point::default();
-        Self { shape, cursor_color, text_color, width, point }
+        Self {
+            shape,
+            cursor_color,
+            text_color,
+            width,
+            point,
+        }
     }
 }
 
@@ -424,7 +460,13 @@ impl RenderableCursor {
         cursor_color: Rgb,
         width: NonZeroU32,
     ) -> Self {
-        Self { shape, cursor_color, text_color: cursor_color, width, point }
+        Self {
+            shape,
+            cursor_color,
+            text_color: cursor_color,
+            width,
+            point,
+        }
     }
 
     pub fn color(&self) -> Rgb {
@@ -500,7 +542,10 @@ impl Hint<'_> {
 impl<'a> From<&'a HintState> for Hint<'a> {
     fn from(hint_state: &'a HintState) -> Self {
         let matches = HintMatches::new(hint_state.matches());
-        Self { labels: hint_state.labels(), matches }
+        Self {
+            labels: hint_state.labels(),
+            matches,
+        }
     }
 }
 
@@ -517,7 +562,10 @@ struct HintMatches<'a> {
 impl<'a> HintMatches<'a> {
     /// Create new renderable matches iterator..
     fn new(matches: impl Into<Cow<'a, [Match]>>) -> Self {
-        Self { matches: matches.into(), index: 0 }
+        Self {
+            matches: matches.into(),
+            index: 0,
+        }
     }
 
     /// Create from regex matches on term visible part.

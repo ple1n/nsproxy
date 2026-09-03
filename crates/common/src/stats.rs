@@ -254,11 +254,7 @@ impl ProxyStats {
     }
 
     pub fn observe_udp_ability(&mut self, ts: Timestamp, udp_ok: bool) {
-        if self
-            .udp_ability_ts
-            .map(|cur| ts >= cur)
-            .unwrap_or(true)
-        {
+        if self.udp_ability_ts.map(|cur| ts >= cur).unwrap_or(true) {
             self.udp_ability = Some(udp_ok);
             self.udp_ability_ts = Some(ts);
         }

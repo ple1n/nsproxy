@@ -21,7 +21,9 @@ pub fn load_saved_uplink_hub() -> Result<crate::uplink::UplinkHub> {
     hub.load_stats()?;
 
     if count == 0 {
-        bail!("No saved proxies found. Import Clash config first with 'sp uplink clash config-add'.");
+        bail!(
+            "No saved proxies found. Import Clash config first with 'sp uplink clash config-add'."
+        );
     }
 
     Ok(hub)
@@ -42,17 +44,15 @@ pub fn cmd_uplink(kind: UplinkCommand) -> Result<()> {
 }
 
 fn cmd_stats() -> Result<()> {
-    use crate::uplink::UplinkStatsState;
     use crate::state_blueprint::PersistentState;
+    use crate::uplink::UplinkStatsState;
 
     let mut hub = crate::uplink::UplinkHub::new();
     hub.hydrate_from_persisted()
         .context("Failed to load persisted proxies")?;
-    hub.load_stats()
-        .context("Failed to load persisted stats")?;
+    hub.load_stats().context("Failed to load persisted stats")?;
 
-    let stats_state = UplinkStatsState::load_or_default()
-        .context("Failed to load stats.json")?;
+    let stats_state = UplinkStatsState::load_or_default().context("Failed to load stats.json")?;
 
     // Collect all proxies; tag whether they have recorded stats for sort ordering.
     let mut rows: Vec<(bool, String, String, String, String)> = hub
@@ -63,7 +63,8 @@ fn cmd_stats() -> Result<()> {
             let proxy_display = proxy.to_string();
             let (has_stats, latency_s, conn_s) = if let Some(s) = stats_state.stats.get(id) {
                 let h = s.past_hour();
-                let lat = h.avg_latency_ms()
+                let lat = h
+                    .avg_latency_ms()
                     .map(|ms| format!("{:.0}ms", ms))
                     .unwrap_or_else(|| "-".to_string());
                 let conn = match h.success_rate() {
@@ -87,7 +88,11 @@ fn cmd_stats() -> Result<()> {
 
     println!(
         "{}",
-        format!("Uplink proxy stats ({} total, showing first {}):", total, shown).bold()
+        format!(
+            "Uplink proxy stats ({} total, showing first {}):",
+            total, shown
+        )
+        .bold()
     );
     println!(
         "  {:<8}  {:<40}  {:<10}  {}",
@@ -117,10 +122,7 @@ fn cmd_stats() -> Result<()> {
 
 fn cmd_clash(cmd: ClashOps) -> Result<()> {
     match cmd {
-        ClashOps::ConfigAdd {
-            group_id,
-            path,
-        } => clash_config_add(group_id, path),
+        ClashOps::ConfigAdd { group_id, path } => clash_config_add(group_id, path),
         ClashOps::List => clash_list(),
         ClashOps::ConfigExplain { path } => clash_config_explain(path),
         ClashOps::Resolve {
@@ -143,13 +145,21 @@ fn clash_config_add(group_id: String, path: std::path::PathBuf) -> Result<()> {
 
     let clash_profile = crate::uplink::clash::ClashProfile::load_file(&path)?;
 
-    let append_report = clash_state
-        .append_profile_to_group(&clash_profile, crate::uplink::clash::GroupId::from(group_id))?;
+    let append_report = clash_state.append_profile_to_group(
+        &clash_profile,
+        crate::uplink::clash::GroupId::from(group_id),
+    )?;
     hub.set_clash_state(clash_state)?;
 
     println!("\n✓ Profile imported");
-    println!("  Tier1 nameservers: {}", clash_profile.tier1_nameservers.len());
-    println!("  Tier2 nameservers: {}", clash_profile.tier2_nameservers.len());
+    println!(
+        "  Tier1 nameservers: {}",
+        clash_profile.tier1_nameservers.len()
+    );
+    println!(
+        "  Tier2 nameservers: {}",
+        clash_profile.tier2_nameservers.len()
+    );
     println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
     println!(
         "  Appended tier1 nameservers: {}",
@@ -187,13 +197,7 @@ fn clash_list() -> Result<()> {
             for (i, (id, proxy)) in hub.all_proxies().iter().take(max_show).enumerate() {
                 if let Some(nym) = hub.get_nym(id) {
                     if let Some(stats) = hub.get_link_stats(id) {
-                        println!(
-                            "    {} => {} => {} ({})",
-                            i + 1,
-                            nym,
-                            proxy,
-                            stats
-                        );
+                        println!("    {} => {} => {} ({})", i + 1, nym, proxy, stats);
                     } else {
                         println!("    {} => {} => {}", i + 1, nym, proxy);
                     }
@@ -437,7 +441,11 @@ fn clash_config_explain(path: std::path::PathBuf) -> Result<()> {
     }
 
     println!();
-    println!("  {} ({} total)", "Main Tier".cyan(), config.dns.nameserver.len());
+    println!(
+        "  {} ({} total)",
+        "Main Tier".cyan(),
+        config.dns.nameserver.len()
+    );
     for ns in config.dns.nameserver.iter().take(max_show) {
         println!("    {}", ns);
     }
@@ -548,7 +556,11 @@ fn clash_config_explain(path: std::path::PathBuf) -> Result<()> {
         );
         valid = false;
     } else {
-        println!("  {} Trojan proxies ({})", "[✓]".green().bold(), trojan_count);
+        println!(
+            "  {} Trojan proxies ({})",
+            "[✓]".green().bold(),
+            trojan_count
+        );
     }
 
     println!();
@@ -674,7 +686,10 @@ fn run_trojan_tests(
             .ok_or_else(|| anyhow!("No resolved IP for {}", trojan.server_name))?;
 
         println!("{}  Testing TCP connectivity...", "[•]".cyan());
-        match trojan.connect_tcp(server_ip, WireAddress::from(("ip.me", 80u16))).await {
+        match trojan
+            .connect_tcp(server_ip, WireAddress::from(("ip.me", 80u16)))
+            .await
+        {
             Ok(crate::uplink::clash::TrojanConnection::TcpConnect(mut stream, _)) => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -683,15 +698,17 @@ fn run_trojan_tests(
                 // measure start before sending request; we'll treat first successful read as TTFB
                 let start = std::time::Instant::now();
 
-                    if let Err(e) = stream.write_all(request.as_bytes()).await {
+                if let Err(e) = stream.write_all(request.as_bytes()).await {
                     println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
                     // record failure in hub
-                        hub.update_link_conn_check(proxy_id, false);
+                    hub.update_link_conn_check(proxy_id, false);
                 } else {
                     // attempt first read (treat as TTFB)
                     let mut first_buf = vec![0u8; 2048];
-                    match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut first_buf)).await {
-                            Ok(Ok(n)) => {
+                    match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut first_buf))
+                        .await
+                    {
+                        Ok(Ok(n)) => {
                             if n == 0 {
                                 println!("{}  TCP test failed: remote closed", "[✗]".red().bold());
                                 hub.update_link_conn_check(proxy_id, false);
@@ -701,10 +718,19 @@ fn run_trojan_tests(
                                 hub.update_link_conn_check(proxy_id, true);
 
                                 // build response string from first chunk then read rest
-                                let mut response = String::from_utf8_lossy(&first_buf[..n]).to_string();
-                                match tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut response)).await {
+                                let mut response =
+                                    String::from_utf8_lossy(&first_buf[..n]).to_string();
+                                match tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    stream.read_to_string(&mut response),
+                                )
+                                .await
+                                {
                                     Ok(Ok(_)) => {
-                                        println!("    Raw TCP response ({} bytes):", response.len());
+                                        println!(
+                                            "    Raw TCP response ({} bytes):",
+                                            response.len()
+                                        );
                                         for line in response.lines() {
                                             println!("      {}", line);
                                         }
@@ -726,7 +752,10 @@ fn run_trojan_tests(
                                         hub.update_link_conn_check(proxy_id, false);
                                     }
                                     Err(_) => {
-                                        println!("{}  TCP test failed: timeout", "[✗]".red().bold());
+                                        println!(
+                                            "{}  TCP test failed: timeout",
+                                            "[✗]".red().bold()
+                                        );
                                         hub.update_link_conn_check(proxy_id, false);
                                     }
                                 }
@@ -763,10 +792,8 @@ fn run_trojan_tests(
         .await
         {
             Ok(crate::uplink::proxy_adapters::ProxyConnection::Udp(mut tunnel)) => {
-                let dns_server = WireAddress::SocketAddress(SocketAddr::new(
-                    "1.1.1.1".parse::<IpAddr>()?,
-                    53,
-                ));
+                let dns_server =
+                    WireAddress::SocketAddress(SocketAddr::new("1.1.1.1".parse::<IpAddr>()?, 53));
                 match crate::uplink::proxy_dns::query_via_udp(
                     tunnel.as_mut(),
                     &dns_server,
@@ -776,7 +803,11 @@ fn run_trojan_tests(
                 .await
                 {
                     Ok(ips) => {
-                        println!("{}  UDP test passed (resolved): {:?}", "[✓]".green().bold(), ips);
+                        println!(
+                            "{}  UDP test passed (resolved): {:?}",
+                            "[✓]".green().bold(),
+                            ips
+                        );
                     }
                     Err(e) => {
                         println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
@@ -845,11 +876,19 @@ async fn test_remote_socks5_tcp(remote: &ArgProxy) {
             }
 
             let mut response = String::new();
-            match tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut response)).await {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                stream.read_to_string(&mut response),
+            )
+            .await
+            {
                 Ok(Ok(_)) => {
                     if response.contains("200 OK") || !response.is_empty() {
                         println!("{}", response);
-                        println!("{}  TCP test passed (ip.me responded)", "[✓]".green().bold());
+                        println!(
+                            "{}  TCP test passed (ip.me responded)",
+                            "[✓]".green().bold()
+                        );
                     } else {
                         println!("{}  TCP test failed: invalid response", "[✗]".red().bold());
                     }
@@ -863,7 +902,10 @@ async fn test_remote_socks5_tcp(remote: &ArgProxy) {
             }
         }
         Ok(_) => {
-            println!("{}  TCP test failed: wrong connection type", "[✗]".red().bold());
+            println!(
+                "{}  TCP test failed: wrong connection type",
+                "[✗]".red().bold()
+            );
         }
         Err(e) => {
             println!("{}  TCP test failed: {}", "[✗]".red().bold(), e);
@@ -877,10 +919,8 @@ async fn test_remote_socks5_udp(remote: &ArgProxy) {
     println!("{}  Testing UDP connectivity...", "[•]".cyan());
     match RemoteAdapter::connect_udp(remote).await {
         Ok(ProxyConnection::Udp(mut tunnel)) => {
-            let dns_server = WireAddress::SocketAddress(SocketAddr::new(
-                "1.1.1.1".parse().unwrap(),
-                53,
-            ));
+            let dns_server =
+                WireAddress::SocketAddress(SocketAddr::new("1.1.1.1".parse().unwrap(), 53));
 
             match crate::uplink::proxy_dns::query_via_udp(
                 tunnel.as_mut(),
@@ -891,7 +931,11 @@ async fn test_remote_socks5_udp(remote: &ArgProxy) {
             .await
             {
                 Ok(ips) => {
-                    println!("{}  UDP test passed (resolved): {:?}", "[✓]".green().bold(), ips);
+                    println!(
+                        "{}  UDP test passed (resolved): {:?}",
+                        "[✓]".green().bold(),
+                        ips
+                    );
                 }
                 Err(e) => {
                     println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
@@ -899,7 +943,10 @@ async fn test_remote_socks5_udp(remote: &ArgProxy) {
             }
         }
         Ok(_) => {
-            println!("{}  UDP test failed: wrong connection type", "[✗]".red().bold());
+            println!(
+                "{}  UDP test failed: wrong connection type",
+                "[✗]".red().bold()
+            );
         }
         Err(e) => {
             println!("{}  UDP test failed: {}", "[✗]".red().bold(), e);
@@ -913,8 +960,8 @@ fn cmd_export(path: std::path::PathBuf) -> Result<()> {
         .context("Failed to load persisted uplink state")?;
 
     let snapshot = hub.export();
-    let json = serde_json::to_string_pretty(&snapshot)
-        .context("Failed to serialize UplinkSnapshot")?;
+    let json =
+        serde_json::to_string_pretty(&snapshot).context("Failed to serialize UplinkSnapshot")?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -957,7 +1004,10 @@ fn cmd_import(path: std::path::PathBuf) -> Result<()> {
     remote_state
         .save_atomic()
         .context("Failed to persist remote proxy state from snapshot")?;
-    println!("  ✓ Remote proxy state written ({} proxies)", snapshot.remote_proxies.len());
+    println!(
+        "  ✓ Remote proxy state written ({} proxies)",
+        snapshot.remote_proxies.len()
+    );
 
     let stats_state = crate::uplink::UplinkStatsState {
         stats: snapshot.stats.clone(),
@@ -976,8 +1026,7 @@ fn cmd_dns_backup(path: std::path::PathBuf) -> Result<()> {
     let state = crate::uplink::clash::ClashState::load_or_default()
         .context("Failed to load clash state for DNS backup")?;
     let backup = crate::uplink::backup::UplinkBackup::from_clash_state(&state);
-    let json = serde_json::to_string_pretty(&backup)
-        .context("Failed to serialize UplinkBackup")?;
+    let json = serde_json::to_string_pretty(&backup).context("Failed to serialize UplinkBackup")?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

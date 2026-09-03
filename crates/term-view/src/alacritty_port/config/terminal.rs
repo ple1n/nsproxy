@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use toml::Value;
 
 use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
@@ -23,6 +23,8 @@ impl<'de> Deserialize<'de> for SerdeOsc52 {
         D: Deserializer<'de>,
     {
         let value = deserializer.deserialize_str(StringVisitor)?;
-        Osc52::deserialize(Value::String(value)).map(SerdeOsc52).map_err(de::Error::custom)
+        Osc52::deserialize(Value::String(value))
+            .map(SerdeOsc52)
+            .map_err(de::Error::custom)
     }
 }

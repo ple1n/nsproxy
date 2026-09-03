@@ -9,9 +9,9 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Point};
 use alacritty_terminal::term::cell::Flags;
 
-use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl::types::*;
 use crate::renderer::shader::{ShaderError, ShaderProgram, ShaderVersion};
 use crate::{gl, renderer};
@@ -29,7 +29,15 @@ pub struct RenderRect {
 
 impl RenderRect {
     pub fn new(x: f32, y: f32, width: f32, height: f32, color: Rgb, alpha: f32) -> Self {
-        RenderRect { kind: RectKind::Normal, x, y, width, height, color, alpha }
+        RenderRect {
+            kind: RectKind::Normal,
+            x,
+            y,
+            width,
+            height,
+            color,
+            alpha,
+        }
     }
 }
 
@@ -93,27 +101,42 @@ impl RenderLine {
                 ));
 
                 (bottom_pos, metrics.underline_thickness, RectKind::Normal)
-            },
+            }
             // Make undercurl occupy the entire descent area.
             Flags::UNDERCURL => (metrics.descent, metrics.descent.abs(), RectKind::Undercurl),
-            Flags::UNDERLINE => {
-                (metrics.underline_position, metrics.underline_thickness, RectKind::Normal)
-            },
+            Flags::UNDERLINE => (
+                metrics.underline_position,
+                metrics.underline_thickness,
+                RectKind::Normal,
+            ),
             // Make dotted occupy the entire descent area.
-            Flags::DOTTED_UNDERLINE => {
-                (metrics.descent, metrics.descent.abs(), RectKind::DottedUnderline)
-            },
-            Flags::DASHED_UNDERLINE => {
-                (metrics.underline_position, metrics.underline_thickness, RectKind::DashedUnderline)
-            },
-            Flags::STRIKEOUT => {
-                (metrics.strikeout_position, metrics.strikeout_thickness, RectKind::Normal)
-            },
+            Flags::DOTTED_UNDERLINE => (
+                metrics.descent,
+                metrics.descent.abs(),
+                RectKind::DottedUnderline,
+            ),
+            Flags::DASHED_UNDERLINE => (
+                metrics.underline_position,
+                metrics.underline_thickness,
+                RectKind::DashedUnderline,
+            ),
+            Flags::STRIKEOUT => (
+                metrics.strikeout_position,
+                metrics.strikeout_thickness,
+                RectKind::Normal,
+            ),
             _ => unimplemented!("Invalid flag for cell line drawing specified"),
         };
 
-        let mut rect =
-            Self::create_rect(size, metrics.descent, start, end, position, thickness, color);
+        let mut rect = Self::create_rect(
+            size,
+            metrics.descent,
+            start,
+            end,
+            position,
+            thickness,
+            color,
+        );
         rect.kind = ty;
         rects.push(rect);
     }
@@ -172,7 +195,9 @@ impl RenderLines {
         self.inner
             .iter()
             .flat_map(|(flag, lines)| {
-                lines.iter().flat_map(move |line| line.rects(*flag, metrics, size))
+                lines
+                    .iter()
+                    .flat_map(move |line| line.rects(*flag, metrics, size))
             })
             .collect()
     }
@@ -195,7 +220,11 @@ impl RenderLines {
         }
 
         // The underline color escape does not apply to strikeout.
-        let color = if flag.contains(Flags::STRIKEOUT) { cell.fg } else { cell.underline };
+        let color = if flag.contains(Flags::STRIKEOUT) {
+            cell.fg
+        } else {
+            cell.underline
+        };
 
         // Include wide char spacer if the current cell is a wide char.
         let mut end = cell.point;
@@ -216,12 +245,16 @@ impl RenderLines {
         }
 
         // Start new line if there currently is none.
-        let line = RenderLine { start: cell.point, end, color };
+        let line = RenderLine {
+            start: cell.point,
+            end,
+            color,
+        };
         match self.inner.get_mut(&flag) {
             Some(lines) => lines.push(line),
             None => {
                 self.inner.insert(flag, vec![line]);
-            },
+            }
         }
     }
 }
@@ -269,7 +302,7 @@ impl RectRenderer {
             Err(err) => {
                 info!("Error compiling dotted shader: {err}\n  falling back to underline");
                 RectShaderProgram::new(shader_version, RectKind::Normal)?
-            },
+            }
         };
         let dashed_program = RectShaderProgram::new(shader_version, RectKind::DashedUnderline)?;
 
@@ -313,8 +346,18 @@ impl RectRenderer {
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         }
 
-        let programs = [rect_program, undercurl_program, dotted_program, dashed_program];
-        Ok(Self { vao, vbo, programs, vertices: Default::default() })
+        let programs = [
+            rect_program,
+            undercurl_program,
+            dotted_program,
+            dashed_program,
+        ];
+        Ok(Self {
+            vao,
+            vbo,
+            programs,
+            vertices: Default::default(),
+        })
     }
 
     pub fn draw(&mut self, size_info: &SizeInfo, metrics: &Metrics, rects: Vec<RenderRect>) {
@@ -330,9 +373,16 @@ impl RectRenderer {
         let half_height = size_info.height() / 2.;
 
         // Build rect vertices vector.
-        self.vertices.iter_mut().for_each(|vertices| vertices.clear());
+        self.vertices
+            .iter_mut()
+            .for_each(|vertices| vertices.clear());
         for rect in &rects {
-            Self::add_rect(&mut self.vertices[rect.kind as usize], half_width, half_height, rect);
+            Self::add_rect(
+                &mut self.vertices[rect.kind as usize],
+                half_width,
+                half_height,
+                rect,
+            );
         }
 
         unsafe {
@@ -382,9 +432,30 @@ impl RectRenderer {
         // Make quad vertices.
         let quad = [
             Vertex { x, y, r, g, b, a },
-            Vertex { x, y: y - height, r, g, b, a },
-            Vertex { x: x + width, y, r, g, b, a },
-            Vertex { x: x + width, y: y - height, r, g, b, a },
+            Vertex {
+                x,
+                y: y - height,
+                r,
+                g,
+                b,
+                a,
+            },
+            Vertex {
+                x: x + width,
+                y,
+                r,
+                g,
+                b,
+                a,
+            },
+            Vertex {
+                x: x + width,
+                y: y - height,
+                r,
+                g,
+                b,
+                a,
+            },
         ];
 
         // Append the vertices to form two triangles.

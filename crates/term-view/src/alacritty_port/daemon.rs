@@ -58,7 +58,11 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = Command::new(program);
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     let working_directory = foreground_process_path(master_fd, shell_pid).ok();
     unsafe {

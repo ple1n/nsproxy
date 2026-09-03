@@ -16,7 +16,10 @@ pub struct Scrolling {
 
 impl Default for Scrolling {
     fn default() -> Self {
-        Self { multiplier: 3, history: Default::default() }
+        Self {
+            multiplier: 3,
+            history: Default::default(),
+        }
     }
 }
 

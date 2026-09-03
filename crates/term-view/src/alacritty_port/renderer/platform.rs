@@ -10,7 +10,7 @@ use glutin::display::{Display, DisplayApiPreference, DisplayFeatures, GetGlDispl
 use glutin::error::Result as GlutinResult;
 use glutin::prelude::*;
 use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
-use log::{LevelFilter, debug};
+use log::{debug, LevelFilter};
 
 use winit::dpi::PhysicalSize;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
@@ -63,7 +63,11 @@ pub fn pick_gl_config(
 
     let config_10bit = default_config
         .clone()
-        .with_buffer_type(ColorBufferType::Rgb { r_size: 10, g_size: 10, b_size: 10 })
+        .with_buffer_type(ColorBufferType::Rgb {
+            r_size: 10,
+            g_size: 10,
+            b_size: 10,
+        })
         .with_alpha_size(2);
 
     let configs = [
@@ -75,7 +79,10 @@ pub fn pick_gl_config(
 
     for config in configs {
         let gl_config = unsafe {
-            gl_display.find_configs(config.build()).ok().and_then(|mut configs| configs.next())
+            gl_display
+                .find_configs(config.build())
+                .ok()
+                .and_then(|mut configs| configs.next())
         };
 
         if let Some(gl_config) = gl_config {
@@ -113,7 +120,10 @@ pub fn create_gl_context(
     let mut builder = ContextAttributesBuilder::new().with_debug(debug);
 
     // Try to enable robustness.
-    if gl_display.supported_features().contains(DisplayFeatures::CONTEXT_ROBUSTNESS) {
+    if gl_display
+        .supported_features()
+        .contains(DisplayFeatures::CONTEXT_ROBUSTNESS)
+    {
         builder = builder.with_robustness(Robustness::RobustLoseContextOnReset);
     }
 
@@ -155,8 +165,9 @@ pub fn create_gl_surface(
     let gl_display = gl_context.display();
     let gl_config = gl_context.config();
 
-    let surface_attributes =
-        SurfaceAttributesBuilder::<WindowSurface>::new().with_srgb(Some(false)).build(
+    let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new()
+        .with_srgb(Some(false))
+        .build(
             raw_window_handle,
             NonZeroU32::new(size.width).unwrap(),
             NonZeroU32::new(size.height).unwrap(),

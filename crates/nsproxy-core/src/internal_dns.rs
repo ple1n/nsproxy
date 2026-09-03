@@ -42,7 +42,7 @@ pub async fn run_dns_ipv4_only() -> anyhow::Result<()> {
     loop {
         trace_spawn_result("dns server", server.block_until_done()).await
     }
-    
+
     Ok(())
 }
 

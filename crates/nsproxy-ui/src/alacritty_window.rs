@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+use term_view::{run_standalone_window, PtyIpc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::task::JoinHandle;
-use term_view::{PtyIpc, run_standalone_window};
 use tracing::{error, info, warn};
 
 use crate::supervisor::ContainerName;
@@ -132,7 +132,10 @@ impl ExternalTermWindowClient {
         let target = TermWindowTarget { profile, pid };
 
         if self.pending_spawn.is_some() {
-            if self.pending_target().is_some_and(|pending| *pending == target) {
+            if self
+                .pending_target()
+                .is_some_and(|pending| *pending == target)
+            {
                 return Ok(());
             }
             warn!(target = ?target, "terminal window spawn already pending; ignoring new attach request");
@@ -417,7 +420,10 @@ impl AlacrittyWindowIpc {
     }
 }
 
-async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, ipc: Arc<AlacrittyWindowIpc>) -> Result<()> {
+async fn run_backend(
+    cmd_rx: flume::Receiver<BackendCommand>,
+    ipc: Arc<AlacrittyWindowIpc>,
+) -> Result<()> {
     let shared = Arc::clone(&ipc.shared);
     let mut target: Option<TermWindowTarget> = None;
     let mut current_profile: Option<ContainerName> = None;
@@ -558,7 +564,9 @@ async fn run_backend(cmd_rx: flume::Receiver<BackendCommand>, ipc: Arc<Alacritty
 
     if let (Some(active_target), Some(active_writer)) = (target.as_ref(), writer.as_mut()) {
         let _ = active_writer
-            .send_unstable_request(&DaemonRequest::DetachPty { task_pgid: active_target.pid })
+            .send_unstable_request(&DaemonRequest::DetachPty {
+                task_pgid: active_target.pid,
+            })
             .await;
     }
 
@@ -593,7 +601,9 @@ async fn ensure_attached(
 
     if let Some(active_writer) = writer.as_mut() {
         if let Err(err) = active_writer
-            .send_unstable_request(&DaemonRequest::AttachPty { task_pgid: target.pid })
+            .send_unstable_request(&DaemonRequest::AttachPty {
+                task_pgid: target.pid,
+            })
             .await
         {
             *reader = None;
@@ -616,7 +626,8 @@ fn handle_up_event(
     };
 
     match event {
-        DaemonEvent::PtyScrollback { task_pgid, data } | DaemonEvent::PtyOutput { task_pgid, data }
+        DaemonEvent::PtyScrollback { task_pgid, data }
+        | DaemonEvent::PtyOutput { task_pgid, data }
             if task_pgid == active_target.pid =>
         {
             shared.append_incoming(&data);
@@ -740,20 +751,31 @@ async fn spawn_terminal_window_process(
     }
 }
 
-async fn read_terminal_signal(stream: &mut TokioUnixStream, expected: TermWindowSignal) -> Result<()> {
+async fn read_terminal_signal(
+    stream: &mut TokioUnixStream,
+    expected: TermWindowSignal,
+) -> Result<()> {
     loop {
         match read_terminal_signal_any(stream).await? {
-            Some(signal) if std::mem::discriminant(&signal) == std::mem::discriminant(&expected) => {
+            Some(signal)
+                if std::mem::discriminant(&signal) == std::mem::discriminant(&expected) =>
+            {
                 return Ok(())
             }
             Some(TermWindowSignal::Error(err)) => return Err(anyhow::anyhow!(err)),
             Some(_) => continue,
-            None => return Err(anyhow::anyhow!("terminal child closed control socket unexpectedly")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "terminal child closed control socket unexpectedly"
+                ))
+            }
         }
     }
 }
 
-async fn read_terminal_signal_any(stream: &mut TokioUnixStream) -> Result<Option<TermWindowSignal>> {
+async fn read_terminal_signal_any(
+    stream: &mut TokioUnixStream,
+) -> Result<Option<TermWindowSignal>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -865,7 +887,11 @@ pub fn run_term_window_process(control_fd: RawFd) -> Result<()> {
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let control_stream = unsafe { UnixStream::from_raw_fd(control_fd) };
-    let signal_tx = Arc::new(Mutex::new(control_stream.try_clone().context("clone terminal control socket for signal writer")?));
+    let signal_tx = Arc::new(Mutex::new(
+        control_stream
+            .try_clone()
+            .context("clone terminal control socket for signal writer")?,
+    ));
     let control_reader = control_stream
         .try_clone()
         .context("clone terminal control socket for reader thread")?;

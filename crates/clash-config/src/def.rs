@@ -330,10 +330,7 @@ proxy-groups:
         let config: Config = yaml.parse().expect("should parse yaml with anchors");
         let groups = config.proxy_group.unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].get("interval").unwrap().as_u64().unwrap(),
-            300
-        );
+        assert_eq!(groups[0].get("interval").unwrap().as_u64().unwrap(), 300);
     }
 
     #[test]
@@ -362,7 +359,10 @@ port: not_a_number
         assert!(config.allow_lan.unwrap());
         assert_eq!(config.mode, RunMode::Rule);
         assert_eq!(config.log_level, LogLevel::Info);
-        assert_eq!(config.external_controller, Some("127.0.0.1:9090".to_string()));
+        assert_eq!(
+            config.external_controller,
+            Some("127.0.0.1:9090".to_string())
+        );
 
         // Verify DNS config
         assert!(!config.dns.enable);
@@ -385,10 +385,16 @@ port: not_a_number
         let first_proxy = &proxies[0];
         assert_eq!(first_proxy.get("name").unwrap().as_str().unwrap(), "test1");
         assert_eq!(first_proxy.get("type").unwrap().as_str().unwrap(), "trojan");
-        assert_eq!(first_proxy.get("server").unwrap().as_str().unwrap(), "example-server-hk-01.example.com");
+        assert_eq!(
+            first_proxy.get("server").unwrap().as_str().unwrap(),
+            "example-server-hk-01.example.com"
+        );
 
         // Verify proxy groups
-        let groups = config.proxy_group.as_ref().expect("proxy groups should exist");
+        let groups = config
+            .proxy_group
+            .as_ref()
+            .expect("proxy groups should exist");
         assert!(!groups.is_empty());
         assert!(groups.len() >= 3); // At least 3 groups
 

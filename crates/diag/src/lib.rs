@@ -18,15 +18,21 @@ use std::{
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Result, bail};
-use nsproxy_common::{routing::{ProxyID, RoutingResovled}, state_paths};
-use socks5_impl::protocol::WireAddress;
+use anyhow::{bail, Result};
 pub use nsproxy_common::stats::Timestamp;
+use nsproxy_common::{
+    routing::{ProxyID, RoutingResovled},
+    state_paths,
+};
 use serde::{Deserialize, Serialize};
+use socks5_impl::protocol::WireAddress;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -214,6 +220,7 @@ pub struct RootDaemonRequest {
 pub enum RootDaemonOp {
     Ping,
     Stop,
+    InitializeBasisNamespace,
     CreateDirAll {
         path: PathBuf,
     },
@@ -264,6 +271,11 @@ pub enum RootDaemonResult {
     ReadFile {
         content: String,
         path: PathBuf,
+    },
+    NamespaceInitialized {
+        current: nsproxy_common::ProfileNamespaces,
+        basis_ns: nsproxy_common::ProfileNamespaces,
+        initialized: bool,
     },
     Ok {
         message: String,
@@ -404,7 +416,9 @@ pub fn encode_control_greeting(greeting: &ControlSocketGreeting) -> Result<Vec<u
 }
 
 /// Read a [`ControlSocketGreeting`] from the *unsplit* stream.  Returns `None` on clean EOF.
-pub async fn read_control_greeting(stream: &mut UnixStream) -> Result<Option<ControlSocketGreeting>> {
+pub async fn read_control_greeting(
+    stream: &mut UnixStream,
+) -> Result<Option<ControlSocketGreeting>> {
     read_frame(stream).await
 }
 
@@ -806,7 +820,14 @@ impl DiagServer {
         let ring = self.event_ring.clone();
         let track_conns = self.track_conns.clone();
         let conns_tx = self.conns_tx.clone();
-        tokio::spawn(serve_client(stream, rx, cmd_tx, ring, track_conns, conns_tx));
+        tokio::spawn(serve_client(
+            stream,
+            rx,
+            cmd_tx,
+            ring,
+            track_conns,
+            conns_tx,
+        ));
     }
 
     /// Run `fut` inside a task-local scope so that all `tracing` log records
@@ -976,7 +997,10 @@ impl DiagEventStream {
     /// Construct from an already-established stream (reversed connection).
     pub fn from_stream(stream: UnixStream) -> Self {
         let (read_half, write_half) = stream.into_split();
-        DiagEventStream { read_half, write_half }
+        DiagEventStream {
+            read_half,
+            write_half,
+        }
     }
     /// Read the next [`DiagEvent`] from the stream. Returns `None` on EOF.
     pub async fn next(&mut self) -> Result<Option<DiagEvent>> {
@@ -1074,7 +1098,8 @@ static ROOT_DAEMON_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> 
 /// Installed once via [`DiagServer::install_as_global`] after the diag server is created.
 /// [`DiagTracingLayer`] forwards log records here (as [`DiagEvent::Log`] frames) for tasks
 /// that are not running inside a [`DiagServer::scope`].
-static SERVE_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> = std::sync::OnceLock::new();
+static SERVE_LOG_TX: std::sync::OnceLock<broadcast::Sender<Arc<Vec<u8>>>> =
+    std::sync::OnceLock::new();
 
 /// Child-process log forward sink used by forked helpers that cannot emit directly to UI.
 ///
@@ -1173,13 +1198,10 @@ pub const LOG_RING_CAP: usize = 2000;
 
 /// The per-process log ring buffer. Shared by all paths (`sp serve` and `sp up` each run in
 /// their own process and therefore have their own instance).
-static LOG_RING: std::sync::OnceLock<Arc<Mutex<VecDeque<LogEntry>>>> =
-    std::sync::OnceLock::new();
+static LOG_RING: std::sync::OnceLock<Arc<Mutex<VecDeque<LogEntry>>>> = std::sync::OnceLock::new();
 
 fn log_ring() -> &'static Arc<Mutex<VecDeque<LogEntry>>> {
-    LOG_RING.get_or_init(|| {
-        Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_CAP)))
-    })
+    LOG_RING.get_or_init(|| Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_CAP))))
 }
 
 /// Append a log entry to the in-process ring buffer.
@@ -1550,10 +1572,16 @@ pub enum DaemonRequest {
     Stop,
     /// Request the most-recent `limit` log entries from the up-daemon ring buffer.
     /// The server responds immediately with `DaemonEvent::RecentLogs`.
-    QueryRecentLogs { limit: usize },
+    QueryRecentLogs {
+        limit: usize,
+    },
     /// Request the most-recent `limit` raw stdout/stderr lines captured from the managed task `task_pgid`.
     /// The server responds immediately with `DaemonEvent::RawLogs`.
-    QueryRawLogs { task_pgid: u32, limit: usize },
+    QueryRawLogs {
+        task_pgid: u32,
+        limit: usize,
+        after_seq: Option<u64>,
+    },
     Personal(personal::PersonalDaemonRequest),
 }
 
@@ -1595,13 +1623,19 @@ pub struct SpawnCliType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonEvent {
     /// Managed task was spawned.
-    Spawned { task_pgid: u32 },
+    Spawned {
+        task_pgid: u32,
+    },
     /// Managed task exited.
-    ProcessExit { task_pgid: u32 },
+    ProcessExit {
+        task_pgid: u32,
+    },
     /// Snapshot of all managed tasks (live and dead)
     ProcessListSnapshot(ProcessListSnapshot),
     /// Error response
-    Error { msg: String },
+    Error {
+        msg: String,
+    },
     /// Response to Ping
     Pong,
     /// Daemon process stopping
@@ -1613,11 +1647,23 @@ pub enum DaemonEvent {
     RecentLogs(Vec<LogEntry>),
     /// Raw stdout/stderr lines captured from a managed task.
     /// Sent in response to `DaemonRequest::QueryRawLogs`.
-    RawLogs { task_pgid: u32, logs: Vec<RawLog> },
+    RawLogs {
+        task_pgid: u32,
+        reset: bool,
+        start_seq: u64,
+        next_seq: u64,
+        logs: Vec<RawLog>,
+    },
     /// Raw PTY bytes for a managed PTY child.
-    PtyOutput { task_pgid: u32, data: Vec<u8> },
+    PtyOutput {
+        task_pgid: u32,
+        data: Vec<u8>,
+    },
     /// Initial PTY scrollback bytes sent on successful attach.
-    PtyScrollback { task_pgid: u32, data: Vec<u8> },
+    PtyScrollback {
+        task_pgid: u32,
+        data: Vec<u8>,
+    },
     Personal(personal::PersonalDaemonEvent),
 }
 
@@ -1627,10 +1673,16 @@ pub enum StableEvent {
     Pong,
     ShuttingDown,
     /// Version-specific protocol is available; `build_tree_hash` reports the responder identity.
-    UpgradeAccepted { build_tree_hash: String },
+    UpgradeAccepted {
+        build_tree_hash: String,
+    },
     /// Version-specific protocol is unavailable for reasons other than a build-hash mismatch.
-    UpgradeRejected { msg: String },
-    Error { msg: String },
+    UpgradeRejected {
+        msg: String,
+    },
+    Error {
+        msg: String,
+    },
 }
 
 /// Up-daemon wire event envelope.
@@ -1834,7 +1886,8 @@ impl UpDaemonWriter {
 
     /// Ergonomic helper for version-specific requests.
     pub async fn send_unstable_request(&mut self, req: &DaemonRequest) -> Result<()> {
-        self.send_request(&UpWireRequest::Unstable(req.clone())).await
+        self.send_request(&UpWireRequest::Unstable(req.clone()))
+            .await
     }
 
     /// Ergonomic helper for stable control requests.
@@ -1895,7 +1948,10 @@ impl UpDaemonStream {
     /// the remote end connected to us rather than us connecting to it).
     pub fn from_stream(stream: UnixStream) -> Self {
         let (read_half, write_half) = stream.into_split();
-        UpDaemonStream { read_half, write_half }
+        UpDaemonStream {
+            read_half,
+            write_half,
+        }
     }
 }
 
@@ -1912,7 +1968,8 @@ impl UpDaemonStream {
 
     /// Ergonomic helper for version-specific requests.
     pub async fn send_unstable_request(&mut self, req: &DaemonRequest) -> Result<()> {
-        self.send_request(&UpWireRequest::Unstable(req.clone())).await
+        self.send_request(&UpWireRequest::Unstable(req.clone()))
+            .await
     }
 
     /// Ergonomic helper for stable control requests.
