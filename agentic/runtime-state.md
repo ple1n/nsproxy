@@ -33,10 +33,10 @@ Non-daemonized interactive work should exit with its process tree:
 
 - `enter_ns` enters namespaces from `NsAlive` in `crates/nsproxy-core/src/cmd_common.rs`.
 - `ShellPrefs::{spawn_in_ns,spawn}` performs clone, setns, and exec in `crates/nsproxy-core/src/shell.rs`.
-- `MainCommand::Sandbox` uses this path with pivot/mount orchestration and `watch_hot_mounts`.
+- `MainCommand::Sandbox` uses this path with pivot/mount orchestration. See [case-sp-sandbox-hotconfig-mounts.md](case-sp-sandbox-hotconfig-mounts.md) for the current HotConfig mount behavior and risks.
 
 ## Hotconfig watcher boundary
 
-- `sp sandbox` initially reads `hot.json`, expands paths, merges `mnt` and `mounts`, and applies those mounts after sandbox setup.
-- `watch_hot_mounts` listens for data modifications to `hot.json` and reapplies changed `mnt` / `mounts` entries.
+- `sp sandbox` initially reads `hot.json`, expands paths, merges `mnt` and `mounts`, and applies those mounts after sandbox setup. This also applies in Overlay mode, where no pivot occurs; `TemplateConfig.mounts` are only applied by the pivot path.
+- `sp serve` deliberately skips live HotConfig mount reconciliation. `watch_hot_mounts` exists but currently has no caller, so `hot.json` changes do not automatically reapply `mnt` / `mounts`.
 - The watcher does not create, remove, or reconfigure veth pairs. `sp up` reconciles persisted `HotConfig.veth` entries and writes per-entry results to `veth_status.json`; temporary requests use the separate `MainCommand::Veth` path documented in `agentic/ui.md`.

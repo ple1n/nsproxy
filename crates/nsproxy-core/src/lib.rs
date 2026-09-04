@@ -277,6 +277,8 @@ mod tests {
             hot: PathBuf::from("@/hot.json"),
             hot_init: Some(HotConfig {
                 dns: HashMap::new(),
+                x11: false,
+                wayland: false,
                 tun: HashMap::new(),
                 devs: HashMap::new(),
                 mnt: {
@@ -324,6 +326,102 @@ mod tests {
             hot_init.mnt.get(&home).cloned(),
             Some(instance_root.join("hot-target"))
         );
+    }
+
+    fn test_mount(source: &str, target: &str) -> ProfileMount {
+        ProfileMount {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only: false,
+            recursive: true,
+            skip_missing: false,
+        }
+    }
+
+    #[test]
+    fn test_hotconfig_merged_mounts_preserves_explicit_order() {
+        let mut hot = HotConfig::default();
+        hot.mounts = vec![
+            test_mount("/source-a", "/target-a"),
+            test_mount("/source-b", "/target-b"),
+        ];
+
+        let mounts = hot.merged_mounts().unwrap();
+        assert_eq!(mounts, hot.mounts);
+    }
+
+    #[test]
+    fn test_hotconfig_process_x11_appends_once() {
+        let mut hot = HotConfig::default();
+        hot.x11 = true;
+        hot.mounts = vec![test_mount("/source", "/target")];
+
+        hot.process_x11_with_authority(PathBuf::from("~/.Xauthority"));
+        let first = hot.mounts.clone();
+        hot.process_x11_with_authority(PathBuf::from("~/.Xauthority"));
+
+        assert_eq!(hot.mounts, first);
+        assert_eq!(hot.mounts[0].target, PathBuf::from("/target"));
+        assert_eq!(hot.mounts[1].target, PathBuf::from("/tmp/.X11-unix"));
+        assert_eq!(hot.mounts[2].target, PathBuf::from("~/.Xauthority"));
+    }
+
+    #[test]
+    fn test_hotconfig_process_x11_preserves_explicit_targets() {
+        let mut hot = HotConfig::default();
+        hot.x11 = true;
+        hot.mounts = vec![
+            test_mount("/custom-x11", "/tmp/.X11-unix"),
+            test_mount("/custom-authority", "~/.Xauthority"),
+        ];
+
+        hot.process_x11_with_authority(PathBuf::from("~/.Xauthority"));
+
+        assert_eq!(hot.mounts.len(), 2);
+        assert_eq!(hot.mounts[0].source, PathBuf::from("/custom-x11"));
+        assert_eq!(hot.mounts[1].source, PathBuf::from("/custom-authority"));
+    }
+
+    #[test]
+    fn test_hotconfig_process_wayland_appends_socket_once() {
+        let mut hot = HotConfig::default();
+        hot.wayland = true;
+        hot.process_wayland();
+        let first = hot.mounts.clone();
+        hot.process_wayland();
+
+        assert_eq!(hot.mounts, first);
+        assert_eq!(hot.mounts.len(), 1);
+        assert!(hot.mounts[0].source.to_string_lossy().ends_with("wayland-0"));
+        assert_eq!(hot.mounts[0].source, hot.mounts[0].target);
+    }
+
+    #[test]
+    fn test_hotconfig_merged_mounts_rejects_duplicate_targets() {
+        let mut structured = HotConfig::default();
+        structured.mounts = vec![
+            test_mount("/source-a", "/same-target"),
+            test_mount("/source-b", "/same-target"),
+        ];
+        assert!(structured.merged_mounts().is_err());
+
+        let mut shorthand = HotConfig::default();
+        shorthand
+            .mounts
+            .push(test_mount("/source-a", "/same-target"));
+        shorthand
+            .mnt
+            .insert(PathBuf::from("/source-b"), PathBuf::from("/same-target"));
+        assert!(shorthand.merged_mounts().is_err());
+
+        let mut x11 = HotConfig::default();
+        x11.x11 = true;
+        x11.mnt.insert(
+            PathBuf::from("/custom-x11"),
+            PathBuf::from("/tmp/.X11-unix"),
+        );
+        x11.process_x11_with_authority(PathBuf::from("~/.Xauthority"));
+        assert!(x11.merged_mounts().is_err());
     }
 }
 
@@ -908,6 +1006,12 @@ pub struct LaunchableApp {
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
+    /// Bind the host X11 socket and Xauthority file into the sandbox.
+    #[serde(default)]
+    pub x11: bool,
+    /// Bind the host Wayland display socket into the sandbox.
+    #[serde(default)]
+    pub wayland: bool,
     /// NAT by TUN
     pub tun: HashMap<String, Value>,
     /// Map devs from a mac address (or interface name) to an IP address
@@ -1136,7 +1240,105 @@ impl HotConfig {
         }
     }
 
-    /// Merge shorthand `mnt` entries with explicit `mounts`.
+    /// Compile the X11 convenience flag into explicit mount entries.
+    /// This is idempotent; explicit mounts take precedence over generated ones.
+    pub fn process_x11(&mut self) {
+        if !self.x11 {
+            return;
+        }
+
+        let xauthority = match std::env::var_os("XAUTHORITY") {
+            Some(path) if !path.is_empty() => {
+                let path = PathBuf::from(path);
+                if !path.is_file() {
+                    warn!(
+                        path = %path.display(),
+                        "X11 is enabled but XAUTHORITY does not point to a readable file"
+                    );
+                }
+                path
+            }
+            Some(_) => {
+                warn!("X11 is enabled but XAUTHORITY is empty; falling back to ~/.Xauthority");
+                PathBuf::from("~/.Xauthority")
+            }
+            None => {
+                warn!("X11 is enabled but XAUTHORITY is unset; falling back to ~/.Xauthority");
+                PathBuf::from("~/.Xauthority")
+            }
+        };
+        self.process_x11_with_authority(xauthority);
+    }
+
+    /// Compile the Wayland convenience flag into an explicit socket mount.
+    /// This is idempotent; explicit mounts take precedence over the generated one.
+    pub fn process_wayland(&mut self) {
+        if !self.wayland {
+            return;
+        }
+
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
+                libc::getuid()
+            })));
+        let display = std::env::var_os("WAYLAND_DISPLAY")
+            .filter(|name| !name.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("wayland-0"));
+        let socket = if display.is_absolute() {
+            display
+        } else {
+            runtime_dir.join(display)
+        };
+
+        let mount = ProfileMount {
+            source: socket.clone(),
+            target: socket,
+            read_only: false,
+            recursive: false,
+            skip_missing: true,
+        };
+        if !self
+            .mounts
+            .iter()
+            .any(|existing| existing.target == mount.target)
+        {
+            self.mounts.push(mount);
+        }
+    }
+
+    fn process_x11_with_authority(&mut self, xauthority: PathBuf) {
+        let x11_mounts = [
+            ProfileMount {
+                source: PathBuf::from("/tmp/.X11-unix"),
+                target: PathBuf::from("/tmp/.X11-unix"),
+                read_only: false,
+                recursive: true,
+                skip_missing: true,
+            },
+            ProfileMount {
+                source: xauthority.clone(),
+                target: xauthority,
+                read_only: false,
+                recursive: false,
+                skip_missing: true,
+            },
+        ];
+
+        for mount in x11_mounts {
+            if !self
+                .mounts
+                .iter()
+                .any(|existing| existing.target == mount.target)
+            {
+                self.mounts.push(mount);
+            }
+        }
+    }
+
+    /// Merge explicit mounts with shorthand `mnt` entries.
     /// Errors on duplicate target paths.
     pub fn merged_mounts(&self) -> Result<Vec<ProfileMount>> {
         let mut merged = Vec::with_capacity(self.mounts.len() + self.mnt.len());

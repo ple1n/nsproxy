@@ -950,6 +950,12 @@ fn main() -> anyhow::Result<()> {
             };
             let selfprogdst = dstdir.join(selfprog.file_name().unwrap());
             overwrite(&selfprog, &selfprogdst)?;
+            let ui_src = selfprog
+                .parent()
+                .ok_or_else(|| anyhow!("installed executable has no parent directory"))?
+                .join("nsproxy-ui");
+            let ui_dst = dstdir.join("nsproxy-ui");
+            overwrite(&ui_src, &ui_dst)?;
             sproxyf.set_file_name("sproxy");
 
             let fd = dstdir.join(sproxyf.file_name().unwrap());
@@ -2054,6 +2060,8 @@ fn main() -> anyhow::Result<()> {
             if hot_path.exists() {
                 let fc = std::fs::read_to_string(&hot_path)?;
                 if let Ok(mut hot) = serde_json::from_str::<HotConfig>(&fc) {
+                    hot.process_x11();
+                    hot.process_wayland();
                     hot.expand_with(&hot_vars);
                     if let Ok(mounts) = hot.merged_mounts() {
                         if !mounts.is_empty() {
@@ -2157,7 +2165,11 @@ fn exit_with_warn(code: i32, reason: &'static str) -> ! {
 fn load_hot_config_from_disk_or_default(path: &Path) -> HotConfig {
     match std::fs::read_to_string(path) {
         Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
-            Ok(conf) => conf,
+            Ok(mut conf) => {
+                conf.process_x11();
+                conf.process_wayland();
+                conf
+            }
             Err(e) => {
                 warn!(
                     "failed to parse hot config {:?} at startup: {}, using default",
@@ -2453,6 +2465,8 @@ async fn serve_worker_runtime(
                 >(&payload)
                 {
                     let mut newconf = request.config;
+                    newconf.process_x11();
+                    newconf.process_wayland();
                     replace_mount_resolv_conf(
                         &newconf.resolv_conf_dns,
                         write_resolv_conf_directly,
@@ -4433,40 +4447,13 @@ fn reap_dead_task_groups_into_state(state: &Arc<ArcSwap<UpDaemonState>>) -> Vec<
     let mut changed = false;
 
     for task_pgid in tracked_task_pgids {
-        let mut saw_wait_event = false;
         loop {
             match nix::sys::wait::waitpid(
                 Pid::from_raw(-(task_pgid as i32)),
                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
             ) {
-                Ok(nix::sys::wait::WaitStatus::Exited(pid, code)) => {
-                    if code == 0 {
-                        warn!(
-                            task_pgid,
-                            pid = pid.as_raw(),
-                            code,
-                            "task group child exited cleanly during reap"
-                        );
-                    } else {
-                        warn!(
-                            task_pgid,
-                            pid = pid.as_raw(),
-                            code,
-                            "task group child exited with nonzero status during reap"
-                        );
-                    }
-                    saw_wait_event = true;
-                }
-                Ok(nix::sys::wait::WaitStatus::Signaled(pid, signal, dumped_core)) => {
-                    warn!(
-                        task_pgid,
-                        pid = pid.as_raw(),
-                        ?signal,
-                        dumped_core,
-                        "task group child terminated by signal during reap"
-                    );
-                    saw_wait_event = true;
-                }
+                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {}
                 Ok(nix::sys::wait::WaitStatus::StillAlive)
                 | Err(nix::errno::Errno::ECHILD)
                 | Err(nix::errno::Errno::ESRCH) => break,
@@ -4496,14 +4483,6 @@ fn reap_dead_task_groups_into_state(state: &Arc<ArcSwap<UpDaemonState>>) -> Vec<
                 new.serve_pid = 0;
                 changed = true;
             }
-        } else if saw_wait_event {
-            let status = new
-                .process_list
-                .processes
-                .get(&task_pgid)
-                .map(|entry| format!("{:?}", entry.status))
-                .unwrap_or_else(|| "<missing>".to_string());
-            warn!(task_pgid, status, "task still alive after reap");
         }
     }
 
@@ -5960,6 +5939,8 @@ async fn watch_hot_mounts(hot_path: &Path, vars: nsproxy_core::PathExpansionStat
             }
         };
 
+        hot.process_x11();
+        hot.process_wayland();
         hot.expand_with(&vars);
 
         if prev_hot.as_ref() == Some(&hot) {

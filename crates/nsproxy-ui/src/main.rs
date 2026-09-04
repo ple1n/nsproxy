@@ -3097,6 +3097,29 @@ impl App {
         if Self::render_path_map(ui, "mnt", &mut hot.mnt, id_prefix) {
             changed = true;
         }
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("display backends");
+                ui.weak("mount host display sockets into the sandbox");
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .toggle_value(&mut hot.x11, "X11")
+                    .on_hover_text("Mount /tmp/.X11-unix and XAUTHORITY")
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .toggle_value(&mut hot.wayland, "Wayland")
+                    .on_hover_text("Mount the host Wayland display socket")
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+        });
         if Self::render_mount_list(ui, &mut hot.mounts, "mounts") {
             changed = true;
         }
