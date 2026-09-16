@@ -43,6 +43,11 @@ struct ProcessLogTextBuffer {
     visible_start: usize,
 }
 
+struct LogEditorPopup {
+    title: String,
+    text: String,
+}
+
 impl ProcessLogTextBuffer {
     fn clear(&mut self) {
         self.text.clear();
@@ -159,6 +164,7 @@ mod process_log_text_buffer_tests {
 
         assert_eq!(buffer.visible_text(), "red plain");
     }
+
 }
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -998,6 +1004,7 @@ struct App {
     fps_window_count: u32,
     last_fps: f32,
     log_panel_min_level: LogMinLevel,
+    log_editor_popup: Option<LogEditorPopup>,
     /// State for the Manage (creation wizard) tab.
     manage_wizard: ManageWizard,
     /// Applications with an in-flight lifecycle launch request, keyed by profile and app name.
@@ -1611,6 +1618,7 @@ impl App {
             fps_window_count: 0,
             last_fps: 0.0,
             log_panel_min_level: LogMinLevel::default(),
+            log_editor_popup: None,
             manage_wizard: ManageWizard::default(),
             action_launching: Arc::new(Mutex::new(HashSet::new())),
             action_status: Arc::new(Mutex::new(None)),
@@ -4732,6 +4740,7 @@ impl eframe::App for App {
 
         self.render_external_pty_window(ctx);
         self.render_proxy_detail_window(ctx);
+        self.render_log_editor_popup(ctx);
 
         // Minimal dev-only watermark at bottom-left: non-intrusive, low-contrast
         egui::Area::new(egui::Id::new("dev_frame_watermark"))
@@ -5503,7 +5512,8 @@ impl App {
         log_panel_min_level: &mut LogMinLevel,
         entries: &VecDeque<Arc<RenderedLogEntry>>,
         total_entries: usize,
-    ) {
+    ) -> Option<String> {
+        let mut open_editor = false;
         egui::Frame::none()
             .fill(Color32::from_gray(18))
             .inner_margin(egui::Margin::same(6))
@@ -5525,6 +5535,14 @@ impl App {
                         Color32::from_gray(130),
                         format!("showing {} / {}", total, total_entries),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        open_editor = ui
+                            .small_button("Open editor")
+                            .on_hover_text(
+                                "Open this filtered log view in a selectable, scrollable editor",
+                            )
+                            .clicked();
+                    });
                 });
 
                 ui.add_space(6.0);
@@ -5591,6 +5609,27 @@ impl App {
                         }
                     });
             });
+        open_editor.then(|| {
+            let mut text = ProcessLogTextBuffer::default();
+            for entry in entries {
+                text.append_line(&format!(
+                    "{} {} [{}] {}",
+                    match entry.entry.src {
+                        LogSource::Serve => "serve",
+                        LogSource::Up => "up",
+                        LogSource::RootDaemon => "daemon",
+                        LogSource::Pid(_) => "pid",
+                    },
+                    entry.entry.log.level,
+                    entry.entry.log.target,
+                    entry.entry.log.message,
+                ));
+                for field in &entry.entry.log.fields {
+                    text.append_line(&format!("{}={}", field.name, field.value));
+                }
+            }
+            text.visible_text().to_string()
+        })
     }
 
     fn render_daemon_tab(&mut self, ui: &mut egui::Ui) {
@@ -5605,7 +5644,7 @@ impl App {
         let entries = guard.entries_for_min_level(self.log_panel_min_level.rank_value());
         let total_entries = guard.total_entries();
 
-        Self::render_structured_log_panel(
+        if let Some(text) = Self::render_structured_log_panel(
             ui,
             "root_daemon",
             "no daemon logs yet",
@@ -5616,7 +5655,12 @@ impl App {
             &mut self.log_panel_min_level,
             entries,
             total_entries,
-        );
+        ) {
+            self.log_editor_popup = Some(LogEditorPopup {
+                title: "sp daemon logs".to_string(),
+                text,
+            });
+        }
 
         ui.add_space(10.0);
         ui.separator();
@@ -5998,7 +6042,7 @@ impl App {
         if let Some(guard) = logs_guard.as_ref() {
             let entries = guard.entries_for_min_level(log_panel_min_level.rank_value());
             let total_entries = guard.total_entries();
-            Self::render_structured_log_panel(
+            if let Some(text) = Self::render_structured_log_panel(
                 ui,
                 profile_name,
                 "no logs yet — start the container to see output",
@@ -6009,9 +6053,14 @@ impl App {
                 &mut log_panel_min_level,
                 entries,
                 total_entries,
-            );
+            ) {
+                self.log_editor_popup = Some(LogEditorPopup {
+                    title: format!("{} logs", self.display_text(profile_name)),
+                    text,
+                });
+            }
         } else {
-            Self::render_structured_log_panel(
+            if let Some(text) = Self::render_structured_log_panel(
                 ui,
                 profile_name,
                 "no logs yet — start the container to see output",
@@ -6022,10 +6071,48 @@ impl App {
                 &mut log_panel_min_level,
                 &VecDeque::new(),
                 0,
-            );
+            ) {
+                self.log_editor_popup = Some(LogEditorPopup {
+                    title: format!("{} logs", self.display_text(profile_name)),
+                    text,
+                });
+            }
         }
 
         self.log_panel_min_level = log_panel_min_level;
+    }
+
+    fn render_log_editor_popup(&mut self, ctx: &egui::Context) {
+        let Some(popup) = self.log_editor_popup.as_mut() else {
+            return;
+        };
+
+        let mut open = true;
+        egui::Window::new(&popup.title)
+            .id(egui::Id::new("structured_log_editor_popup"))
+            .default_size(egui::vec2(900.0, 640.0))
+            .min_size(egui::vec2(500.0, 320.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Editable local snapshot of the currently filtered log view");
+                ui.add_space(6.0);
+                let mut editor = CodeEditor::default()
+                    .id_source("structured_log_editor")
+                    .with_rows(32)
+                    .with_theme(ColorTheme::GRUVBOX)
+                    .with_syntax(
+                        Syntax::new("log").with_keywords([
+                            "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
+                        ]),
+                    )
+                    .with_numlines(true)
+                    .with_ui_fontsize(ui);
+                let _ = editor.show(ui, &mut popup.text);
+            });
+
+        if !open {
+            self.log_editor_popup = None;
+        }
     }
 
     fn render_process_spawn_args_panel(&mut self, ui: &mut egui::Ui) {
