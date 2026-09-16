@@ -1059,7 +1059,6 @@ struct Supervisor {
     /// Used on the actor thread to detect newly spawned process slots.
     pending_auto_open_logs: HashMap<ContainerName, HashSet<u32>>,
     sandbox_in_flight: HashSet<ContainerName>,
-    pending_start_sandbox: HashSet<ContainerName>,
     /// Profiles that already have a sandbox_status.json file watcher spawned.
     sandbox_status_watchers: HashSet<ContainerName>,
     /// Last computed "open raw logs for this process" target sent to UI.
@@ -1104,7 +1103,6 @@ impl Supervisor {
         // Clear stale process list from any previous sp up instance so restart
         // always shows a clean slate — new sp up sends its own fresh snapshot.
         self.process_list_snapshot.remove(&profile);
-        self.pending_start_sandbox.insert(profile.clone());
         self.reset_backoff(&profile);
         let cli = Cli {
             conf: None,
@@ -1161,7 +1159,6 @@ impl Supervisor {
                 );
             }
             Err(err) => {
-                self.pending_start_sandbox.remove(&profile);
                 self.set_container_lifecycle(&profile, ContainerLifecycleState::Stopped);
                 warn!("failed to start sp up for {}: {err:?}", profile);
             }
@@ -1283,7 +1280,6 @@ impl Supervisor {
             pty_repaint_notify: Arc::new(tokio::sync::Notify::new()),
             pending_auto_open_logs: HashMap::new(),
             sandbox_in_flight: HashSet::new(),
-            pending_start_sandbox: HashSet::new(),
             sandbox_status_watchers: HashSet::new(),
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
@@ -2488,9 +2484,6 @@ impl Supervisor {
         self.reconcile_container_lifecycle(profile, child_alive, start_in_flight);
 
         if !child_alive {
-            if !start_in_flight {
-                self.pending_start_sandbox.remove(profile);
-            }
             self.process_list_snapshot.remove(profile);
             if start_in_flight {
                 // Container is in Starting state — sp up hasn't written ns_alive yet.
@@ -2530,12 +2523,9 @@ impl Supervisor {
         if rearm_clients && serve_alive {
             self.ensure_diag_client(profile);
         }
-        if child_alive && !had_child_alive && self.pending_start_sandbox.remove(profile) {
-            self.spawn_sandbox_reconcile(profile, "container startup");
-        } else if child_alive && !had_child_alive {
-            // Container came alive but no sandbox reconcile was pending (restart after
-            // sandbox already applied).  Check the persisted sandbox status and start
-            // dbus immediately if the sandbox is already pivoted.
+        if child_alive && !had_child_alive {
+            // Sandbox application is manual. A previously pivoted container may still
+            // need its D-Bus service restored after a restart.
             self.maybe_ensure_dbus(profile);
         }
     }
@@ -2902,12 +2892,10 @@ impl Supervisor {
                                 PendingRootDaemonOp::SaveHotconfig { profile } => {
                                     self.refresh_config_cache(profile);
                                     self.refresh_profile_status(profile);
-                                    self.spawn_sandbox_reconcile(profile, "hotconfig saved");
                                 }
                                 PendingRootDaemonOp::SaveProfile { profile } => {
                                     self.refresh_config_cache(profile);
                                     self.refresh_profile_status(profile);
-                                    self.spawn_sandbox_reconcile(profile, "profile saved");
                                 }
                                 PendingRootDaemonOp::SaveConstants => {}
                                 PendingRootDaemonOp::LoadConstants => {}
@@ -3174,7 +3162,6 @@ impl Supervisor {
         self.profile_ns_cache.remove(profile);
         self.pending_auto_open_logs.remove(profile);
         self.sandbox_in_flight.remove(profile);
-        self.pending_start_sandbox.remove(profile);
         self.up_start_time.remove(profile);
         self.spawned_daemons
             .retain(|key| !key.starts_with(&format!("{}:", profile)));
