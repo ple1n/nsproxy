@@ -234,12 +234,8 @@ impl DemoApp {
                     {
                         self.selected = Some(service.id);
                     }
-                    let popup_enabled = popup_open || self.selected == Some(service.id);
                     if ui
-                        .add_enabled(
-                            popup_enabled,
-                            egui::Button::new(if popup_open { "close" } else { "popup" }),
-                        )
+                        .button(if popup_open { "close" } else { "popup" })
                         .clicked()
                     {
                         let mut popups = self
