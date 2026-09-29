@@ -380,11 +380,9 @@ impl EventLog {
             });
         let ctrl_copy = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
         let command_copy = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
-        let log_has_focus = ui.ctx().memory(|memory| memory.focused() == Some(focus_id));
-        let copy_requested = log_has_focus
-            && ui.ctx().input_mut(|input| {
-                input.consume_shortcut(&ctrl_copy) || input.consume_shortcut(&command_copy)
-            });
+        let copy_requested = ui.ctx().input_mut(|input| {
+            input.consume_shortcut(&ctrl_copy) || input.consume_shortcut(&command_copy)
+        });
         if copy_requested {
             let selected = self.selected_text();
             if !selected.is_empty() {
