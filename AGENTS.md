@@ -14,6 +14,7 @@ contextual guidance with minimal repeated tokens.
 - Unix sockets, daemon/service lifecycle, routing, diagnostics, reconnection, or the supervisor actor: `agentic/ipc-diagnostics.md`
 - egui views, editors, widgets, styling, or compact removal controls: `agentic/ui.md`
 - PTYs, external terminal windows, titles, or terminal key mappings: `agentic/terminal.md`
+- Independent service manager prototype and PTY service abstractions: `agentic/service-mgr.md`
 
 Load more than one note only when the owning code path genuinely crosses those boundaries. Keep durable discoveries in the narrowest topic note, and add a routing entry here when introducing a new topic branch.
 

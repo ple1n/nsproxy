@@ -6,6 +6,7 @@ members = [
     "crates/id_alloc",
     "crates/nsproxy-core",
     "crates/nsproxy-ui",
+    "crates/service-mgr",
     "crates/term-view",
 ]
 exclude = [

@@ -6011,6 +6011,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-mgr"
+version = "0.3.5"
+dependencies = [
+ "alacritty_terminal",
+ "eframe 0.33.3",
+ "egui 0.33.3",
+ "libc",
+ "serde",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

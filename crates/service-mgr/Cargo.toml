@@ -1,0 +1,18 @@
+[package]
+name = "service-mgr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.25.1"
+eframe = "0.33.3"
+egui = "0.33.3"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+
+[[bin]]
+name = "service-mgr-demo"
+path = "src/bin/demo.rs"
