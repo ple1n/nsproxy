@@ -12,6 +12,7 @@ use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
 
 const MAX_INCOMING_BYTES: usize = 256 * 1024;
 const MAX_LOG_LINES: usize = 200;
+const LOG_PREFIX_WIDTH: usize = 32;
 type ServiceKey = (usize, ServiceId);
 
 struct UiPtyState {
@@ -615,21 +616,30 @@ impl DemoApp {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
+                            let prefix = format!("[{event_label} #{id} {:?}] ", chunk.stream);
                             logs.append_stream(
                                 (*id, chunk.stream as u8),
-                                &format!("[{event_label} #{id} {:?}] ", chunk.stream),
+                                &format!("{prefix:<width$}", width = LOG_PREFIX_WIDTH),
                                 &String::from_utf8_lossy(&chunk.data),
                             );
                         }
                         ServiceEvent::Started { id, pid } => {
-                            let line = format!("[{event_label} #{id}] started pid {pid}");
+                            let prefix = format!("[{event_label} #{id}] ");
+                            let line = format!(
+                                "{prefix:<width$}started pid {pid}",
+                                width = LOG_PREFIX_WIDTH
+                            );
                             event_shared.set_notice(line.clone());
                             logs.push(line);
                         }
                         ServiceEvent::StateChanged { id, state } => {
                             logs.flush_stream((*id, 1));
                             logs.flush_stream((*id, 2));
-                            let line = format!("[{event_label} #{id}] state {state:?}");
+                            let prefix = format!("[{event_label} #{id}] ");
+                            let line = format!(
+                                "{prefix:<width$}state {state:?}",
+                                width = LOG_PREFIX_WIDTH
+                            );
                             event_shared.set_notice(line.clone());
                             logs.push(line);
                         }
