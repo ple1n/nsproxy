@@ -325,15 +325,29 @@ impl EventLog {
                         }
                     }
                     ui.painter().galley(pos, galley, egui::Color32::WHITE);
-                    if response.clicked() || response.dragged() {
+                    if response.clicked() || response.drag_started() || response.dragged() {
                         if let Some(pointer) = response.interact_pointer_pos() {
-                            let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
-                            let point = (row, column.min(line.plain.chars().count()));
                             let mut selection = self
                                 .selection
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
-                            let anchor = selection.map(|value| value.0).unwrap_or(point);
+                            let target_row = if response.clicked() || response.drag_started() {
+                                row
+                            } else {
+                                let row_offset =
+                                    ((pointer.y - rect.top()) / row_height).floor() as isize;
+                                (row as isize + row_offset)
+                                    .clamp(0, lines.len().saturating_sub(1) as isize)
+                                    as usize
+                            };
+                            let target_line = lines.get(target_row).cloned().unwrap_or_default();
+                            let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
+                            let point = (target_row, column.min(target_line.plain.chars().count()));
+                            let anchor = if response.drag_started() || response.clicked() {
+                                point
+                            } else {
+                                selection.map(|value| value.0).unwrap_or(point)
+                            };
                             *selection = Some((anchor, point));
                         }
                     }
