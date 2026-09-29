@@ -533,13 +533,6 @@ impl PidPath {
             PidPath::Selfproc => "self".into(),
         }
     }
-    /// Convert it to pid number
-    fn to_n(&self) -> Self {
-        match self {
-            PidPath::Selfproc => Self::N(getpid().as_raw()),
-            k => *k,
-        }
-    }
 }
 
 pub trait NSFrom<S>: Sized {
@@ -561,7 +554,7 @@ impl NSFrom<(PidPath, &str)> for ExactNS {
     fn from_source(source: (PidPath, &str)) -> Result<Self> {
         let path = PathBuf::from(format!(
             "/proc/{}/ns/{}",
-            source.0.to_n().to_str(),
+            source.0.to_str(),
             source.1
         ));
         NSFrom::from_source(path)
@@ -805,6 +798,16 @@ fn initialize_basis_replaces_incompatible_registry() {
 
     let _ = std::fs::remove_dir_all(root);
     state_paths::set_persist_root(previous_root);
+}
+
+#[test]
+fn selfproc_namespace_source_uses_proc_self() {
+    let namespace = ExactNS::from_source((PidPath::Selfproc, "mnt")).unwrap();
+
+    assert!(matches!(
+        namespace.source,
+        NSSource::Path(path) if path == PathBuf::from("/proc/self/ns/mnt")
+    ));
 }
 
 pub macro forever() {

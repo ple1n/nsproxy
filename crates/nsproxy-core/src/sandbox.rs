@@ -581,16 +581,17 @@ pub fn collect_sandbox_status(
             }
         })
         .collect();
-
+    let mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))
+        .map(|ns| ns.unique)
+        .ok();
+    info!("collected sandbox status {:?}", mnt);
     Ok(SandboxStatus {
         updated_at_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         boot_id: current_boot_id().ok(),
-        mnt_namespace: ExactNS::from_source((PidPath::Selfproc, "mnt"))
-            .map(|ns| ns.unique)
-            .ok(),
+        mnt_namespace: mnt,
         configured_mode,
         detected_state,
         pivot_dir_status: inspect_path(Path::new("/pivot")),
