@@ -262,7 +262,6 @@ impl EventLog {
         let lines = self.snapshot();
         let font_id = egui::FontId::monospace(12.0);
         let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
-        let focus_id = ui.id().with("log-focus");
         let selection = *self
             .selection
             .lock()
@@ -347,7 +346,6 @@ impl EventLog {
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
                             let new_gesture = pointer_pressed || response.drag_started();
-                            ui.ctx().memory_mut(|memory| memory.request_focus(focus_id));
                             let target_row = if new_gesture || response.clicked() {
                                 *drag_origin = None;
                                 row
@@ -378,10 +376,11 @@ impl EventLog {
                     }
                 }
             });
-        let ctrl_copy = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
-        let command_copy = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
-        let copy_requested = ui.ctx().input_mut(|input| {
-            input.consume_shortcut(&ctrl_copy) || input.consume_shortcut(&command_copy)
+        let copy_requested = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
         });
         if copy_requested {
             let selected = self.selected_text();
