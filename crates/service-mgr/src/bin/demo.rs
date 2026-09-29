@@ -270,6 +270,7 @@ impl EventLog {
             .id_salt("nested-service-log-view")
             .stick_to_bottom(true)
             .show_rows(ui, row_height, lines.len().max(1), |ui, rows| {
+                ui.spacing_mut().item_spacing.y = 0.0;
                 for row in rows {
                     let line = lines.get(row).cloned().unwrap_or_default();
                     let mut job = LayoutJob::default();
