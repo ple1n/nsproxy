@@ -6019,6 +6019,7 @@ dependencies = [
  "egui 0.33.3",
  "libc",
  "serde",
+ "term-view",
  "thiserror 2.0.17",
 ]
 

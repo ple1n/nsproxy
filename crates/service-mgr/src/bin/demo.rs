@@ -1,98 +1,167 @@
-use std::collections::HashMap;
-use std::sync::mpsc::{self, TryRecvError};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::term::{self, test::TermSize, Term};
-use alacritty_terminal::vte::ansi::Processor;
 use eframe::egui;
 use service_mgr::{
     ServiceEvent, ServiceId, ServiceInfo, ServiceManager, ServiceSpec, ServiceState,
 };
+use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
-struct PtyWriter {
-    id: ServiceId,
-    replies: mpsc::Sender<(ServiceId, String)>,
+const MAX_INCOMING_BYTES: usize = 256 * 1024;
+
+struct UiPtyState {
+    incoming: Mutex<HashMap<ServiceId, VecDeque<u8>>>,
+    generations: Mutex<HashMap<ServiceId, u64>>,
+    wake: Condvar,
+    notice: Mutex<String>,
 }
 
-impl EventListener for PtyWriter {
-    fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(data) = event {
-            let _ = self.replies.send((self.id, data));
-        }
-    }
-}
-
-struct TerminalState {
-    terminal: Term<PtyWriter>,
-    processor: Processor,
-}
-
-impl TerminalState {
-    fn new(id: ServiceId, replies: mpsc::Sender<(ServiceId, String)>) -> Self {
+impl UiPtyState {
+    fn new() -> Self {
         Self {
-            terminal: Term::new(
-                term::Config::default(),
-                &TermSize::new(100, 30),
-                PtyWriter { id, replies },
-            ),
-            processor: Processor::new(),
+            incoming: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
+            wake: Condvar::new(),
+            notice: Mutex::new("No services".to_string()),
         }
     }
 
-    fn feed(&mut self, data: &[u8]) {
-        self.processor.advance(&mut self.terminal, data);
+    fn append_output(&self, id: ServiceId, data: &[u8]) {
+        let mut incoming = self
+            .incoming
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let buffer = incoming.entry(id).or_default();
+        buffer.extend(data.iter().copied());
+        while buffer.len() > MAX_INCOMING_BYTES {
+            buffer.pop_front();
+        }
+        drop(incoming);
+
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = generations.entry(id).or_default();
+        *generation = generation.saturating_add(1);
+        self.wake.notify_all();
     }
 
-    fn text(&self) -> String {
-        let grid = self.terminal.grid();
-        let mut text = String::new();
-        for indexed in grid.display_iter() {
-            if indexed.point.column.0 == 0 && !text.is_empty() {
-                text.push('\n');
+    fn set_notice(&self, notice: String) {
+        *self
+            .notice
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = notice;
+    }
+
+    fn notice(&self) -> String {
+        self.notice
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct ServicePtyIpc {
+    manager: ServiceManager,
+    shared: Arc<UiPtyState>,
+    id: ServiceId,
+}
+
+impl PtyIpc for ServicePtyIpc {
+    fn drain_incoming(&self) -> Vec<u8> {
+        let mut incoming = self
+            .shared
+            .incoming
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        incoming
+            .remove(&self.id)
+            .map(|buffer| buffer.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn wait_for_incoming(&self, observed_generation: u64) -> u64 {
+        let mut generations = self
+            .shared
+            .generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            let generation = generations.get(&self.id).copied().unwrap_or_default();
+            if generation > observed_generation {
+                return generation;
             }
-            text.push(indexed.c);
+            generations = self
+                .shared
+                .wake
+                .wait(generations)
+                .unwrap_or_else(|error| error.into_inner());
         }
-        text
+    }
+
+    fn wake_waiters(&self) {
+        self.shared.wake.notify_all();
+    }
+
+    fn send_input(&self, data: Vec<u8>) {
+        let _ = self.manager.write_input(self.id, &data);
+    }
+
+    fn send_resize(&self, cols: u16, rows: u16) {
+        let _ = self.manager.resize(self.id, rows, cols);
     }
 }
 
 struct DemoApp {
     manager: ServiceManager,
-    events: mpsc::Receiver<ServiceEvent>,
-    replies: mpsc::Receiver<(ServiceId, String)>,
-    reply_tx: mpsc::Sender<(ServiceId, String)>,
-    terminals: HashMap<ServiceId, TerminalState>,
+    shared: Arc<UiPtyState>,
+    sessions: HashMap<ServiceId, TermSession>,
     selected: Option<ServiceId>,
-    input: String,
-    notice: String,
 }
 
 impl DemoApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let (manager, handle) = ServiceManager::new();
-        let (reply_tx, replies) = mpsc::channel();
+        let shared = Arc::new(UiPtyState::new());
+        let event_shared = Arc::clone(&shared);
+        let event_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("service-mgr-ui-events".to_string())
+            .spawn(move || {
+                while let Ok(event) = handle.events.recv() {
+                    match event {
+                        ServiceEvent::Output { id, chunk } => {
+                            event_shared.append_output(id, &chunk.data);
+                        }
+                        ServiceEvent::Started { id, pid } => {
+                            event_shared.set_notice(format!("Started service {id} (pid {pid})"));
+                        }
+                        ServiceEvent::StateChanged { id, state } => {
+                            event_shared.set_notice(format!("Service {id} changed to {state:?}"));
+                        }
+                    }
+                    event_ctx.request_repaint();
+                }
+            })
+            .expect("failed to start service manager event bridge");
+
         Self {
             manager,
-            events: handle.events,
-            replies,
-            reply_tx,
-            terminals: HashMap::new(),
+            shared,
+            sessions: HashMap::new(),
             selected: None,
-            input: String::new(),
-            notice: "No services".to_string(),
         }
     }
 
     fn spawn(&mut self, spec: ServiceSpec) {
         match self.manager.spawn_pty(spec) {
             Ok(id) => {
-                self.terminals
-                    .insert(id, TerminalState::new(id, self.reply_tx.clone()));
                 self.selected = Some(id);
-                self.notice = format!("Started service {id}");
             }
-            Err(error) => self.notice = error.to_string(),
+            Err(error) => self.shared.set_notice(error.to_string()),
         }
     }
 
@@ -114,27 +183,6 @@ impl DemoApp {
         spec.rows = 30;
         spec.cols = 100;
         self.spawn(spec);
-    }
-
-    fn poll(&mut self) {
-        loop {
-            match self.events.try_recv() {
-                Ok(ServiceEvent::Output { id, chunk }) => {
-                    if let Some(terminal) = self.terminals.get_mut(&id) {
-                        terminal.feed(&chunk.data);
-                    }
-                }
-                Ok(ServiceEvent::StateChanged { id, state }) => {
-                    self.notice = format!("Service {id} changed to {state:?}");
-                }
-                Ok(ServiceEvent::Started { .. }) => {}
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
-
-        while let Ok((id, reply)) = self.replies.try_recv() {
-            let _ = self.manager.write_input(id, reply.as_bytes());
-        }
     }
 
     fn selected_info<'a>(&self, services: &'a [ServiceInfo]) -> Option<&'a ServiceInfo> {
@@ -178,7 +226,7 @@ impl DemoApp {
                         .clicked()
                     {
                         if let Err(error) = self.manager.terminate(service.id) {
-                            self.notice = error.to_string();
+                            self.shared.set_notice(error.to_string());
                         }
                     }
                     ui.end_row();
@@ -192,39 +240,41 @@ impl DemoApp {
             return;
         };
         let id = info.id;
+        let pid = info.pid;
+        let manager = self.manager.clone();
+        let shared = Arc::clone(&self.shared);
+        let session = self
+            .sessions
+            .entry(id)
+            .or_insert_with(|| TermSession::new(pid));
+        let ipc = ServicePtyIpc {
+            manager,
+            shared,
+            id,
+        };
+
         ui.horizontal(|ui| {
             ui.strong(format!(
-                "Embedded terminal — {} ({})",
-                info.command.display(),
-                id
+                "Embedded terminal — {} ({id})",
+                info.command.display()
             ));
             ui.label(state_label(info.state));
         });
         ui.separator();
-        if let Some(terminal) = self.terminals.get(&id) {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    ui.monospace(terminal.text());
-                });
-        }
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut self.input).hint_text("Type input and press Enter"),
+
+        let mut input_frames = Vec::new();
+        let mut resize_event = None;
+        pump_pty_io(&ipc, session);
+        ui.add(
+            TermView::new(session, &mut input_frames, &mut resize_event)
+                .set_size(ui.available_size()),
         );
-        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            let input = std::mem::take(&mut self.input);
-            let _ = self
-                .manager
-                .write_input(id, format!("{input}\n").as_bytes());
-            response.request_focus();
-        }
+        flush_term_outputs(&ipc, input_frames, resize_event);
     }
 }
 
 impl eframe::App for DemoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
         let services = self.manager.list();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -236,7 +286,7 @@ impl eframe::App for DemoApp {
                     self.start_worker();
                 }
                 ui.separator();
-                ui.label(&self.notice);
+                ui.label(self.shared.notice());
             });
         });
 
@@ -252,8 +302,6 @@ impl eframe::App for DemoApp {
             ui.separator();
             self.render_terminal(ui, &services);
         });
-
-        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 
@@ -286,6 +334,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "service-mgr demo",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(DemoApp::new()))),
+        Box::new(|cc| Ok(Box::new(DemoApp::new(&cc.egui_ctx)))),
     )
 }

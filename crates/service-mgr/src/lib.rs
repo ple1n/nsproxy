@@ -172,8 +172,9 @@ impl OutputHub {
     }
 }
 
+#[derive(Clone)]
 pub struct ServiceManager {
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     services: Arc<Mutex<HashMap<ServiceId, ManagedService>>>,
     events: mpsc::Sender<ServiceEvent>,
 }
@@ -194,7 +195,7 @@ impl ServiceManager {
         let (events, event_rx) = mpsc::channel();
         (
             Self {
-                next_id: AtomicU64::new(1),
+                next_id: Arc::new(AtomicU64::new(1)),
                 services: Arc::new(Mutex::new(HashMap::new())),
                 events,
             },
