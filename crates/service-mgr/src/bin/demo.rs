@@ -3,6 +3,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
+use egui::text::{LayoutJob, TextFormat};
 use service_mgr::{
     OutputCursor, Ownership, ServiceEvent, ServiceId, ServiceInfo, ServiceManager, ServiceSpec,
     ServiceState,
@@ -69,31 +70,281 @@ impl UiPtyState {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct LogSpan {
+    text: String,
+    color: egui::Color32,
+    bold: bool,
+}
+
+#[derive(Clone, Default)]
+struct LogLine {
+    spans: Vec<LogSpan>,
+    plain: String,
+}
+
 struct EventLog {
-    entries: Mutex<VecDeque<String>>,
+    lines: Mutex<VecDeque<LogLine>>,
+    pending: Mutex<LogLine>,
+    color: Mutex<egui::Color32>,
+    bold: Mutex<bool>,
+    selection: Mutex<Option<((usize, usize), (usize, usize))>>,
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self {
+            lines: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(LogLine::default()),
+            color: Mutex::new(egui::Color32::LIGHT_GRAY),
+            bold: Mutex::new(false),
+            selection: Mutex::new(None),
+        }
+    }
 }
 
 impl EventLog {
-    fn push(&self, line: String) {
-        let mut entries = self
-            .entries
+    fn push(&self, text: String) {
+        let mut pending = self
+            .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        entries.push_back(line);
-        while entries.len() > MAX_LOG_LINES {
-            entries.pop_front();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut code = String::new();
+                    while let Some(next) = chars.next() {
+                        if next.is_ascii_alphabetic() {
+                            if next == 'm' {
+                                self.apply_sgr(&code);
+                            }
+                            break;
+                        }
+                        code.push(next);
+                    }
+                }
+                continue;
+            }
+            if ch == '\n' {
+                let completed = std::mem::take(&mut *pending);
+                let mut lines = self.lines.lock().unwrap_or_else(|error| error.into_inner());
+                lines.push_back(completed);
+                while lines.len() > MAX_LOG_LINES {
+                    lines.pop_front();
+                }
+                continue;
+            }
+            let color = *self.color.lock().unwrap_or_else(|error| error.into_inner());
+            let bold = *self.bold.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(span) = pending.spans.last_mut() {
+                if span.color == color && span.bold == bold {
+                    span.text.push(ch);
+                } else {
+                    pending.spans.push(LogSpan {
+                        text: ch.to_string(),
+                        color,
+                        bold,
+                    });
+                }
+            } else {
+                pending.spans.push(LogSpan {
+                    text: ch.to_string(),
+                    color,
+                    bold,
+                });
+            }
+            pending.plain.push(ch);
         }
     }
 
-    fn snapshot(&self) -> Vec<String> {
-        self.entries
+    fn apply_sgr(&self, codes: &str) {
+        let mut color = self.color.lock().unwrap_or_else(|error| error.into_inner());
+        let mut bold = self.bold.lock().unwrap_or_else(|error| error.into_inner());
+        let values = if codes.is_empty() {
+            vec![0]
+        } else {
+            codes
+                .split(';')
+                .filter_map(|value| value.parse::<u32>().ok())
+                .collect()
+        };
+        for value in values {
+            match value {
+                0 => {
+                    *color = egui::Color32::LIGHT_GRAY;
+                    *bold = false;
+                }
+                1 => *bold = true,
+                22 => *bold = false,
+                30..=37 => *color = ansi_color(value - 30),
+                39 => *color = egui::Color32::LIGHT_GRAY,
+                90..=97 => *color = ansi_color(value - 90 + 8),
+                _ => {}
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<LogLine> {
+        let mut lines = self
+            .lines
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .iter()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !pending.plain.is_empty() {
+            lines.push(pending.clone());
+        }
+        lines
     }
+
+    fn selected_text(&self) -> String {
+        let lines = self.snapshot();
+        let Some((start, end)) = *self
+            .selection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        else {
+            return String::new();
+        };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let mut result = String::new();
+        for (line_index, line) in lines
+            .iter()
+            .enumerate()
+            .skip(start.0)
+            .take(end.0 - start.0 + 1)
+        {
+            let from = if line_index == start.0 { start.1 } else { 0 };
+            let to = if line_index == end.0 {
+                end.1
+            } else {
+                line.plain.chars().count()
+            };
+            result.extend(line.plain.chars().skip(from).take(to.saturating_sub(from)));
+            if line_index < end.0 {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    fn show(&self, ui: &mut egui::Ui) {
+        let lines = self.snapshot();
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let selection = *self
+            .selection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        egui::ScrollArea::both()
+            .id_salt("nested-service-log-view")
+            .stick_to_bottom(true)
+            .show_rows(ui, row_height, lines.len().max(1), |ui, rows| {
+                for row in rows {
+                    let line = lines.get(row).cloned().unwrap_or_default();
+                    let mut job = LayoutJob::default();
+                    for span in &line.spans {
+                        job.append(
+                            &span.text,
+                            0.0,
+                            TextFormat {
+                                font_id: egui::FontId::monospace(12.0),
+                                color: span.color,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(1.0), row_height),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let pos = rect.left_top() + egui::vec2(4.0, 0.0);
+                    if let Some((start, end)) = selection {
+                        let (start, end) = if start <= end {
+                            (start, end)
+                        } else {
+                            (end, start)
+                        };
+                        if row >= start.0 && row <= end.0 {
+                            let from = if row == start.0 { start.1 } else { 0 };
+                            let to = if row == end.0 {
+                                end.1
+                            } else {
+                                line.plain.chars().count()
+                            };
+                            let highlight = egui::Rect::from_min_size(
+                                pos + egui::vec2(from as f32 * 7.2, 0.0),
+                                egui::vec2(to.saturating_sub(from) as f32 * 7.2, row_height),
+                            );
+                            ui.painter().rect_filled(
+                                highlight,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(70, 110, 180, 130),
+                            );
+                        }
+                        if start == end && row == end.0 {
+                            let caret_x = pos.x + end.1 as f32 * 7.2;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(caret_x, pos.y + 2.0),
+                                    egui::pos2(caret_x, pos.y + row_height - 2.0),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                            );
+                        }
+                    }
+                    let galley = ui.painter().layout_job(job);
+                    ui.painter().galley(pos, galley, egui::Color32::WHITE);
+                    if response.clicked() || response.dragged() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
+                            let point = (row, column.min(line.plain.chars().count()));
+                            let mut selection = self
+                                .selection
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            let anchor = selection.map(|value| value.0).unwrap_or(point);
+                            *selection = Some((anchor, point));
+                        }
+                    }
+                }
+            });
+        if ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::C)) {
+            ui.ctx().copy_text(self.selected_text());
+        }
+    }
+}
+
+fn ansi_color(index: u32) -> egui::Color32 {
+    const COLORS: [egui::Color32; 16] = [
+        egui::Color32::from_rgb(0, 0, 0),
+        egui::Color32::from_rgb(205, 49, 49),
+        egui::Color32::from_rgb(13, 188, 121),
+        egui::Color32::from_rgb(229, 229, 16),
+        egui::Color32::from_rgb(36, 114, 200),
+        egui::Color32::from_rgb(188, 63, 188),
+        egui::Color32::from_rgb(17, 168, 205),
+        egui::Color32::from_rgb(229, 229, 229),
+        egui::Color32::from_rgb(102, 102, 102),
+        egui::Color32::from_rgb(241, 76, 76),
+        egui::Color32::from_rgb(35, 209, 139),
+        egui::Color32::from_rgb(245, 245, 67),
+        egui::Color32::from_rgb(59, 142, 234),
+        egui::Color32::from_rgb(214, 112, 214),
+        egui::Color32::from_rgb(41, 184, 219),
+        egui::Color32::from_rgb(255, 255, 255),
+    ];
+    COLORS[index.min(15) as usize]
 }
 
 #[derive(Clone)]
@@ -246,7 +497,7 @@ impl DemoApp {
             worker.args = vec![
                 "-c".into(),
                 format!(
-                    "i=0; while true; do i=$((i+1)); printf '{} worker tick %s\\n' \"$i\"; sleep 2; done",
+                    "i=0; while true; do i=$((i+1)); printf '\\033[3%sm{} worker tick %s\\033[0m\\n' \"$((i % 8 + 1))\" \"$i\"; sleep 2; done",
                     child.label
                 ),
             ];
@@ -641,13 +892,19 @@ impl eframe::App for DemoApp {
                 ui.heading("Replayable event journal");
                 ui.label("Live events are retained by each manager's bounded output hub.");
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in self.logs.snapshot() {
-                            ui.monospace(line);
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    if ui.button("copy selection").clicked() {
+                        ui.ctx().copy_text(self.logs.selected_text());
+                    }
+                    if ui.button("clear selection").clicked() {
+                        *self
+                            .logs
+                            .selection
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = None;
+                    }
+                });
+                self.logs.show(ui);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
