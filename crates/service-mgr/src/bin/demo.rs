@@ -616,10 +616,9 @@ impl DemoApp {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
-                            let prefix = format!("[{event_label} #{id} {:?}] ", chunk.stream);
                             logs.append_stream(
                                 (*id, chunk.stream as u8),
-                                &format!("{prefix:<width$}", width = LOG_PREFIX_WIDTH),
+                                "",
                                 &String::from_utf8_lossy(&chunk.data),
                             );
                         }
