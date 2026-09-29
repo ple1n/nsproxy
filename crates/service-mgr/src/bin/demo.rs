@@ -85,6 +85,7 @@ struct LogLine {
 
 struct EventLog {
     items: Mutex<VecDeque<LogLine>>,
+    pending: Mutex<HashMap<(ServiceId, u8), LogLine>>,
     color: Mutex<egui::Color32>,
     bold: Mutex<bool>,
     selection: Mutex<Option<((usize, usize), (usize, usize))>>,
@@ -95,6 +96,7 @@ impl Default for EventLog {
     fn default() -> Self {
         Self {
             items: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(HashMap::new()),
             color: Mutex::new(egui::Color32::LIGHT_GRAY),
             bold: Mutex::new(false),
             selection: Mutex::new(None),
@@ -122,6 +124,7 @@ impl EventLog {
                         code.push(next);
                     }
                 }
+
                 continue;
             }
             let color = *self.color.lock().unwrap_or_else(|error| error.into_inner());
@@ -150,6 +153,99 @@ impl EventLog {
         while items.len() > MAX_LOG_LINES {
             items.pop_front();
         }
+    }
+
+    fn append_stream(&self, key: (ServiceId, u8), prefix: &str, text: &str) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut item = pending.remove(&key).unwrap_or_default();
+        let mut completed_items = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if item.plain.is_empty() {
+                self.append_plain(&mut item, prefix);
+            }
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut code = String::new();
+                    while let Some(next) = chars.next() {
+                        if next.is_ascii_alphabetic() {
+                            if next == 'm' {
+                                self.apply_sgr(&code);
+                            }
+                            break;
+                        }
+                        code.push(next);
+                    }
+                }
+                continue;
+            }
+            let color = *self.color.lock().unwrap_or_else(|error| error.into_inner());
+            let bold = *self.bold.lock().unwrap_or_else(|error| error.into_inner());
+            self.append_char(&mut item, ch, color, bold);
+            if ch == '\n' {
+                completed_items.push(std::mem::take(&mut item));
+            }
+        }
+        if !item.plain.is_empty() {
+            pending.insert(key, item);
+        }
+        drop(pending);
+        if !completed_items.is_empty() {
+            let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+            items.extend(completed_items);
+            while items.len() > MAX_LOG_LINES {
+                items.pop_front();
+            }
+        }
+    }
+
+    fn flush_stream(&self, key: (ServiceId, u8)) {
+        let Some(item) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key)
+        else {
+            return;
+        };
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        items.push_back(item);
+        while items.len() > MAX_LOG_LINES {
+            items.pop_front();
+        }
+    }
+
+    fn append_plain(&self, line: &mut LogLine, text: &str) {
+        let color = *self.color.lock().unwrap_or_else(|error| error.into_inner());
+        let bold = *self.bold.lock().unwrap_or_else(|error| error.into_inner());
+        for ch in text.chars() {
+            self.append_char(line, ch, color, bold);
+        }
+    }
+
+    fn append_char(&self, line: &mut LogLine, ch: char, color: egui::Color32, bold: bool) {
+        if let Some(span) = line.spans.last_mut() {
+            if span.color == color && span.bold == bold {
+                span.text.push(ch);
+            } else {
+                line.spans.push(LogSpan {
+                    text: ch.to_string(),
+                    color,
+                    bold,
+                });
+            }
+        } else {
+            line.spans.push(LogSpan {
+                text: ch.to_string(),
+                color,
+                bold,
+            });
+        }
+        line.plain.push(ch);
     }
 
     fn apply_sgr(&self, codes: &str) {
@@ -187,8 +283,15 @@ impl EventLog {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut lines = Vec::new();
-        for item in items {
+        for item in items.into_iter().chain(pending) {
             let mut line = LogLine::default();
             for span in item.spans {
                 for ch in span.text.chars() {
@@ -508,23 +611,15 @@ impl DemoApp {
         std::thread::Builder::new()
             .name(format!("events-{label}"))
             .spawn(move || {
-                let mut pending_output = HashMap::<(ServiceId, u8), String>::new();
                 while let Ok(event) = handle.events.recv() {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
-                            let key = (*id, chunk.stream as u8);
-                            let buffered = pending_output.entry(key).or_default();
-                            buffered.push_str(&String::from_utf8_lossy(&chunk.data));
-                            if let Some(end) = buffered.rfind('\n') {
-                                let complete = buffered[..=end].to_string();
-                                let remainder = buffered[end + 1..].to_string();
-                                *buffered = remainder;
-                                logs.push(format!(
-                                    "[{event_label} #{id} {:?}] {complete}",
-                                    chunk.stream,
-                                ));
-                            }
+                            logs.append_stream(
+                                (*id, chunk.stream as u8),
+                                &format!("[{event_label} #{id} {:?}] ", chunk.stream),
+                                &String::from_utf8_lossy(&chunk.data),
+                            );
                         }
                         ServiceEvent::Started { id, pid } => {
                             let line = format!("[{event_label} #{id}] started pid {pid}");
@@ -532,6 +627,8 @@ impl DemoApp {
                             logs.push(line);
                         }
                         ServiceEvent::StateChanged { id, state } => {
+                            logs.flush_stream((*id, 1));
+                            logs.flush_stream((*id, 2));
                             let line = format!("[{event_label} #{id}] state {state:?}");
                             event_shared.set_notice(line.clone());
                             logs.push(line);
