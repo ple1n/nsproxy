@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,7 +33,7 @@ pub enum Error {
     UnsupportedPlatform,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ServiceId(pub u64);
 
 impl std::fmt::Display for ServiceId {
@@ -76,6 +77,16 @@ pub struct ServiceSpec {
     pub rows: u16,
     pub cols: u16,
     pub output_capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceInfo {
+    pub id: ServiceId,
+    pub pid: u32,
+    pub state: ServiceState,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub uptime: Duration,
 }
 
 impl ServiceSpec {
@@ -170,6 +181,8 @@ pub struct ServiceManager {
 struct ManagedService {
     state: ServiceState,
     pty: PtySession,
+    spec: ServiceSpec,
+    started_at: Instant,
 }
 
 pub struct ServiceManagerHandle {
@@ -214,6 +227,8 @@ impl ServiceManager {
                 ManagedService {
                     state: ServiceState::Running,
                     pty,
+                    spec,
+                    started_at: Instant::now(),
                 },
             );
 
@@ -235,6 +250,23 @@ impl ServiceManager {
 
         let _ = self.events.send(ServiceEvent::Started { id, pid });
         Ok(id)
+    }
+
+    pub fn list(&self) -> Vec<ServiceInfo> {
+        let services = self.services.lock().expect("service manager lock poisoned");
+        let mut result = services
+            .iter()
+            .map(|(&id, service)| ServiceInfo {
+                id,
+                pid: service.pty.pid(),
+                state: service.state,
+                command: service.spec.command.clone(),
+                args: service.spec.args.clone(),
+                uptime: service.started_at.elapsed(),
+            })
+            .collect::<Vec<_>>();
+        result.sort_by_key(|service| service.id);
+        result
     }
 
     pub fn state(&self, id: ServiceId) -> Result<ServiceState, Error> {
