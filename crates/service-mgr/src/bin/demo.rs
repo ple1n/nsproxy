@@ -88,6 +88,7 @@ struct EventLog {
     color: Mutex<egui::Color32>,
     bold: Mutex<bool>,
     selection: Mutex<Option<((usize, usize), (usize, usize))>>,
+    drag_origin: Mutex<Option<(usize, f32)>>,
 }
 
 impl Default for EventLog {
@@ -97,6 +98,7 @@ impl Default for EventLog {
             color: Mutex::new(egui::Color32::LIGHT_GRAY),
             bold: Mutex::new(false),
             selection: Mutex::new(None),
+            drag_origin: Mutex::new(None),
         }
     }
 }
@@ -332,12 +334,21 @@ impl EventLog {
                                 .selection
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
-                            let target_row = if response.clicked() || response.drag_started() {
+                            let mut drag_origin = self
+                                .drag_origin
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            let target_row = if response.clicked() {
+                                *drag_origin = None;
                                 row
                             } else {
-                                let row_offset =
-                                    ((pointer.y - rect.center().y) / row_height).round() as isize;
-                                (row as isize + row_offset)
+                                if response.drag_started() {
+                                    *drag_origin = Some((row, pointer.y));
+                                }
+                                let (origin_row, origin_y) =
+                                    drag_origin.unwrap_or((row, pointer.y));
+                                (origin_row as isize
+                                    + ((pointer.y - origin_y) / row_height).round() as isize)
                                     .clamp(0, lines.len().saturating_sub(1) as isize)
                                     as usize
                             };
@@ -345,7 +356,11 @@ impl EventLog {
                             let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
                             let point = (target_row, column.min(target_line.plain.chars().count()));
                             let anchor = if response.drag_started() || response.clicked() {
-                                point
+                                if response.clicked() {
+                                    point
+                                } else {
+                                    selection.map(|value| value.0).unwrap_or(point)
+                                }
                             } else {
                                 selection.map(|value| value.0).unwrap_or(point)
                             };
