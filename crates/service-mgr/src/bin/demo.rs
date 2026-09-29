@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -642,7 +643,11 @@ impl DemoApp {
     }
 
     fn new_scope(label: &str, ctx: &egui::Context, logs: Arc<LogViewer>) -> Scope {
-        let (manager, handle) = ServiceManager::new();
+        let journal_root = PathBuf::from("/tmp")
+            .join("service-mgr-demo")
+            .join(std::process::id().to_string())
+            .join(label.replace(' ', "-"));
+        let (manager, handle) = ServiceManager::with_journal_root(journal_root);
         let shared = Arc::new(UiPtyState::new());
         let event_ctx = ctx.clone();
         let event_shared = Arc::clone(&shared);
