@@ -264,8 +264,12 @@ impl EventLog {
                             },
                         );
                     }
+                    job.wrap.max_width = f32::INFINITY;
+                    let galley = ui.painter().layout_job(job);
+                    let row_width = ui.available_width().max(galley.size().x + 8.0);
+                    ui.set_min_width(row_width);
                     let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width().max(1.0), row_height),
+                        egui::vec2(row_width, row_height),
                         egui::Sense::click_and_drag(),
                     );
                     let pos = rect.left_top() + egui::vec2(4.0, 0.0);
@@ -303,7 +307,6 @@ impl EventLog {
                             );
                         }
                     }
-                    let galley = ui.painter().layout_job(job);
                     ui.painter().galley(pos, galley, egui::Color32::WHITE);
                     if response.clicked() || response.dragged() {
                         if let Some(pointer) = response.interact_pointer_pos() {
