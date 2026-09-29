@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -84,20 +85,32 @@ struct LogLine {
     plain: String,
 }
 
-struct EventLog {
-    items: Mutex<VecDeque<LogLine>>,
-    pending: Mutex<HashMap<(ServiceId, u8), LogLine>>,
+trait LogItem: Clone {
+    fn to_text(&self) -> String;
+}
+
+impl LogItem for LogLine {
+    fn to_text(&self) -> String {
+        self.plain.clone()
+    }
+}
+
+struct LogViewer<I: LogItem = LogLine> {
+    items: Mutex<VecDeque<I>>,
+    pending: Mutex<HashMap<(ServiceId, u8), I>>,
+    text_cache: Mutex<HashMap<u64, Arc<str>>>,
     color: Mutex<egui::Color32>,
     bold: Mutex<bool>,
     selection: Mutex<Option<((usize, usize), (usize, usize))>>,
     drag_origin: Mutex<Option<(usize, f32)>>,
 }
 
-impl Default for EventLog {
+impl Default for LogViewer<LogLine> {
     fn default() -> Self {
         Self {
             items: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashMap::new()),
+            text_cache: Mutex::new(HashMap::new()),
             color: Mutex::new(egui::Color32::LIGHT_GRAY),
             bold: Mutex::new(false),
             selection: Mutex::new(None),
@@ -106,7 +119,27 @@ impl Default for EventLog {
     }
 }
 
-impl EventLog {
+impl LogViewer<LogLine> {
+    fn cached_text(&self, item: &LogLine) -> Arc<str> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        item.plain.hash(&mut hasher);
+        for span in &item.spans {
+            span.text.hash(&mut hasher);
+            span.color.hash(&mut hasher);
+            span.bold.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let mut cache = self
+            .text_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Arc::clone(
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::<str>::from(item.to_text())),
+        )
+    }
+
     fn push(&self, text: String) {
         let mut item = LogLine::default();
         let mut chars = text.chars().peekable();
@@ -293,6 +326,7 @@ impl EventLog {
             .collect::<Vec<_>>();
         let mut lines = Vec::new();
         for item in items.into_iter().chain(pending) {
+            let _cached_text = self.cached_text(&item);
             let mut line = LogLine::default();
             for span in item.spans {
                 for ch in span.text.chars() {
@@ -577,9 +611,9 @@ impl PtyIpc for ServicePtyIpc {
 struct DemoApp {
     root: Scope,
     children: Vec<Scope>,
-    logs: Arc<EventLog>,
+    logs: Arc<LogViewer>,
     sessions: Arc<Mutex<HashMap<ServiceKey, TermSession>>>,
-    pipe_viewers: HashMap<ServiceKey, EventLog>,
+    pipe_viewers: HashMap<ServiceKey, LogViewer>,
     pipe_cursors: HashMap<ServiceKey, OutputCursor>,
     popups: Arc<Mutex<HashSet<ServiceKey>>>,
     selected: Option<ServiceKey>,
@@ -587,7 +621,7 @@ struct DemoApp {
 
 impl DemoApp {
     fn new(ctx: &egui::Context) -> Self {
-        let logs = Arc::new(EventLog::default());
+        let logs = Arc::new(LogViewer::default());
         let root = Self::new_scope("root supervisor", ctx, Arc::clone(&logs));
         let children = ["profile-alpha", "profile-beta"]
             .into_iter()
@@ -607,7 +641,7 @@ impl DemoApp {
         app
     }
 
-    fn new_scope(label: &str, ctx: &egui::Context, logs: Arc<EventLog>) -> Scope {
+    fn new_scope(label: &str, ctx: &egui::Context, logs: Arc<LogViewer>) -> Scope {
         let (manager, handle) = ServiceManager::new();
         let shared = Arc::new(UiPtyState::new());
         let event_ctx = ctx.clone();
