@@ -84,8 +84,7 @@ struct LogLine {
 }
 
 struct EventLog {
-    lines: Mutex<VecDeque<LogLine>>,
-    pending: Mutex<LogLine>,
+    items: Mutex<VecDeque<LogLine>>,
     color: Mutex<egui::Color32>,
     bold: Mutex<bool>,
     selection: Mutex<Option<((usize, usize), (usize, usize))>>,
@@ -94,8 +93,7 @@ struct EventLog {
 impl Default for EventLog {
     fn default() -> Self {
         Self {
-            lines: Mutex::new(VecDeque::new()),
-            pending: Mutex::new(LogLine::default()),
+            items: Mutex::new(VecDeque::new()),
             color: Mutex::new(egui::Color32::LIGHT_GRAY),
             bold: Mutex::new(false),
             selection: Mutex::new(None),
@@ -105,10 +103,7 @@ impl Default for EventLog {
 
 impl EventLog {
     fn push(&self, text: String) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut item = LogLine::default();
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
             if ch == '\x1b' {
@@ -127,35 +122,31 @@ impl EventLog {
                 }
                 continue;
             }
-            if ch == '\n' {
-                let completed = std::mem::take(&mut *pending);
-                let mut lines = self.lines.lock().unwrap_or_else(|error| error.into_inner());
-                lines.push_back(completed);
-                while lines.len() > MAX_LOG_LINES {
-                    lines.pop_front();
-                }
-                continue;
-            }
             let color = *self.color.lock().unwrap_or_else(|error| error.into_inner());
             let bold = *self.bold.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(span) = pending.spans.last_mut() {
+            if let Some(span) = item.spans.last_mut() {
                 if span.color == color && span.bold == bold {
                     span.text.push(ch);
                 } else {
-                    pending.spans.push(LogSpan {
+                    item.spans.push(LogSpan {
                         text: ch.to_string(),
                         color,
                         bold,
                     });
                 }
             } else {
-                pending.spans.push(LogSpan {
+                item.spans.push(LogSpan {
                     text: ch.to_string(),
                     color,
                     bold,
                 });
             }
-            pending.plain.push(ch);
+            item.plain.push(ch);
+        }
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        items.push_back(item);
+        while items.len() > MAX_LOG_LINES {
+            items.pop_front();
         }
     }
 
@@ -187,19 +178,45 @@ impl EventLog {
     }
 
     fn snapshot(&self) -> Vec<LogLine> {
-        let mut lines = self
-            .lines
+        let items = self
+            .items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !pending.plain.is_empty() {
-            lines.push(pending.clone());
+        let mut lines = Vec::new();
+        for item in items {
+            let mut line = LogLine::default();
+            for span in item.spans {
+                for ch in span.text.chars() {
+                    if ch == '\n' {
+                        lines.push(std::mem::take(&mut line));
+                    } else {
+                        if let Some(last) = line.spans.last_mut() {
+                            if last.color == span.color && last.bold == span.bold {
+                                last.text.push(ch);
+                            } else {
+                                line.spans.push(LogSpan {
+                                    text: ch.to_string(),
+                                    color: span.color,
+                                    bold: span.bold,
+                                });
+                            }
+                        } else {
+                            line.spans.push(LogSpan {
+                                text: ch.to_string(),
+                                color: span.color,
+                                bold: span.bold,
+                            });
+                        }
+                        line.plain.push(ch);
+                    }
+                }
+            }
+            if !line.plain.is_empty() || lines.is_empty() {
+                lines.push(line);
+            }
         }
         lines
     }
