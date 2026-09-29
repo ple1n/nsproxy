@@ -579,6 +579,8 @@ struct DemoApp {
     children: Vec<Scope>,
     logs: Arc<EventLog>,
     sessions: Arc<Mutex<HashMap<ServiceKey, TermSession>>>,
+    pipe_viewers: HashMap<ServiceKey, EventLog>,
+    pipe_cursors: HashMap<ServiceKey, OutputCursor>,
     popups: Arc<Mutex<HashSet<ServiceKey>>>,
     selected: Option<ServiceKey>,
 }
@@ -596,6 +598,8 @@ impl DemoApp {
             children,
             logs,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            pipe_viewers: HashMap::new(),
+            pipe_cursors: HashMap::new(),
             popups: Arc::new(Mutex::new(HashSet::new())),
             selected: None,
         };
@@ -945,18 +949,26 @@ impl DemoApp {
         let manager = self.scope(key.0).manager.clone();
         let shared = Arc::clone(&self.scope(key.0).shared);
         if info.kind == ServiceKind::Pipe {
-            let output = EventLog::default();
-            if let Ok(hub) = manager.output(key.1) {
-                for chunk in hub.snapshot() {
-                    output.append_stream(
+            let cursor = self
+                .pipe_cursors
+                .get(&key)
+                .copied()
+                .unwrap_or(OutputCursor(0));
+            if let Ok(replay) = manager.journal_replay(key.1, cursor) {
+                let viewer = self.pipe_viewers.entry(key).or_default();
+                for chunk in replay.chunks {
+                    viewer.append_stream(
                         (key.1, chunk.stream as u8),
                         "",
                         &String::from_utf8_lossy(&chunk.data),
                     );
                 }
+                self.pipe_cursors.insert(key, replay.next);
             }
             ui.separator();
-            output.show(ui);
+            if let Some(viewer) = self.pipe_viewers.get(&key) {
+                viewer.show(ui);
+            }
             return;
         }
         let mut sessions = self
