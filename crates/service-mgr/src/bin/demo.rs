@@ -508,15 +508,21 @@ impl DemoApp {
         std::thread::Builder::new()
             .name(format!("events-{label}"))
             .spawn(move || {
+                let mut pending_output = HashMap::<(ServiceId, u8), String>::new();
                 while let Ok(event) = handle.events.recv() {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
-                            let text = String::from_utf8_lossy(&chunk.data);
-                            if !text.is_empty() {
+                            let key = (*id, chunk.stream as u8);
+                            let buffered = pending_output.entry(key).or_default();
+                            buffered.push_str(&String::from_utf8_lossy(&chunk.data));
+                            if let Some(end) = buffered.rfind('\n') {
+                                let complete = buffered[..=end].to_string();
+                                let remainder = buffered[end + 1..].to_string();
+                                *buffered = remainder;
                                 logs.push(format!(
-                                    "[{event_label} #{id} {:?}] {text}",
-                                    chunk.stream
+                                    "[{event_label} #{id} {:?}] {complete}",
+                                    chunk.stream,
                                 ));
                             }
                         }
