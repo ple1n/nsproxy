@@ -1,7 +1,7 @@
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell;
-use alacritty_terminal::term::{self, test::TermSize, Term};
+use alacritty_terminal::term::{self, Term, test::TermSize};
 use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use egui::epaint::{Galley, RectShape};
@@ -308,6 +308,7 @@ impl TermSession {
 pub struct TermView<'a> {
     session: &'a mut TermSession,
     has_focus: bool,
+    request_focus: bool,
     size: Vec2,
     input_sink: &'a mut Vec<Vec<u8>>,
     resize_sink: &'a mut Option<(u16, u16)>,
@@ -322,6 +323,7 @@ impl<'a> TermView<'a> {
         Self {
             session,
             has_focus: true,
+            request_focus: false,
             size: Vec2::ZERO,
             input_sink,
             resize_sink,
@@ -331,6 +333,15 @@ impl<'a> TermView<'a> {
     pub fn set_focus(mut self, has_focus: bool) -> Self {
         self.has_focus = has_focus;
         self
+    }
+
+    pub fn request_focus(mut self) -> Self {
+        self.request_focus = true;
+        self
+    }
+
+    pub fn request_focus_if(self, request: bool) -> Self {
+        if request { self.request_focus() } else { self }
     }
 
     pub fn set_size(mut self, size: Vec2) -> Self {
@@ -719,7 +730,7 @@ impl Widget for TermView<'_> {
         };
         let (layout, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
 
-        if layout.clicked() {
+        if layout.clicked() || self.request_focus {
             layout.request_focus();
         }
 

@@ -650,6 +650,7 @@ struct DemoApp {
     pipe_cursors: HashMap<ServiceKey, OutputCursor>,
     popups: Arc<Mutex<HashSet<ServiceKey>>>,
     selected: Option<ServiceKey>,
+    focus_terminal: Option<ServiceKey>,
     frame_window_start: Instant,
     frame_count: u32,
     last_fps: f32,
@@ -673,6 +674,7 @@ impl DemoApp {
             pipe_cursors: HashMap::new(),
             popups: Arc::new(Mutex::new(HashSet::new())),
             selected: None,
+            focus_terminal: None,
             frame_window_start: Instant::now(),
             frame_count: 0,
             last_fps: 0.0,
@@ -945,6 +947,7 @@ impl DemoApp {
             .clicked()
         {
             self.selected = Some(key);
+            self.focus_terminal = Some(key);
         }
         ui.label(service.pid.to_string());
         ui.colored_label(state_color(service.state), state_label(service.state));
@@ -963,6 +966,7 @@ impl DemoApp {
             .clicked()
         {
             self.selected = Some(key);
+            self.focus_terminal = Some(key);
         }
         if ui
             .button(if popup_open { "close" } else { "popup" })
@@ -1063,8 +1067,9 @@ impl DemoApp {
         let session = sessions
             .entry(key)
             .or_insert_with(|| TermSession::new(info.pid));
+        let request_focus = self.focus_terminal.take() == Some(key);
         ui.separator();
-        Self::render_terminal_content(ui, manager, shared, key.1, session);
+        Self::render_terminal_content(ui, manager, shared, key.1, session, request_focus);
     }
 
     fn render_terminal_content(
@@ -1073,6 +1078,7 @@ impl DemoApp {
         shared: Arc<UiPtyState>,
         id: ServiceId,
         session: &mut TermSession,
+        request_focus: bool,
     ) {
         let ipc = ServicePtyIpc {
             manager,
@@ -1084,7 +1090,8 @@ impl DemoApp {
         pump_pty_io(&ipc, session);
         ui.add(
             TermView::new(session, &mut input_frames, &mut resize_event)
-                .set_size(ui.available_size()),
+                .set_size(ui.available_size())
+                .request_focus_if(request_focus),
         );
         flush_term_outputs(&ipc, input_frames, resize_event);
     }
@@ -1136,6 +1143,7 @@ impl DemoApp {
                             Arc::clone(&shared),
                             key.1,
                             session,
+                            false,
                         );
                     };
                     match viewport_class {
