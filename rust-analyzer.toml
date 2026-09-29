@@ -30,10 +30,6 @@ excludeDirs = [
     "derive"
 ]
 
-[procMacro]
-# Disable proc macros to prevent cycle panics
-enable = false
-
 [diagnostics]
 # Disable expensive diagnostics
 disabled = [
