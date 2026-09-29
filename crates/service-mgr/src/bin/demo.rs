@@ -5,8 +5,8 @@ use std::time::Duration;
 use eframe::egui;
 use egui::text::{LayoutJob, TextFormat};
 use service_mgr::{
-    OutputCursor, Ownership, ServiceEvent, ServiceId, ServiceInfo, ServiceManager, ServiceSpec,
-    ServiceState,
+    OutputCursor, Ownership, ServiceEvent, ServiceId, ServiceInfo, ServiceKind, ServiceManager,
+    ServiceSpec, ServiceState,
 };
 use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
 
@@ -944,6 +944,21 @@ impl DemoApp {
         }
         let manager = self.scope(key.0).manager.clone();
         let shared = Arc::clone(&self.scope(key.0).shared);
+        if info.kind == ServiceKind::Pipe {
+            let output = EventLog::default();
+            if let Ok(hub) = manager.output(key.1) {
+                for chunk in hub.snapshot() {
+                    output.append_stream(
+                        (key.1, chunk.stream as u8),
+                        "",
+                        &String::from_utf8_lossy(&chunk.data),
+                    );
+                }
+            }
+            ui.separator();
+            output.show(ui);
+            return;
+        }
         let mut sessions = self
             .sessions
             .lock()

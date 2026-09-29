@@ -6,13 +6,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString, NulError};
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,12 @@ pub enum OutputStream {
     Pty,
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceKind {
+    Pty,
+    Pipe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +326,7 @@ pub struct ServiceInfo {
     pub args: Vec<String>,
     pub uptime: Duration,
     pub ownership: Ownership,
+    pub kind: ServiceKind,
 }
 
 impl ServiceSpec {
@@ -476,6 +483,13 @@ enum ProcessSession {
 }
 
 impl ProcessSession {
+    fn kind(&self) -> ServiceKind {
+        match self {
+            Self::Pty(_) => ServiceKind::Pty,
+            Self::Pipe(_) => ServiceKind::Pipe,
+        }
+    }
+
     fn pid(&self) -> u32 {
         match self {
             Self::Pty(p) => p.pid(),
@@ -721,6 +735,7 @@ impl ServiceManager {
                 args: service.spec.args.clone(),
                 uptime: service.started_at.elapsed(),
                 ownership: service.spec.ownership.clone(),
+                kind: service.process.kind(),
             })
             .collect::<Vec<_>>();
         result.sort_by_key(|service| service.id);
