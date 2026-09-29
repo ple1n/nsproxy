@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -6,7 +6,7 @@ use eframe::egui;
 use service_mgr::{
     ServiceEvent, ServiceId, ServiceInfo, ServiceManager, ServiceSpec, ServiceState,
 };
-use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
+use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
 
 const MAX_INCOMING_BYTES: usize = 256 * 1024;
 
@@ -118,7 +118,8 @@ impl PtyIpc for ServicePtyIpc {
 struct DemoApp {
     manager: ServiceManager,
     shared: Arc<UiPtyState>,
-    sessions: HashMap<ServiceId, TermSession>,
+    sessions: Arc<Mutex<HashMap<ServiceId, TermSession>>>,
+    popups: Arc<Mutex<HashSet<ServiceId>>>,
     selected: Option<ServiceId>,
 }
 
@@ -151,7 +152,8 @@ impl DemoApp {
         Self {
             manager,
             shared,
-            sessions: HashMap::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            popups: Arc::new(Mutex::new(HashSet::new())),
             selected: None,
         }
     }
@@ -190,13 +192,24 @@ impl DemoApp {
             .and_then(|id| services.iter().find(|service| service.id == id))
     }
 
+    fn popup_open(&self, id: ServiceId) -> bool {
+        self.popups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&id)
+    }
+
+    fn viewport_id(id: ServiceId) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of(("service-mgr-popup", id))
+    }
+
     fn render_service_table(&mut self, ui: &mut egui::Ui, services: &[ServiceInfo]) {
         egui::Grid::new("service-list")
             .striped(true)
             .min_col_width(44.0)
             .show(ui, |ui| {
                 for heading in [
-                    "ID", "PID", "State", "Program", "Uptime", "Terminal", "Kill",
+                    "ID", "PID", "State", "Program", "Uptime", "Switch", "Popup", "Kill",
                 ] {
                     ui.strong(heading);
                 }
@@ -214,8 +227,37 @@ impl DemoApp {
                     ui.colored_label(state_color(service.state), state_label(service.state));
                     ui.label(service.command.display().to_string());
                     ui.label(format_duration(service.uptime));
-                    if ui.button("View").clicked() {
-                        self.selected = Some(service.id);
+                    if ui.button("switch").clicked() {
+                        if self.popup_open(service.id) {
+                            ui.ctx().send_viewport_cmd_to(
+                                Self::viewport_id(service.id),
+                                egui::ViewportCommand::Focus,
+                            );
+                            self.shared
+                                .set_notice(format!("Focus requested for popup {}", service.id));
+                        } else {
+                            self.selected = Some(service.id);
+                        }
+                    }
+                    let popup_open = self.popup_open(service.id);
+                    if ui
+                        .button(if popup_open { "close" } else { "popup" })
+                        .clicked()
+                    {
+                        let mut popups = self
+                            .popups
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if popup_open {
+                            popups.remove(&service.id);
+                            ui.ctx().send_viewport_cmd_to(
+                                Self::viewport_id(service.id),
+                                egui::ViewportCommand::Close,
+                            );
+                        } else {
+                            popups.insert(service.id);
+                            self.selected = Some(service.id);
+                        }
                     }
                     let can_kill = matches!(
                         service.state,
@@ -240,18 +282,17 @@ impl DemoApp {
             return;
         };
         let id = info.id;
+        if self.popup_open(id) {
+            ui.centered_and_justified(|ui| {
+                ui.label(format!(
+                    "Terminal for service {id} is open in a popup window."
+                ));
+            });
+            return;
+        }
         let pid = info.pid;
         let manager = self.manager.clone();
         let shared = Arc::clone(&self.shared);
-        let session = self
-            .sessions
-            .entry(id)
-            .or_insert_with(|| TermSession::new(pid));
-        let ipc = ServicePtyIpc {
-            manager,
-            shared,
-            id,
-        };
 
         ui.horizontal(|ui| {
             ui.strong(format!(
@@ -262,6 +303,26 @@ impl DemoApp {
         });
         ui.separator();
 
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let session = sessions.entry(id).or_insert_with(|| TermSession::new(pid));
+        Self::render_terminal_content(ui, manager, shared, id, session);
+    }
+
+    fn render_terminal_content(
+        ui: &mut egui::Ui,
+        manager: ServiceManager,
+        shared: Arc<UiPtyState>,
+        id: ServiceId,
+        session: &mut TermSession,
+    ) {
+        let ipc = ServicePtyIpc {
+            manager,
+            shared,
+            id,
+        };
         let mut input_frames = Vec::new();
         let mut resize_event = None;
         pump_pty_io(&ipc, session);
@@ -270,6 +331,68 @@ impl DemoApp {
                 .set_size(ui.available_size()),
         );
         flush_term_outputs(&ipc, input_frames, resize_event);
+    }
+
+    fn render_popups(&self, ctx: &egui::Context, services: &[ServiceInfo]) {
+        let open_ids = self
+            .popups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        for id in open_ids {
+            let Some(info) = services.iter().find(|service| service.id == id).cloned() else {
+                continue;
+            };
+            let manager = self.manager.clone();
+            let shared = Arc::clone(&self.shared);
+            let sessions = Arc::clone(&self.sessions);
+            let popups = Arc::clone(&self.popups);
+            ctx.show_viewport_deferred(
+                Self::viewport_id(id),
+                egui::ViewportBuilder::default()
+                    .with_title(format!("service {} — {}", id, info.command.display()))
+                    .with_inner_size([900.0, 520.0]),
+                move |popup_ctx, viewport_class| {
+                    if popup_ctx.input(|input| input.viewport().close_requested()) {
+                        popups
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&id);
+                        return;
+                    }
+
+                    let mut render = |ui: &mut egui::Ui| {
+                        let mut sessions =
+                            sessions.lock().unwrap_or_else(|error| error.into_inner());
+                        let session = sessions
+                            .entry(id)
+                            .or_insert_with(|| TermSession::new(info.pid));
+                        DemoApp::render_terminal_content(
+                            ui,
+                            manager.clone(),
+                            Arc::clone(&shared),
+                            id,
+                            session,
+                        );
+                    };
+
+                    match viewport_class {
+                        egui::ViewportClass::Embedded => {
+                            egui::Window::new(format!("service {} terminal", id))
+                                .show(popup_ctx, |ui| render(ui));
+                        }
+                        egui::ViewportClass::Root
+                        | egui::ViewportClass::Immediate
+                        | egui::ViewportClass::Deferred => {
+                            egui::CentralPanel::default().show(popup_ctx, |ui| render(ui));
+                        }
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -302,6 +425,7 @@ impl eframe::App for DemoApp {
             ui.separator();
             self.render_terminal(ui, &services);
         });
+        self.render_popups(ctx, &services);
     }
 }
 
