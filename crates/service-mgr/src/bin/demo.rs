@@ -329,7 +329,13 @@ impl EventLog {
                         }
                     }
                     ui.painter().galley(pos, galley, egui::Color32::WHITE);
-                    if response.clicked() || response.drag_started() || response.dragged() {
+                    let pointer_pressed =
+                        response.hovered() && ui.input(|input| input.pointer.primary_pressed());
+                    if pointer_pressed
+                        || response.clicked()
+                        || response.drag_started()
+                        || response.dragged()
+                    {
                         if let Some(pointer) = response.interact_pointer_pos() {
                             let mut selection = self
                                 .selection
@@ -339,7 +345,8 @@ impl EventLog {
                                 .drag_origin
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
-                            let target_row = if response.clicked() {
+                            let new_gesture = pointer_pressed || response.drag_started();
+                            let target_row = if new_gesture || response.clicked() {
                                 *drag_origin = None;
                                 row
                             } else {
@@ -356,22 +363,26 @@ impl EventLog {
                             let target_line = lines.get(target_row).cloned().unwrap_or_default();
                             let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
                             let point = (target_row, column.min(target_line.plain.chars().count()));
-                            let anchor = if response.drag_started() || response.clicked() {
-                                if response.clicked() {
-                                    point
-                                } else {
-                                    selection.map(|value| value.0).unwrap_or(point)
-                                }
+                            if new_gesture {
+                                *drag_origin = Some((row, pointer.y));
+                                *selection = Some((point, point));
+                            } else if response.clicked() {
+                                *selection = Some((point, point));
                             } else {
-                                selection.map(|value| value.0).unwrap_or(point)
-                            };
-                            *selection = Some((anchor, point));
+                                let anchor = selection.map(|value| value.0).unwrap_or(point);
+                                *selection = Some((anchor, point));
+                            }
                         }
                     }
                 }
             });
-        if ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::C)) {
-            ui.ctx().copy_text(self.selected_text());
+        if ui.input(|input| {
+            (input.modifiers.command || input.modifiers.ctrl) && input.key_pressed(egui::Key::C)
+        }) {
+            let selected = self.selected_text();
+            if !selected.is_empty() {
+                ui.ctx().copy_text(selected);
+            }
         }
     }
 }
