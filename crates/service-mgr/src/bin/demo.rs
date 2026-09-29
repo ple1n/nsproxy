@@ -654,11 +654,6 @@ impl DemoApp {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
-                            logs.append_stream(
-                                (*id, chunk.stream as u8),
-                                "",
-                                &String::from_utf8_lossy(&chunk.data),
-                            );
                         }
                         ServiceEvent::Started { id, pid } => {
                             let prefix = format!("[{event_label} #{id}] ");
@@ -811,15 +806,6 @@ impl DemoApp {
                         ""
                     }
                 ));
-                for chunk in replay.chunks {
-                    let text = String::from_utf8_lossy(&chunk.data).trim_end().to_string();
-                    if !text.is_empty() {
-                        self.logs.push(format!(
-                            "[replay {} #{id} {:?}] {text}",
-                            scope.label, chunk.stream
-                        ));
-                    }
-                }
             }
             Err(error) => self.logs.push(format!(
                 "[{} #{id}] journal replay failed: {error}",
