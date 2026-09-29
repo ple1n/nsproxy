@@ -258,7 +258,8 @@ impl EventLog {
 
     fn show(&self, ui: &mut egui::Ui) {
         let lines = self.snapshot();
-        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let font_id = egui::FontId::monospace(12.0);
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
         let selection = *self
             .selection
             .lock()
@@ -275,7 +276,7 @@ impl EventLog {
                             &span.text,
                             0.0,
                             TextFormat {
-                                font_id: egui::FontId::monospace(12.0),
+                                font_id: font_id.clone(),
                                 color: span.color,
                                 ..Default::default()
                             },
@@ -335,7 +336,7 @@ impl EventLog {
                                 row
                             } else {
                                 let row_offset =
-                                    ((pointer.y - rect.top()) / row_height).floor() as isize;
+                                    ((pointer.y - rect.center().y) / row_height).round() as isize;
                                 (row as isize + row_offset)
                                     .clamp(0, lines.len().saturating_sub(1) as isize)
                                     as usize
