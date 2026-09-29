@@ -449,7 +449,7 @@ impl DemoApp {
                     match &event {
                         ServiceEvent::Output { id, chunk } => {
                             event_shared.append_output(*id, &chunk.data);
-                            let text = String::from_utf8_lossy(&chunk.data).trim_end().to_string();
+                            let text = String::from_utf8_lossy(&chunk.data);
                             if !text.is_empty() {
                                 logs.push(format!(
                                     "[{event_label} #{id} {:?}] {text}",
