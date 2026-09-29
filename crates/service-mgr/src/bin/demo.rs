@@ -435,13 +435,13 @@ impl LogViewer<LogLine> {
             .selection
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::both()
             .id_salt("nested-service-log-view")
             .max_height(ui.available_height().max(row_height))
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show_rows(ui, row_height, row_count, |ui, rows| {
-                ui.spacing_mut().item_spacing.y = 0.0;
                 for row in rows {
                     let line = self.row_at(row);
                     let mut job = LayoutJob::default();
