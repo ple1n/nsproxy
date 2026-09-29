@@ -397,8 +397,38 @@ impl LogViewer<LogLine> {
         result
     }
 
+    fn row_count(&self) -> usize {
+        let completed = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        completed + pending
+    }
+
+    fn row_at(&self, row: usize) -> LogLine {
+        let items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(item) = items.get(row) {
+            return item.clone();
+        }
+        let completed_len = items.len();
+        drop(items);
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .nth(row.saturating_sub(completed_len))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn show(&self, ui: &mut egui::Ui) {
-        let lines = self.snapshot();
+        let row_count = self.row_count().max(1);
         let font_id = egui::FontId::monospace(12.0);
         let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
         let selection = *self
@@ -408,10 +438,10 @@ impl LogViewer<LogLine> {
         egui::ScrollArea::both()
             .id_salt("nested-service-log-view")
             .stick_to_bottom(true)
-            .show_rows(ui, row_height, lines.len().max(1), |ui, rows| {
+            .show_rows(ui, row_height, row_count, |ui, rows| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for row in rows {
-                    let line = lines.get(row).cloned().unwrap_or_default();
+                    let line = self.row_at(row);
                     let mut job = LayoutJob::default();
                     for span in &line.spans {
                         job.append(
@@ -496,10 +526,10 @@ impl LogViewer<LogLine> {
                                     drag_origin.unwrap_or((row, pointer.y));
                                 (origin_row as isize
                                     + ((pointer.y - origin_y) / row_height).round() as isize)
-                                    .clamp(0, lines.len().saturating_sub(1) as isize)
+                                    .clamp(0, row_count.saturating_sub(1) as isize)
                                     as usize
                             };
-                            let target_line = lines.get(target_row).cloned().unwrap_or_default();
+                            let target_line = self.row_at(target_row);
                             let column = ((pointer.x - pos.x) / 7.2).max(0.0) as usize;
                             let point = (target_row, column.min(target_line.plain.chars().count()));
                             if new_gesture {
