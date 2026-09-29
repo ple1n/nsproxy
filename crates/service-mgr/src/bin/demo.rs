@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::text::{LayoutJob, TextFormat};
@@ -13,7 +13,7 @@ use service_mgr::{
 use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
 
 const MAX_INCOMING_BYTES: usize = 256 * 1024;
-const MAX_LOG_LINES: usize = 200;
+const MAX_LOG_LINES: usize = 100_000;
 const LOG_PREFIX_WIDTH: usize = 32;
 type ServiceKey = (usize, ServiceId);
 
@@ -618,6 +618,10 @@ struct DemoApp {
     pipe_cursors: HashMap<ServiceKey, OutputCursor>,
     popups: Arc<Mutex<HashSet<ServiceKey>>>,
     selected: Option<ServiceKey>,
+    frame_window_start: Instant,
+    frame_count: u32,
+    last_fps: f32,
+    last_frame_ms: u128,
 }
 
 impl DemoApp {
@@ -637,6 +641,10 @@ impl DemoApp {
             pipe_cursors: HashMap::new(),
             popups: Arc::new(Mutex::new(HashSet::new())),
             selected: None,
+            frame_window_start: Instant::now(),
+            frame_count: 0,
+            last_fps: 0.0,
+            last_frame_ms: 0,
         };
         app.seed_services();
         app
@@ -770,6 +778,26 @@ impl DemoApp {
         };
         if let Err(error) = self.scope(scope_index).manager.spawn(spec) {
             self.scope(scope_index).shared.set_notice(error.to_string());
+        }
+    }
+
+    fn spawn_log_stress(&mut self, scope_index: usize) {
+        let scope_label = self.scope(scope_index).label.clone();
+        let mut spec = ServiceSpec::new("/bin/sh");
+        spec.args = vec![
+            "-c".into(),
+            "i=1; while [ \"$i\" -le 100000 ]; do printf 'stress %06d %s\\n' \"$i\" \"$i\"; i=$((i+1)); done"
+                .into(),
+        ];
+        spec.output_capacity = 8 * 1024 * 1024;
+        spec.ownership = Ownership {
+            manager: scope_label,
+            parent: None,
+            label: Some("virtual-scroll stress log".into()),
+        };
+        match self.scope(scope_index).manager.spawn(spec) {
+            Ok(id) => self.selected = Some((scope_index, id)),
+            Err(error) => self.scope(scope_index).shared.set_notice(error.to_string()),
         }
     }
 
@@ -1097,10 +1125,14 @@ impl DemoApp {
 
 impl eframe::App for DemoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("root pipe job").clicked() {
                     self.spawn_pipe(0);
+                }
+                if ui.button("stress 100k logs").clicked() {
+                    self.spawn_log_stress(1);
                 }
                 if ui.button("alpha PTY").clicked() {
                     self.spawn_shell(1);
@@ -1148,6 +1180,30 @@ impl eframe::App for DemoApp {
             self.render_terminal(ui);
         });
         self.render_popups(ctx);
+
+        egui::Area::new(egui::Id::new("service_mgr_frame_watermark"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .show(ctx, |ui| {
+                let color = if self.last_frame_ms <= 16 {
+                    egui::Color32::from_rgba_unmultiplied(120, 220, 120, 150)
+                } else if self.last_frame_ms <= 33 {
+                    egui::Color32::from_rgba_unmultiplied(240, 200, 120, 150)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(220, 100, 100, 150)
+                };
+                ui.colored_label(
+                    color,
+                    format!("{}ms  {:.1}fps", self.last_frame_ms, self.last_fps),
+                );
+            });
+        self.last_frame_ms = frame_started.elapsed().as_millis();
+        self.frame_count += 1;
+        let elapsed = self.frame_window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.last_fps = self.frame_count as f32 / elapsed.as_secs_f32();
+            self.frame_count = 0;
+            self.frame_window_start = Instant::now();
+        }
     }
 }
 
