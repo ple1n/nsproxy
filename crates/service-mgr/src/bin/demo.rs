@@ -227,21 +227,19 @@ impl DemoApp {
                     ui.colored_label(state_color(service.state), state_label(service.state));
                     ui.label(service.command.display().to_string());
                     ui.label(format_duration(service.uptime));
-                    if ui.button("switch").clicked() {
-                        if self.popup_open(service.id) {
-                            ui.ctx().send_viewport_cmd_to(
-                                Self::viewport_id(service.id),
-                                egui::ViewportCommand::Focus,
-                            );
-                            self.shared
-                                .set_notice(format!("Focus requested for popup {}", service.id));
-                        } else {
-                            self.selected = Some(service.id);
-                        }
-                    }
                     let popup_open = self.popup_open(service.id);
                     if ui
-                        .button(if popup_open { "close" } else { "popup" })
+                        .add_enabled(!popup_open, egui::Button::new("switch"))
+                        .clicked()
+                    {
+                        self.selected = Some(service.id);
+                    }
+                    let popup_enabled = popup_open || self.selected == Some(service.id);
+                    if ui
+                        .add_enabled(
+                            popup_enabled,
+                            egui::Button::new(if popup_open { "close" } else { "popup" }),
+                        )
                         .clicked()
                     {
                         let mut popups = self
