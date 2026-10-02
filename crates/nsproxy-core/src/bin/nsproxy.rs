@@ -247,6 +247,319 @@ fn session_bus_ready(socket_path: &Path) -> bool {
     }
 }
 
+const CONTAINER_SESSION_BUS_SERVICE_BLACKLIST: &[&str] = &["org.freedesktop.Notifications"];
+
+fn service_file_name(path: &Path) -> Result<Option<String>> {
+    let content = fs::read_to_string(path)?;
+    let mut in_dbus_service_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_dbus_service_section = line == "[D-BUS Service]";
+            continue;
+        }
+        if in_dbus_service_section {
+            if let Some((key, value)) = line.split_once('=')
+                && key.trim() == "Name"
+            {
+                let name = value.trim();
+                return Ok((!name.is_empty()).then(|| name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn container_session_service_dirs() -> Vec<PathBuf> {
+    let mut service_dirs = Vec::new();
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        service_dirs.push(runtime_dir.join("dbus-1/services"));
+    }
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/share"))
+        });
+    if let Some(data_home) = data_home.filter(|path| path.is_absolute()) {
+        service_dirs.push(data_home.join("dbus-1/services"));
+    }
+
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    for data_dir in std::env::split_paths(&data_dirs).filter(|path| path.is_absolute()) {
+        let service_dir = data_dir.join("dbus-1/services");
+        if !service_dirs.contains(&service_dir) {
+            service_dirs.push(service_dir);
+        }
+    }
+    let system_service_dir = PathBuf::from("/usr/share/dbus-1/services");
+    if !service_dirs.contains(&system_service_dir) {
+        service_dirs.push(system_service_dir);
+    }
+    service_dirs
+}
+
+fn populate_container_session_service_dir(
+    service_dirs: &[PathBuf],
+    service_dir: &Path,
+) -> Result<usize> {
+    if service_dir.exists() {
+        fs::remove_dir_all(service_dir)?;
+    }
+    fs::create_dir_all(service_dir)?;
+
+    let mut seen_names = HashSet::new();
+    let mut installed = 0;
+    for directory in service_dirs {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let source = entry.path();
+            if source.extension() != Some(OsStr::new("service")) {
+                continue;
+            }
+            match fs::metadata(&source) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            }
+            let Some(name) = service_file_name(&source)? else {
+                warn!(path = %source.display(), "ignoring D-Bus service file without a name");
+                continue;
+            };
+            if CONTAINER_SESSION_BUS_SERVICE_BLACKLIST.contains(&name.as_str())
+                || !seen_names.insert(name)
+            {
+                continue;
+            }
+            symlink(&source, service_dir.join(format!("{installed:05}.service")))?;
+            installed += 1;
+        }
+    }
+    Ok(installed)
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn replace_standard_session_service_dirs(contents: &str, service_dir: &Path) -> Result<String> {
+    let mut replaced_service_dirs = false;
+    let mut config = String::new();
+    for line in contents.lines() {
+        if matches!(
+            line.trim(),
+            "<standard_session_servicedirs />" | "<standard_session_servicedirs/>"
+        ) {
+            ensure!(
+                !replaced_service_dirs,
+                "multiple standard session service directory directives"
+            );
+            config.push_str(&format!(
+                "  <servicedir>{}</servicedir>\n",
+                escape_xml(&service_dir.display().to_string())
+            ));
+            replaced_service_dirs = true;
+        } else {
+            config.push_str(line);
+            config.push('\n');
+        }
+    }
+    ensure!(
+        replaced_service_dirs,
+        "standard session service directory directive not found"
+    );
+    Ok(config)
+}
+
+fn prepare_container_session_bus_config(runtime_dir: &Path) -> Result<PathBuf> {
+    let service_dir = runtime_dir.join("session-services");
+    let installed = populate_container_session_service_dir(
+        &container_session_service_dirs(),
+        &service_dir,
+    )?;
+    let system_config = Path::new("/usr/share/dbus-1/session.conf");
+    let system_config_contents = fs::read_to_string(system_config)?;
+    let config = replace_standard_session_service_dirs(&system_config_contents, &service_dir)
+        .map_err(|err| anyhow!("{err:#} in {}", system_config.display()))?;
+    let config_path = runtime_dir.join("session.conf");
+    fs::write(&config_path, config)?;
+    info!(
+        installed,
+        service_dir = %service_dir.display(),
+        "prepared private session D-Bus activation directory"
+    );
+    Ok(config_path)
+}
+
+#[cfg(test)]
+mod container_session_bus_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nsproxy-session-bus-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn activation_filter_blacklists_notifications_and_keeps_other_services() {
+        let root = test_root();
+        let source_dir = root.join("source");
+        let service_dir = root.join("filtered");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("org.freedesktop.Notifications.service"),
+            "[D-BUS Service]\nName=org.freedesktop.Notifications\nExec=/bin/true\n",
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("org.kde.kwalletd6.service"),
+            "[D-BUS Service]\nName=org.kde.kwalletd6\nExec=/bin/true\n",
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("org.example.Other.service"),
+            "[D-BUS Service]\nName=org.example.Other\nExec=/bin/true\n",
+        )
+        .unwrap();
+
+        let installed = populate_container_session_service_dir(
+            std::slice::from_ref(&source_dir),
+            &service_dir,
+        )
+        .unwrap();
+        let names = fs::read_dir(&service_dir)
+            .unwrap()
+            .map(|entry| {
+                let target = fs::read_link(entry.unwrap().path()).unwrap();
+                service_file_name(&target).unwrap().unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(installed, 2);
+        assert!(names.iter().any(|name| name == "org.kde.kwalletd6"));
+        assert!(names.iter().any(|name| name == "org.example.Other"));
+        assert!(!names.iter().any(|name| name == "org.freedesktop.Notifications"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_config_replaces_standard_service_dirs_only() {
+        let service_dir = Path::new("/tmp/dbus&services");
+        let config = replace_standard_session_service_dirs(
+            "<busconfig>\n  <standard_session_servicedirs />\n  <policy context=\"default\"/>\n</busconfig>",
+            service_dir,
+        )
+        .unwrap();
+
+        assert!(config.contains("<servicedir>/tmp/dbus&amp;services</servicedir>"));
+        assert!(config.contains("<policy context=\"default\"/>"));
+        assert!(!config.contains("standard_session_servicedirs"));
+        assert!(replace_standard_session_service_dirs("<busconfig/>", service_dir).is_err());
+        assert!(
+            replace_standard_session_service_dirs(
+                "<busconfig>\n<standard_session_servicedirs />\n<standard_session_servicedirs />\n</busconfig>",
+                service_dir,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn private_bus_advertises_retained_services_without_notifications() {
+        let root = test_root();
+        let source_dir = root.join("source");
+        let service_dir = root.join("session-services");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("org.freedesktop.Notifications.service"),
+            "[D-BUS Service]\nName=org.freedesktop.Notifications\nExec=/bin/true\n",
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("org.kde.kwalletd6.service"),
+            "[D-BUS Service]\nName=org.kde.kwalletd6\nExec=/bin/true\n",
+        )
+        .unwrap();
+        populate_container_session_service_dir(
+            std::slice::from_ref(&source_dir),
+            &service_dir,
+        )
+        .unwrap();
+        let system_config = fs::read_to_string("/usr/share/dbus-1/session.conf").unwrap();
+        let config = replace_standard_session_service_dirs(&system_config, &service_dir).unwrap();
+        let config_path = root.join("session.conf");
+        fs::write(&config_path, config).unwrap();
+        let socket_path = root.join("session.sock");
+        let address = format!("unix:path={}", socket_path.display());
+        let mut daemon = Command::new("dbus-daemon")
+            .args(["--config-file"])
+            .arg(&config_path)
+            .args(["--nofork", "--nopidfile"])
+            .arg(format!("--address={address}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break Err(anyhow!("dbus-daemon exited early with {status}"));
+            }
+            let output = Command::new("dbus-send")
+                .arg(format!("--bus={address}"))
+                .args([
+                    "--type=method_call",
+                    "--print-reply",
+                    "--reply-timeout=500",
+                    "--dest=org.freedesktop.DBus",
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus.ListActivatableNames",
+                ])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                break Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            if Instant::now() >= deadline {
+                break Err(anyhow!("timed out querying the private session bus"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        fs::remove_dir_all(root).unwrap();
+
+        let names = result.unwrap();
+        assert!(names.contains("org.kde.kwalletd6"));
+        assert!(!names.contains("org.freedesktop.Notifications"));
+    }
+}
+
 fn dbus_mode_for_profile(ns_alive: &nsproxy_core::NsAlive) -> nsproxy_core::DbusMode {
     ns_alive
         .profile_name
@@ -323,14 +636,19 @@ fn run_container_dbus_daemon(socket_path: &Path, system: bool) -> Result<()> {
     fs::set_permissions(runtime_dir, Permissions::from_mode(0o700))?;
 
     let mut command = Command::new("dbus-daemon");
-    let dbus_args = if system {
-        ["--system", "--nofork", "--nopidfile"]
+    if system {
+        command
+            .args(["--system", "--nofork", "--nopidfile"])
+            .arg(format!("--address={address}"));
     } else {
-        ["--session", "--nofork", "--nopidfile"]
-    };
+        let config_path = prepare_container_session_bus_config(runtime_dir)?;
+        command
+            .args(["--config-file"])
+            .arg(config_path)
+            .args(["--nofork", "--nopidfile"])
+            .arg(format!("--address={address}"));
+    }
     command
-        .args(dbus_args)
-        .arg(format!("--address={address}"))
         .uid(uid)
         .gid(gid)
         // Activated services receive DBUS_STARTER_ADDRESS from the daemon.

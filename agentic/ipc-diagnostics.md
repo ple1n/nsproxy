@@ -8,6 +8,7 @@ Load this note for `sp up`, `sp serve`, Unix socket protocols, reconnection, rou
 - `sp up` listens on `/nsp3/{name}/up.sock`; search `up_sock_path`, `run_up_daemon`, and `handle_up_client`.
 - `sp serve` diagnostics listen on `/nsp3/{name}/tun_diag.sock`; search `diag_sock_path`, `Router::init_diag`, and `DiagServer::start`.
 - Frames are bincode payloads prefixed by a little-endian `u32`. Search `encode_frame`, `read_frame`, `write_bincode_frame`, `read_bincode_frame`, and async variants in `crates/diag/src/lib.rs` and `crates/nsproxy-core/src/bin/nsproxy.rs`.
+- The private session bus replaces the standard activation directories with a filtered copy in `run_container_dbus_daemon`; it blacklists only `org.freedesktop.Notifications` because Plasma's `plasma_waitforname` activation can hang on the private bus. Other standard activations, including KWallet, remain available.
 
 ## Server and client ownership
 
