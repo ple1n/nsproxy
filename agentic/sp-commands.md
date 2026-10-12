@@ -67,6 +67,7 @@ For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resol
 - `sp rm <FILE>`: remove a bind-mount file.
 - `sp clean [--veth]`: clean runtime state; `--veth` also removes the default veth.
 - `sp netlink`: print all IPv4 addresses through the netlink test path.
+- `sp udp [HOST:PORT] [--socks5 HOST:PORT|URL] [--timeout-secs SECONDS]`: test UDP connectivity with an NTP request. Defaults to `time.cloudflare.com:123`; `--socks5` accepts a proxy address or a `socks5://[user:pass@]host:port` URL. Run it inside the target container to test that container's network namespace.
 - `sp gen <SAVE_TO>`: generate an empty config file.
 - `sp init`: record the current process namespaces as the basis namespace set.
 - `sp id [PID]`: identify the current net namespace, or the namespace associated with `PID`.

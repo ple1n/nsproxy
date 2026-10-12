@@ -43,6 +43,7 @@ use tracing_subscriber::Layer;
 
 pub mod personal;
 pub mod summary;
+pub mod history;
 
 // ── Wire protocol types ──────────────────────────────────────────────
 
@@ -765,6 +766,7 @@ impl DiagServer {
     /// [`DIAG_EVENT_RING_CAP`]) and, when [`Self::track_conns`] is `true`,
     /// forwarded to the [`ConnsActor`] for live connection-tracking.
     pub fn emit(&self, event: DiagEvent) {
+        history::record_diag_event(&event);
         // 1. Push to the rolling ring buffer.
         if let Ok(mut ring) = self.event_ring.lock() {
             if ring.len() >= DIAG_EVENT_RING_CAP {
@@ -1234,7 +1236,16 @@ fn log_ring() -> &'static Arc<Mutex<VecDeque<LogEntry>>> {
 /// Append a log entry to the in-process ring buffer.
 /// The oldest entry is discarded when the buffer reaches `LOG_RING_CAP`.
 fn push_log_ring(entry: &LogEntry) {
+    if history::is_enabled() {
+        history::record_log(entry);
+        return;
+    }
     if let Ok(mut guard) = log_ring().lock() {
+        if history::is_enabled() {
+            drop(guard);
+            history::record_log(entry);
+            return;
+        }
         if guard.len() >= LOG_RING_CAP {
             guard.pop_front();
         }
@@ -1246,6 +1257,11 @@ fn push_log_ring(entry: &LogEntry) {
 ///
 /// Use this to serve `ControlCommand::QueryRecentLogs` / `DaemonRequest::QueryRecentLogs`.
 pub fn query_recent_logs(limit: usize) -> Vec<LogEntry> {
+    if let Some(entries) = history::query_recent_logs(limit) {
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
     match log_ring().lock() {
         Ok(guard) if !guard.is_empty() => {
             let skip = guard.len().saturating_sub(limit);
@@ -1406,6 +1422,12 @@ fn append_file_log_entry(path: &Path, entry: &LogEntry) -> Result<()> {
 }
 
 fn snapshot_log_ring() -> Vec<LogEntry> {
+    if let Some(mut entries) = history::snapshot_logs() {
+        if entries.len() > LOG_RING_CAP {
+            entries.drain(..entries.len() - LOG_RING_CAP);
+        }
+        return entries;
+    }
     match log_ring().lock() {
         Ok(guard) => guard.iter().cloned().collect(),
         Err(_) => Vec::new(),

@@ -14,6 +14,7 @@ Load this note for `sp up`, `sp serve`, Unix socket protocols, reconnection, rou
 
 - Serve entry/probe: `cmd_serve` in `crates/nsproxy-core/src/bin/nsproxy.rs`.
 - Per-diagnostic-client handling: `serve_client`, `DiagServer::emit`, `DiagServer::install_as_global` in `crates/diag/src/lib.rs`.
+- Bounded historical logs, virtual-IP mapping, connection activity, SSE, and the embedded React console: `diag::history` in `crates/diag/src/history.rs`; frontend source is `crates/diag/web/`. Logs, mappings, and activity share the `--history-max-bytes` budget. `sp serve` listens inside the profile network namespace (default `0.0.0.0:17890`, unauthenticated).
 - Up requests include `GetProcessList`, `Spawn`, `SpawnCli`, and `Stop`; handling is in `handle_up_client`.
 - UI connection guards and loops: `ensure_up_client`, `ensure_diag_client`, `up_stream_loop`, `diag_stream_loop` in `crates/nsproxy-ui/src/supervisor.rs`.
 

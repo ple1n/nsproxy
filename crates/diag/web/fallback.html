@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nsproxy serve console unavailable</title>
+    <style>
+      body { background: #0b1020; color: #e2e8f0; font: 16px system-ui; margin: 4rem; }
+      main { max-width: 42rem; margin: auto; padding: 2rem; border: 1px solid #334155; border-radius: 1rem; background: #111a2e; }
+      code { color: #67e8f9; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>nsproxy serve console is not included</h1>
+      <p>This build skipped the React console. The normal build includes it by default.</p>
+      <p>Rebuild with <code>./build-ui.sh</code> or <code>./deploy.sh</code>, without <code>--no-web</code>.</p>
+      <p>The diagnostics API remains available at <code>/v1/</code>.</p>
+    </main>
+  </body>
+</html>

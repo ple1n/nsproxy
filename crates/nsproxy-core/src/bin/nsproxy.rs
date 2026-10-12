@@ -1415,6 +1415,46 @@ fn main() -> anyhow::Result<()> {
                 Ok::<(), anyhow::Error>(())
             })?;
         }
+        MainCommand::Udp {
+            target,
+            socks5,
+            timeout_secs,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            let result = rt.block_on(nsproxy_core::cmd_udp::probe_ntp(
+                &target,
+                socks5.as_deref(),
+                Duration::from_secs(timeout_secs),
+            ))?;
+
+            println!(
+                "NTP response from {}{} in {:.1} ms",
+                result.peer,
+                result
+                    .via_proxy
+                    .as_ref()
+                    .map(|proxy| format!(" via {proxy}"))
+                    .unwrap_or_default(),
+                result.elapsed.as_secs_f64() * 1000.0
+            );
+            match result.stratum {
+                0 => println!(
+                    "  UDP path is reachable; server declined the request (Kiss-o'-Death: {})",
+                    result.reference_id
+                ),
+                16 => println!("  UDP path is reachable; server reports unsynchronized time"),
+                stratum if result.leap_indicator == 3 => println!(
+                    "  UDP path is reachable; server reports unsynchronized time (stratum {stratum})"
+                ),
+                stratum => println!("  NTP stratum: {stratum}"),
+            }
+            if let Some(server_time) = result.server_time {
+                println!("  Server time: {}", server_time.to_rfc3339());
+            }
+        }
         MainCommand::Curl { url, proxy } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -2201,6 +2241,8 @@ fn main() -> anyhow::Result<()> {
             clash,
             no_dns_capture,
             internal_dns_server,
+            history_listen,
+            history_max_bytes,
         } => cmd_serve(
             profile,
             tun_name,
@@ -2215,6 +2257,8 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             },
             internal_dns_server,
+            history_listen,
+            history_max_bytes,
         )?,
         MainCommand::Dbus { profile } => {
             let profile_path = state_paths::profile_config(&profile);
@@ -3006,7 +3050,13 @@ fn cmd_serve(
     control_socket: Option<PathBuf>,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
     internal_dns_server: Option<bool>,
+    history_listen: SocketAddr,
+    history_max_bytes: usize,
 ) -> Result<()> {
+    ensure!(
+        history_max_bytes >= 1024,
+        "--history-max-bytes must be at least 1024"
+    );
     let ns_meta = state_paths::profile_ns_meta(&profile);
     let ns_alive = read_ns_alive(&ns_meta)?;
     let registry = NamespacesRegistry::load_locked()?;
@@ -3124,6 +3174,8 @@ fn cmd_serve(
                 ns_source.enter(CloneFlags::CLONE_NEWNET)?;
                 warn!(child_pid, "serve child validating mount namespace identity");
                 nsproxy_core::sandbox::assert_mount_ns_matches(&expected_mnt)?;
+                let history_listener = std::net::TcpListener::bind(history_listen)?;
+                history_listener.set_nonblocking(true)?;
 
                 let initial_hot = load_hot_config_with_serve_dns_overrides(
                     &hot_conf,
@@ -3148,6 +3200,7 @@ fn cmd_serve(
                 warn!(fd = raw, "serve child sending TUN fd to parent");
                 tx.send_fd(raw)?;
                 drop(dev);
+                tx.send_fd(history_listener.as_raw_fd())?;
 
                 // Supervisor loop: fork a worker grandchild for the async runtime.
                 // If the worker is killed or crashes, the supervisor forks a fresh one.
@@ -3222,6 +3275,12 @@ fn cmd_serve(
                 info!("recved fd");
                 let dev = tx.recv_fd()?;
                 let dev = Arc::new(unsafe { AsyncDevice::from_fd(dev) }?);
+                let history_listener_fd = tx.recv_fd()?;
+                let history_listener = unsafe {
+                    std::net::TcpListener::from_raw_fd(history_listener_fd.into_raw_fd())
+                };
+                history_listener.set_nonblocking(true)?;
+                diag::history::init(history_max_bytes)?;
 
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -3305,6 +3364,29 @@ fn cmd_serve(
                     };
 
                     router.init_diag(&diag_path).await?;
+                    let uplink = router.uplink.clone();
+                    let dns_handle = Arc::new(sync::Mutex::new(router.dns_handle()));
+                    let route_query_handler: diag::history::RouteQueryHandler =
+                        Arc::new(move |query| {
+                            let uplink = uplink.clone();
+                            let dns_handle = dns_handle.clone();
+                            Box::pin(async move {
+                                let target = SocketAddr::new(query.dst, query.port);
+                                let dns = dns_handle.lock().await.preprocess(target);
+                                let context = nsproxy_common::routing::RoutingContext {
+                                    target_ip: query.dst,
+                                    target_port: query.port,
+                                    source_ip: query.src,
+                                    protocol: query.protocol,
+                                    tried_proxies: Default::default(),
+                                    attempt_num: 0,
+                                    dns,
+                                };
+                                let hub = uplink.read().await;
+                                Ok(hub.route(&context))
+                            }) as diag::history::RouteQueryFuture
+                        });
+                    diag::history::start_server(history_listener, route_query_handler).await?;
 
                     let diag_srv = router.diag_handle();
                     tokio::spawn(nsproxy_common::trace_spawn_result(

@@ -58,6 +58,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 pub use tun2socks5;
 pub mod cmd_common;
+pub mod cmd_udp;
 pub mod cmd_uplink;
 pub mod env;
 pub mod hot_reload;
@@ -2307,6 +2308,18 @@ pub enum MainCommand {
     #[command(alias = "n")]
     /// Netlink testing: print all IPv4 addresses
     Netlink,
+    /// Test UDP connectivity with an NTP request
+    Udp {
+        /// NTP server address (defaults to time.cloudflare.com:123)
+        #[arg(default_value = "time.cloudflare.com:123")]
+        target: String,
+        /// SOCKS5 proxy address, optionally with a socks5:// URL and credentials
+        #[arg(long, value_name = "HOST:PORT|URL")]
+        socks5: Option<String>,
+        /// Response timeout in seconds
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+    },
     /// Generates an empty config file
     Gen { save_to: PathBuf },
     /// Record the current process namespaces as the basis namespace set.
@@ -2421,6 +2434,14 @@ pub enum MainCommand {
         /// This was intended for Geph, because at the point of writing Geph doesn't work with IPv6 properly
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         internal_dns_server: Option<bool>,
+        /// HTTP/JSON history query listener inside the profile network namespace.
+        #[arg(long, default_value = "0.0.0.0:17890")]
+        #[serde(default = "default_history_listen")]
+        history_listen: SocketAddr,
+        /// Aggregate in-memory history budget for logs, virtual-IP mappings, and connection activity.
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        #[serde(default = "default_history_max_bytes")]
+        history_max_bytes: usize,
     },
     /// Run the private `dbus-daemon` session bus for an already-up container.
     Dbus {
@@ -2490,6 +2511,19 @@ pub enum MainCommand {
         #[command(flatten)]
         sargs: ShellArgs,
     },
+}
+
+pub const DEFAULT_HISTORY_LISTEN: &str = "0.0.0.0:17890";
+pub const DEFAULT_HISTORY_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn default_history_listen() -> SocketAddr {
+    DEFAULT_HISTORY_LISTEN
+        .parse()
+        .expect("valid default history address")
+}
+
+fn default_history_max_bytes() -> usize {
+    DEFAULT_HISTORY_MAX_BYTES
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
@@ -2739,6 +2773,8 @@ mod cli_fd_tests {
                 clash: None,
                 no_dns_capture: Some(true),
                 internal_dns_server: Some(false),
+                history_listen: default_history_listen(),
+                history_max_bytes: default_history_max_bytes(),
             },
         });
     }

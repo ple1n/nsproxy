@@ -28,7 +28,8 @@ use nsproxy_core::cmd_common::read_ns_alive;
 use nsproxy_core::sandbox::{read_sandbox_status, SandboxStatus};
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{
-    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, HotVeth, MainCommand, TemplateConfig,
+    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, HotVeth, MainCommand,
+    TemplateConfig, DEFAULT_HISTORY_LISTEN, DEFAULT_HISTORY_MAX_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -1808,6 +1809,10 @@ impl Supervisor {
                         clash: None,
                         no_dns_capture: None,
                         internal_dns_server: None,
+                        history_listen: DEFAULT_HISTORY_LISTEN
+                            .parse()
+                            .expect("valid default history address"),
+                        history_max_bytes: DEFAULT_HISTORY_MAX_BYTES,
                     },
                 };
                 match bincode::serialize(&cli) {

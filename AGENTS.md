@@ -28,7 +28,7 @@ Load more than one note only when the owning code path genuinely crosses those b
 
 - When adding or changing a durable convention, update the narrowest relevant note under `agentic/` and add or adjust its route here when needed.
 - Keep routed notes factual, searchable, and focused on ownership, symbols, invariants, and validation commands. Do not duplicate the whole repository map in this file.
-- After code edits, use `./build-ui.sh` (or `./build-ui.sh --release` when release behavior is relevant) as the standard build/check path.
+- After code edits, use `./build-ui.sh` (or `./build-ui.sh --release` when release behavior is relevant) as the standard build/check path. The serve React console is included by default; use `--no-web` for a bare-bones build.
 - Make a local commit after completing a coherent change, using a simple descriptive commit message. Branching is allowed for draft work; local commits may be squashed before pushing.
 - Commits should describe the project change and contain no agent or tool identity.
 - UI controls with the same semantic role must share a renderer and visual states. Compact removal controls are borderless, fixed-size, icon-based, and hover-responsive; validation indicators are a separate shared status renderer and must also provide clear hover feedback.

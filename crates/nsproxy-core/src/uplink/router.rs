@@ -512,12 +512,10 @@ impl Router {
     async fn relay_udp(
         tunnel: &mut dyn crate::uplink::proxy_adapters::UdpLike,
         udp: &mut IpStackUdpStream,
-        peer: SocketAddr,
+        target: WireAddress,
     ) -> Result<(u128, u128)> {
-        use socks5_impl::protocol::WireAddress;
         use tokio::io::AsyncReadExt;
 
-        let dst = WireAddress::SocketAddress(peer);
         let mut bytes_up: u128 = 0;
         let mut bytes_down: u128 = 0;
         let mut buf = vec![0u8; 65535];
@@ -530,7 +528,8 @@ impl Router {
                     if n == 0 {
                         break;
                     }
-                    tunnel.send_to(&buf[..n], dst.clone()).await
+                    // The TUN peer may be a synthetic DNS address; send to the routed destination.
+                    tunnel.send_to(&buf[..n], target.clone()).await
                         .map_err(|e| anyhow::anyhow!("UDP send_to failed: {}", e))?;
                     bytes_up += n as u128;
                 }
@@ -738,7 +737,13 @@ impl Router {
                         ts: Timestamp::now(),
                     });
 
-                    match Self::relay_udp(remote.as_udp_mut().unwrap(), &mut udp, peer).await {
+                    match Self::relay_udp(
+                        remote.as_udp_mut().unwrap(),
+                        &mut udp,
+                        WireAddress::SocketAddress(addr),
+                    )
+                    .await
+                    {
                         Ok((up, down)) => {
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
@@ -852,7 +857,7 @@ impl Router {
                         stats.record_latency_ms(latency_ms);
                     }
 
-                    match Self::relay_udp(tunnel, &mut udp, peer).await {
+                    match Self::relay_udp(tunnel, &mut udp, target.clone()).await {
                         Ok((up, down)) => {
                             {
                                 let mut hub = uplink.write().await;

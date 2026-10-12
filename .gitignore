@@ -12,3 +12,5 @@ netns
 sproxy
 nsproxy
 local/
+/crates/diag/web/node_modules/
+/crates/diag/web/dist/
