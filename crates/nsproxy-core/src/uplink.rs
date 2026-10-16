@@ -13,7 +13,7 @@
 //! ### 3. RoutingContext & RoutingDecision
 //! Simple framework exposed as a function where you can:
 //! - Access target domain, IP, port, source IP, and protocol
-//! - Return a routing decision: proxy to use, direct connection, or special handling
+//! - Return a routing decision: proxy to use, no-proxy connection, or special handling
 //!
 //! ### 4. ProxyStream Trait
 //! Unified interface that all proxies implement for stream-based communication
@@ -52,7 +52,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -66,7 +66,8 @@ use nsproxy_common::routing::{
     RoutingResovled, VDNSRES,
 };
 use nsproxy_common::stats::{
-    ChronoData, ProxyProtocol, ProxyStats, Timestamp, default_udp_expectation,
+    ChronoData, HostRouteKey, HostRouteMetric, HostRouteStats, ObservedRoute, ProxyProtocol,
+    ProxyStats, Timestamp, TransferRateSample, default_udp_expectation,
 };
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
@@ -83,6 +84,7 @@ pub mod router;
 const POOL_SIZE: usize = 65_535;
 const DNS_PORT: u16 = 53;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HOST_ROUTE_STATS: usize = 16_384;
 
 fn ensure_rustls_crypto_provider() -> Result<()> {
     static TLS_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
@@ -160,14 +162,13 @@ pub struct DNSResponse {
     pub ips: BTreeSet<IpAddr>,
 }
 
-/// Profile is only considered usable once all domains are resolved to IPs.
-/// We keep this data separately
+/// Results of resolving domains to IP addresses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileSolved {
+pub struct ResolvedDomains {
     pub domains: DomainsSolved,
 }
 
-impl ProfileSolved {
+impl ResolvedDomains {
     pub fn new() -> Self {
         Self {
             domains: BTreeMap::new(),
@@ -212,9 +213,9 @@ impl ProfileSolved {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Invalid solved.json path: {:?}", path))?;
         info!("Ensuring parent directory exists: {:?}", parent);
-        std::fs::create_dir_all(parent).context("Failed to create uplink profile directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create uplink state directory")?;
         let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize ProfileSolved")?;
+            serde_json::to_string_pretty(self).context("Failed to serialize resolved domains")?;
         let bytes = content.len();
         std::fs::write(path, content)
             .context(format!("Failed to write solved.json to {:?}", path))?;
@@ -399,6 +400,42 @@ pub fn no_routing() -> RoutingFunction {
     })
 }
 
+pub fn no_proxy_routing() -> RoutingFunction {
+    Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| {
+        if ctx.attempt_num > 0 {
+            return RoutingResovled::Drop(DropReason::MaxRetry);
+        }
+
+        match &ctx.dns {
+            VDNSRES::NormalProxying => {
+                RoutingResovled::NoProxy(SocketAddr::new(ctx.target_ip, ctx.target_port))
+            }
+            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => {
+                RoutingResovled::NATByTUN(*sock)
+            }
+            VDNSRES::Opine(RoutingDecision::NoProxy(sock))
+            | VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => {
+                RoutingResovled::NoProxy(*sock)
+            }
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => {
+                RoutingResovled::NoProxyDomain {
+                    host: host.clone(),
+                    port: ctx.target_port,
+                }
+            }
+            VDNSRES::Opine(RoutingDecision::File(_)) => {
+                RoutingResovled::NoProxy(SocketAddr::new(ctx.target_ip, ctx.target_port))
+            }
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => {
+                RoutingResovled::Drop(reason.clone())
+            }
+            VDNSRES::ERR => {
+                RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed("vdns error")))
+            }
+        }
+    })
+}
+
 pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     Arc::new(move |ctx: &RoutingContext, _hub: &UplinkHub| {
         if ctx.attempt_num > 0 {
@@ -426,7 +463,7 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
                 }
             }
             VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => RoutingResovled::NATByTUN(*sock),
-            VDNSRES::Opine(RoutingDecision::Direct(sock)) => RoutingResovled::Direct(*sock),
+            VDNSRES::Opine(RoutingDecision::NoProxy(sock)) => RoutingResovled::NoProxy(*sock),
             VDNSRES::Opine(RoutingDecision::File(path)) => RoutingResovled::ProxyResovled {
                 target: WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port)),
                 id: ProxyID::for_file(path.as_path()),
@@ -439,14 +476,62 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     })
 }
 
+pub fn group_routing(group_id: clash::GroupId) -> RoutingFunction {
+    Arc::new(move |ctx: &RoutingContext, hub: &UplinkHub| {
+        let target = match &ctx.dns {
+            VDNSRES::NormalProxying => {
+                WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
+            }
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => {
+                WireAddress::DomainAddress(host.clone(), ctx.target_port)
+            }
+            VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => {
+                WireAddress::SocketAddress(*sock)
+            }
+            VDNSRES::Opine(RoutingDecision::File(path)) => {
+                return RoutingResovled::ProxyResovled {
+                    target: WireAddress::SocketAddress(SocketAddr::new(
+                        ctx.target_ip,
+                        ctx.target_port,
+                    )),
+                    id: ProxyID::for_file(path.as_path()),
+                };
+            }
+            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => {
+                return RoutingResovled::NATByTUN(*sock);
+            }
+            VDNSRES::Opine(RoutingDecision::NoProxy(sock)) => {
+                return RoutingResovled::NoProxy(*sock);
+            }
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => {
+                return RoutingResovled::Drop(reason.clone());
+            }
+            VDNSRES::ERR => {
+                return RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed("vdns error")));
+            }
+        };
+
+        let Some(id) = hub.best_proxy_in_group(&group_id, &ctx.tried_proxies) else {
+            return RoutingResovled::Drop(DropReason::Preprocess(Cow::Owned(format!(
+                "no available proxies in group '{}'",
+                group_id.as_str()
+            ))));
+        };
+
+        RoutingResovled::ProxyResovled { target, id }
+    })
+}
+
 // This struct is not directly serialized
 /// Central hub of all resources we have
 pub struct UplinkHub {
     pub proxies: HashMap<ProxyID, UplinkProxy>,
     routing_fn: RoutingFunction,
-    /// Centralized Clash resolver/cache state loaded from /nsp3/clash.json
+    /// User-owned Clash groups, imported proxy configs, and resolver caches.
     pub clash: Option<clash::ClashState>,
     pub stats: HashMap<ProxyID, ProxyStats>,
+    /// Process-local TCP performance estimates keyed by host and exact route.
+    pub host_route_stats: HashMap<HostRouteKey, HostRouteStats>,
     pub stats_clear: Timestamp,
     /// Map from proxy pseudonym (nym) to ProxyID for O(1) lookup
     pub nym_map: HashMap<ProxyNym, ProxyID>,
@@ -552,6 +637,7 @@ impl UplinkHub {
             routing_fn: no_routing(),
             clash: None,
             stats: HashMap::new(),
+            host_route_stats: HashMap::new(),
             stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
             found_ips: ChronoData::default(),
@@ -575,8 +661,92 @@ impl UplinkHub {
         self.stats.get(id).cloned()
     }
 
+    fn host_route_stats_mut(&mut self, key: HostRouteKey) -> &mut HostRouteStats {
+        if !self.host_route_stats.contains_key(&key)
+            && self.host_route_stats.len() >= MAX_HOST_ROUTE_STATS
+        {
+            if let Some(oldest) = self
+                .host_route_stats
+                .iter()
+                .min_by_key(|(_, stats)| stats.last_observed)
+                .map(|(key, _)| key.clone())
+            {
+                self.host_route_stats.remove(&oldest);
+            }
+        }
+        self.host_route_stats.entry(key).or_default()
+    }
+
+    pub fn record_host_route_attempt(
+        &mut self,
+        target: WireAddress,
+        route: ObservedRoute,
+        connect_latency: Duration,
+        success: bool,
+    ) -> HostRouteMetric {
+        let key = HostRouteKey::new(target, route);
+        let at = Timestamp::now();
+        let stats = self.host_route_stats_mut(key.clone());
+        stats.record_tcp_attempt(connect_latency, success, at);
+        stats.metric(key, at)
+    }
+
+    pub fn record_host_route_connection(
+        &mut self,
+        target: WireAddress,
+        route: ObservedRoute,
+        connect_latency: Duration,
+        upload_sample: Option<TransferRateSample>,
+        download_sample: Option<TransferRateSample>,
+    ) -> HostRouteMetric {
+        let key = HostRouteKey::new(target, route);
+        let at = Timestamp::now();
+        let stats = self.host_route_stats_mut(key.clone());
+        stats.record_tcp_connection(connect_latency, upload_sample, download_sample, at);
+        stats.metric(key, at)
+    }
+
+    pub fn record_host_route_transfer_samples(
+        &mut self,
+        target: WireAddress,
+        route: ObservedRoute,
+        upload_sample: Option<TransferRateSample>,
+        download_sample: Option<TransferRateSample>,
+    ) -> HostRouteMetric {
+        let key = HostRouteKey::new(target, route);
+        let at = Timestamp::now();
+        let stats = self.host_route_stats_mut(key.clone());
+        stats.record_tcp_transfer_samples(upload_sample, download_sample, at);
+        stats.metric(key, at)
+    }
+
+    pub fn record_host_route_udp_transfer_samples(
+        &mut self,
+        target: WireAddress,
+        route: ObservedRoute,
+        upload_sample: Option<TransferRateSample>,
+        download_sample: Option<TransferRateSample>,
+    ) -> HostRouteMetric {
+        let key = HostRouteKey::new(target, route);
+        let at = Timestamp::now();
+        let stats = self.host_route_stats_mut(key.clone());
+        stats.record_udp_transfer_samples(upload_sample, download_sample, at);
+        stats.metric(key, at)
+    }
+
+    pub fn host_route_metrics(&self, at: Timestamp) -> Vec<HostRouteMetric> {
+        let mut metrics: Vec<_> = self
+            .host_route_stats
+            .iter()
+            .map(|(key, stats)| stats.metric(key.clone(), at))
+            .collect();
+        metrics.sort_by_key(|metric| metric.key.clone());
+        metrics
+    }
+
     pub fn clear_stats(&mut self) {
         self.stats.clear();
+        self.host_route_stats.clear();
         self.stats_clear = Timestamp::now();
     }
 
@@ -631,6 +801,7 @@ impl UplinkHub {
             routing_fn,
             clash: None,
             stats: HashMap::new(),
+            host_route_stats: HashMap::new(),
             stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
             found_ips: ChronoData::default(),
@@ -638,7 +809,7 @@ impl UplinkHub {
     }
 
     /// Hydrate hub from persisted state in one entrypoint:
-    /// - loads centralized Clash state (`/nsp3/uplink/clash.json`)
+    /// - loads persisted Clash group state
     /// - loads all saved proxies that can be materialized from that state
     pub fn hydrate_from_persisted(&mut self) -> Result<usize> {
         let _ = self.load_clash_state()?;
@@ -647,7 +818,7 @@ impl UplinkHub {
         Ok(self.proxies.len())
     }
 
-    /// Load centralized Clash state from /nsp3/clash.json when not yet present.
+    /// Load persisted Clash groups when not yet present.
     pub fn load_clash_state(&mut self) -> Result<&clash::ClashState> {
         if self.clash.is_none() {
             self.clash = Some(clash::ClashState::load_or_default()?);
@@ -655,7 +826,7 @@ impl UplinkHub {
         Ok(self.clash.as_ref().expect("clash state must exist"))
     }
 
-    /// Replace in-memory Clash state and persist it to /nsp3/clash.json.
+    /// Replace in-memory Clash group state and persist it.
     pub fn set_clash_state(&mut self, state: clash::ClashState) -> Result<()> {
         state.save_atomic()?;
         self.clash = Some(state);
@@ -679,6 +850,40 @@ impl UplinkHub {
     /// using hub state (proxy registry, etc.) into a concrete `RoutingResovled`.
     pub fn route(&self, ctx: &RoutingContext) -> RoutingResovled {
         (self.routing_fn)(ctx, self)
+    }
+
+    fn best_proxy_in_group(
+        &self,
+        group_id: &clash::GroupId,
+        tried_proxies: &HashSet<ProxyID>,
+    ) -> Option<ProxyID> {
+        let group = self.clash.as_ref()?.groups.get(group_id)?;
+        group
+            .proxy_configs
+            .keys()
+            .filter(|id| self.proxies.contains_key(*id) && !tried_proxies.contains(*id))
+            .min_by(|left, right| {
+                let left_stats = self
+                    .stats
+                    .get(*left)
+                    .map(ProxyStats::past_hour)
+                    .unwrap_or_default();
+                let right_stats = self
+                    .stats
+                    .get(*right)
+                    .map(ProxyStats::past_hour)
+                    .unwrap_or_default();
+                let left_health = left_stats.success_rate().unwrap_or(1.0);
+                let right_health = right_stats.success_rate().unwrap_or(1.0);
+                let left_latency = left_stats.avg_latency_ms().unwrap_or(f64::INFINITY);
+                let right_latency = right_stats.avg_latency_ms().unwrap_or(f64::INFINITY);
+
+                right_health
+                    .total_cmp(&left_health)
+                    .then_with(|| left_latency.total_cmp(&right_latency))
+                    .then_with(|| left.cmp(right))
+            })
+            .cloned()
     }
 
     /// Set a new routing function
@@ -769,13 +974,14 @@ impl UplinkHub {
         Ok(hub)
     }
 
-    /// Load all Clash proxies from centralized clash state and add them to the hub
+    /// Load all proxy configs owned by Clash groups and add resolved proxies to the hub
     pub fn load_clash_proxies(&mut self) -> Result<usize> {
         let clash_state = self.load_clash_state()?.clone();
-        let state_proxies = clash_state.proxies;
+        let proxy_configs = clash_state.all_proxy_configs();
+        let state_proxies = clash_state.proxy_resolutions;
 
         let mut count = 0;
-        for (_proxy_id, cfg) in clash_state.trojan_proxies {
+        for (_proxy_id, cfg) in proxy_configs {
             let resolved_ip = state_proxies
                 .get(&Domain::from(cfg.server.clone()))
                 .and_then(|responses| responses.last_key_value())
@@ -858,7 +1064,7 @@ impl CRDT for UplinkStatsState {
 /// routing function with `UplinkHub::with_routing`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UplinkSnapshot {
-    /// Centralized Clash state (proxy configs, resolved IPs, …)
+    /// User-owned Clash groups, proxy configs, and resolved IPs.
     pub clash: Option<clash::ClashState>,
     /// Saved remote proxies (SOCKS5 / HTTP, …)
     pub remote_proxies: Vec<ArgProxy>,
@@ -1838,7 +2044,7 @@ pub struct RoutingBuilder {
 }
 
 impl RoutingBuilder {
-    /// Create a new routing builder with a default direct routing
+    /// Create a new routing builder with a default no-proxy routing
     pub fn new() -> Self {
         Self {
             rules: Vec::new(),
@@ -1876,7 +2082,7 @@ impl RoutingBuilder {
                 if let Some(ref decision) = default_decision {
                     decision.clone()
                 } else {
-                    RoutingResovled::Direct(SocketAddr::new(ctx.target_ip, ctx.target_port))
+                    RoutingResovled::NoProxy(SocketAddr::new(ctx.target_ip, ctx.target_port))
                 }
             },
         )
@@ -1893,6 +2099,211 @@ impl Default for RoutingBuilder {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn explicit_no_proxy_routing_is_distinct_from_no_route() {
+        let context = RoutingContext {
+            target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            target_port: 443,
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            protocol: RoutingProtocol::Tcp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: VDNSRES::NormalProxying,
+        };
+        let hub = UplinkHub::new();
+
+        assert_eq!(
+            no_proxy_routing()(&context, &hub),
+            RoutingResovled::NoProxy(SocketAddr::new(context.target_ip, context.target_port))
+        );
+        assert!(matches!(no_routing()(&context, &hub), RoutingResovled::Drop(_)));
+    }
+
+    #[test]
+    fn group_routing_prefers_health_then_retries_another_member() {
+        let group_id = clash::GroupId::from("fedora");
+        let healthy = ProxyID::for_remote("127.0.0.1:1080".parse().unwrap());
+        let fast_but_unhealthy = ProxyID::for_remote("127.0.0.1:1081".parse().unwrap());
+        let mut group = clash::ClashGroupState::default();
+        for id in [&healthy, &fast_but_unhealthy] {
+            group.proxy_configs.insert(
+                id.clone(),
+                clash::TrojanConfig {
+                    name: id.nym().to_string(),
+                    server: "proxy.example.test".to_string(),
+                    port: 443,
+                    password: "secret".to_string(),
+                },
+            );
+        }
+
+        let mut hub = UplinkHub::new();
+        hub.clash = Some(clash::ClashState {
+            groups: BTreeMap::from([(group_id.clone(), group)]),
+            ..Default::default()
+        });
+        hub.add_proxy(healthy.clone(), UplinkProxy::Geph);
+        hub.add_proxy(fast_but_unhealthy.clone(), UplinkProxy::Geph);
+        hub.update_link_conn_check(&healthy, true);
+        hub.update_link_conn_check(&fast_but_unhealthy, true);
+        hub.update_link_conn_check(&fast_but_unhealthy, false);
+        hub.update_link_ttfb(&healthy, Duration::from_millis(300));
+        hub.update_link_ttfb(&fast_but_unhealthy, Duration::from_millis(1));
+        hub.set_routing(group_routing(group_id));
+
+        let mut context = RoutingContext {
+            target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            target_port: 443,
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            protocol: RoutingProtocol::Tcp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: VDNSRES::NormalProxying,
+        };
+
+        assert!(matches!(
+            hub.route(&context),
+            RoutingResovled::ProxyResovled { id, .. } if id == healthy
+        ));
+        context.tried_proxies.insert(healthy.clone());
+        assert!(matches!(
+            hub.route(&context),
+            RoutingResovled::ProxyResovled { id, .. } if id == fast_but_unhealthy
+        ));
+        context.tried_proxies.insert(fast_but_unhealthy);
+        assert!(matches!(hub.route(&context), RoutingResovled::Drop(_)));
+    }
+
+    #[test]
+    fn group_routing_uses_latency_when_health_is_equal() {
+        let group_id = clash::GroupId::from("latency");
+        let slow = ProxyID::for_remote("127.0.0.1:1082".parse().unwrap());
+        let fast = ProxyID::for_remote("127.0.0.1:1083".parse().unwrap());
+        let mut group = clash::ClashGroupState::default();
+        for id in [&slow, &fast] {
+            group.proxy_configs.insert(
+                id.clone(),
+                clash::TrojanConfig {
+                    name: id.nym().to_string(),
+                    server: "proxy.example.test".to_string(),
+                    port: 443,
+                    password: "secret".to_string(),
+                },
+            );
+        }
+
+        let mut hub = UplinkHub::new();
+        hub.clash = Some(clash::ClashState {
+            groups: BTreeMap::from([(group_id.clone(), group)]),
+            ..Default::default()
+        });
+        hub.add_proxy(slow.clone(), UplinkProxy::Geph);
+        hub.add_proxy(fast.clone(), UplinkProxy::Geph);
+        for id in [&slow, &fast] {
+            hub.update_link_conn_check(id, true);
+        }
+        hub.update_link_ttfb(&slow, Duration::from_millis(150));
+        hub.update_link_ttfb(&fast, Duration::from_millis(25));
+        hub.set_routing(group_routing(group_id));
+
+        let context = RoutingContext {
+            target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            target_port: 443,
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            protocol: RoutingProtocol::Tcp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: VDNSRES::NormalProxying,
+        };
+
+        assert!(matches!(
+            hub.route(&context),
+            RoutingResovled::ProxyResovled { id, .. } if id == fast
+        ));
+    }
+
+    #[test]
+    fn host_route_stats_keep_no_proxy_and_each_proxy_separate() {
+        fn sample(bytes: u128) -> TransferRateSample {
+            let mut tracker = nsproxy_common::stats::TransferRateTracker::default();
+            tracker.record(bytes - 2, Duration::ZERO);
+            tracker.record(1, Duration::from_secs(1));
+            tracker.record(1, Duration::from_secs(2));
+            tracker.sample(Timestamp(0)).unwrap()
+        }
+
+        let mut hub = UplinkHub::new();
+        let proxy_a = ProxyID::for_remote("127.0.0.1:1080".parse().unwrap());
+        let proxy_b = ProxyID::for_remote("127.0.0.1:1081".parse().unwrap());
+
+        let no_proxy = hub.record_host_route_connection(
+            WireAddress::DomainAddress("Packages.Example.".to_string(), 443),
+            ObservedRoute::NoProxy,
+            Duration::from_millis(100),
+            None,
+            Some(sample(2_000_000)),
+        );
+        hub.record_host_route_connection(
+            WireAddress::DomainAddress("packages.example".to_string(), 443),
+            ObservedRoute::Proxy(proxy_a),
+            Duration::from_millis(200),
+            None,
+            Some(sample(4_000_000)),
+        );
+        hub.record_host_route_connection(
+            WireAddress::DomainAddress("packages.example".to_string(), 443),
+            ObservedRoute::Proxy(proxy_b),
+            Duration::from_millis(300),
+            None,
+            Some(sample(6_000_000)),
+        );
+
+        assert_eq!(hub.host_route_stats.len(), 3);
+        assert!(
+            hub.host_route_stats
+                .keys()
+                .all(|key| key.target == WireAddress::DomainAddress("packages.example".into(), 443))
+        );
+        assert_eq!(no_proxy.connect_latency_ms, Some(100.0));
+        assert_eq!(no_proxy.download_bytes_per_sec, Some(1_000_000.0));
+        assert_eq!(
+            hub.host_route_metrics(Timestamp::now()).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn host_route_tcp_connect_is_visible_before_transfer_samples() {
+        let mut hub = UplinkHub::new();
+        let target = WireAddress::SocketAddress("192.0.2.10:443".parse().unwrap());
+
+        let connected = hub.record_host_route_attempt(
+            target.clone(),
+            ObservedRoute::NoProxy,
+            Duration::from_millis(42),
+            true,
+        );
+
+        assert_eq!(hub.host_route_metrics(Timestamp::now()).len(), 1);
+        assert_eq!(connected.connect_latency_ms, Some(42.0));
+        assert_eq!(connected.connect_success_rate, Some(1.0));
+
+        let mut tracker = nsproxy_common::stats::TransferRateTracker::default();
+        tracker.record(10, Duration::ZERO);
+        tracker.record(10, Duration::from_secs(1));
+        tracker.record(10, Duration::from_secs(2));
+        let sample = tracker.sample(Timestamp::now()).unwrap();
+        let transferred = hub.record_host_route_transfer_samples(
+            target,
+            ObservedRoute::NoProxy,
+            Some(sample),
+            None,
+        );
+
+        assert_eq!(transferred.connect_success_rate, Some(1.0));
+        assert!(transferred.upload_bytes_per_sec.is_some());
+    }
 
     #[test]
     fn test_uplink_stats_state_serde_with_hex_proxy_id() {

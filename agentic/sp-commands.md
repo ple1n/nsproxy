@@ -53,15 +53,16 @@ cat /nsp3/config/<profile>/hot.json
 sp enter <profile> -s sh --args -c 'cat /etc/resolv.conf'
 ```
 
-`hot.json` owns `dns`, `tun`, `devs`, `mnt`/`mounts`, `locals`, `dns_capture`, `resolv_conf_dns`, `route`, `daemons`, `applications`, and `veth`. Empty `dns_capture` means capture all DNS source IPs; a disabled sentinel captures none. A `dns` entry maps a name directly to an IPv4 address and is pinned into Virtual DNS. A `tun` entry routes through TUN or a file server. Hot changes are watched and applied to the running serve process; invalid JSON is rejected and does not replace the active config.
+`hot.json` owns `dns`, `tun`, `devs`, `mnt`/`mounts`, `locals`, `dns_capture`, `resolv_conf_dns`, `route`, `daemons`, `applications`, and `veth`. Empty `dns_capture` means capture all DNS source IPs; a disabled sentinel captures none. A `dns` entry maps a name directly to an IPv4 address and is pinned into Virtual DNS. Synthesized A/AAAA answers for virtual domains have a 300-second DNS TTL; their in-process address mappings remain subject to the virtual-DNS LRU capacity. A `tun` entry routes through TUN or a file server. Hot changes are watched and applied to the running serve process; invalid JSON is rejected and does not replace the active config.
 
-For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resolv_conf_dns` inside the profile points at the intended DNS server; `dns_capture` includes the query source; `veth_status.json` says `success: true`; the target address is reachable from the profile namespace; and the serve process was running when the change was applied. `sp enter` is the supported namespace check.
+For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resolv_conf_dns` inside the profile points at the intended DNS server; `dns_capture` includes the query source; `veth_status.json` says `success: true`; the target address is reachable from the profile namespace; and the serve process was running when the change was applied. The internal IPv4-only DNS forwarder preserves AAAA questions and removes AAAA records from responses, yielding a valid no-data response instead of `FORMERR`. `sp enter` is the supported namespace check.
 
 ## Command reference
 
 ### Global and utility commands
 
 - `sp enter [OPTIONS] <TARGET>`: enter an existing profile namespace. Options: `-u/--uid`, `-g/--gid`, `-s/--shell`, `--cwd`, `--gids`, `--args`.
+- `sp temp [OPTIONS] <COMMAND> [ARGS]`: create an Overlay profile named from a filesystem-safe command prefix (up to five characters) and a four-character URL-safe Base64 prefix of the current timestamp's BLAKE3 digest in the normal state root and namespace registry (so it is visible in the UI while running). It runs with `sp enter`-style options, then tears down and removes the profile and its config when it exits. Put options before the command, e.g. `sp temp -u 0 fish`.
 - `sp install [DIR]`: install binaries/scripts into `DIR` (default `./install`).
 - `sp completions --fish`: install fish completions under `~/.config/fish/completions`.
 - `sp rm <FILE>`: remove a bind-mount file.
@@ -88,7 +89,7 @@ For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resol
 - `sp clone <NAME> <FROM>`: clone an existing profile into a new profile directory.
 - `sp up [OPTIONS] <PROFILE>`: create/persist the profile namespaces and keeper. Development protocol-test options are `--cmd <JSON>`, `--simulate-protocol-no-upgrade`, `--simulate-conn-close`, and `--simulate-slow-shutdown`; use them only for targeted tests.
 - `sp down [--rm] <PROFILE>`: tear down the profile; `--rm` also removes config/runtime directories.
-- `sp serve --profile <PROFILE> [OPTIONS]`: attach TUN/router to an up profile. Options: `--tun-name`, `--simple <NYM>`, `-n/--no-default`, `-l/--log <PATH>`, `--clash <PATH>`, `--no-dns-capture [true|false]`, and `--internal-dns-server [true|false]`.
+- `sp serve --profile <PROFILE> [OPTIONS]`: attach TUN/router to an up profile. Options: `--tun-name`, `--simple <NYM>`, `-n/--no-default`, `-l/--log <PATH>`, `--no-dns-capture [true|false]`, and `--internal-dns-server [true|false]`.
 - `sp sandbox <PROFILE>`: enter the existing profile namespace and apply its Pivot-root sandbox/template mounts.
 - `sp dbus --profile <PROFILE>`: run the private D-Bus daemon for an up profile.
 - `sp veth --src <SRC> --dst <DST> [OPTIONS]`: create a veth pair between up namespaces. Options: `--veth-name`, `--src-ip4`, `--dst-ip4`, `--prefix-len` (default `30`), and `-l/--log`.
@@ -113,7 +114,8 @@ For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resol
 
 #### Clash operations
 
-- `sp uplink clash config-add <GROUP_ID> <PATH>`: import a Clash YAML config for a group.
+- `sp uplink clash config-add <GROUP_ID> <PATH>`: create a new user-owned group from a Clash YAML config; it fails if the group already exists.
+- `sp uplink clash config-replace <GROUP_ID> <PATH>`: replace all imported data in an existing group from a Clash YAML config.
 - `sp uplink clash list`: show imported groups and cached proxy status.
 - `sp uplink clash config-explain <PATH>`: explain the two-tier DNS bootstrap for a Clash config.
 - `sp uplink clash resolve [--direct] [--refresh] [--backup <PATH>]`: resolve proxies without known IPs; optionally force direct resolution, refresh state, or preload a DNS backup.

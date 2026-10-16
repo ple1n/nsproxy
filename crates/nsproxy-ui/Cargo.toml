@@ -19,6 +19,7 @@ nsproxy-core = { version = "0.3.5", path = "../nsproxy-core" }
 diag = { version = "0.1.1", path = "../diag" }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+chrono.workspace = true
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.27.1", features = ["process", "signal"] }

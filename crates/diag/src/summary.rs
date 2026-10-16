@@ -163,6 +163,7 @@ impl DiagAccumulator {
                     c.connected_ts = Some(*ts);
                 }
             }
+            DiagEvent::AttemptFailed { .. } => {}
             DiagEvent::Finished {
                 id,
                 ts,
@@ -175,6 +176,12 @@ impl DiagAccumulator {
                     c.error = error.clone();
                     c.bytes_up = *bytes_up;
                     c.bytes_down = *bytes_down;
+                }
+            }
+            DiagEvent::Killed { id, ts } => {
+                if let Some(c) = self.conns.get_mut(id) {
+                    c.finished_ts = Some(*ts);
+                    c.error = Some("killed by user".to_string());
                 }
             }
             DiagEvent::Dispatched { id, dispatch_us } => {
@@ -242,6 +249,9 @@ impl DiagAccumulator {
             | DiagEvent::DnsState { .. }
             | DiagEvent::RoutingState { .. }
             | DiagEvent::UplinkStatsSnapshot { .. }
+            | DiagEvent::HostRouteStatsSnapshot { .. }
+            | DiagEvent::HostRouteStatsUpdated { .. }
+            | DiagEvent::ConnectionsExpired { .. }
             | DiagEvent::Log(_)
             | DiagEvent::RecentLogs(_)
             | DiagEvent::RecentDiagEvents(_)

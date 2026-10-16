@@ -10,7 +10,7 @@ use egui_plot::{GridInput, GridMark, Line, LineStyle, PlotPoints};
 use nsproxy_common::crdt::CRDT;
 use nsproxy_common::normalize_domain;
 use nsproxy_common::routing::ProxyID;
-use nsproxy_common::stats::ProxyStats;
+use nsproxy_common::stats::{ProxyStats, TransferRateSample};
 use nsproxy_core::personal::PersonalConstants;
 use nsproxy_core::sandbox::{SandboxState, SandboxStatus};
 use nsproxy_core::shell::ShellArgs;
@@ -164,7 +164,6 @@ mod process_log_text_buffer_tests {
 
         assert_eq!(buffer.visible_text(), "red plain");
     }
-
 }
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -237,27 +236,6 @@ const HOTCONFIG_EXAMPLE: &str = r#"{}"#;
 
 const PROFILE_JSON_EXAMPLE: &str = r#"{}"#;
 
-#[derive(Clone, Debug)]
-enum RoutingMode {
-    Simple { selected_proxy: Option<String> },
-    Unknown,
-}
-
-impl RoutingMode {
-    fn selected_proxy(&self) -> Option<&str> {
-        match self {
-            RoutingMode::Simple { selected_proxy } => selected_proxy.as_deref(),
-            RoutingMode::Unknown => None,
-        }
-    }
-}
-
-impl Default for RoutingMode {
-    fn default() -> Self {
-        RoutingMode::Unknown
-    }
-}
-
 #[derive(Clone)]
 struct ProxyItem {
     id: ProxyID,
@@ -274,10 +252,176 @@ struct ProxyItem {
     groups: HashSet<GroupId>,
 }
 
+#[derive(Clone)]
+struct TrafficRouteTarget {
+    route: nsproxy_common::stats::ObservedRoute,
+    key: String,
+    summary: String,
+    filter_text: String,
+}
+
+fn build_traffic_route_targets(proxies: &BTreeMap<ProxyID, ProxyItem>) -> Vec<TrafficRouteTarget> {
+    let mut targets = Vec::with_capacity(proxies.len() + 1);
+    targets.push(TrafficRouteTarget {
+        route: nsproxy_common::stats::ObservedRoute::NoProxy,
+        key: "NoProxy".to_string(),
+        summary: "Direct connection".to_string(),
+        filter_text: "noproxy direct connection".to_string(),
+    });
+    for (proxy_id, proxy) in proxies {
+        targets.push(TrafficRouteTarget {
+            route: nsproxy_common::stats::ObservedRoute::Proxy(proxy_id.clone()),
+            key: proxy.name.clone(),
+            summary: proxy.url.clone(),
+            filter_text: format!("{} {} {}", proxy.name, proxy.nym, proxy.url).to_lowercase(),
+        });
+    }
+    targets
+}
+
+fn default_clash_group_name(path: &str) -> Option<String> {
+    std::path::Path::new(path.trim())
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+}
+
 struct ProxySnapshot {
     proxies: BTreeMap<ProxyID, ProxyItem>,
     nym_to_id: BTreeMap<String, ProxyID>,
     proxy_groups: BTreeMap<ProxyID, HashSet<GroupId>>,
+    groups: Vec<GroupId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProxyTableEntry {
+    NoProxy,
+    Group { id: GroupId, proxy_count: usize },
+    Proxy(ProxyID),
+}
+
+fn build_proxy_table_entries(
+    filtered_proxy_ids: &[ProxyID],
+    proxy_groups: &BTreeMap<ProxyID, HashSet<GroupId>>,
+    expanded_groups: &[GroupId],
+    all_groups: &[GroupId],
+) -> Vec<ProxyTableEntry> {
+    let mut grouped: BTreeMap<GroupId, Vec<ProxyID>> = BTreeMap::new();
+    let mut ungrouped = Vec::new();
+    for proxy_id in filtered_proxy_ids {
+        let groups = proxy_groups.get(proxy_id);
+        if let Some(groups) = groups.filter(|groups| !groups.is_empty()) {
+            for group in groups {
+                grouped
+                    .entry(group.clone())
+                    .or_default()
+                    .push(proxy_id.clone());
+            }
+        } else {
+            ungrouped.push(proxy_id.clone());
+        }
+    }
+    for group_id in all_groups {
+        grouped.entry(group_id.clone()).or_default();
+    }
+
+    let mut entries = Vec::with_capacity(filtered_proxy_ids.len() + grouped.len() + 1);
+    entries.push(ProxyTableEntry::NoProxy);
+    for (id, members) in grouped {
+        let is_expanded = expanded_groups.contains(&id);
+        entries.push(ProxyTableEntry::Group {
+            id,
+            proxy_count: members.len(),
+        });
+        if is_expanded {
+            entries.extend(members.into_iter().map(ProxyTableEntry::Proxy));
+        }
+    }
+    entries.extend(ungrouped.into_iter().map(ProxyTableEntry::Proxy));
+    entries
+}
+
+fn build_proxy_group_controls(entries: &[ProxyTableEntry]) -> Vec<(GroupId, usize)> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ProxyTableEntry::Group { id, proxy_count } => Some((id.clone(), *proxy_count)),
+            ProxyTableEntry::NoProxy | ProxyTableEntry::Proxy(_) => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod proxy_table_entry_tests {
+    use super::*;
+
+    #[test]
+    fn groups_collapse_into_single_entries_until_expanded() {
+        let first = ProxyID([1; 32]);
+        let second = ProxyID([2; 32]);
+        let ungrouped = ProxyID([3; 32]);
+        let group = GroupId("group-a".to_string());
+        let filtered = vec![first.clone(), second.clone(), ungrouped.clone()];
+        let memberships = BTreeMap::from([
+            (first.clone(), HashSet::from([group.clone()])),
+            (second.clone(), HashSet::from([group.clone()])),
+        ]);
+
+        let collapsed_entries = build_proxy_table_entries(&filtered, &memberships, &[], &[]);
+        assert_eq!(
+            collapsed_entries,
+            vec![
+                ProxyTableEntry::NoProxy,
+                ProxyTableEntry::Group {
+                    id: group.clone(),
+                    proxy_count: 2,
+                },
+                ProxyTableEntry::Proxy(ungrouped),
+            ]
+        );
+        assert_eq!(
+            build_proxy_group_controls(&collapsed_entries),
+            vec![(group.clone(), 2)]
+        );
+        assert_eq!(
+            build_proxy_table_entries(&filtered, &memberships, &[group.clone()], &[]),
+            vec![
+                ProxyTableEntry::NoProxy,
+                ProxyTableEntry::Group {
+                    id: group,
+                    proxy_count: 2,
+                },
+                ProxyTableEntry::Proxy(first),
+                ProxyTableEntry::Proxy(second),
+                ProxyTableEntry::Proxy(ProxyID([3; 32])),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_user_groups_remain_visible() {
+        let group = GroupId("empty-group".to_string());
+        assert_eq!(
+            build_proxy_table_entries(&[], &BTreeMap::new(), &[], &[group.clone()]),
+            vec![
+                ProxyTableEntry::NoProxy,
+                ProxyTableEntry::Group {
+                    id: group,
+                    proxy_count: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clash_group_name_defaults_to_yaml_file_stem() {
+        assert_eq!(
+            default_clash_group_name("/tmp/fedora-proxies.yaml").as_deref(),
+            Some("fedora-proxies")
+        );
+        assert_eq!(default_clash_group_name(""), None);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -761,7 +905,6 @@ impl SortFrequency {
 
 #[derive(Clone)]
 struct ProxyFilters {
-    selected_groups: HashSet<GroupId>,
     selected_types: HashSet<ProxyType>,
     sort_column: SortColumn,
     sort_direction: SortDirection,
@@ -771,7 +914,6 @@ struct ProxyFilters {
 impl Default for ProxyFilters {
     fn default() -> Self {
         ProxyFilters {
-            selected_groups: HashSet::new(),
             selected_types: HashSet::new(),
             sort_column: SortColumn::FailRate,
             sort_direction: SortDirection::Ascending,
@@ -933,7 +1075,19 @@ struct App {
     proxies: BTreeMap<ProxyID, ProxyItem>,
     nym_to_id: BTreeMap<String, ProxyID>,
     proxy_groups: BTreeMap<ProxyID, HashSet<GroupId>>,
+    user_groups: Vec<GroupId>,
+    clash_import_path: String,
+    clash_import_group_name: String,
+    clash_import_default_group_name: String,
+    clash_replace_group: Option<GroupId>,
+    clash_import_status: Option<String>,
+    clash_import_pending: bool,
+    clash_import_result_rx: Option<flume::Receiver<supervisor::ClashGroupImportCompletion>>,
     filtered_proxy_ids: Vec<ProxyID>,
+    proxy_table_entries: Vec<ProxyTableEntry>,
+    proxy_group_controls: Vec<(GroupId, usize)>,
+    expanded_proxy_groups: Vec<GroupId>,
+    proxy_table_entries_dirty: bool,
     filters_dirty: bool,
     hovered_proxy: Option<usize>,
     reload_tx: flume::Sender<()>,
@@ -941,7 +1095,6 @@ struct App {
     persisted_logs_tx: flume::Sender<PersistedLogsRequest>,
     persisted_logs_rx: flume::Receiver<PersistedLogsSnapshot>,
     proxy_filters: ProxyFilters,
-    all_groups: HashSet<GroupId>,
     supervisor: SupervisorHandle,
     personal_state: personal::PersonalUiState,
     snapshot: supervisor::SupervisorSnapshot,
@@ -971,6 +1124,12 @@ struct App {
     hotconfig_veth_drafts: HashMap<ContainerName, Vec<VethDraft>>,
     selected_traffic_conn: Option<diag::ConnId>,
     traffic_subview: TrafficSubview,
+    traffic_route_target: nsproxy_common::stats::ObservedRoute,
+    traffic_route_target_index: usize,
+    traffic_route_targets: Vec<TrafficRouteTarget>,
+    traffic_route_filter: String,
+    traffic_route_filter_applied: String,
+    filtered_traffic_route_target_indices: Vec<usize>,
     traffic_subscription_profile: Option<ContainerName>,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
@@ -1050,8 +1209,11 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
             proxies: BTreeMap::new(),
             nym_to_id: BTreeMap::new(),
             proxy_groups: BTreeMap::new(),
+            groups: clash_state.groups.keys().cloned().collect(),
         };
     }
+    let proxy_groups = clash_state.proxy_group_memberships();
+    let groups = clash_state.groups.keys().cloned().collect();
 
     let mut nym_to_id = BTreeMap::new();
     let mut proxies: BTreeMap<ProxyID, ProxyItem> = BTreeMap::new();
@@ -1097,8 +1259,7 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
             .unwrap_or_default();
 
         // Get groups for this proxy from clash state
-        let groups: HashSet<GroupId> = clash_state
-            .proxy_group
+        let groups: HashSet<GroupId> = proxy_groups
             .get(id)
             .map(|g| g.clone())
             .unwrap_or_default();
@@ -1125,7 +1286,8 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
     ProxySnapshot {
         proxies,
         nym_to_id,
-        proxy_groups: clash_state.proxy_group,
+        proxy_groups,
+        groups,
     }
 }
 
@@ -1284,20 +1446,35 @@ impl App {
             .send(SupervisorCommand::SetTrafficSubscription { profile: desired });
     }
 
+    fn refresh_traffic_route_target_filter(&mut self) {
+        let filter = self.traffic_route_filter.trim().to_lowercase();
+        self.filtered_traffic_route_target_indices = self
+            .traffic_route_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                (filter.is_empty() || target.filter_text.contains(&filter)).then_some(index)
+            })
+            .collect();
+        self.traffic_route_filter_applied = self.traffic_route_filter.clone();
+    }
+
     pub fn new(ectx: egui::Context) -> Self {
         info!("initializing nsproxy-ui app state");
         let snapshot = load_proxies_from_persisted();
         let proxies = snapshot.proxies.clone();
         let nym_to_id = snapshot.nym_to_id.clone();
         let proxy_groups = snapshot.proxy_groups.clone();
-
-        // Collect all groups from all proxies
-        let mut all_groups = HashSet::new();
-        for groups in snapshot.proxies.values() {
-            all_groups.extend(groups.groups.iter().cloned());
-        }
+        let user_groups = snapshot.groups.clone();
 
         let filtered_proxy_ids: Vec<ProxyID> = snapshot.proxies.keys().cloned().collect();
+        let proxy_table_entries = build_proxy_table_entries(
+            &filtered_proxy_ids,
+            &snapshot.proxy_groups,
+            &[],
+            &user_groups,
+        );
+        let proxy_group_controls = build_proxy_group_controls(&proxy_table_entries);
 
         // Background reload: caller sends () to trigger a reload on a worker thread.
         let (reload_tx, reload_rx) = flume::bounded::<()>(1);
@@ -1532,6 +1709,8 @@ impl App {
             initial_proxy_count = proxies.len(),
             "nsproxy-ui app initialized"
         );
+        let traffic_route_targets = build_traffic_route_targets(&proxies);
+        let filtered_traffic_route_target_indices = (0..traffic_route_targets.len()).collect();
         Self {
             selected_profile: None,
             remove_containers_armed: false,
@@ -1540,7 +1719,19 @@ impl App {
             proxies,
             nym_to_id,
             proxy_groups,
+            clash_replace_group: user_groups.first().cloned(),
+            clash_import_path: String::new(),
+            clash_import_group_name: String::new(),
+            clash_import_default_group_name: String::new(),
+            clash_import_status: None,
+            clash_import_pending: false,
+            clash_import_result_rx: None,
+            user_groups,
             filtered_proxy_ids,
+            proxy_table_entries,
+            proxy_group_controls,
+            expanded_proxy_groups: Vec::new(),
+            proxy_table_entries_dirty: false,
             filters_dirty: false,
             hovered_proxy: None,
             reload_tx,
@@ -1548,7 +1739,6 @@ impl App {
             persisted_logs_tx,
             persisted_logs_rx,
             proxy_filters: ProxyFilters::default(),
-            all_groups,
             supervisor,
             personal_state,
             snapshot: supervisor::SupervisorSnapshot {
@@ -1591,6 +1781,12 @@ impl App {
             hotconfig_veth_drafts: HashMap::new(),
             selected_traffic_conn: None,
             traffic_subview: TrafficSubview::default(),
+            traffic_route_target: nsproxy_common::stats::ObservedRoute::NoProxy,
+            traffic_route_target_index: 0,
+            traffic_route_targets,
+            traffic_route_filter: String::new(),
+            traffic_route_filter_applied: String::new(),
+            filtered_traffic_route_target_indices,
             traffic_subscription_profile: None,
             selected_process_logs: None,
             process_log_editor_target: None,
@@ -1984,11 +2180,20 @@ impl App {
             .profiles
             .get(profile_name)
             .and_then(|profile| profile.routing_state.as_ref())
-            .map(|routing| match &routing.selected_proxy {
-                Some(proxy_id) => nsproxy_core::HotRoute::SimpleProxy {
-                    proxy_id: proxy_id.clone(),
-                },
-                None => nsproxy_core::HotRoute::None,
+            .map(|routing| {
+                if routing.no_proxy {
+                    nsproxy_core::HotRoute::NoProxy
+                } else if let Some(group_id) = &routing.selected_group {
+                    nsproxy_core::HotRoute::Group {
+                        group_id: group_id.clone(),
+                    }
+                } else if let Some(proxy_id) = &routing.selected_proxy {
+                    nsproxy_core::HotRoute::SimpleProxy {
+                        proxy_id: proxy_id.clone(),
+                    }
+                } else {
+                    nsproxy_core::HotRoute::None
+                }
             })
     }
 
@@ -2280,8 +2485,7 @@ impl App {
     }
 
     fn remove_icon_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
         let color = if response.hovered() {
             Color32::from_rgb(255, 135, 135)
         } else {
@@ -2289,11 +2493,8 @@ impl App {
         };
 
         if response.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                3.0,
-                Color32::from_rgba_unmultiplied(220, 75, 75, 65),
-            );
+            ui.painter()
+                .rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(220, 75, 75, 65));
         }
         ui.painter().text(
             rect.center(),
@@ -2307,8 +2508,7 @@ impl App {
     }
 
     fn validation_icon(ui: &mut egui::Ui, valid: bool, tooltip: &str) -> egui::Response {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
         let color = if valid {
             if response.hovered() {
                 Color32::from_rgb(155, 255, 175)
@@ -2726,7 +2926,8 @@ impl App {
                                 }
                             });
                             table_row.col(|ui| {
-                                if Self::remove_icon_button(ui, "Remove virtual DNS route").clicked()
+                                if Self::remove_icon_button(ui, "Remove virtual DNS route")
+                                    .clicked()
                                 {
                                     remove_ix = Some(index);
                                 }
@@ -3200,6 +3401,25 @@ impl App {
                 }
             });
             ui.small("DNS edits stay local until Save.");
+        });
+
+        section_frame(ui, |ui| {
+            ui.strong("traffic diagnostics");
+            ui.horizontal(|ui| {
+                ui.label("finished connection retention");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut hot.diag_conn_persist_secs, 0..=3600)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text(
+                        "Keep completed TCP/UDP activity visible for this many seconds; active connections are retained.",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
         });
 
         changed
@@ -3792,17 +4012,6 @@ impl App {
                     }
                 }
 
-                // Filter by groups if any groups are selected
-                if !self.proxy_filters.selected_groups.is_empty() {
-                    if !item
-                        .groups
-                        .iter()
-                        .any(|g| self.proxy_filters.selected_groups.contains(g))
-                    {
-                        return false;
-                    }
-                }
-
                 true
             })
             .map(|(id, _)| id.clone())
@@ -3820,6 +4029,14 @@ impl App {
             self.sort_filtered_proxies();
             self.last_sort_time = now;
         }
+        self.proxy_table_entries = build_proxy_table_entries(
+            &self.filtered_proxy_ids,
+            &self.proxy_groups,
+            &self.expanded_proxy_groups,
+            &self.user_groups,
+        );
+        self.proxy_group_controls = build_proxy_group_controls(&self.proxy_table_entries);
+        self.proxy_table_entries_dirty = false;
     }
 
     fn sort_filtered_proxies(&mut self) {
@@ -4239,12 +4456,6 @@ where
     (hot.text, profile_json.text, hot.error, profile_json.error)
 }
 
-fn routing_mode_from_diag(state: &diag::RoutingState) -> RoutingMode {
-    RoutingMode::Simple {
-        selected_proxy: state.selected_proxy.as_ref().map(|p| p.nym().to_string()),
-    }
-}
-
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         use egui::Color32;
@@ -4271,17 +4482,36 @@ impl eframe::App for App {
                 "applying proxy reload snapshot"
             );
             self.proxies = updated.proxies.clone();
+            self.traffic_route_targets = build_traffic_route_targets(&self.proxies);
+            self.refresh_traffic_route_target_filter();
+            self.traffic_route_target_index = self
+                .traffic_route_targets
+                .iter()
+                .position(|target| target.route == self.traffic_route_target)
+                .unwrap_or(0);
+            if let Some(target) = self
+                .traffic_route_targets
+                .get(self.traffic_route_target_index)
+            {
+                self.traffic_route_target = target.route.clone();
+            }
             self.nym_to_id = updated.nym_to_id.clone();
             self.proxy_groups = updated.proxy_groups.clone();
-
-            // Collect all groups from all proxies
-            self.all_groups.clear();
-            for item in self.proxies.values() {
-                self.all_groups.extend(item.groups.iter().cloned());
+            self.user_groups = updated.groups.clone();
+            if !self
+                .clash_replace_group
+                .as_ref()
+                .is_some_and(|group| self.user_groups.contains(group))
+            {
+                self.clash_replace_group = self.user_groups.first().cloned();
             }
 
             // Reapply filters with new data
             self.apply_filters();
+        }
+
+        if self.traffic_route_filter_applied != self.traffic_route_filter {
+            self.refresh_traffic_route_target_filter();
         }
 
         while let Ok(snapshot) = self.persisted_logs_rx.try_recv() {
@@ -4399,18 +4629,30 @@ impl eframe::App for App {
                     .inner_margin(Margin::same(8)),
             )
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("left_sidebar_content")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.heading("Containers");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
                         ui.add_space(5.);
-                        if Self::refresh_button(ui, "Reload all container status").clicked() {
+                                    if Self::refresh_button(ui, "Reload all container status")
+                                        .clicked()
+                                    {
                             self.reload_all_ns_alive();
                         }
-                        if Self::remove_armed_button(ui, self.remove_containers_armed).clicked() {
-                            self.remove_containers_armed = !self.remove_containers_armed;
+                                    if Self::remove_armed_button(ui, self.remove_containers_armed)
+                                        .clicked()
+                                    {
+                                        self.remove_containers_armed =
+                                            !self.remove_containers_armed;
                         }
-                    });
+                                },
+                            );
                 });
 
                 ui.add_space(6.0);
@@ -4418,31 +4660,35 @@ impl eframe::App for App {
                 // Global configuration box at the top
                 let global_selected = self.selected_profile.is_none();
                 let global_status_color = egui::Color32::from_rgb(100, 150, 240);
-                if sidebar_box(ui, "all", "", global_selected, global_status_color).clicked() {
+                        if sidebar_box(ui, "all", "", global_selected, global_status_color)
+                            .clicked()
+                        {
                     self.selected_profile = None;
                 }
 
                 ui.add_space(6.0);
                 // Profiles
                 if self.snapshot.profiles.is_empty() {
-                    ui.label(egui::RichText::new("No profiles found").color(egui::Color32::GRAY));
+                            ui.label(
+                                egui::RichText::new("No profiles found").color(egui::Color32::GRAY),
+                            );
                     ui.small(format!(
                         "Create profiles in {}",
                         self.display_path(&state_paths::persist_root())
                     ));
                 } else {
                     for (profile_name, profile_snapshot) in &self.snapshot.profiles {
-                        let is_selected = self.selected_profile.as_ref() == Some(profile_name);
+                                let is_selected =
+                                    self.selected_profile.as_ref() == Some(profile_name);
 
                         let running = profile_snapshot.container_lifecycle.is_active()
                             || profile_snapshot.serve_alive;
 
                         let unpivoted_warning = running
                             && profile_snapshot.template.sandbox_mode == SandboxMode::Pivot
-                            && profile_snapshot
-                                .sandbox_status
-                                .as_ref()
-                                .map_or(true, |s| s.detected_state == SandboxState::NoPivot);
+                                    && profile_snapshot.sandbox_status.as_ref().map_or(true, |s| {
+                                        s.detected_state == SandboxState::NoPivot
+                                    });
 
                         let status_color = if unpivoted_warning {
                             Color32::from_rgb(255, 185, 0)
@@ -4458,8 +4704,12 @@ impl eframe::App for App {
                                 supervisor::ContainerLifecycleState::Stopped => "stopped",
                                 supervisor::ContainerLifecycleState::Starting => "starting",
                                 supervisor::ContainerLifecycleState::Running => "running",
-                                supervisor::ContainerLifecycleState::Stopping { .. } => "stopping",
-                                supervisor::ContainerLifecycleState::Killing { .. } => "killing",
+                                        supervisor::ContainerLifecycleState::Stopping {
+                                            ..
+                                        } => "stopping",
+                                        supervisor::ContainerLifecycleState::Killing { .. } => {
+                                            "killing"
+                                        }
                             }
                         };
 
@@ -4472,10 +4722,11 @@ impl eframe::App for App {
                         );
                         if box_resp.clicked() {
                             self.selected_profile = Some(profile_name.clone());
-                            self.supervisor
-                                .send(supervisor::SupervisorCommand::LoadProfile(
+                                    self.supervisor.send(
+                                        supervisor::SupervisorCommand::LoadProfile(
                                     profile_name.clone(),
-                                ));
+                                        ),
+                                    );
                         }
                         ui.add_space(6.0);
                     }
@@ -4487,12 +4738,18 @@ impl eframe::App for App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.heading("Namespaces");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
                             ui.add_space(5.);
-                            if Self::refresh_button(ui, "Refresh namespace view").clicked() {
-                                self.supervisor.send(SupervisorCommand::RefreshNamespaces);
+                                        if Self::refresh_button(ui, "Refresh namespace view")
+                                            .clicked()
+                                        {
+                                            self.supervisor
+                                                .send(SupervisorCommand::RefreshNamespaces);
                             }
-                        });
+                                    },
+                                );
                     });
 
                     ui.add_space(4.0);
@@ -4515,7 +4772,9 @@ impl eframe::App for App {
                     );
 
                     if let Some(profile_name) = &self.selected_profile {
-                        if let Some(profile_snapshot) = self.snapshot.profiles.get(profile_name) {
+                                if let Some(profile_snapshot) =
+                                    self.snapshot.profiles.get(profile_name)
+                                {
                             let up_pid = profile_snapshot
                                 .ns_alive
                                 .as_ref()
@@ -4549,7 +4808,9 @@ impl eframe::App for App {
                             }
                             if up_pid.is_none() && child_pid.is_none() {
                                 ui.label(
-                                    egui::RichText::new("Selected profile has no live pid yet")
+                                            egui::RichText::new(
+                                                "Selected profile has no live pid yet",
+                                            )
                                         .small()
                                         .color(Color32::GRAY),
                                 );
@@ -4557,7 +4818,9 @@ impl eframe::App for App {
                         }
                     } else {
                         ui.label(
-                            egui::RichText::new("Select a profile to compare its namespace state")
+                                    egui::RichText::new(
+                                        "Select a profile to compare its namespace state",
+                                    )
                                 .small()
                                 .color(Color32::GRAY),
                         );
@@ -4565,6 +4828,7 @@ impl eframe::App for App {
                 });
 
                 // minimal dev-only frame info intentionally omitted here
+            });
             });
 
         let tab_fill = {
@@ -4984,17 +5248,17 @@ impl App {
         });
         ui.add_space(8.0);
 
-        // Routing mode selector
-        ui.horizontal(|ui| {
-            ui.label("Routing Mode:");
-            if ui.selectable_label(true, "Simple").clicked() {
-                // Simple routing is current default
-            }
-            if ui.selectable_label(false, "Group").clicked() {
-                // Group routing will be implemented in future
-            }
-        });
-        ui.add_space(4.0);
+        self.render_clash_group_import(ui);
+        ui.add_space(8.0);
+
+        if !self.expanded_proxy_groups.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.button("Collapse all groups").clicked() {
+                    self.expanded_proxy_groups.clear();
+                    self.proxy_table_entries_dirty = true;
+                }
+            });
+        }
 
         self.render_selected_proxy_summary(ui);
         ui.add_space(6.0);
@@ -5011,13 +5275,197 @@ impl App {
         ui.add_space(8.0);
     }
 
+    fn request_clash_group_import(&mut self, replace: bool) {
+        if self.clash_import_pending {
+            return;
+        }
+
+        let path = std::path::PathBuf::from(self.clash_import_path.trim());
+        if !path.is_absolute() {
+            self.clash_import_status =
+                Some("Enter an absolute path to the Clash YAML file.".to_string());
+            return;
+        }
+
+        let group_id = if replace {
+            self.clash_replace_group
+                .as_ref()
+                .map(|group| group.as_str().to_string())
+        } else {
+            let name = self.clash_import_group_name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        };
+        let Some(group_id) = group_id else {
+            self.clash_import_status = Some(if replace {
+                "Select a group to replace.".to_string()
+            } else {
+                "Enter a name for the new group.".to_string()
+            });
+            return;
+        };
+
+        let (result_tx, result_rx) = flume::bounded(1);
+            self.clash_import_result_rx = Some(result_rx);
+            self.supervisor.send(SupervisorCommand::ImportClashGroup {
+                group_id: group_id.clone(),
+                path,
+                replace,
+                result_tx,
+            });
+        self.clash_import_pending = true;
+        self.clash_import_status = Some(format!("Importing into '{group_id}'…"));
+    }
+
+    fn render_clash_group_import(&mut self, ui: &mut egui::Ui) {
+        if let Some(receiver) = self.clash_import_result_rx.take() {
+            if let Some(runtime) = self.tokio_rt.as_ref() {
+                let ctx = ui.ctx().clone();
+                runtime.spawn(async move {
+                    let completion = receiver.recv_async().await.unwrap_or_else(|error| {
+                        supervisor::ClashGroupImportCompletion {
+                            result: Some(Err(format!(
+                                "Supervisor closed before returning the import result: {error}"
+                            ))),
+                            ..Default::default()
+                        }
+                    });
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("clash_group_import_completion"),
+                            completion,
+                        )
+                    });
+                    ctx.request_repaint();
+                });
+            } else {
+                self.clash_import_pending = false;
+                self.clash_import_status =
+                    Some("Import failed: the UI runtime is unavailable".to_owned());
+            }
+        }
+
+        let completion = ui.ctx().data_mut(|data| {
+            data.remove_temp::<supervisor::ClashGroupImportCompletion>(egui::Id::new(
+                "clash_group_import_completion",
+            ))
+        });
+        if let Some(completion) = completion {
+            self.clash_import_pending = false;
+            match completion.result.unwrap_or_else(|| {
+                Err("Supervisor returned an empty Clash import result".to_owned())
+            }) {
+                Ok(message) => {
+                    self.clash_import_status = Some(message.clone());
+                    match self.reload_tx.try_send(()) {
+                        Ok(()) | Err(flume::TrySendError::Full(())) => {}
+                        Err(flume::TrySendError::Disconnected(())) => {
+                            self.clash_import_status = Some(format!(
+                                "{message}; failed to refresh the proxy group list"
+                            ));
+                        }
+                    }
+                    for (profile, state) in &self.snapshot.profiles {
+                        if state.serve_alive {
+                            self.supervisor.send(SupervisorCommand::Ctrl {
+                                profile: profile.clone(),
+                                cmd: diag::ControlCommand::ReloadUplink,
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.clash_import_status =
+                        Some(format!("Clash group import failed: {error}"));
+                }
+            }
+        }
+        egui::CollapsingHeader::new("Import Clash group")
+            .id_salt("clash_group_import")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Add a Clash YAML file as a new group, or replace all data in an existing group.");
+                ui.weak("Run `sp uplink clash resolve` to resolve imported proxy servers before routing through them.");
+                let path_changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.clash_import_path)
+                            .hint_text("Absolute path to Clash YAML"),
+                    )
+                    .changed();
+                if path_changed {
+                    let default_name =
+                        default_clash_group_name(&self.clash_import_path).unwrap_or_default();
+                    if self.clash_import_group_name.trim().is_empty()
+                        || self.clash_import_group_name == self.clash_import_default_group_name
+                    {
+                        self.clash_import_group_name = default_name.clone();
+                    }
+                    self.clash_import_default_group_name = default_name;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("New group name");
+                    ui.text_edit_singleline(&mut self.clash_import_group_name);
+                    if ui
+                        .add_enabled(
+                            !self.clash_import_pending,
+                            egui::Button::new("Add as new group"),
+                        )
+                        .clicked()
+                    {
+                        self.request_clash_group_import(false);
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Replace existing");
+                    let selected_text = self
+                        .clash_replace_group
+                        .as_ref()
+                        .map(GroupId::as_str)
+                        .unwrap_or("Select group");
+                    egui::ComboBox::from_id_salt("clash_replace_group")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            for group in &self.user_groups {
+                                ui.selectable_value(
+                                    &mut self.clash_replace_group,
+                                    Some(group.clone()),
+                                    group.as_str(),
+                                );
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            !self.clash_import_pending && !self.user_groups.is_empty(),
+                            egui::Button::new("Replace group"),
+                        )
+                        .clicked()
+                    {
+                        self.request_clash_group_import(true);
+                    }
+                });
+
+                if let Some(status) = &self.clash_import_status {
+                    ui.label(status);
+                }
+            });
+    }
+
     fn render_selected_proxy_summary(&self, ui: &mut egui::Ui) {
         if let Some(profile_name) = &self.selected_profile {
             if let Some(profile) = self.snapshot.profiles.get(profile_name) {
                 ui.horizontal(|ui| {
                     ui.label("Selected:");
                     if let Some(routing) = &profile.routing_state {
-                        if let Some(proxy_id) = &routing.selected_proxy {
+                        if routing.no_proxy {
+                            ui.label(egui::RichText::new("NoProxy").color(Color32::LIGHT_GREEN));
+                        } else if let Some(group_id) = &routing.selected_group {
+                            ui.label(
+                                egui::RichText::new(format!("Group: {group_id}"))
+                                    .strong()
+                                    .color(Color32::LIGHT_GREEN),
+                            );
+                        } else if let Some(proxy_id) = &routing.selected_proxy {
                             let proxy_nym_str = proxy_id.nym().to_string();
                             if let Some(proxy_item) = self.proxies.get(proxy_id) {
                                 ui.label(
@@ -5074,36 +5522,13 @@ impl App {
                     self.filters_dirty = true;
                 }
             }
-            if !self.proxy_filters.selected_types.is_empty()
-                || !self.proxy_filters.selected_groups.is_empty()
-            {
+            if !self.proxy_filters.selected_types.is_empty() {
                 if ui.button("Clear Filters").clicked() {
                     self.proxy_filters.selected_types.clear();
                     self.filters_dirty = true;
                 }
             }
         });
-
-        if !self.all_groups.is_empty() {
-            ui.label("Group Filter:");
-            ui.horizontal_wrapped(|ui| {
-                for group in self.all_groups.iter() {
-                    let is_selected = self.proxy_filters.selected_groups.contains(group);
-                    if ui.selectable_label(is_selected, group.as_str()).clicked() {
-                        if is_selected {
-                            self.proxy_filters.selected_groups.remove(group);
-                        } else {
-                            self.proxy_filters.selected_groups.insert(group.clone());
-                        }
-                        self.filters_dirty = true;
-                    }
-                }
-                if ui.button("Clear Filters").clicked() {
-                    self.proxy_filters.selected_groups.clear();
-                    self.filters_dirty = true;
-                }
-            });
-        }
 
         ui.add_space(6.0);
         ui.label("Sort Frequency:");
@@ -5124,15 +5549,51 @@ impl App {
             }
         });
 
+        ui.add_space(6.0);
         if self.proxy_filters.sort_column != SortColumn::None {
             ui.label(format!(
                 "Current sort: {:?} ({:?})",
                 self.proxy_filters.sort_column, self.proxy_filters.sort_direction
             ));
         }
+
+        ui.label("Expanded groups:");
+        if self.proxy_group_controls.is_empty() {
+            ui.weak("No groups");
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for (group, proxy_count) in &self.proxy_group_controls {
+                    let expanded = self.expanded_proxy_groups.contains(group);
+                    if ui
+                        .selectable_label(expanded, format!("{} ({proxy_count})", group.as_str()))
+                        .clicked()
+                    {
+                        if expanded {
+                            self.expanded_proxy_groups
+                                .retain(|expanded_group| expanded_group != group);
+                        } else {
+                            self.expanded_proxy_groups.push(group.clone());
+                        }
+                        self.proxy_table_entries_dirty = true;
+                    }
+                }
+            });
+        }
+
     }
 
     fn render_proxies_table(&mut self, ui: &mut egui::Ui) {
+        if self.proxy_table_entries_dirty {
+            self.proxy_table_entries = build_proxy_table_entries(
+                &self.filtered_proxy_ids,
+                &self.proxy_groups,
+                &self.expanded_proxy_groups,
+                &self.user_groups,
+            );
+            self.proxy_group_controls = build_proxy_group_controls(&self.proxy_table_entries);
+            self.proxy_table_entries_dirty = false;
+        }
+
         let header_h = 28.0;
         let row_h = if self.expanded_ip_rows.is_empty() {
             96.0
@@ -5150,6 +5611,25 @@ impl App {
                 .get(profile_name)
                 .and_then(|profile| profile.routing_state.as_ref())
                 .and_then(|routing| routing.selected_proxy.as_ref().cloned())
+        });
+        let selected_group_id = self.selected_profile.as_ref().and_then(|profile_name| {
+            self.snapshot
+                .profiles
+                .get(profile_name)
+                .and_then(|profile| profile.routing_state.as_ref())
+                .and_then(|routing| {
+                    routing
+                        .selected_group
+                        .as_deref()
+                        .map(GroupId::from)
+                })
+        });
+        let no_proxy_route_selected = self.selected_profile.as_ref().is_some_and(|profile_name| {
+            self.snapshot
+                .profiles
+                .get(profile_name)
+                .and_then(|profile| profile.routing_state.as_ref())
+                .is_some_and(|routing| routing.no_proxy)
         });
 
         let live_stats: HashMap<ProxyID, ProxyStats> = self
@@ -5241,20 +5721,37 @@ impl App {
                         let row_width = widths.iter().sum::<f32>()
                             + spacing_x * (widths.len().saturating_sub(1) as f32);
 
-                        body.rows(row_h, self.filtered_proxy_ids.len(), |mut row| {
+                        body.rows(row_h, self.proxy_table_entries.len(), |mut row| {
                             let i = row.index();
-                            if i >= self.filtered_proxy_ids.len() {
-                                return;
+                            match self.proxy_table_entries.get(i).cloned() {
+                                Some(ProxyTableEntry::NoProxy) => {
+                                    self.render_no_proxy_row(
+                                        &mut row,
+                                        row_width,
+                                        no_proxy_route_selected,
+                                    );
+                                }
+                                Some(ProxyTableEntry::Group { id, proxy_count }) => {
+                                    self.render_proxy_group_row(
+                                        &mut row,
+                                        &id,
+                                        proxy_count,
+                                        selected_group_id.as_ref(),
+                                    );
+                                }
+                                Some(ProxyTableEntry::Proxy(proxy_id)) => {
+                                    self.render_proxy_row(
+                                        &mut row,
+                                        &proxy_id,
+                                        i,
+                                        row_width,
+                                        selected_proxy_id.as_ref(),
+                                        &live_stats,
+                                        &mut next_hovered_proxy,
+                                    );
+                                }
+                                None => {}
                             }
-
-                            self.render_proxy_row(
-                                &mut row,
-                                i,
-                                row_width,
-                                selected_proxy_id.as_ref(),
-                                &live_stats,
-                                &mut next_hovered_proxy,
-                            );
                         });
                     });
             });
@@ -5262,26 +5759,144 @@ impl App {
         self.hovered_proxy = next_hovered_proxy;
     }
 
+    fn render_no_proxy_row(
+        &mut self,
+        row: &mut egui_extras::TableRow,
+        row_width: f32,
+        is_selected: bool,
+    ) {
+        let mut is_hover = false;
+
+        row.col(|ui| {
+            if is_selected {
+                let row_rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(
+                    row_rect,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(100, 180, 100, 40),
+                );
+            }
+            ui.vertical(|ui| {
+                let response = ui.label(egui::RichText::new("NoProxy").strong());
+                let row_rect =
+                    egui::Rect::from_min_size(response.rect.min, egui::vec2(row_width, 96.0));
+                let pointer_pos = ui
+                    .ctx()
+                    .input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
+                is_hover = pointer_pos.is_some_and(|pos| row_rect.contains(pos));
+                ui.small("No proxy");
+                if is_hover {
+                    if let Some(profile_name) = self.selected_profile.clone() {
+                        if ui.button("Select NoProxy").clicked() {
+                            self.supervisor.send(SupervisorCommand::Ctrl {
+                                profile: profile_name,
+                                cmd: diag::ControlCommand::SetNoProxyRouting,
+                            });
+                        }
+                    }
+                }
+            });
+        });
+        row.col(|ui| {
+            ui.label("NoProxy connection");
+        });
+        row.col(|ui| {
+            ui.label(egui::RichText::new("—").color(Color32::from_gray(120)));
+        });
+        row.col(|ui| {
+            ui.label(egui::RichText::new("—").color(Color32::from_gray(120)));
+        });
+        row.col(|ui| {
+            ui.vertical(|ui| {
+                ui.colored_label(
+                    if is_selected {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::from_gray(160)
+                    },
+                    if is_selected { "active" } else { "no proxy" },
+                );
+            });
+        });
+    }
+
+    fn render_proxy_group_row(
+        &mut self,
+        row: &mut egui_extras::TableRow,
+        group: &GroupId,
+        proxy_count: usize,
+        selected_group_id: Option<&GroupId>,
+    ) {
+        let expanded = self.expanded_proxy_groups.contains(group);
+        let is_selected = selected_group_id == Some(group);
+        row.col(|ui| {
+            if ui.small_button(if expanded { "▾" } else { "▸" }).clicked() {
+                if expanded {
+                    self.expanded_proxy_groups
+                        .retain(|expanded_group| expanded_group != group);
+                } else {
+                    self.expanded_proxy_groups.push(group.clone());
+                }
+                self.proxy_table_entries_dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(group.as_str())
+                    .strong()
+                    .color(if is_selected {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        ui.visuals().text_color()
+                    }),
+            );
+        });
+        row.col(|ui| {
+            ui.label(format!("{proxy_count} proxies"));
+        });
+        row.col(|ui| {
+            ui.label(egui::RichText::new("—").color(Color32::from_gray(120)));
+        });
+        row.col(|ui| {
+            ui.label(egui::RichText::new("—").color(Color32::from_gray(120)));
+        });
+        row.col(|ui| {
+            if let Some(profile_name) = self.selected_profile.clone() {
+                if ui
+                    .small_button(if is_selected {
+                        "Selected group"
+                    } else {
+                        "Route via group"
+                    })
+                    .clicked()
+                {
+                    self.supervisor.send(SupervisorCommand::Ctrl {
+                        profile: profile_name,
+                        cmd: diag::ControlCommand::SetGroupRouting {
+                            group_id: group.as_str().to_string(),
+                        },
+                    });
+                }
+            } else {
+            ui.label("Group");
+            }
+        });
+    }
+
     fn render_proxy_row(
         &mut self,
         row: &mut egui_extras::TableRow,
+        proxy_id: &ProxyID,
         i: usize,
         row_width: f32,
         selected_proxy_id: Option<&ProxyID>,
         live_stats: &HashMap<ProxyID, ProxyStats>,
         next_hovered: &mut Option<usize>,
     ) {
-        let proxy_id = match self.filtered_proxy_ids.get(i) {
-            Some(id) => id.clone(),
-            None => return,
-        };
-
-        let proxy_item = match self.proxies.get(&proxy_id) {
+        let proxy_item = match self.proxies.get(proxy_id) {
             Some(item) => item.clone(),
             None => return,
         };
 
-        let stats = live_stats.get(&proxy_id);
+        let stats = live_stats.get(proxy_id);
 
         let live_latency_ms = stats.and_then(|s| {
             let h = s.past_hour();
@@ -5301,7 +5916,7 @@ impl App {
 
         let mut row_hot = false;
         let mut is_hover = false;
-        let is_selected = selected_proxy_id.map(|id| id == &proxy_id).unwrap_or(false);
+        let is_selected = selected_proxy_id.map(|id| id == proxy_id).unwrap_or(false);
 
         row.col(|ui| {
             if is_selected {
@@ -5359,11 +5974,11 @@ impl App {
                     ui.small(format!("{}{}", first_ip, trunc));
 
                     if has_more_ips {
-                        let expanded = self.expanded_ip_rows.contains(&proxy_id);
+                        let expanded = self.expanded_ip_rows.contains(proxy_id);
                         let toggle = if expanded { "IPs ▾" } else { "IPs ▸" };
                         if ui.small_button(toggle).clicked() {
                             if expanded {
-                                self.expanded_ip_rows.remove(&proxy_id);
+                                self.expanded_ip_rows.remove(proxy_id);
                             } else {
                                 self.expanded_ip_rows.insert(proxy_id.clone());
                             }
@@ -5433,7 +6048,7 @@ impl App {
         // Mini sparkline chart column
         row.col(|ui| {
             if let Some(proxy_stats) = stats {
-                render_mini_sparkline(ui, proxy_stats, &proxy_id);
+                render_mini_sparkline(ui, proxy_stats, proxy_id);
             } else {
                 ui.label(egui::RichText::new("—").color(egui::Color32::from_gray(120)));
             }
@@ -6101,9 +6716,8 @@ impl App {
                     .with_rows(32)
                     .with_theme(ColorTheme::GRUVBOX)
                     .with_syntax(
-                        Syntax::new("log").with_keywords([
-                            "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
-                        ]),
+                        Syntax::new("log")
+                            .with_keywords(["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]),
                     )
                     .with_numlines(true)
                     .with_ui_fontsize(ui);
@@ -6787,7 +7401,6 @@ impl App {
                     },
                 );
             });
-
     }
 
     fn render_logs_tab(&mut self, ui: &mut egui::Ui) {
@@ -7157,7 +7770,104 @@ impl App {
             });
     }
 
+    fn render_host_route_action_popup(
+        supervisor: &SupervisorHandle,
+        proxies: &BTreeMap<ProxyID, ProxyItem>,
+        hide_secret: bool,
+        cover_text: &str,
+        response: egui::Response,
+        profile_name: &str,
+        metric: &nsproxy_common::stats::HostRouteMetric,
+        selected_route: &nsproxy_common::stats::ObservedRoute,
+        diag_connected: bool,
+    ) {
+        let mut tooltip = egui::Tooltip::for_enabled(&response);
+        tooltip.popup = tooltip.popup.align(egui::RectAlign::RIGHT_START).gap(6.0);
+        tooltip.show(|popup_ui| {
+            let host = nsproxy_common::stats::HostRouteHost::from_wire_address(&metric.key.target);
+            popup_ui.strong(host.display_host());
+            popup_ui.weak(format!(
+                "Last observed {}",
+                format_timestamp_age(metric.last_observed.unwrap_or(metric.observed_at))
+            ));
+            if let nsproxy_common::stats::ObservedRoute::Proxy(proxy_id) = &metric.key.route {
+                Self::render_proxy_summary(popup_ui, proxy_id, proxies, hide_secret, cover_text);
+            }
+            popup_ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(diag_connected, egui::Button::new("Kill"))
+                    .clicked()
+                {
+                    supervisor.send(SupervisorCommand::Ctrl {
+                        profile: profile_name.to_string(),
+                        cmd: diag::ControlCommand::KillHostConnections { host: host.clone() },
+                    });
+                }
+                if ui
+                    .add_enabled(diag_connected, egui::Button::new("Route"))
+                    .clicked()
+                {
+                    supervisor.send(SupervisorCommand::Ctrl {
+                        profile: profile_name.to_string(),
+                        cmd: diag::ControlCommand::SetHostRoute {
+                            host: host.clone(),
+                            target: selected_route.clone(),
+                        },
+                    });
+                }
+            });
+        });
+    }
+
+    fn render_proxy_summary(
+        ui: &mut egui::Ui,
+        proxy_id: &ProxyID,
+        proxies: &BTreeMap<ProxyID, ProxyItem>,
+        hide_secret: bool,
+        cover_text: &str,
+    ) {
+        ui.separator();
+        if let Some(proxy) = proxies.get(proxy_id) {
+            ui.strong(format!("Proxy: {}", proxy.name));
+            let url = if hide_secret { cover_text } else { &proxy.url };
+            ui.label(egui::RichText::new(url).monospace());
+            ui.horizontal_wrapped(|ui| {
+                if let Some(latency_ms) = proxy.latency_ms {
+                    ui.label(format!("{} ms", latency_ms));
+                }
+                if let Some(conn_ok) = proxy.conn_ok {
+                    ui.label(if conn_ok {
+                        "Connection OK"
+                    } else {
+                        "Connection failed"
+                    });
+                }
+                ui.label(match proxy.udp_ability {
+                    Some(true) => "UDP supported",
+                    Some(false) => "UDP failed",
+                    None if proxy.udp_expected => "UDP expected",
+                    None => "TCP only",
+                });
+            });
+        } else {
+            ui.weak(format!("Proxy {}", proxy_id.nym()));
+        }
+    }
+
     fn render_traffic_tab(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let original_style = ctx.style();
+        let mut immediate_tooltip_style = (*original_style).clone();
+        immediate_tooltip_style.interaction.tooltip_delay = 0.0;
+        immediate_tooltip_style
+            .interaction
+            .show_tooltips_only_when_still = false;
+        ctx.set_style(immediate_tooltip_style);
+        self.render_traffic_tab_contents(ui);
+        ctx.set_style(original_style);
+    }
+
+    fn render_traffic_tab_contents(&mut self, ui: &mut egui::Ui) {
         if self.selected_profile.is_none() {
             ui.heading("Traffic — Global");
             ui.label(format!("Profiles: {}", self.snapshot.profiles.len()));
@@ -7225,10 +7935,14 @@ impl App {
             ));
         }
         if let Some(routing) = &profile.routing_state {
-            if let Some(proxy_id) = &routing.selected_proxy {
+            if routing.no_proxy {
+                ui.label("Routing: NoProxy");
+            } else if let Some(group_id) = &routing.selected_group {
+                ui.label(format!("Routing: selected group '{group_id}'"));
+            } else if let Some(proxy_id) = &routing.selected_proxy {
                 ui.label(format!("Routing: selected proxy {}", proxy_id));
             } else {
-                ui.label("Routing: no proxy selected");
+                ui.label("Routing: no route selected");
             }
         }
 
@@ -7648,10 +8362,15 @@ impl App {
                                     });
                                     row.col(|ui| match (&c.dns_query, &c.dns_response) {
                                         (Some(q), Some(r)) => {
-                                            ui.label(format!("{} -> {}", q, r));
+                                            ui.label(format!(
+                                                "{} {} {}",
+                                                q,
+                                                regular::ARROW_RIGHT,
+                                                r
+                                            ));
                                         }
                                         (Some(q), None) => {
-                                            ui.label(format!("{} -> …", q));
+                                            ui.label(format!("{} {} …", q, regular::ARROW_RIGHT));
                                         }
                                         _ => {}
                                     });
@@ -7704,10 +8423,14 @@ impl App {
                                     });
                                     row.col(|ui| {
                                         if let Some(ref err) = c.error {
-                                            ui.colored_label(
-                                                Color32::RED,
-                                                format!("{}", &err[..err.len().min(40)]),
-                                            );
+                                            if err == "killed by user" {
+                                                ui.colored_label(Color32::from_gray(150), "killed");
+                                            } else {
+                                                ui.colored_label(
+                                                    Color32::RED,
+                                                    format!("{}", &err[..err.len().min(40)]),
+                                                );
+                                            }
                                         } else if c.is_dns() {
                                             if let Some(ref resp) = c.dns_response {
                                                 if resp.starts_with("err:") {
@@ -7733,128 +8456,344 @@ impl App {
         // ── Connections sub-view ──────────────────────────────────────────────
         let conns = &profile.conns_state;
         let row_height = 18.0_f32;
-
-        // BTreeMap<ConnId, _> is ordered by ascending ConnId (monotonically assigned),
-        // so .rev() gives newest-first with no sort needed.
-        let active_entries: Vec<(&diag::ConnId, &diag::ConnEntry)> = conns
-            .conns
-            .iter()
-            .rev()
-            .filter(|(_, e)| e.finished_at.is_none())
-            .collect();
-        let finished_entries: Vec<(&diag::ConnId, &diag::ConnEntry)> = conns
-            .conns
-            .iter()
-            .rev()
-            .filter(|(_, e)| e.finished_at.is_some())
-            .collect();
-
+        let proxies = &self.proxies;
+        let hide_secret = self.hide_secret;
+        let cover_text = self.cover_text.as_str();
         if conns.conns.is_empty() {
-            ui.colored_label(Color32::from_gray(110), "no active connections");
+            ui.colored_label(Color32::from_gray(110), "no tracked connections");
         }
 
-        let render_conn_table = |ui: &mut egui::Ui,
-                                 id_salt: String,
-                                 entries: &[(&diag::ConnId, &diag::ConnEntry)],
-                                 show_status: bool| {
+        let render_conn_table = |ui: &mut egui::Ui, id_salt: String, ids: &[diag::ConnId]| {
             egui::ScrollArea::horizontal()
                 .id_salt(id_salt.clone())
                 .show(ui, |ui| {
-                    let mut builder = TableBuilder::new(ui)
+                    TableBuilder::new(ui)
                         .id_salt(format!("{}_tbl", id_salt))
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(Column::auto().at_least(70.0)) // ID
+                        .column(Column::auto().at_least(105.0)) // State
                         .column(Column::remainder().at_least(140.0)) // Route
-                        .column(Column::remainder().at_least(160.0)); // Dst
-                    if show_status {
-                        builder = builder
-                            .column(Column::auto().at_least(55.0)) // Status
-                            .column(Column::auto().at_least(70.0)); // Duration
-                    }
-                    builder
+                        .column(Column::remainder().at_least(160.0)) // Destination
+                        .column(Column::auto().at_least(70.0)) // Duration
                         .header(row_height, |mut header| {
                             header.col(|ui| {
                                 ui.strong("ID");
                             });
                             header.col(|ui| {
+                                ui.strong("State");
+                            });
+                            header.col(|ui| {
                                 ui.strong("Route");
                             });
-                            if show_status {
-                                header.col(|ui| {
-                                    ui.strong("Duration");
-                                });
-                            }
                             header.col(|ui| {
                                 ui.strong("Destination");
                             });
-                            if show_status {
-                                header.col(|ui| {
-                                    ui.strong("Status");
-                                });
-                            }
+                            header.col(|ui| {
+                                ui.strong("Duration");
+                            });
                         })
                         .body(|mut body| {
-                            body.rows(row_height, entries.len(), |mut row| {
-                                let (id, entry) = &entries[row.index()];
+                            body.rows(row_height, ids.len(), |mut row| {
+                                let id = ids[row.index()];
+                                let Some(entry) = conns.conns.get(&id) else {
+                                    return;
+                                };
                                 row.col(|ui| {
                                     ui.colored_label(Color32::LIGHT_BLUE, format!("{}", id.0));
                                 });
-                                row.col(|ui| match &entry.route {
-                                    Some(r) => {
-                                        ui.label(format!("{:?}", r));
-                                    }
-                                    None => {}
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        conn_phase_color(entry.phase),
+                                        conn_phase_label(entry.phase),
+                                    );
                                 });
-                                if show_status {
-                                    row.col(|ui| {
-                                        if let Some(fin) = entry.finished_at {
-                                            let us =
-                                                fin.elapsed_since(entry.accepted_at).as_micros()
-                                                    as f64;
-                                            ui.label(diag::summary::format_duration_us(us));
+                                row.col(|ui| {
+                                    let response = ui.label(conn_route_label(entry.route.as_ref()));
+                                    response.on_hover_ui(|ui| {
+                                        ui.strong(format!(
+                                            "Connection #{} — {}",
+                                            id.0, entry.dst
+                                        ));
+                                        ui.label(format!(
+                                            "Final state: {}",
+                                            conn_phase_label(entry.phase)
+                                        ));
+                                        if let Some(
+                                            nsproxy_common::routing::RoutingResovled::ProxyResovled {
+                                                id,
+                                                ..
+                                            },
+                                        ) = entry.route.as_ref()
+                                        {
+                                            Self::render_proxy_summary(
+                                                ui,
+                                                id,
+                                                proxies,
+                                                hide_secret,
+                                                cover_text,
+                                            );
                                         }
+                                        if let Some(error) = &entry.error {
+                                            ui.colored_label(Color32::LIGHT_RED, error);
+                                        }
+                                        if entry.history_truncated {
+                                            ui.weak("Earlier transitions were trimmed.");
+                                        }
+                                        egui::ScrollArea::vertical()
+                                            .max_height(280.0)
+                                            .show(ui, |ui| {
+                                                egui::Grid::new(("conn_history", id.0))
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        for transition in &entry.history {
+                                                            ui.label(format_conn_timestamp(
+                                                                transition.ts,
+                                                            ));
+                                                            ui.label(conn_transition_label(
+                                                                &transition.kind,
+                                                            ));
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            });
                                     });
-                                }
+                                });
                                 row.col(|ui| {
                                     ui.label(format!("{}", entry.dst));
                                 });
-                                if show_status {
-                                    row.col(|ui| match &entry.error {
-                                        Some(e) => {
-                                            ui.colored_label(Color32::RED, "error")
-                                                .on_hover_text(e.as_str());
-                                        }
-                                        None => {
-                                            ui.colored_label(Color32::LIGHT_GREEN, "OK");
-                                        }
-                                    });
-                                }
+                                row.col(|ui| {
+                                    let end = entry
+                                        .finished_at
+                                        .unwrap_or_else(diag::Timestamp::now);
+                                    let duration = end.elapsed_since(entry.accepted_at);
+                                    ui.label(diag::summary::format_duration_us(
+                                        duration.as_secs_f64() * 1_000_000.0,
+                                    ));
+                                });
                             });
                         });
                 });
         };
 
-        if !active_entries.is_empty() {
+        if !profile.active_conn_ids.is_empty() {
             ui.label(egui::RichText::new("Active").strong());
             render_conn_table(
                 ui,
                 format!("conns_active_{}", profile_name),
-                &active_entries,
-                false,
+                &profile.active_conn_ids,
             );
             ui.add_space(4.0);
         }
 
-        if !finished_entries.is_empty() {
+        if !profile.finished_conn_ids.is_empty() {
             ui.label(egui::RichText::new("Recently Finished").strong());
             render_conn_table(
                 ui,
                 format!("conns_finished_{}", profile_name),
-                &finished_entries,
-                true,
+                &profile.finished_conn_ids,
             );
         }
+
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(format!(
+            "Recent host / route performance ({})",
+            profile.host_route_stats.len()
+        ))
+        .default_open(true)
+        .show(ui, |ui| {
+            let supervisor = &self.supervisor;
+            let route_targets = &self.traffic_route_targets;
+            let route_target_index = &mut self.traffic_route_target_index;
+            let route_target = &mut self.traffic_route_target;
+            let route_filter = &mut self.traffic_route_filter;
+            let filtered_route_target_indices = &self.filtered_traffic_route_target_indices;
+            ui.weak("Showing up to 512 most recently observed TCP and UDP target/route estimates.");
+            ui.horizontal(|ui| {
+                ui.label("Click button to route to");
+                egui::ComboBox::from_id_salt("traffic_host_route_target")
+                    .selected_text(
+                        route_targets
+                            .get(*route_target_index)
+                            .map(|target| target.key.as_str())
+                            .unwrap_or("NoProxy"),
+                    )
+                    .width(360.0)
+                    .height(360.0)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        ui.set_min_width(420.0);
+                        ui.set_min_height(340.0);
+                        ui.add(
+                            egui::TextEdit::singleline(route_filter)
+                                .hint_text("Filter by proxy name or address")
+                                .desired_width(400.0),
+                        );
+                        ui.separator();
+                        if filtered_route_target_indices.is_empty() {
+                            ui.weak("No matching routes.");
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
+                                .min_scrolled_height(220.0)
+                                .show_rows(
+                                    ui,
+                                    24.0,
+                                    filtered_route_target_indices.len(),
+                                    |ui, rows| {
+                                        for row in rows {
+                                            let target_index = filtered_route_target_indices[row];
+                                            let target = &route_targets[target_index];
+                                            ui.horizontal(|ui| {
+                                                let selected = *route_target_index == target_index;
+                                                let clicked = ui
+                                                    .selectable_label(selected, &target.key)
+                                                    .clicked();
+                                                let summary = if hide_secret
+                                                    && matches!(
+                                                        &target.route,
+                                                        nsproxy_common::stats::ObservedRoute::Proxy(
+                                                            _
+                                                    )
+                                                    ) {
+                                                    cover_text
+                                                } else {
+                                                    target.summary.as_str()
+                                                };
+                                                ui.add_sized(
+                                                    [260.0, 20.0],
+                                                    egui::Label::new(
+                                                        egui::RichText::new(summary).monospace(),
+                                                    ),
+                                                );
+                                                if clicked {
+                                                    *route_target_index = target_index;
+                                                    *route_target = target.route.clone();
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                        }
+                    });
+                if let Some(target) = route_targets.get(*route_target_index) {
+                    *route_target = target.route.clone();
+                }
+            });
+            if profile.host_route_stats.is_empty() {
+                ui.weak("No host / route measurements yet.");
+                return;
+            }
+            let selected_route = route_target.clone();
+            let diag_connected = profile.diag_connected;
+            TableBuilder::new(ui)
+                .id_salt("host_route_performance")
+                .max_scroll_height(360.0)
+                .animate_scrolling(false)
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::remainder().at_least(180.0))
+                .column(Column::remainder().at_least(130.0))
+                .column(Column::auto().at_least(80.0))
+                .column(Column::auto().at_least(70.0))
+                .column(Column::auto().at_least(85.0))
+                .column(Column::auto().at_least(85.0))
+                .column(Column::auto().at_least(85.0))
+                .column(Column::auto().at_least(85.0))
+                .header(row_height, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Target");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Route");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Connect");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Success");
+                    });
+                    header.col(|ui| {
+                        ui.strong("TCP up");
+                    });
+                    header.col(|ui| {
+                        ui.strong("TCP down");
+                    });
+                    header.col(|ui| {
+                        ui.strong("UDP up");
+                    });
+                    header.col(|ui| {
+                        ui.strong("UDP down");
+                    });
+                })
+                .body(|mut body| {
+                    body.rows(row_height, profile.host_route_stats.len(), |mut row| {
+                        let metric = &profile.host_route_stats[row.index()];
+                        row.col(|ui| {
+                            ui.label(metric.key.target.to_string());
+                        });
+                        row.col(|ui| {
+                            let response = ui.label(format!("{:?}", metric.key.route));
+                            Self::render_host_route_action_popup(
+                                supervisor,
+                                proxies,
+                                hide_secret,
+                                cover_text,
+                                response,
+                                &profile_name,
+                                metric,
+                                &selected_route,
+                                diag_connected,
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                metric
+                                    .connect_latency_ms
+                                    .map(|ms| format!("{ms:.0} ms"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                metric
+                                    .connect_success_rate
+                                    .map(|rate| format!("{:.0}%", rate * 100.0))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            );
+                        });
+                        row.col(|ui| {
+                            render_transfer_rate_cell(
+                                ui,
+                                metric.upload_bytes_per_sec,
+                                metric.upload_sample,
+                            );
+                        });
+                        row.col(|ui| {
+                            render_transfer_rate_cell(
+                                ui,
+                                metric.download_bytes_per_sec,
+                                metric.download_sample,
+                            );
+                        });
+                        row.col(|ui| {
+                            render_transfer_rate_cell(
+                                ui,
+                                metric.udp_upload_bytes_per_sec,
+                                metric.udp_upload_sample,
+                            );
+                        });
+                        row.col(|ui| {
+                            render_transfer_rate_cell(
+                                ui,
+                                metric.udp_download_bytes_per_sec,
+                                metric.udp_download_sample,
+                            );
+                        });
+                    });
+                });
+        });
     }
 
     // ── Manage tab ────────────────────────────────────────────────────────────
@@ -8494,6 +9433,27 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         );
         ui.add_space(8.0);
 
+        let current_route = self.manage_wizard.hot.route.clone();
+        let mut new_route = current_route.clone();
+
+        ui.strong("Proxy groups");
+        for group_id in &self.user_groups {
+            let is_selected = matches!(
+                &current_route,
+                nsproxy_core::HotRoute::Group { group_id: selected } if selected.as_str() == group_id.as_str()
+            );
+            if ui
+                .selectable_label(is_selected, format!("Group: {}", group_id.as_str()))
+                .clicked()
+            {
+                new_route = nsproxy_core::HotRoute::Group {
+                    group_id: group_id.as_str().to_string(),
+                };
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.strong("Individual proxies");
         // Show available proxies
         if self.proxies.is_empty() {
             ui.colored_label(
@@ -8501,8 +9461,6 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 "No uplink proxies configured yet. Add proxies in the Proxies tab first.",
             );
         } else {
-            let current_route = self.manage_wizard.hot.route.clone();
-            let mut new_route = current_route.clone();
             for (proxy_id, item) in &self.proxies {
                 let is_selected = matches!(&current_route, nsproxy_core::HotRoute::SimpleProxy { proxy_id: pid } if pid == proxy_id);
                 ui.horizontal(|ui| {
@@ -8514,18 +9472,23 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     ui.colored_label(Color32::from_gray(140), &item.url);
                 });
             }
+        }
 
-            let is_none = matches!(&current_route, nsproxy_core::HotRoute::None);
-            if ui.selectable_label(is_none, "None  (no proxy)").clicked() {
-                new_route = nsproxy_core::HotRoute::None;
-            }
+        let is_no_proxy = matches!(&current_route, nsproxy_core::HotRoute::NoProxy);
+        if ui.selectable_label(is_no_proxy, "NoProxy").clicked() {
+            new_route = nsproxy_core::HotRoute::NoProxy;
+        }
 
-            if new_route != current_route {
-                self.manage_wizard.hot.route = new_route;
-                self.manage_wizard.template.hot_init = Some(self.manage_wizard.hot.clone());
-                self.manage_wizard.hot_json =
-                    serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
-            }
+        let is_none = matches!(&current_route, nsproxy_core::HotRoute::None);
+        if ui.selectable_label(is_none, "None  (no route)").clicked() {
+            new_route = nsproxy_core::HotRoute::None;
+        }
+
+        if new_route != current_route {
+            self.manage_wizard.hot.route = new_route;
+            self.manage_wizard.template.hot_init = Some(self.manage_wizard.hot.clone());
+            self.manage_wizard.hot_json =
+                serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
         }
 
         ui.add_space(8.0);
@@ -8849,7 +9812,12 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         hot: &mut HotConfig,
     ) -> bool {
         let mut changed = false;
-        let known_profiles = self.snapshot.profiles.keys().cloned().collect::<HashSet<_>>();
+        let known_profiles = self
+            .snapshot
+            .profiles
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let veth_status = self
             .snapshot
             .profiles
@@ -8884,7 +9852,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     ui.push_id(("veth-card", index), |ui| {
                         ui.horizontal(|ui| {
                             ui.strong(format!("Veth pair {}", index + 1));
-                            if ui.checkbox(&mut draft.add_on_start, "on container creation").changed() {
+                            if ui
+                                .checkbox(&mut draft.add_on_start, "on container creation")
+                                .changed()
+                            {
                                 changed = true;
                             }
                             if Self::remove_icon_button(ui, "Remove veth pair").clicked() {
@@ -8971,16 +9942,19 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                 && known_profiles.contains(peer));
                         let valid_name = draft.name.trim().is_empty()
                             || (draft.name.len() <= 15
-                                && draft
-                                    .name
-                                    .chars()
-                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+                                && draft.name.chars().all(|ch| {
+                                    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+                                }));
                         let ready = valid_peer && valid_name;
                         let fixed_ips = draft.src_ip4.trim().is_empty()
                             && draft.dst_ip4.trim().is_empty()
                             || (draft.src_ip4.trim().parse::<std::net::Ipv4Addr>().is_ok()
                                 && draft.dst_ip4.trim().parse::<std::net::Ipv4Addr>().is_ok());
-                        let valid_prefix = draft.prefix_len.trim().parse::<u8>().is_ok_and(|p| p > 0 && p < 32);
+                        let valid_prefix = draft
+                            .prefix_len
+                            .trim()
+                            .parse::<u8>()
+                            .is_ok_and(|p| p > 0 && p < 32);
                         let ready = ready && fixed_ips && valid_prefix;
                         if ui
                             .add_enabled(ready, egui::Button::new("Create veth pair"))
@@ -9005,7 +9979,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                             draft.submitted = true;
                         }
                         if draft.submitted {
-                            ui.colored_label(Color32::LIGHT_BLUE, "Creation requested; see Logs for result.");
+                            ui.colored_label(
+                                Color32::LIGHT_BLUE,
+                                "Creation requested; see Logs for result.",
+                            );
                         }
                         if draft.add_on_start {
                             ui.small("Saved to hotconfig; retried when this container starts.");
@@ -9058,7 +10035,9 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 .snapshot
                 .profiles
                 .get(&profile_name)
-                .map_or(true, |profile| self.hotconfig_editor_value != profile.hotconfig);
+                .map_or(true, |profile| {
+                    self.hotconfig_editor_value != profile.hotconfig
+                });
         let (dns_state, sandbox_status, child_alive, dbus_mode) = self
             .snapshot
             .profiles
@@ -10202,6 +11181,143 @@ fn format_timestamp_age(ts: Timestamp) -> String {
     format_relative_age_label(age)
 }
 
+fn format_conn_timestamp(ts: diag::Timestamp) -> String {
+    use chrono::TimeZone;
+
+    let clock = chrono::Local
+        .timestamp_opt(ts.as_secs() as i64, ((ts.0 % 1_000_000) * 1_000) as u32)
+        .single()
+        .map(|datetime| datetime.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".to_string());
+    format!("{} {}", format_timestamp_age(ts), clock)
+}
+
+fn conn_phase_label(phase: diag::ConnPhase) -> &'static str {
+    match phase {
+        diag::ConnPhase::Accepted => "accepted",
+        diag::ConnPhase::Routing => "connecting",
+        diag::ConnPhase::Connected => "connected",
+        diag::ConnPhase::DnsResolved => "DNS resolved",
+        diag::ConnPhase::DnsFailed => "DNS failed",
+        diag::ConnPhase::Finished => "finished",
+        diag::ConnPhase::Killed => "killed",
+        diag::ConnPhase::Failed => "failed",
+        diag::ConnPhase::RouteExhausted => "retry limit reached",
+        diag::ConnPhase::RouteRejected => "route rejected",
+    }
+}
+
+fn conn_phase_color(phase: diag::ConnPhase) -> Color32 {
+    match phase {
+        diag::ConnPhase::Finished | diag::ConnPhase::DnsResolved => Color32::LIGHT_GREEN,
+        diag::ConnPhase::Killed => Color32::GRAY,
+        diag::ConnPhase::Failed | diag::ConnPhase::DnsFailed | diag::ConnPhase::RouteRejected => {
+            Color32::LIGHT_RED
+        }
+        diag::ConnPhase::RouteExhausted => Color32::YELLOW,
+        diag::ConnPhase::Connected => Color32::LIGHT_BLUE,
+        diag::ConnPhase::Accepted | diag::ConnPhase::Routing => Color32::GRAY,
+    }
+}
+
+fn conn_route_label(route: Option<&nsproxy_common::routing::RoutingResovled>) -> String {
+    use nsproxy_common::routing::{DropReason, RoutingResovled};
+
+    match route {
+        Some(RoutingResovled::NoProxy(address)) => {
+            format!("NoProxy {} {address}", regular::ARROW_RIGHT)
+        }
+        Some(RoutingResovled::NoProxyDomain { host, port }) => {
+            format!("NoProxy {} {host}:{port}", regular::ARROW_RIGHT)
+        }
+        Some(RoutingResovled::NATByTUN(address)) => {
+            format!("TUN {} {address}", regular::ARROW_RIGHT)
+        }
+        Some(RoutingResovled::ProxyResovled { target, id }) => {
+            format!("Proxy {id} {} {target}", regular::ARROW_RIGHT)
+        }
+        Some(RoutingResovled::Drop(DropReason::MaxRetry)) => "Retry limit reached".to_string(),
+        Some(RoutingResovled::Drop(DropReason::Preprocess(reason))) => {
+            format!("Rejected: {reason}")
+        }
+        None => "—".to_string(),
+    }
+}
+
+fn conn_transition_label(kind: &diag::ConnTransitionKind) -> String {
+    use nsproxy_common::routing::{DropReason, RoutingResovled};
+
+    match kind {
+        diag::ConnTransitionKind::Accepted => "Accepted".to_string(),
+        diag::ConnTransitionKind::Dispatched { dispatch_us } => format!(
+            "Dispatched after {}",
+            diag::summary::format_duration_us(*dispatch_us as f64)
+        ),
+        diag::ConnTransitionKind::Route(RoutingResovled::Drop(DropReason::MaxRetry)) => {
+            "Retry limit reached".to_string()
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::Drop(DropReason::Preprocess(reason))) => {
+            format!("Route rejected: {reason}")
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::NoProxy(address)) => {
+            format!("NoProxy: {address}")
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::NoProxyDomain { host, port }) => {
+            format!("NoProxy: {host}:{port}")
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::NATByTUN(address)) => {
+            format!("Direct through TUN: {address}")
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::ProxyResovled { target, id }) => {
+            format!("Proxy {id} {} {target}", regular::ARROW_RIGHT)
+        }
+        diag::ConnTransitionKind::Connected => "Upstream connected".to_string(),
+        diag::ConnTransitionKind::AttemptFailed { error } => {
+            format!("Route attempt failed: {error}")
+        }
+        diag::ConnTransitionKind::DnsResolved { domain, result } => {
+            format!("DNS {domain}: {result}")
+        }
+        diag::ConnTransitionKind::Finished { error: Some(error) } => {
+            format!("Failed: {error}")
+        }
+        diag::ConnTransitionKind::Finished { error: None } => "Finished successfully".to_string(),
+        diag::ConnTransitionKind::Killed => "Killed by user".to_string(),
+    }
+}
+
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    const UNITS: [&str; 5] = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"];
+    let mut value = bytes_per_sec;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn render_transfer_rate_cell(
+    ui: &mut egui::Ui,
+    bytes_per_sec: Option<f64>,
+    sample: Option<TransferRateSample>,
+) {
+    let response = ui.label(
+        bytes_per_sec
+            .map(format_bytes_per_sec)
+            .unwrap_or_else(|| "—".to_string()),
+    );
+    if let Some(sample) = sample {
+        response.on_hover_text(format!(
+            "Latest qualified sample: {} bytes over {:.2}s ({} write events), observed {}",
+            sample.bytes,
+            sample.duration_secs(),
+            sample.event_count,
+            format_timestamp_age(sample.observed_at)
+        ));
+    }
+}
+
 fn list_persisted_log_files() -> Vec<PersistedLogFileInfo> {
     let Ok(dir_entries) = std::fs::read_dir(state_paths::logs_root()) else {
         return Vec::new();
@@ -10640,6 +11756,10 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
             ui.colored_label(Color32::LIGHT_GREEN, "Connected");
             ui.label(format!("#{}", id.0));
         }
+        diag::DiagEvent::AttemptFailed { id, error, .. } => {
+            ui.colored_label(Color32::YELLOW, "Attempt failed");
+            ui.label(format!("#{} {}", id.0, error));
+        }
         diag::DiagEvent::Finished {
             id,
             error,
@@ -10657,6 +11777,10 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
                 "#{} {} ↑{:.0} ↓{:.0}",
                 id.0, err_str, bytes_up, bytes_down
             ));
+        }
+        diag::DiagEvent::Killed { id, .. } => {
+            ui.colored_label(Color32::from_gray(150), "Killed");
+            ui.label(format!("#{} by user", id.0));
         }
         diag::DiagEvent::DnsQuery { id, query, .. } => {
             ui.colored_label(Color32::from_rgb(200, 200, 100), "DNS?");
@@ -10716,7 +11840,9 @@ fn diag_event_kind_label(ev: &diag::DiagEvent) -> &'static str {
         diag::DiagEvent::Dispatched { .. } => "Dispatched",
         diag::DiagEvent::Route { .. } => "Route",
         diag::DiagEvent::Connected { .. } => "Connected",
+        diag::DiagEvent::AttemptFailed { .. } => "AttemptFailed",
         diag::DiagEvent::Finished { .. } => "Finished",
+        diag::DiagEvent::Killed { .. } => "Killed",
         diag::DiagEvent::DnsResolved { .. } => "DnsResolved",
         diag::DiagEvent::DnsQuery { .. } => "DnsQuery",
         diag::DiagEvent::Wait { .. } => "Wait",
@@ -10726,6 +11852,9 @@ fn diag_event_kind_label(ev: &diag::DiagEvent) -> &'static str {
         diag::DiagEvent::DnsState { .. } => "DnsState",
         diag::DiagEvent::RoutingState { .. } => "RoutingState",
         diag::DiagEvent::UplinkStatsSnapshot { .. } => "UplinkStatsSnapshot",
+        diag::DiagEvent::HostRouteStatsSnapshot { .. } => "HostRouteStatsSnapshot",
+        diag::DiagEvent::HostRouteStatsUpdated { .. } => "HostRouteStatsUpdated",
+        diag::DiagEvent::ConnectionsExpired { .. } => "ConnectionsExpired",
         diag::DiagEvent::Log(_) => "Log",
         diag::DiagEvent::RecentLogs(_) => "RecentLogs",
         diag::DiagEvent::RecentDiagEvents(_) => "RecentDiagEvents",

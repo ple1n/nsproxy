@@ -13,7 +13,7 @@ pub struct UplinkBackup {
 
 impl UplinkBackup {
     pub fn from_clash_state(state: &ClashState) -> Self {
-        let mut dns = state.proxies.clone();
+        let mut dns = state.proxy_resolutions.clone();
         for group in state.groups.values() {
             merge_domains(&mut dns, &group.tier2_cache);
         }
@@ -21,7 +21,7 @@ impl UplinkBackup {
     }
 
     pub fn merge_into_clash_state(&self, state: &mut ClashState) {
-        merge_domains(&mut state.proxies, &self.dns);
+        merge_domains(&mut state.proxy_resolutions, &self.dns);
         for group in state.groups.values_mut() {
             merge_domains(&mut group.tier2_cache, &self.dns);
         }

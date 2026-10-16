@@ -19,7 +19,7 @@ use std::{
     os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, SystemTime},
@@ -29,6 +29,7 @@ use anyhow::{bail, Result};
 pub use nsproxy_common::stats::Timestamp;
 use nsproxy_common::{
     routing::{ProxyID, RoutingResovled},
+    stats::{HostRouteHost, HostRouteMetric, ObservedRoute},
     state_paths, ExactNS, NSFrom, PidPath, UniqueFile,
 };
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,26 @@ pub enum DiagEvent {
     /// Snapshot of the current live connection-tracking state.
     /// Sent in response to [`ControlCommand::QueryConnsState`].
     ConnsStateSnapshot { ts: Timestamp, state: ConnsState },
+    /// Full snapshot of serve-computed host/route performance estimates.
+    HostRouteStatsSnapshot {
+        ts: Timestamp,
+        stats: Vec<HostRouteMetric>,
+    },
+    /// Incremental update for one host/route performance estimate.
+    HostRouteStatsUpdated {
+        ts: Timestamp,
+        stat: HostRouteMetric,
+    },
+    /// Connection entries removed from the server-side retention window.
+    ConnectionsExpired { ts: Timestamp, ids: Vec<ConnId> },
+    /// One route attempt failed while the connection may still be retried.
+    AttemptFailed {
+        id: ConnId,
+        ts: Timestamp,
+        error: String,
+    },
+    /// Connection intentionally closed by a user action.
+    Killed { id: ConnId, ts: Timestamp },
 }
 
 /// A single tracing log record, usable across multiple transport protocols.
@@ -181,6 +202,12 @@ pub enum ControlCommand {
     SetSimpleRouting {
         proxy_id: nsproxy_common::routing::ProxyID,
     },
+    /// Route all traffic through a named user-owned proxy group.
+    SetGroupRouting {
+        group_id: String,
+    },
+    /// Route all traffic without a proxy, independently of the no-route state.
+    SetNoProxyRouting,
     /// Request current DNS state snapshot.
     QueryDnsState,
     /// Request current routing selection snapshot.
@@ -209,6 +236,15 @@ pub enum ControlCommand {
     /// Intended for infrequent polling; prefer consuming live events via
     /// [`ConnsState::apply_event`] for real-time client-side reconstruction.
     QueryConnsState,
+    /// Request serve-computed per-target, per-route performance estimates.
+    QueryHostRouteStats,
+    /// Set or replace a host-wide routing override and persist it through `sp serve`.
+    SetHostRoute {
+        host: HostRouteHost,
+        target: ObservedRoute,
+    },
+    /// Close all active TCP and UDP connections for a host.
+    KillHostConnections { host: HostRouteHost },
 }
 
 /// Request sent to the global privileged `sp daemon` service.
@@ -234,6 +270,11 @@ pub enum RootDaemonOp {
         path: PathBuf,
         content: Vec<u8>,
         create_parent: bool,
+    },
+    ImportClashGroup {
+        group_id: String,
+        path: PathBuf,
+        replace: bool,
     },
     CreateProfile {
         name: String,
@@ -305,6 +346,10 @@ pub struct DnsState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingState {
     pub selected_proxy: Option<ProxyID>,
+    #[serde(default)]
+    pub selected_group: Option<String>,
+    #[serde(default)]
+    pub no_proxy: bool,
 }
 
 /// Logical protocol channel carried over the framed Unix stream.
@@ -471,12 +516,52 @@ pub struct ConnsSummary(pub BTreeMap<RoutingResovled, u64>);
 /// events arrive.  Finished entries (where `finished_at` is `Some`) are retained
 /// for [`DiagServer::conn_persist`] before being garbage-collected by a
 /// [`ConnsActor`] GC tick.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnPhase {
+    Accepted,
+    Routing,
+    Connected,
+    DnsResolved,
+    DnsFailed,
+    Finished,
+    Failed,
+    RouteExhausted,
+    RouteRejected,
+    Killed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConnTransitionKind {
+    Accepted,
+    Dispatched { dispatch_us: u64 },
+    Route(RoutingResovled),
+    Connected,
+    AttemptFailed { error: String },
+    DnsResolved { domain: String, result: String },
+    Finished { error: Option<String> },
+    Killed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnTransition {
+    pub ts: Timestamp,
+    pub kind: ConnTransitionKind,
+}
+
+const MAX_CONN_TRANSITIONS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnEntry {
     /// Resolved destination address.
     pub dst: WireAddress,
-    /// Last-seen routing decision for this connection (set on [`DiagEvent::Route`]).
+    /// Most recent non-drop routing decision; a later Drop does not hide the useful route.
     pub route: Option<RoutingResovled>,
+    /// Current summarized lifecycle state.
+    pub phase: ConnPhase,
+    /// Recent state transitions in timestamp order.
+    pub history: Vec<ConnTransition>,
+    /// True when old transitions were trimmed to keep each entry bounded.
+    pub history_truncated: bool,
     /// Timestamp when the connection was accepted.
     pub accepted_at: Timestamp,
     /// Timestamp when the upstream connection was established.
@@ -491,6 +576,16 @@ pub struct ConnEntry {
     pub bytes_down: Option<f32>,
 }
 
+impl ConnEntry {
+    fn push_transition(&mut self, ts: Timestamp, kind: ConnTransitionKind) {
+        if self.history.len() == MAX_CONN_TRANSITIONS {
+            self.history.remove(0);
+            self.history_truncated = true;
+        }
+        self.history.push(ConnTransition { ts, kind });
+    }
+}
+
 /// Live connection-tracking state owned by [`ConnsActor`] and delivered to
 /// clients as a snapshot in response to [`ControlCommand::QueryConnsState`].
 ///
@@ -500,10 +595,14 @@ pub struct ConnEntry {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ConnsState {
     /// All tracked connections (pending, active, and recently-finished).
-    pub conns: BTreeMap<ConnId, ConnEntry>,
+    pub conns: BTreeMap<ConnId, Arc<ConnEntry>>,
 }
 
 impl ConnsState {
+    fn entry_mut(&mut self, id: &ConnId) -> Option<&mut ConnEntry> {
+        self.conns.get_mut(id).map(Arc::make_mut)
+    }
+
     /// Apply a single [`DiagEvent`] to this state.
     ///
     /// Called both server-side (inside [`ConnsActor`]) and client-side
@@ -512,38 +611,84 @@ impl ConnsState {
         match event {
             DiagEvent::Accept { id, dst, ts, .. } => {
                 if let Ok(addr) = WireAddress::try_from(dst.as_str()) {
-                    self.conns.insert(
-                        *id,
-                        ConnEntry {
-                            dst: addr,
-                            route: None,
-                            accepted_at: *ts,
-                            connected_at: None,
-                            finished_at: None,
-                            error: None,
-                            bytes_up: None,
-                            bytes_down: None,
+                    let mut entry = ConnEntry {
+                        dst: addr,
+                        route: None,
+                        phase: ConnPhase::Accepted,
+                        history: Vec::new(),
+                        history_truncated: false,
+                        accepted_at: *ts,
+                        connected_at: None,
+                        finished_at: None,
+                        error: None,
+                        bytes_up: None,
+                        bytes_down: None,
+                    };
+                    entry.push_transition(*ts, ConnTransitionKind::Accepted);
+                    self.conns.insert(*id, Arc::new(entry));
+                }
+            }
+            DiagEvent::Route { id, ts, route } => {
+                if let Some(entry) = self.entry_mut(id) {
+                    entry.push_transition(*ts, ConnTransitionKind::Route(route.clone()));
+                    match route {
+                        RoutingResovled::Drop(nsproxy_common::routing::DropReason::MaxRetry) => {
+                            entry.phase = ConnPhase::RouteExhausted;
+                        }
+                        RoutingResovled::Drop(
+                            nsproxy_common::routing::DropReason::Preprocess(_),
+                        ) => {
+                            entry.phase = ConnPhase::RouteRejected;
+                        }
+                        _ => {
+                            entry.phase = ConnPhase::Routing;
+                            entry.route = Some(route.clone());
+                        }
+                    }
+                }
+            }
+            DiagEvent::Connected { id, ts } => {
+                if let Some(entry) = self.entry_mut(id) {
+                    entry.connected_at = Some(*ts);
+                    entry.phase = ConnPhase::Connected;
+                    entry.push_transition(*ts, ConnTransitionKind::Connected);
+                }
+            }
+            DiagEvent::AttemptFailed { id, ts, error } => {
+                if let Some(entry) = self.entry_mut(id) {
+                    entry.phase = ConnPhase::Routing;
+                    entry.push_transition(
+                        *ts,
+                        ConnTransitionKind::AttemptFailed {
+                            error: error.clone(),
                         },
                     );
                 }
             }
-            DiagEvent::Route { id, route, .. } => {
-                if let Some(entry) = self.conns.get_mut(id) {
-                    entry.route = Some(route.clone());
-                }
-            }
-            DiagEvent::Connected { id, ts } => {
-                if let Some(entry) = self.conns.get_mut(id) {
-                    entry.connected_at = Some(*ts);
-                }
-            }
-            DiagEvent::DnsResolved { id, ts, .. } => {
+            DiagEvent::DnsResolved {
+                id,
+                ts,
+                domain,
+                result,
+            } => {
                 // DNS connections are handled internally; mark as finished so they
                 // enter the persistence window rather than accumulating as active.
-                if let Some(entry) = self.conns.get_mut(id) {
+                if let Some(entry) = self.entry_mut(id) {
                     if entry.finished_at.is_none() {
                         entry.finished_at = Some(*ts);
                     }
+                    entry.phase = if result.starts_with("err:") {
+                        ConnPhase::DnsFailed
+                    } else {
+                        ConnPhase::DnsResolved
+                    };
+                    entry.push_transition(
+                        *ts,
+                        ConnTransitionKind::DnsResolved {
+                            domain: domain.clone(),
+                            result: result.clone(),
+                        },
+                    );
                 }
             }
             DiagEvent::Finished {
@@ -554,11 +699,46 @@ impl ConnsState {
                 bytes_down,
                 ..
             } => {
-                if let Some(entry) = self.conns.get_mut(id) {
+                if let Some(entry) = self.entry_mut(id) {
                     entry.finished_at = Some(*ts);
                     entry.error = error.clone();
                     entry.bytes_up = Some(*bytes_up);
                     entry.bytes_down = Some(*bytes_down);
+                    entry.phase = if error.is_some() {
+                        ConnPhase::Failed
+                    } else {
+                        ConnPhase::Finished
+                    };
+                    entry.push_transition(
+                        *ts,
+                        ConnTransitionKind::Finished {
+                            error: error.clone(),
+                        },
+                    );
+                }
+            }
+            DiagEvent::Killed { id, ts } => {
+                if let Some(entry) = self.entry_mut(id) {
+                    entry.finished_at = Some(*ts);
+                    entry.error = None;
+                    entry.phase = ConnPhase::Killed;
+                    entry.push_transition(*ts, ConnTransitionKind::Killed);
+                }
+            }
+            DiagEvent::Dispatched { id, dispatch_us } => {
+                if let Some(entry) = self.entry_mut(id) {
+                    let ts = Timestamp(entry.accepted_at.0.saturating_add(*dispatch_us));
+                    entry.push_transition(
+                        ts,
+                        ConnTransitionKind::Dispatched {
+                            dispatch_us: *dispatch_us,
+                        },
+                    );
+                }
+            }
+            DiagEvent::ConnectionsExpired { ids, .. } => {
+                for id in ids {
+                    self.conns.remove(id);
                 }
             }
             _ => {}
@@ -572,15 +752,21 @@ impl ConnsState {
 
     /// Remove finished entries whose age exceeds `max_age`.
     /// Active (unfinished) entries are never removed by this method.
-    pub fn gc(&mut self, max_age: Duration) {
+    pub fn gc(&mut self, max_age: Duration) -> Vec<ConnId> {
         let now_us = Timestamp::now().0;
         let max_age_us = max_age.as_micros() as u64;
-        self.conns.retain(|_, entry| {
-            entry
+        let mut expired = Vec::new();
+        self.conns.retain(|id, entry| {
+            let retain = entry
                 .finished_at
                 .map(|ts| now_us.saturating_sub(ts.0) < max_age_us)
-                .unwrap_or(true) // keep all non-finished (active) entries
+                .unwrap_or(true);
+            if !retain {
+                expired.push(*id);
+            }
+            retain
         });
+        expired
     }
 }
 
@@ -594,6 +780,11 @@ pub enum ConnsCmd {
     Reset,
     /// Request a snapshot; the response is sent on the provided oneshot channel.
     Query(oneshot::Sender<ConnsState>),
+    /// Change how long completed entries remain in the state.
+    SetPersist {
+        conn_persist: Duration,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// How often the actor checks for stale finished entries to garbage-collect.
@@ -607,21 +798,24 @@ struct ConnsActor {
     state: ConnsState,
     conn_persist: Duration,
     rx: mpsc::Receiver<ConnsCmd>,
+    expired_tx: mpsc::Sender<Vec<ConnId>>,
 }
 
 impl ConnsActor {
     /// Spawn the actor task and return its command sender.
-    fn spawn(conn_persist: Duration) -> mpsc::Sender<ConnsCmd> {
+    fn spawn(conn_persist: Duration) -> (mpsc::Sender<ConnsCmd>, mpsc::Receiver<Vec<ConnId>>) {
         let (tx, rx) = mpsc::channel(256);
+        let (expired_tx, expired_rx) = mpsc::channel(64);
         tokio::spawn(
             Self {
                 state: ConnsState::default(),
                 conn_persist,
                 rx,
+                expired_tx,
             }
             .run(),
         );
-        tx
+        (tx, expired_rx)
     }
 
     async fn run(mut self) {
@@ -630,14 +824,37 @@ impl ConnsActor {
         loop {
             tokio::select! {
                 _ = gc_interval.tick() => {
-                    self.state.gc(self.conn_persist);
+                    let expired = self.state.gc(self.conn_persist);
+                    if !expired.is_empty() && self.expired_tx.send(expired).await.is_err() {
+                        break;
+                    }
                 }
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(ConnsCmd::Event(ev)) => self.state.apply_event(&ev),
+                        Some(ConnsCmd::Event(ev)) => {
+                            let terminal = matches!(
+                                &ev,
+                                DiagEvent::Finished { .. } | DiagEvent::DnsResolved { .. }
+                            );
+                            self.state.apply_event(&ev);
+                            if terminal && self.conn_persist.is_zero() {
+                                let expired = self.state.gc(self.conn_persist);
+                                if !expired.is_empty() && self.expired_tx.send(expired).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         Some(ConnsCmd::Reset) => self.state.reset(),
                         Some(ConnsCmd::Query(resp)) => {
                             let _ = resp.send(self.state.clone());
+                        }
+                        Some(ConnsCmd::SetPersist { conn_persist, response }) => {
+                            self.conn_persist = conn_persist;
+                            let expired = self.state.gc(self.conn_persist);
+                            if !expired.is_empty() && self.expired_tx.send(expired).await.is_err() {
+                                break;
+                            }
+                            let _ = response.send(());
                         }
                         None => break, // all senders dropped — shut down
                     }
@@ -664,8 +881,8 @@ pub struct DiagServer {
     /// Shared across clones; may be toggled at runtime via [`Self::set_track_conns`]
     /// or the [`ControlCommand::SetTrackConns`] wire command.
     track_conns: Arc<AtomicBool>,
-    /// Duration to retain finished connection entries before garbage-collecting them.
-    /// Default: [`DEFAULT_CONN_PERSIST`]. Set at construction time via [`DiagServer::start`].
+    /// Initial duration for finished-entry retention. The live value may be changed
+    /// through [`Self::set_conn_persist`].
     pub conn_persist: Duration,
 }
 
@@ -678,7 +895,7 @@ pub const DIAG_EVENT_RING_CAP: usize = 50;
 /// Default value of [`DiagServer::track_conns`] when created via [`DiagServer::start`] or [`DiagServer::noop`].
 pub const DEFAULT_TRACK_CONNS: bool = true;
 /// Default duration finished connection entries are retained before GC.
-pub const DEFAULT_CONN_PERSIST: Duration = Duration::from_secs(60);
+pub const DEFAULT_CONN_PERSIST: Duration = Duration::from_secs(300);
 
 impl DiagServer {
     /// Create a new `DiagServer` and spawn the UNIX listener task.
@@ -688,7 +905,7 @@ impl DiagServer {
     ///
     /// `conn_persist` controls how long finished connection entries are retained
     /// before the [`ConnsActor`] GC tick removes them.  Pass [`DEFAULT_CONN_PERSIST`]
-    /// for the default 60-second window.
+    /// for the default 300-second window.
     ///
     /// Returns `(server, cmd_rx)`.  Poll `cmd_rx` to receive [`ControlCommand`]s sent
     /// by any connected client.
@@ -718,7 +935,7 @@ impl DiagServer {
         let event_ring: Arc<Mutex<VecDeque<DiagEvent>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(DIAG_EVENT_RING_CAP)));
         let track_conns = Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS));
-        let conns_tx = ConnsActor::spawn(conn_persist);
+        let (conns_tx, mut expired_rx) = ConnsActor::spawn(conn_persist);
         let server = DiagServer {
             tx: tx.clone(),
             cmd_tx: cmd_tx.clone(),
@@ -727,6 +944,16 @@ impl DiagServer {
             track_conns: track_conns.clone(),
             conn_persist,
         };
+
+        let expiry_server = server.clone();
+        tokio::spawn(async move {
+            while let Some(ids) = expired_rx.recv().await {
+                expiry_server.emit(DiagEvent::ConnectionsExpired {
+                    ts: Timestamp::now(),
+                    ids,
+                });
+            }
+        });
 
         // Spawn acceptor
         let tx2 = tx.clone();
@@ -768,11 +995,18 @@ impl DiagServer {
     pub fn emit(&self, event: DiagEvent) {
         history::record_diag_event(&event);
         // 1. Push to the rolling ring buffer.
-        if let Ok(mut ring) = self.event_ring.lock() {
-            if ring.len() >= DIAG_EVENT_RING_CAP {
-                ring.pop_front();
+        if !matches!(
+            event,
+            DiagEvent::HostRouteStatsSnapshot { .. }
+                | DiagEvent::HostRouteStatsUpdated { .. }
+                | DiagEvent::ConnectionsExpired { .. }
+        ) {
+            if let Ok(mut ring) = self.event_ring.lock() {
+                if ring.len() >= DIAG_EVENT_RING_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back(event.clone());
             }
-            ring.push_back(event.clone());
         }
         // 2. Forward to the ConnsActor (fire-and-forget; never blocks the caller).
         if self.track_conns.load(Ordering::Relaxed) {
@@ -804,6 +1038,21 @@ impl DiagServer {
     /// Set the connection-tracking flag. Takes effect immediately across all clones.
     pub fn set_track_conns(&self, enabled: bool) {
         self.track_conns.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Change the finished-connection retention window immediately.
+    pub async fn set_conn_persist(&self, conn_persist: Duration) -> Result<()> {
+        let (response, response_rx) = oneshot::channel();
+        self.conns_tx
+            .send(ConnsCmd::SetPersist {
+                conn_persist,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("connection tracking actor has stopped"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("connection tracking actor dropped retention update"))
     }
 
     /// Install this server's broadcast channel as the process-global serve log sink.
@@ -2035,5 +2284,207 @@ impl UpDaemonStream {
                 write_half: self.write_half,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_history_keeps_useful_route_and_expires_finished_entries() {
+        let id = ConnId(7);
+        let ts = Timestamp::now();
+        let no_proxy_address: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let mut state = ConnsState::default();
+
+        state.apply_event(&DiagEvent::Accept {
+            id,
+            ts,
+            kind: StreamKind::Tcp,
+            src: "127.0.0.1:50000".to_string(),
+            dst: no_proxy_address.to_string(),
+        });
+        state.apply_event(&DiagEvent::Route {
+            id,
+            ts,
+            route: RoutingResovled::NoProxy(no_proxy_address),
+        });
+        state.apply_event(&DiagEvent::AttemptFailed {
+            id,
+            ts,
+            error: "transient route failure".to_string(),
+        });
+        assert_eq!(state.conns.get(&id).unwrap().finished_at, None);
+        state.apply_event(&DiagEvent::Route {
+            id,
+            ts,
+            route: RoutingResovled::Drop(
+                nsproxy_common::routing::DropReason::MaxRetry,
+            ),
+        });
+        assert_eq!(
+            state.conns.get(&id).unwrap().phase,
+            ConnPhase::RouteExhausted
+        );
+        state.apply_event(&DiagEvent::Finished {
+            id,
+            ts,
+            error: Some("route dropped".to_string()),
+            bytes_up: 0.0,
+            bytes_down: 0.0,
+        });
+
+        let entry = state.conns.get(&id).unwrap();
+        assert_eq!(entry.phase, ConnPhase::Failed);
+        assert_eq!(
+            entry.route,
+            Some(RoutingResovled::NoProxy(no_proxy_address))
+        );
+        assert_eq!(entry.history.len(), 5);
+
+        let snapshot = DiagEvent::ConnsStateSnapshot {
+            ts,
+            state: state.clone(),
+        };
+        let encoded = bincode::serialize(&snapshot).unwrap();
+        let decoded: DiagEvent = bincode::deserialize(&encoded).unwrap();
+        assert!(matches!(decoded, DiagEvent::ConnsStateSnapshot { .. }));
+
+        assert_eq!(state.gc(Duration::ZERO), vec![id]);
+        assert!(!state.conns.contains_key(&id));
+    }
+
+    #[test]
+    fn connection_expiry_events_remove_client_rows() {
+        let id = ConnId(8);
+        let ts = Timestamp::now();
+        let mut state = ConnsState::default();
+        state.apply_event(&DiagEvent::Accept {
+            id,
+            ts,
+            kind: StreamKind::Udp,
+            src: "127.0.0.1:50000".to_string(),
+            dst: "127.0.0.1:53".to_string(),
+        });
+
+        state.apply_event(&DiagEvent::ConnectionsExpired {
+            ts,
+            ids: vec![id],
+        });
+        assert!(!state.conns.contains_key(&id));
+    }
+
+    #[test]
+    fn killed_connections_have_a_distinct_terminal_phase() {
+        let id = ConnId(9);
+        let ts = Timestamp::now();
+        let mut state = ConnsState::default();
+        state.apply_event(&DiagEvent::Accept {
+            id,
+            ts,
+            kind: StreamKind::Tcp,
+            src: "127.0.0.1:50000".to_string(),
+            dst: "example.com:443".to_string(),
+        });
+
+        state.apply_event(&DiagEvent::Killed { id, ts });
+
+        let entry = state.conns.get(&id).unwrap();
+        assert_eq!(entry.phase, ConnPhase::Killed);
+        assert_eq!(entry.finished_at, Some(ts));
+        assert_eq!(entry.error, None);
+        assert!(matches!(
+            entry.history.last().map(|transition| &transition.kind),
+            Some(ConnTransitionKind::Killed)
+        ));
+    }
+
+    #[test]
+    fn host_route_metrics_round_trip_over_the_diag_protocol() {
+        let target = WireAddress::DomainAddress("packages.example".to_string(), 443);
+        let event = DiagEvent::HostRouteStatsUpdated {
+            ts: Timestamp::now(),
+            stat: HostRouteMetric {
+                key: nsproxy_common::stats::HostRouteKey::new(
+                    target.clone(),
+                    nsproxy_common::stats::ObservedRoute::NoProxy,
+                ),
+                observed_at: Timestamp::now(),
+                last_observed: Some(Timestamp::now()),
+                connect_latency_ms: Some(100.0),
+                connect_success_rate: Some(1.0),
+                upload_bytes_per_sec: Some(2_000_000.0),
+                download_bytes_per_sec: Some(1_000_000.0),
+                upload_sample: Some(nsproxy_common::stats::TransferRateSample {
+                    bytes: 2_000_000,
+                    duration_micros: 1_000_000,
+                    event_count: 32,
+                    observed_at: Timestamp::now(),
+                }),
+                download_sample: None,
+                udp_upload_bytes_per_sec: Some(500_000.0),
+                udp_download_bytes_per_sec: None,
+                udp_upload_sample: Some(nsproxy_common::stats::TransferRateSample {
+                    bytes: 500_000,
+                    duration_micros: 1_000_000,
+                    event_count: 10,
+                    observed_at: Timestamp::now(),
+                }),
+                udp_download_sample: None,
+            },
+        };
+
+        let encoded = bincode::serialize(&event).unwrap();
+        let decoded: DiagEvent = bincode::deserialize(&encoded).unwrap();
+        let DiagEvent::HostRouteStatsUpdated { stat, .. } = decoded else {
+            panic!("decoded the wrong event variant");
+        };
+        assert_eq!(stat.key.target, target);
+        assert_eq!(stat.connect_latency_ms, Some(100.0));
+        assert_eq!(stat.download_bytes_per_sec, Some(1_000_000.0));
+        assert_eq!(stat.upload_sample.unwrap().event_count, 32);
+        assert_eq!(stat.udp_upload_bytes_per_sec, Some(500_000.0));
+        assert_eq!(stat.udp_upload_sample.unwrap().event_count, 10);
+    }
+
+    #[tokio::test]
+    async fn connection_retention_can_be_reduced_at_runtime() {
+        let (tx, mut expired_rx) = ConnsActor::spawn(Duration::from_secs(3600));
+        let id = ConnId(9);
+        let ts = Timestamp::now();
+        tx.send(ConnsCmd::Event(DiagEvent::Accept {
+            id,
+            ts,
+            kind: StreamKind::Tcp,
+            src: "127.0.0.1:50000".to_string(),
+            dst: "127.0.0.1:443".to_string(),
+        }))
+        .await
+        .unwrap();
+        tx.send(ConnsCmd::Event(DiagEvent::Finished {
+            id,
+            ts,
+            error: None,
+            bytes_up: 0.0,
+            bytes_down: 0.0,
+        }))
+        .await
+        .unwrap();
+
+        let (response, response_rx) = oneshot::channel();
+        tx.send(ConnsCmd::SetPersist {
+            conn_persist: Duration::ZERO,
+            response,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+
+        let expired = tokio::time::timeout(Duration::from_secs(1), expired_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired, vec![id]);
     }
 }

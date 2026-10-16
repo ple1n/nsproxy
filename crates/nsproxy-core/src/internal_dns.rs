@@ -66,14 +66,16 @@ impl RequestHandler for RequestProxy {
     async fn handle_request<R: ResponseHandler>(
         &self,
         request: &mut Request,
-        mut response_handle: R,
+        response_handle: R,
     ) -> ResponseInfo {
-        request
-            .queries
-            .queries
-            .retain(|query| query.query_type() != RecordType::AAAA);
-
-        self.internal.handle_request(request, response_handle).await
+        self.internal
+            .handle_request(
+                request,
+                ResponseProxy {
+                    internal: response_handle,
+                },
+            )
+            .await
     }
 }
 

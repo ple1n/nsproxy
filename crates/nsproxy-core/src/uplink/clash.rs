@@ -28,10 +28,10 @@ use tun2socks5::dns::{VIRT_IP6_NET, default_virtip6_net};
 // Shorter alias for the commonly used TLS stream type
 type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
-/// Clash-specific profile information
-/// Ephemeral
+/// Parsed Clash data before it is assigned to a user-owned group.
+/// This import object is ephemeral; persisted state stores only groups.
 #[derive(Debug, Clone)]
-pub struct ClashProfile {
+pub struct ClashImport {
     pub tier1_nameservers: BTreeMap<SocketAddr, DNSEndpoints>,
     pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
     pub proxy_domains: HashSet<String>,
@@ -329,8 +329,8 @@ impl TrojanProxy {
     }
 }
 
-impl ClashProfile {
-    /// Import a Clash profile from a YAML file
+impl ClashImport {
+    /// Parse Clash data from a YAML file.
     pub fn load_file(yaml_path: &PathBuf) -> Result<Self> {
         let config =
             Config::try_from(yaml_path.clone()).context("Failed to parse Clash YAML config")?;
@@ -521,16 +521,16 @@ impl ResolutionMetrics {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolveProfileReport {
-    pub solved: ProfileSolved,
+pub struct ResolveGroupReport {
+    pub solved: ResolvedDomains,
     pub metrics: ResolutionMetrics,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct AppendProfileReport {
-    pub added_tier1_nameservers: usize,
-    pub added_tier2_nameservers: usize,
-    pub added_trojan_proxies: usize,
+pub struct GroupImportReport {
+    pub tier1_nameservers: usize,
+    pub tier2_nameservers: usize,
+    pub proxies: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -562,6 +562,8 @@ pub struct ClashGroupState {
     /// Host -> available endpoints
     pub tier2_nameservers: BTreeMap<String, DNSEndpoints>,
     pub tier2_cache: DomainsSolved,
+    pub proxy_domains: BTreeSet<Domain>,
+    pub proxy_configs: BTreeMap<ProxyID, TrojanConfig>,
 }
 
 enum PathAttempt {
@@ -570,53 +572,12 @@ enum PathAttempt {
     Failed(anyhow::Error),
 }
 
-mod trojan_proxy_map_serde {
-    use super::*;
-
-    pub fn serialize<S>(
-        value: &BTreeMap<ProxyID, TrojanConfig>,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let encoded: BTreeMap<String, &TrojanConfig> = value
-            .iter()
-            .map(|(id, cfg)| (hex::encode(id.0), cfg))
-            .collect();
-        encoded.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> std::result::Result<BTreeMap<ProxyID, TrojanConfig>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let encoded = BTreeMap::<String, TrojanConfig>::deserialize(deserializer)?;
-        let mut decoded = BTreeMap::new();
-        for (id_hex, cfg) in encoded {
-            let raw = hex::decode(&id_hex).map_err(serde::de::Error::custom)?;
-            let id: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| serde::de::Error::custom("invalid ProxyID length"))?;
-            decoded.insert(ProxyID(id), cfg);
-        }
-        Ok(decoded)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ClashState {
     pub schema_version: u32,
-    pub domain_group: BTreeMap<Domain, GroupId>,
     pub groups: BTreeMap<GroupId, ClashGroupState>,
-    pub proxies: DomainsSolved,
-    #[serde(default, with = "trojan_proxy_map_serde")]
-    pub trojan_proxies: BTreeMap<ProxyID, TrojanConfig>,
-    #[serde(default)]
-    pub proxy_group: BTreeMap<ProxyID, HashSet<GroupId>>,
+    pub proxy_resolutions: DomainsSolved,
 }
 
 pub type DNSEndpoints = BTreeMap<DNSProtocol, DNSEndpoint>;
@@ -753,12 +714,13 @@ impl ClashState {
             .ok_or_else(|| anyhow::anyhow!("Unknown clash group '{}'", group_id.as_str()))
     }
 
-    fn set_domain_group(&mut self, domain: Domain, group_id: GroupId) {
-        self.domain_group.insert(domain, group_id);
-    }
-
     pub fn group_for_domain(&self, domain: &Domain) -> Option<&GroupId> {
-        self.domain_group.get(domain)
+        self.groups.iter().find_map(|(group_id, group)| {
+            group
+                .proxy_domains
+                .contains(domain)
+                .then_some(group_id)
+        })
     }
 
     pub fn remove_private_ips(&mut self) {
@@ -776,7 +738,7 @@ impl ClashState {
             });
         };
 
-        scrub(&mut self.proxies);
+        scrub(&mut self.proxy_resolutions);
         for group in self.groups.values_mut() {
             scrub(&mut group.tier2_cache);
         }
@@ -787,60 +749,123 @@ impl ClashState {
         );
     }
 
-    pub fn append_profile_to_group(
+    pub fn add_group_import(
         &mut self,
-        profile: &ClashProfile,
+        import: &ClashImport,
         group_id: GroupId,
-    ) -> Result<AppendProfileReport> {
-        let mut report = AppendProfileReport::default();
-        let group = self.ensure_group_mut(&group_id);
+    ) -> Result<GroupImportReport> {
+        Self::validate_group_name(&group_id)?;
+        if self.groups.contains_key(&group_id) {
+            anyhow::bail!(
+                "Clash group '{}' already exists; replace it explicitly",
+                group_id.as_str()
+            );
+        }
+        Ok(self.store_group_import(import, group_id))
+    }
 
-        for (socket, endpoints) in &profile.tier1_nameservers {
-            let current = group
-                .tier1_nameservers
-                .entry(*socket)
-                .or_insert_with(BTreeMap::new);
-            for endpoint in endpoints.values() {
-                if current
-                    .insert(endpoint.proto.clone(), endpoint.clone())
-                    .is_none()
-                {
-                    report.added_tier1_nameservers += 1;
-                }
+    pub fn replace_group_import(
+        &mut self,
+        import: &ClashImport,
+        group_id: GroupId,
+    ) -> Result<GroupImportReport> {
+        Self::validate_group_name(&group_id)?;
+        if !self.groups.contains_key(&group_id) {
+            anyhow::bail!(
+                "Clash group '{}' does not exist; add it as a new group instead",
+                group_id.as_str()
+            );
+        }
+
+        Ok(self.store_group_import(import, group_id))
+    }
+
+    fn validate_group_name(group_id: &GroupId) -> Result<()> {
+        if group_id.as_str().trim().is_empty() {
+            anyhow::bail!("Clash group name cannot be empty");
+        }
+        Ok(())
+    }
+
+    fn store_group_import(
+        &mut self,
+        import: &ClashImport,
+        group_id: GroupId,
+    ) -> GroupImportReport {
+        let replaced_domains = self
+            .groups
+            .get(&group_id)
+            .map(|group| group.proxy_domains.clone())
+            .unwrap_or_default();
+        let proxy_configs: BTreeMap<ProxyID, TrojanConfig> = import
+            .trojan_proxies
+            .iter()
+            .map(|proxy| {
+                (
+                    ProxyID::for_trojan_domain(&proxy.server, proxy.port, &proxy.password),
+                    proxy.clone(),
+                )
+            })
+            .collect();
+        let proxy_domains = import
+            .proxy_domains
+            .iter()
+            .cloned()
+            .map(Domain::from)
+            .collect();
+        let group = ClashGroupState {
+            tier1_nameservers: import.tier1_nameservers.clone(),
+            tier2_nameservers: import.tier2_nameservers.clone(),
+            tier2_cache: DomainsSolved::new(),
+            proxy_domains,
+            proxy_configs,
+        };
+        let report = GroupImportReport {
+            tier1_nameservers: group.tier1_nameservers.values().map(BTreeMap::len).sum(),
+            tier2_nameservers: group.tier2_nameservers.values().map(BTreeMap::len).sum(),
+            proxies: group.proxy_configs.len(),
+        };
+        self.groups.insert(group_id, group);
+        let retained_domains: HashSet<Domain> = self
+            .groups
+            .values()
+            .flat_map(|group| group.proxy_domains.iter().cloned())
+            .collect();
+        self.proxy_resolutions.retain(|domain, _| {
+            !replaced_domains.contains(domain) || retained_domains.contains(domain)
+        });
+        report
+    }
+
+    pub fn all_proxy_configs(&self) -> BTreeMap<ProxyID, TrojanConfig> {
+        let mut configs = BTreeMap::new();
+        for group in self.groups.values() {
+            for (id, config) in &group.proxy_configs {
+                configs.entry(id.clone()).or_insert_with(|| config.clone());
             }
         }
+        configs
+    }
 
-        for (host, endpoints) in &profile.tier2_nameservers {
-            let current = group
-                .tier2_nameservers
-                .entry(host.clone())
-                .or_insert_with(BTreeMap::new);
-            for endpoint in endpoints.values() {
-                if current
-                    .insert(endpoint.proto.clone(), endpoint.clone())
-                    .is_none()
-                {
-                    report.added_tier2_nameservers += 1;
-                }
+    pub fn proxy_group_memberships(&self) -> BTreeMap<ProxyID, HashSet<GroupId>> {
+        let mut memberships = BTreeMap::new();
+        for (group_id, group) in &self.groups {
+            for proxy_id in group.proxy_configs.keys() {
+                memberships
+                    .entry(proxy_id.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(group_id.clone());
             }
         }
+        memberships
+    }
 
-        for domain in &profile.proxy_domains {
-            self.set_domain_group(Domain::from(domain.clone()), group_id.clone());
-        }
-
-        for proxy in &profile.trojan_proxies {
-            let proxy_id = ProxyID::for_trojan_domain(&proxy.server, proxy.port, &proxy.password);
-            if self
-                .trojan_proxies
-                .insert(proxy_id, proxy.clone())
-                .is_none()
-            {
-                report.added_trojan_proxies += 1;
-            }
-        }
-
-        Ok(report)
+    pub fn proxy_domain_count(&self) -> usize {
+        self.groups
+            .values()
+            .flat_map(|group| group.proxy_domains.iter())
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     fn get_latest_ips_in_group(&self, group_id: &GroupId, host: &str) -> Option<&BTreeSet<IpAddr>> {
@@ -885,7 +910,7 @@ impl ClashState {
 
     /// Store latest resolved proxy-domain IPs in the centralized clash state.
     pub fn add_proxy_resolution(&mut self, domain: &str, ips: BTreeSet<IpAddr>) {
-        self.proxies
+        self.proxy_resolutions
             .entry(Domain::from(domain))
             .or_default()
             .insert(Timestamp::now(), DNSResponse { ips });
@@ -893,7 +918,7 @@ impl ClashState {
 
     /// Get latest resolved proxy-domain IPs from centralized clash state.
     pub fn get_latest_proxy_ips(&self, domain: &str) -> Option<&BTreeSet<IpAddr>> {
-        self.proxies
+        self.proxy_resolutions
             .get(&Domain::from(domain))?
             .last_key_value()
             .map(|(_, response)| &response.ips)
@@ -906,7 +931,7 @@ impl ClashState {
         domain: &str,
     ) -> Option<BTreeSet<IpAddr>> {
         let map = match target {
-            ResolutionTargetKind::ProxyDomain => &self.proxies,
+            ResolutionTargetKind::ProxyDomain => &self.proxy_resolutions,
             ResolutionTargetKind::Tier2DnsDomain => &self.groups.get(group_id)?.tier2_cache,
         };
 
@@ -1811,7 +1836,7 @@ impl ClashState {
         hub: Option<&UplinkHub>,
         cancel: Option<&AtomicBool>,
         direct_only: bool,
-        solved: &mut ProfileSolved,
+        solved: &mut ResolvedDomains,
         metrics: &mut ResolutionMetrics,
         refresh: bool,
     ) {
@@ -2040,7 +2065,7 @@ impl ClashState {
         cancel: Option<&AtomicBool>,
         direct_only: bool,
         refresh: bool,
-    ) -> Result<ResolveProfileReport> {
+    ) -> Result<ResolveGroupReport> {
         self.prepare_tier2_dns_via_tier1(group_id, cancel).await?;
 
         let group = self.group(group_id)?;
@@ -2051,13 +2076,9 @@ impl ClashState {
             group.tier2_nameservers.len()
         );
 
-        let domains: Vec<Domain> = self
-            .domain_group
-            .iter()
-            .filter_map(|(domain, gid)| (gid == group_id).then_some(domain.clone()))
-            .collect();
+        let domains: Vec<Domain> = group.proxy_domains.iter().cloned().collect();
 
-        let mut solved = ProfileSolved::new();
+        let mut solved = ResolvedDomains::new();
         let mut metrics = ResolutionMetrics::default();
 
         for domain in domains {
@@ -2087,7 +2108,7 @@ impl ClashState {
             warn!("Failed to persist ClashState: {}", e);
         }
 
-        Ok(ResolveProfileReport { solved, metrics })
+        Ok(ResolveGroupReport { solved, metrics })
     }
 
     /// Resolve exactly one user-supplied domain using proxy-domain path policy.
@@ -2099,7 +2120,7 @@ impl ClashState {
         hub: Option<&UplinkHub>,
         cancel: Option<&AtomicBool>,
         direct_only: bool,
-    ) -> Result<ResolveProfileReport> {
+    ) -> Result<ResolveGroupReport> {
         let mut working = self.clone();
         let domain_key = Domain::from(domain);
         let group_id = working
@@ -2115,7 +2136,7 @@ impl ClashState {
             group.tier2_nameservers.len()
         );
 
-        let mut solved = ProfileSolved::new();
+        let mut solved = ResolvedDomains::new();
         let mut metrics = ResolutionMetrics::default();
 
         if cancel
@@ -2126,7 +2147,7 @@ impl ClashState {
                 "resolve_one_domain_cancelled domain={} before start=true",
                 domain
             );
-            return Ok(ResolveProfileReport { solved, metrics });
+            return Ok(ResolveGroupReport { solved, metrics });
         }
 
         working
@@ -2143,7 +2164,7 @@ impl ClashState {
             )
             .await;
 
-        Ok(ResolveProfileReport { solved, metrics })
+        Ok(ResolveGroupReport { solved, metrics })
     }
 }
 
@@ -2152,5 +2173,184 @@ impl PersistentState for ClashState {
 
     fn path() -> PathBuf {
         state_paths::uplink_clash_state()
+    }
+}
+
+#[cfg(test)]
+mod group_import_tests {
+    use super::*;
+
+    fn import(proxy_name: &str, domain: &str) -> ClashImport {
+        let proxy = TrojanConfig {
+            name: proxy_name.to_string(),
+            server: domain.to_string(),
+            port: 443,
+            password: format!("password-{proxy_name}"),
+        };
+        ClashImport {
+            tier1_nameservers: BTreeMap::new(),
+            tier2_nameservers: BTreeMap::new(),
+            proxy_domains: HashSet::from([domain.to_string()]),
+            trojan_proxies: vec![proxy],
+        }
+    }
+
+    #[test]
+    fn imported_proxies_are_owned_by_their_user_groups() {
+        let import = import("example", "proxy.example.test");
+        let first_group = GroupId::from("first");
+        let second_group = GroupId::from("second");
+        let proxy_id = ProxyID::for_trojan_domain(
+            "proxy.example.test",
+            443,
+            "password-example",
+        );
+        let mut state = ClashState::default();
+
+        state.add_group_import(&import, first_group.clone()).unwrap();
+        state.add_group_import(&import, second_group.clone()).unwrap();
+
+        assert_eq!(
+            state.proxy_group_memberships().get(&proxy_id),
+            Some(&HashSet::from([first_group, second_group]))
+        );
+
+        let json = serde_json::to_vec(&state).unwrap();
+        let restored: ClashState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            restored.proxy_group_memberships(),
+            state.proxy_group_memberships()
+        );
+        assert_eq!(restored.all_proxy_configs().len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_group_removes_its_old_contents_only() {
+        let mut first = import("first", "first.example.test");
+        let second = import("second", "second.example.test");
+        let mut replacement = import("replacement", "replacement.example.test");
+        let first_group = GroupId::from("first");
+        let second_group = GroupId::from("second");
+        let old_id =
+            ProxyID::for_trojan_domain("first.example.test", 443, "password-first");
+        let replacement_id = ProxyID::for_trojan_domain(
+            "replacement.example.test",
+            443,
+            "password-replacement",
+        );
+        let second_id =
+            ProxyID::for_trojan_domain("second.example.test", 443, "password-second");
+        let old_dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let new_dns: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        first.tier1_nameservers.insert(
+            old_dns,
+            BTreeMap::from([(
+                DNSProtocol::UDP,
+                DNSEndpoint {
+                    proto: DNSProtocol::UDP,
+                    port: 53,
+                },
+            )]),
+        );
+        replacement.tier1_nameservers.insert(
+            new_dns,
+            BTreeMap::from([(
+                DNSProtocol::UDP,
+                DNSEndpoint {
+                    proto: DNSProtocol::UDP,
+                    port: 53,
+                },
+            )]),
+        );
+        let mut state = ClashState::default();
+
+        state.add_group_import(&first, first_group.clone()).unwrap();
+        state.add_group_import(&second, second_group.clone()).unwrap();
+        state.add_proxy_resolution(
+            "first.example.test",
+            BTreeSet::from(["192.0.2.10".parse().unwrap()]),
+        );
+        state
+            .replace_group_import(&replacement, first_group.clone())
+            .unwrap();
+
+        assert!(!state.groups[&first_group]
+            .proxy_configs
+            .contains_key(&old_id));
+        assert!(state.groups[&first_group]
+            .proxy_configs
+            .contains_key(&replacement_id));
+        assert!(state.groups[&second_group]
+            .proxy_configs
+            .contains_key(&second_id));
+        assert!(state.groups[&first_group]
+            .tier1_nameservers
+            .contains_key(&new_dns));
+        assert!(!state.groups[&first_group]
+            .tier1_nameservers
+            .contains_key(&old_dns));
+        assert_eq!(
+            state.group_for_domain(&Domain::from("first.example.test")),
+            None
+        );
+        assert!(
+            state
+                .get_latest_proxy_ips("first.example.test")
+                .is_none()
+        );
+        assert_eq!(
+            state.group_for_domain(&Domain::from("replacement.example.test")),
+            Some(&first_group)
+        );
+        assert_eq!(state.all_proxy_configs().len(), 2);
+    }
+
+    #[test]
+    fn replacing_one_group_keeps_dns_cache_shared_by_another_group() {
+        let shared = import("shared", "shared.example.test");
+        let replacement = import("replacement", "replacement.example.test");
+        let first_group = GroupId::from("first");
+        let second_group = GroupId::from("second");
+        let mut state = ClashState::default();
+
+        state
+            .add_group_import(&shared, first_group.clone())
+            .unwrap();
+        state
+            .add_group_import(&shared, second_group.clone())
+            .unwrap();
+        state.add_proxy_resolution(
+            "shared.example.test",
+            BTreeSet::from(["192.0.2.11".parse().unwrap()]),
+        );
+        state
+            .replace_group_import(&replacement, first_group)
+            .unwrap();
+
+        assert!(
+            state
+                .get_latest_proxy_ips("shared.example.test")
+                .is_some()
+        );
+        assert_eq!(
+            state.group_for_domain(&Domain::from("shared.example.test")),
+            Some(&second_group)
+        );
+    }
+
+    #[test]
+    fn adding_an_existing_group_requires_explicit_replacement() {
+        let import = import("first", "first.example.test");
+        let group_id = GroupId::from("first");
+        let mut state = ClashState::default();
+
+        state.add_group_import(&import, group_id.clone()).unwrap();
+        assert!(state.add_group_import(&import, group_id).is_err());
+        assert_eq!(state.groups.len(), 1);
+        assert!(
+            ClashState::default()
+                .replace_group_import(&import, GroupId::from("missing"))
+                .is_err()
+        );
     }
 }

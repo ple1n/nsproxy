@@ -247,6 +247,14 @@ pub struct ContainerState {
     /// Used by the Traffic tab Connections sub-view.
     #[serde(skip)]
     pub conns_state: diag::ConnsState,
+    /// Serve-computed per-target, per-route TCP performance estimates.
+    #[serde(skip)]
+    pub host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
+    /// Render-ready newest-first indexes for the connection tables.
+    #[serde(skip)]
+    pub active_conn_ids: Vec<diag::ConnId>,
+    #[serde(skip)]
+    pub finished_conn_ids: Vec<diag::ConnId>,
     /// Raw PTY bytes received since the previous snapshot, keyed by slot PID.
     #[serde(skip)]
     pub pty_streams: HashMap<u32, Vec<u8>>,
@@ -339,8 +347,21 @@ pub enum TabKind {
     ProfileEditor,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ClashGroupImportCompletion {
+    pub group_id: String,
+    pub replace: bool,
+    pub result: Option<Result<String, String>>,
+}
+
 #[derive(Debug)]
 pub enum SupervisorCommand {
+    ImportClashGroup {
+        group_id: String,
+        path: PathBuf,
+        replace: bool,
+        result_tx: flume::Sender<ClashGroupImportCompletion>,
+    },
     StartUp {
         profile: ContainerName,
     },
@@ -811,6 +832,8 @@ struct DiagState {
     dns_state: Option<diag::DnsState>,
     routing_state: Option<diag::RoutingState>,
     proxy_stats: HashMap<ProxyID, ProxyStats>,
+    host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
+    host_route_snapshot_at: diag::Timestamp,
     /// Rolling local copy of raw `DiagEvent`s (traffic log).
     /// Gets pre-populated via `QueryRecentDiagEvents` when first accessed.
     diag_event_log: VecDeque<DiagEvent>,
@@ -819,6 +842,8 @@ struct DiagState {
     /// on `ConnsStateSnapshot` (from `QueryConnsState`).
     conns_state: diag::ConnsState,
 }
+
+const MAX_TRAFFIC_HOST_ROUTE_METRICS: usize = 512;
 
 /// Cached disk state for a profile — hotconfig + template.
 /// Refreshed explicitly on Load/Reload commands; used by emit_snapshot to avoid
@@ -834,6 +859,11 @@ struct CachedProfileConfig {
 
 #[derive(Debug, Clone)]
 enum PendingRootDaemonOp {
+    ImportClashGroup {
+        group_id: String,
+        replace: bool,
+        result_tx: flume::Sender<ClashGroupImportCompletion>,
+    },
     InitializeBasisNamespace,
     SaveHotconfig { profile: ContainerName },
     SaveProfile { profile: ContainerName },
@@ -870,6 +900,8 @@ impl Default for DiagState {
             dns_state: None,
             routing_state: None,
             proxy_stats: HashMap::new(),
+            host_route_stats: Arc::new(Vec::new()),
+            host_route_snapshot_at: diag::Timestamp::default(),
             diag_event_log: VecDeque::new(),
             conns_state: diag::ConnsState::default(),
         }
@@ -889,6 +921,7 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
         SupervisorCommand::StopServe { .. } => "StopServe",
         SupervisorCommand::StartDaemon { .. } => "StartDaemon",
         SupervisorCommand::CreateVeth { .. } => "CreateVeth",
+        SupervisorCommand::ImportClashGroup { .. } => "ImportClashGroup",
         SupervisorCommand::SaveHotconfigPrivileged { .. } => "SaveHotconfigPrivileged",
         SupervisorCommand::SaveProfilePrivileged { .. } => "SaveProfilePrivileged",
         SupervisorCommand::SaveConstantsPrivileged { .. } => "SaveConstantsPrivileged",
@@ -958,6 +991,7 @@ fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
         | SupervisorCommand::RefreshNamespaces
         | SupervisorCommand::Init
         | SupervisorCommand::SetTrafficSubscription { profile: None } => None,
+        SupervisorCommand::ImportClashGroup { .. } => None,
     }
 }
 
@@ -984,7 +1018,9 @@ fn diag_event_name(event: &DiagEvent) -> &'static str {
         DiagEvent::Dispatched { .. } => "Dispatched",
         DiagEvent::Route { .. } => "Route",
         DiagEvent::Connected { .. } => "Connected",
+        DiagEvent::AttemptFailed { .. } => "AttemptFailed",
         DiagEvent::Finished { .. } => "Finished",
+        DiagEvent::Killed { .. } => "Killed",
         DiagEvent::DnsResolved { .. } => "DnsResolved",
         DiagEvent::DnsQuery { .. } => "DnsQuery",
         DiagEvent::Wait { .. } => "Wait",
@@ -994,6 +1030,9 @@ fn diag_event_name(event: &DiagEvent) -> &'static str {
         DiagEvent::DnsState { .. } => "DnsState",
         DiagEvent::RoutingState { .. } => "RoutingState",
         DiagEvent::UplinkStatsSnapshot { .. } => "UplinkStatsSnapshot",
+        DiagEvent::HostRouteStatsSnapshot { .. } => "HostRouteStatsSnapshot",
+        DiagEvent::HostRouteStatsUpdated { .. } => "HostRouteStatsUpdated",
+        DiagEvent::ConnectionsExpired { .. } => "ConnectionsExpired",
         DiagEvent::Log(_) => "Log",
         DiagEvent::RecentLogs(_) => "RecentLogs",
         DiagEvent::RecentDiagEvents(_) => "RecentDiagEvents",
@@ -1186,6 +1225,7 @@ impl Supervisor {
             PendingRootDaemonOp::SaveHotconfig { profile }
             | PendingRootDaemonOp::SaveProfile { profile } => Some(profile.clone()),
             PendingRootDaemonOp::SaveConstants | PendingRootDaemonOp::LoadConstants => None,
+            PendingRootDaemonOp::ImportClashGroup { .. } => None,
             PendingRootDaemonOp::CreateProfile { name } => Some(name.clone()),
         };
         let status = EditorStatus {
@@ -1202,6 +1242,7 @@ impl Supervisor {
             PendingRootDaemonOp::SaveProfile { .. } | PendingRootDaemonOp::CreateProfile { .. } => {
                 self.profile_editor_status = Some(status);
             }
+            PendingRootDaemonOp::ImportClashGroup { .. } => {}
             PendingRootDaemonOp::SaveConstants | PendingRootDaemonOp::LoadConstants => {
                 self.constants_editor_status = Some(status);
             }
@@ -1454,11 +1495,19 @@ impl Supervisor {
             return;
         };
 
-        hotconfig.route = match &routing.selected_proxy {
-            Some(proxy_id) => HotRoute::SimpleProxy {
+        hotconfig.route = match (
+            &routing.selected_proxy,
+            &routing.selected_group,
+            routing.no_proxy,
+        ) {
+            (_, _, true) => HotRoute::NoProxy,
+            (_, Some(group_id), false) => HotRoute::Group {
+                group_id: group_id.clone(),
+            },
+            (Some(proxy_id), _, false) => HotRoute::SimpleProxy {
                 proxy_id: proxy_id.clone(),
             },
-            None => HotRoute::None,
+            (None, None, false) => HotRoute::None,
         };
     }
 
@@ -1806,7 +1855,6 @@ impl Supervisor {
                         simple: None,
                         no_default: false,
                         log: None,
-                        clash: None,
                         no_dns_capture: None,
                         internal_dns_server: None,
                         history_listen: DEFAULT_HISTORY_LISTEN
@@ -1882,6 +1930,25 @@ impl Supervisor {
                         prefix_len,
                     },
                     "temporary",
+                );
+            }
+            SupervisorCommand::ImportClashGroup {
+                group_id,
+                path,
+                replace,
+                result_tx,
+            } => {
+                self.queue_root_daemon_op(
+                    diag::RootDaemonOp::ImportClashGroup {
+                        group_id: group_id.clone(),
+                        path,
+                        replace,
+                    },
+                    PendingRootDaemonOp::ImportClashGroup {
+                        group_id: group_id.clone(),
+                        replace,
+                        result_tx,
+                    },
                 );
             }
             SupervisorCommand::SaveHotconfigPrivileged { profile, content } => {
@@ -2276,22 +2343,7 @@ impl Supervisor {
             }
             SupervisorCommand::Ctrl { profile, cmd } => {
                 info!(profile = profile.as_str(), cmd = ?cmd, "dispatching diag control command");
-                let selected_proxy = match &cmd {
-                    ControlCommand::SetSimpleRouting { proxy_id } => Some(proxy_id.clone()),
-                    _ => None,
-                };
-                if let Some(proxy_id) = selected_proxy.as_ref() {
-                    self.diag_state
-                        .entry(profile.clone())
-                        .or_default()
-                        .routing_state = Some(diag::RoutingState {
-                        selected_proxy: Some(proxy_id.clone()),
-                    });
-                }
                 let _ = self.send_diag_cmd(&profile, cmd);
-                if selected_proxy.is_some() {
-                    let _ = self.send_diag_cmd(&profile, ControlCommand::QueryRoutingState);
-                }
             }
             SupervisorCommand::ReloadHotconfig(profile) => {
                 info!(profile = profile.as_str(), "reloading hotconfig");
@@ -2549,7 +2601,11 @@ impl Supervisor {
                 state.conns_state.apply_event(&event);
                 const MAX_DIAG_EVENTS: usize = 512;
                 match &event {
-                    DiagEvent::RecentDiagEvents(_) | DiagEvent::ConnsStateSnapshot { .. } => {}
+                    DiagEvent::RecentDiagEvents(_)
+                    | DiagEvent::ConnsStateSnapshot { .. }
+                    | DiagEvent::HostRouteStatsSnapshot { .. }
+                    | DiagEvent::HostRouteStatsUpdated { .. }
+                    | DiagEvent::ConnectionsExpired { .. } => {}
                     _ => {
                         state.diag_event_log.push_back(event.clone());
                         if state.diag_event_log.len() > MAX_DIAG_EVENTS {
@@ -2562,7 +2618,81 @@ impl Supervisor {
                     DiagEvent::RoutingState { state: routing, .. } => {
                         state.routing_state = Some(routing)
                     }
+                    DiagEvent::HotConfigSnapshot {
+                        ok: true,
+                        content: Some(content),
+                        ..
+                    } => match serde_json::from_str::<HotConfig>(&content) {
+                        Ok(hotconfig) => {
+                            if let Some(cached) = self.config_cache.get_mut(&profile) {
+                                match serde_json::to_value(&hotconfig) {
+                                    Ok(value) => cached.hotconfig_value = value,
+                                    Err(err) => warn!(
+                                        profile = profile.as_str(),
+                                        %err,
+                                        "failed to encode live hotconfig snapshot"
+                                    ),
+                                }
+                                cached.hotconfig = hotconfig;
+                            } else {
+                                warn!(
+                                    profile = profile.as_str(),
+                                    "received live hotconfig snapshot without a profile config cache"
+                                );
+                            }
+                        }
+                        Err(err) => warn!(
+                            profile = profile.as_str(),
+                            %err,
+                            "failed to parse live hotconfig snapshot"
+                        ),
+                    },
+                    DiagEvent::HotConfigSnapshot {
+                        ok: false, error, ..
+                    } => {
+                        warn!(
+                            profile = profile.as_str(),
+                            error = error.as_deref().unwrap_or("unknown error"),
+                            "serve rejected hotconfig update"
+                        );
+                    }
                     DiagEvent::UplinkStatsSnapshot { stats, .. } => state.proxy_stats = stats,
+                    DiagEvent::HostRouteStatsSnapshot { ts, mut stats } => {
+                        if ts >= state.host_route_snapshot_at {
+                            let mut by_key: HashMap<
+                                nsproxy_common::stats::HostRouteKey,
+                                nsproxy_common::stats::HostRouteMetric,
+                            > = stats
+                                .drain(..)
+                                .map(|metric| (metric.key.clone(), metric))
+                                .collect();
+                            for metric in state
+                                .host_route_stats
+                                .iter()
+                                .filter(|metric| metric.observed_at >= ts)
+                            {
+                                by_key.insert(metric.key.clone(), metric.clone());
+                            }
+                            let mut merged: Vec<_> = by_key.into_values().collect();
+                            sort_host_route_metrics(&mut merged);
+                            state.host_route_snapshot_at = ts;
+                            state.host_route_stats = Arc::new(merged);
+                        }
+                    }
+                    DiagEvent::HostRouteStatsUpdated { stat, .. } => {
+                        if stat.observed_at >= state.host_route_snapshot_at {
+                            let mut stats = (*state.host_route_stats).clone();
+                            match stats.iter_mut().find(|metric| metric.key == stat.key) {
+                                Some(existing) if existing.observed_at <= stat.observed_at => {
+                                    *existing = stat;
+                                }
+                                Some(_) => {}
+                                None => stats.push(stat),
+                            }
+                            sort_host_route_metrics(&mut stats);
+                            state.host_route_stats = Arc::new(stats);
+                        }
+                    }
                     DiagEvent::Log(entry) => {
                         push_profile_log(&mut self.up_logs, &profile, LogSource::Serve, entry);
                     }
@@ -2859,6 +2989,25 @@ impl Supervisor {
             }
                     SupervisorEvent::RootDaemonEvent { event } => {
                 let pending = self.pending_root_daemon_ops.remove(&event.op_id);
+                if let Some(PendingRootDaemonOp::ImportClashGroup {
+                    group_id,
+                    replace,
+                    result_tx,
+                }) = pending.as_ref()
+                {
+                    let result = match &event.result {
+                        diag::RootDaemonResult::Ok { message, .. } => Ok(message.clone()),
+                        diag::RootDaemonResult::Error { message, .. } => Err(message.clone()),
+                        _ => Err("Unexpected root-daemon response to Clash group import".to_owned()),
+                    };
+                    if let Err(error) = result_tx.send(ClashGroupImportCompletion {
+                        group_id: group_id.clone(),
+                        replace: *replace,
+                        result: Some(result),
+                    }) {
+                        warn!("Clash group import result receiver dropped: {error}");
+                    }
+                }
                 match event.result {
                     diag::RootDaemonResult::Pong { version } => {
                         if let Some(op) = pending.as_ref() {
@@ -2904,6 +3053,7 @@ impl Supervisor {
                                 }
                                 PendingRootDaemonOp::SaveConstants => {}
                                 PendingRootDaemonOp::LoadConstants => {}
+                                PendingRootDaemonOp::ImportClashGroup { .. } => {}
                                 PendingRootDaemonOp::CreateProfile { name } => {
                                     self.known_profiles.insert(name.clone());
                                     self.refresh_config_cache(name);
@@ -3291,6 +3441,7 @@ impl Supervisor {
                 },
             );
             let _ = self.send_diag_cmd(&profile, ControlCommand::QueryConnsState);
+            let _ = self.send_diag_cmd(&profile, ControlCommand::QueryHostRouteStats);
         }
     }
 
@@ -3671,6 +3822,24 @@ impl Supervisor {
                         TrafficSnapshot::default()
                     },
                     proxy_stats: diag.map(|d| d.proxy_stats.clone()).unwrap_or_default(),
+                    host_route_stats: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| d.host_route_stats.clone())
+                            .unwrap_or_else(|| Arc::new(Vec::new()))
+                    } else {
+                        Arc::new(Vec::new())
+                    },
+                    active_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| connection_ids(&d.conns_state, false))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                    finished_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| connection_ids(&d.conns_state, true))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     hotconfig_value,
                     template_value,
                     ns_alive,
@@ -4789,6 +4958,42 @@ fn daemon_key(profile: &ContainerName, args: &ShellArgs) -> String {
     format!("{}:{:x}", profile, hasher.finish())
 }
 
+fn connection_ids(state: &diag::ConnsState, finished: bool) -> Vec<diag::ConnId> {
+    state
+        .conns
+        .iter()
+        .rev()
+        .filter_map(|(id, entry)| (entry.finished_at.is_some() == finished).then_some(*id))
+        .collect()
+}
+
+fn sort_host_route_metrics(metrics: &mut Vec<nsproxy_common::stats::HostRouteMetric>) {
+    let mut by_key: HashMap<
+        nsproxy_common::stats::HostRouteKey,
+        nsproxy_common::stats::HostRouteMetric,
+    > = HashMap::with_capacity(metrics.len());
+    for metric in metrics.drain(..) {
+        match by_key.entry(metric.key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().observed_at <= metric.observed_at {
+                    entry.insert(metric);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(metric);
+            }
+        }
+    }
+    metrics.extend(by_key.into_values());
+    metrics.sort_by(|left, right| {
+        right
+            .last_observed
+            .cmp(&left.last_observed)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    metrics.truncate(MAX_TRAFFIC_HOST_ROUTE_METRICS);
+}
+
 fn build_diag_summary(state: &DiagState) -> Option<DiagSummary> {
     if state.accumulator.conns.is_empty() {
         return None;
@@ -4825,13 +5030,18 @@ fn diag_event_is_traffic_only(event: &DiagEvent) -> bool {
             | DiagEvent::Dispatched { .. }
             | DiagEvent::Route { .. }
             | DiagEvent::Connected { .. }
+            | DiagEvent::AttemptFailed { .. }
             | DiagEvent::Finished { .. }
+            | DiagEvent::Killed { .. }
             | DiagEvent::DnsResolved { .. }
             | DiagEvent::DnsQuery { .. }
             | DiagEvent::Wait { .. }
             | DiagEvent::WaitEnded { .. }
             | DiagEvent::RecentDiagEvents(_)
             | DiagEvent::ConnsStateSnapshot { .. }
+            | DiagEvent::HostRouteStatsSnapshot { .. }
+            | DiagEvent::HostRouteStatsUpdated { .. }
+            | DiagEvent::ConnectionsExpired { .. }
     )
 }
 

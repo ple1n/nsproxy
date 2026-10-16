@@ -190,6 +190,30 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
+    #[test]
+    fn hotconfig_defaults_connection_retention_to_five_minutes() {
+        assert_eq!(HotConfig::default().diag_conn_persist_secs, 300);
+        let old_config: HotConfig = serde_json::from_str(
+            r#"{"dns":{},"tun":{},"devs":{},"mnt":{},"locals":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(old_config.diag_conn_persist_secs, 300);
+        assert!(old_config.host_routes.is_empty());
+    }
+
+    #[test]
+    fn hotconfig_persists_host_wide_route_overrides() {
+        let mut config = HotConfig::default();
+        config.host_routes.push(HostRouteRule {
+            host: nsproxy_common::stats::HostRouteHost::domain("Example.COM."),
+            target: nsproxy_common::stats::ObservedRoute::NoProxy,
+        });
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: HotConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.host_routes, config.host_routes);
+    }
+
     /// Verify that the no_dns_capture sentinel ("0.0.0.0/32") matches no real IP.
     #[test]
     fn test_no_dns_capture_sentinel_matches_nothing() {
@@ -296,10 +320,12 @@ mod tests {
                 dns_capture: Default::default(),
                 resolv_conf_dns: default_resolv_conf_dns(),
                 route: HotRoute::None,
+                host_routes: Vec::new(),
                 mounts: Vec::new(),
                 daemons: Vec::new(),
                 applications: Vec::new(),
                 veth: Vec::new(),
+                diag_conn_persist_secs: default_diag_conn_persist_secs(),
             }),
             sargs: shell::ShellArgs {
                 uid: None,
@@ -1006,9 +1032,19 @@ pub enum HotRoute {
     None,
     /// Route all normal proxyable traffic through one specific uplink proxy.
     SimpleProxy { proxy_id: ProxyID },
+    /// Route traffic without using a proxy.
+    NoProxy,
+    /// Route traffic through the healthiest and fastest available member of a user group.
+    Group { group_id: String },
 }
 
 impl HotRoute {}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct HostRouteRule {
+    pub host: nsproxy_common::stats::HostRouteHost,
+    pub target: nsproxy_common::stats::ObservedRoute,
+}
 
 /// An application that can be launched on demand from a profile's Actions UI.
 /// Unlike `daemons`, applications are never started implicitly on reload.
@@ -1024,7 +1060,7 @@ pub struct LaunchableApp {
     pub command: ShellArgs,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HotConfig {
     /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
@@ -1054,6 +1090,9 @@ pub struct HotConfig {
     /// Persisted live routing selection for the running serve process.
     #[serde(default)]
     pub route: HotRoute,
+    /// Per-host routing overrides applied before the profile-wide route.
+    #[serde(default)]
+    pub host_routes: Vec<HostRouteRule>,
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
@@ -1066,6 +1105,32 @@ pub struct HotConfig {
     /// Veth pairs to create whenever this profile's container starts.
     #[serde(default)]
     pub veth: Vec<HotVeth>,
+    /// Seconds to retain completed TCP/UDP diagnostics; zero disables finished-entry retention.
+    #[serde(default = "default_diag_conn_persist_secs")]
+    pub diag_conn_persist_secs: u32,
+}
+
+impl Default for HotConfig {
+    fn default() -> Self {
+        Self {
+            dns: HashMap::new(),
+            x11: false,
+            wayland: false,
+            tun: HashMap::new(),
+            devs: HashMap::new(),
+            mnt: HashMap::new(),
+            locals: HashMap::new(),
+            dns_capture: HashSet::new(),
+            resolv_conf_dns: String::new(),
+            route: HotRoute::default(),
+            host_routes: Vec::new(),
+            mounts: Vec::new(),
+            daemons: Vec::new(),
+            applications: Vec::new(),
+            veth: Vec::new(),
+            diag_conn_persist_secs: default_diag_conn_persist_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
@@ -1103,6 +1168,10 @@ fn default_veth_source() -> String {
 
 fn default_veth_prefix_len() -> u8 {
     30
+}
+
+fn default_diag_conn_persist_secs() -> u32 {
+    300
 }
 
 pub fn default_hotconfig() -> HotConfig {
@@ -2285,6 +2354,11 @@ pub enum MainCommand {
         #[command(flatten)]
         eargs: EnterArgs,
     },
+    /// Run a command in a temporary Overlay container that is removed on exit.
+    Temp {
+        #[command(flatten)]
+        eargs: EnterArgs,
+    },
 
     /// Install nsproxy to a folder
     Install {
@@ -2423,9 +2497,6 @@ pub enum MainCommand {
         #[arg(short, long)]
         #[serde(with = "level_filter_serde")]
         log: Option<LevelFilter>,
-        /// Use Clash uplink profile for all TUN connections
-        #[arg(long)]
-        clash: Option<String>,
         // Optional override for HotConfig. When omitted, honor hot.json.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         no_dns_capture: Option<bool>,
@@ -2582,16 +2653,23 @@ pub enum UplinkInstanceCommand {
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum ClashOps {
-    /// Import Clash config data into global clash state for a group
+    /// Add a new user-owned group from a Clash YAML config.
     ConfigAdd {
-        /// Target group id for nameservers + domains
+        /// Name of the new group
+        group_id: String,
+        /// Path to Clash YAML config file
+        path: PathBuf,
+    },
+    /// Replace all data in an existing user-owned group from a Clash YAML config.
+    ConfigReplace {
+        /// Name of the group to replace
         group_id: String,
         /// Path to Clash YAML config file
         path: PathBuf,
     },
     /// Show status of imported Clash groups and cached proxies
     List,
-    /// Analyze a Clash profile and explain the two-tier DNS bootstrap process
+    /// Analyze a Clash config and explain the two-tier DNS bootstrap process
     ConfigExplain {
         /// Path to Clash YAML config file
         path: PathBuf,
@@ -2770,7 +2848,6 @@ mod cli_fd_tests {
                 simple: Some(nsproxy_common::routing::ProxyNym("geph".into())),
                 no_default: false,
                 log: Some(LevelFilter::DEBUG),
-                clash: None,
                 no_dns_capture: Some(true),
                 internal_dns_server: Some(false),
                 history_listen: default_history_listen(),
@@ -2794,6 +2871,35 @@ mod cli_fd_tests {
                 simulate_slow_shutdown: false,
             },
         });
+    }
+
+    #[test]
+    fn roundtrip_temp() {
+        roundtrip(Cli {
+            conf: None,
+            root: None,
+            no_wrap_check: false,
+            control_socket: None,
+            cmd: MainCommand::Temp {
+                eargs: EnterArgs {
+                    uid: Some(0),
+                    gid: None,
+                    cwd: None,
+                    gids: Vec::new(),
+                    command: vec!["fish".into(), "-l".into()],
+                },
+            },
+        });
+    }
+
+    #[test]
+    fn parse_temp_with_enter_options() {
+        let cli = Cli::try_parse_from(["sp", "temp", "-u", "1000", "fish", "-l"]).unwrap();
+        let MainCommand::Temp { eargs } = cli.cmd else {
+            panic!("expected temp command");
+        };
+        assert_eq!(eargs.uid, Some(1000));
+        assert_eq!(eargs.command, ["fish", "-l"]);
     }
 
     #[test]

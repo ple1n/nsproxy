@@ -38,6 +38,69 @@ pub enum HotReloadTrigger {
     },
 }
 
+fn routing_state_for_config(config: &HotConfig) -> diag::RoutingState {
+    match &config.route {
+        HotRoute::None => diag::RoutingState {
+            selected_proxy: None,
+            selected_group: None,
+            no_proxy: false,
+        },
+        HotRoute::NoProxy => diag::RoutingState {
+            selected_proxy: None,
+            selected_group: None,
+            no_proxy: true,
+        },
+        HotRoute::SimpleProxy { proxy_id } => diag::RoutingState {
+            selected_proxy: Some(proxy_id.clone()),
+            selected_group: None,
+            no_proxy: false,
+        },
+        HotRoute::Group { group_id } => diag::RoutingState {
+            selected_proxy: None,
+            selected_group: Some(group_id.clone()),
+            no_proxy: false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod route_state_tests {
+    use super::*;
+
+    #[test]
+    fn routing_state_reflects_the_configured_route() {
+        let proxy_id = nsproxy_common::routing::ProxyID([7; 32]);
+        let mut config = HotConfig::default();
+
+        let state = routing_state_for_config(&config);
+        assert!(state.selected_proxy.is_none());
+        assert!(state.selected_group.is_none());
+        assert!(!state.no_proxy);
+
+        config.route = HotRoute::NoProxy;
+        let state = routing_state_for_config(&config);
+        assert!(state.selected_proxy.is_none());
+        assert!(state.selected_group.is_none());
+        assert!(state.no_proxy);
+
+        config.route = HotRoute::SimpleProxy {
+            proxy_id: proxy_id.clone(),
+        };
+        let state = routing_state_for_config(&config);
+        assert_eq!(state.selected_proxy, Some(proxy_id));
+        assert!(state.selected_group.is_none());
+        assert!(!state.no_proxy);
+
+        config.route = HotRoute::Group {
+            group_id: "fedora".to_string(),
+        };
+        let state = routing_state_for_config(&config);
+        assert!(state.selected_proxy.is_none());
+        assert_eq!(state.selected_group.as_deref(), Some("fedora"));
+        assert!(!state.no_proxy);
+    }
+}
+
 fn async_watcher() -> notify::Result<(RecommendedWatcher, sync::mpsc::Receiver<()>)> {
     let (mut tx, rx) = tokio::sync::mpsc::channel(1);
     let tx1 = tx.clone();
@@ -765,6 +828,15 @@ pub async fn watch_hot(
             let desired_state = derive_desired_state(&desired);
             let diff = calculate_hot_diff(applied_state.as_ref(), &desired_state);
             if diff.is_empty() {
+                {
+                    let mut live = live_hot.write().await;
+                    *live = desired.clone();
+                }
+                let _ = hot_tx.send(desired.clone());
+                diag.emit(DiagEvent::RoutingState {
+                    ts: Timestamp::now(),
+                    state: routing_state_for_config(&desired),
+                });
                 diag.emit(DiagEvent::HotConfigReloaded {
                     ts: Timestamp::now(),
                     ok: true,
@@ -804,6 +876,10 @@ pub async fn watch_hot(
                         *live = desired.clone();
                     }
                     let _ = hot_tx.send(desired.clone());
+                    diag.emit(DiagEvent::RoutingState {
+                        ts: Timestamp::now(),
+                        state: routing_state_for_config(&desired),
+                    });
                     diag.emit(DiagEvent::HotConfigReloaded {
                         ts: Timestamp::now(),
                         ok: true,

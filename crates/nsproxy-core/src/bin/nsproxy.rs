@@ -817,6 +817,7 @@ fn should_log_process(cli: &Cli) -> bool {
     matches!(
         &cli.cmd,
         MainCommand::Enter { .. }
+            | MainCommand::Temp { .. }
             | MainCommand::Socks5 { .. }
             | MainCommand::Up { cmd: None, .. }
             | MainCommand::Serve { .. }
@@ -827,6 +828,211 @@ fn should_log_process(cli: &Cli) -> bool {
             }
             | MainCommand::Daemon { cmd: None }
     )
+}
+
+fn temp_command_slug(command: &str) -> String {
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(command);
+    let slug: String = executable
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if character == '-' || character == '_' || character.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .take(5)
+        .collect();
+    if slug.is_empty() {
+        "cmd".to_string()
+    } else {
+        slug
+    }
+}
+
+fn temp_profile_name(command: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let timestamp = chrono::Utc::now();
+    let timestamp_text =
+        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let timestamp_hash = blake3::hash(timestamp_text.as_bytes());
+    let timestamp_suffix = URL_SAFE_NO_PAD.encode(timestamp_hash.as_bytes());
+    format!("{}-{}", temp_command_slug(command), &timestamp_suffix[..4])
+}
+
+fn wait_for_temp_profile(profile: &str, up_child: &mut std::process::Child) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = up_child.try_wait()? {
+            bail!("temporary profile startup exited with status {status}");
+        }
+        if let Some(ns_alive) = read_ns_alive_opt(&state_paths::profile_ns_meta(profile))
+            && ns_alive.child_pid.is_some()
+            && state_paths::profile_netns_bind(profile).exists()
+            && read_sandbox_status(profile).is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for temporary profile '{profile}' to start");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_temp_command(eargs: nsproxy_core::shell::EnterArgs) -> Result<()> {
+    let command = eargs
+        .command
+        .first()
+        .ok_or_else(|| anyhow!("sp temp requires a command"))?;
+    let profile = temp_profile_name(command);
+    let state_root = state_paths::persist_root();
+
+    let mut up_child = None;
+    let mut profile_dir_created = false;
+    let run_result = (|| {
+        let profile_dir = state_paths::profile_dir(&profile);
+        fs::create_dir_all(state_paths::config_root())?;
+        fs::create_dir(&profile_dir)?;
+        profile_dir_created = true;
+        let profile_hot_path = state_paths::hot_config(&profile);
+
+        let template = TemplateConfig::template(&profile, &profile_hot_path)?;
+        fs::write(
+            state_paths::profile_config(&profile),
+            serde_json::to_vec_pretty(&template)?,
+        )?;
+        fs::write(
+            &profile_hot_path,
+            serde_json::to_vec_pretty(&nsproxy_core::default_hotconfig())?,
+        )?;
+
+        let executable = std::env::current_exe()?;
+        up_child = Some(
+            Command::new(&executable)
+                .arg("--root")
+                .arg(&state_root)
+                .arg("up")
+                .arg(&profile)
+                .spawn()?,
+        );
+        wait_for_temp_profile(&profile, up_child.as_mut().unwrap())?;
+
+        let ns_alive = read_ns_alive(&state_paths::profile_ns_meta(&profile))?;
+        let sandbox_status = read_sandbox_status(&profile)
+            .ok_or_else(|| anyhow!("temporary profile '{profile}' has no sandbox status"))?;
+        ensure!(
+            sandbox_status.configured_mode == SandboxMode::Overlay,
+            "temporary profile '{profile}' was not initialized in Overlay mode"
+        );
+
+        let mut shell_prefs = ShellPrefs::default();
+        shell_prefs.take_enter_args(eargs);
+        shell_prefs.adjust()?;
+        apply_ns_env(&mut shell_prefs, &ns_alive);
+        apply_dbus_env(&mut shell_prefs, &ns_alive);
+
+        let bind_mount = state_paths::profile_netns_bind(&profile);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let child = shell_prefs.spawn_in_ns(&ns_alive, &bind_mount)?;
+            child.wait_for_child().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    })();
+
+    let cleanup_result = cleanup_temp_profile(
+        &profile,
+        &state_root,
+        profile_dir_created,
+        up_child.as_mut(),
+    );
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(run_error), Err(cleanup_error)) => Err(anyhow!(
+            "{run_error:#}; temporary profile cleanup also failed: {cleanup_error:#}"
+        )),
+    }
+}
+
+fn cleanup_temp_profile(
+    profile: &str,
+    state_root: &Path,
+    profile_dir_created: bool,
+    up_child: Option<&mut std::process::Child>,
+) -> Result<()> {
+    let mut up_exit_error = None;
+    if let Some(up_child) = up_child {
+        let executable = std::env::current_exe()?;
+        let status = Command::new(executable)
+            .arg("--root")
+            .arg(state_root)
+            .arg("down")
+            .arg("--rm")
+            .arg(profile)
+            .status()?;
+        ensure!(
+            status.success(),
+            "sp down --rm failed for temporary profile '{profile}' with status {status}"
+        );
+        let up_status = up_child.wait()?;
+        if !up_status.success() {
+            up_exit_error = Some(anyhow!(
+                "temporary profile supervisor exited with status {up_status}"
+            ));
+        }
+        ensure!(
+            !state_paths::profile_netns_bind(profile).exists()
+                && !state_paths::profile_dir(profile).exists()
+                && !state_paths::profile_rootfs_dir(profile).exists(),
+            "temporary profile '{profile}' still has mounted or persistent state; leaving it in {}",
+            state_root.display()
+        );
+    } else if profile_dir_created {
+        let profile_dir = state_paths::profile_dir(profile);
+        if profile_dir.exists() {
+            fs::remove_dir_all(profile_dir)?;
+        }
+    }
+
+    if let Some(error) = up_exit_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod temp_command_tests {
+    use super::*;
+
+    #[test]
+    fn generated_profile_name_is_filesystem_safe() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let profile = temp_profile_name("../../Fishy shell*");
+        assert!(profile.starts_with("fishy-"));
+        assert_eq!(profile.split('-').next().unwrap().len(), 5);
+        let suffix = &profile[profile.len() - 4..];
+        assert_eq!(suffix.len(), 4);
+        assert_eq!(URL_SAFE_NO_PAD.decode(suffix).unwrap().len(), 3);
+        assert!(
+            profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_eq!(temp_command_slug("💭"), "cmd");
+    }
 }
 
 fn log_process_invocation(cli: &Cli) -> Result<()> {
@@ -1287,6 +1493,9 @@ fn main() -> anyhow::Result<()> {
 
                 aok!()
             })?;
+        }
+        MainCommand::Temp { eargs } => {
+            run_temp_command(eargs)?;
         }
         MainCommand::Install { dir: dstdir } => {
             if !dstdir.exists() {
@@ -2238,7 +2447,6 @@ fn main() -> anyhow::Result<()> {
             simple,
             no_default,
             log,
-            clash,
             no_dns_capture,
             internal_dns_server,
             history_listen,
@@ -2249,7 +2457,6 @@ fn main() -> anyhow::Result<()> {
             simple,
             no_default,
             log,
-            clash,
             no_dns_capture,
             cli.control_socket.clone(),
             &mut |level| {
@@ -2872,13 +3079,83 @@ fn cmd_ps(target: &str, kill: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, route: &HotRoute) {
-    match route {
-        HotRoute::None => uplink.set_routing(nsproxy_core::uplink::no_routing()),
+fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, hot: &HotConfig) {
+    use nsproxy_common::routing::{
+        DropReason, RoutingDecision, RoutingResovled, VDNSRES,
+    };
+    use nsproxy_common::stats::HostRouteHost;
+    use std::{borrow::Cow, net::SocketAddr, sync::Arc};
+
+    let fallback = match &hot.route {
+        HotRoute::None => nsproxy_core::uplink::no_routing(),
+        HotRoute::NoProxy => nsproxy_core::uplink::no_proxy_routing(),
         HotRoute::SimpleProxy { proxy_id } => {
-            uplink.set_routing(nsproxy_core::uplink::simple_routing(proxy_id.clone()));
+            nsproxy_core::uplink::simple_routing(proxy_id.clone())
         }
-    }
+        HotRoute::Group { group_id } => nsproxy_core::uplink::group_routing(
+            nsproxy_core::uplink::clash::GroupId::from(group_id.clone()),
+        ),
+    };
+    let host_routes: std::collections::HashMap<_, _> = hot
+        .host_routes
+        .iter()
+        .map(|rule| (rule.host.canonicalized(), rule.target.clone()))
+        .collect();
+    uplink.set_routing(Arc::new(move |ctx, hub| {
+        let host = match &ctx.dns {
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(domain)) => {
+                HostRouteHost::domain(domain)
+            }
+            _ => HostRouteHost::Ip(ctx.target_ip),
+        };
+        let Some(route_target) = host_routes.get(&host) else {
+            return fallback(ctx, hub);
+        };
+
+        if ctx.attempt_num > 0 {
+            return RoutingResovled::Drop(DropReason::MaxRetry);
+        }
+
+        let target = match &ctx.dns {
+            VDNSRES::NormalProxying => {
+                WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
+            }
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(domain)) => {
+                WireAddress::DomainAddress(domain.clone(), ctx.target_port)
+            }
+            VDNSRES::Opine(RoutingDecision::SocketOverProxy(address))
+            | VDNSRES::Opine(RoutingDecision::NoProxy(address))
+            | VDNSRES::Opine(RoutingDecision::NATByTUN(address)) => {
+                WireAddress::SocketAddress(*address)
+            }
+            VDNSRES::Opine(RoutingDecision::File(_)) => {
+                return fallback(ctx, hub);
+            }
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => {
+                return RoutingResovled::Drop(reason.clone());
+            }
+            VDNSRES::ERR => {
+                return RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
+                    "vdns error",
+                )));
+            }
+        };
+
+        match route_target {
+            nsproxy_common::stats::ObservedRoute::NoProxy => match target {
+                WireAddress::SocketAddress(address) => RoutingResovled::NoProxy(address),
+                WireAddress::DomainAddress(host, port) => {
+                    RoutingResovled::NoProxyDomain { host, port }
+                }
+            },
+            nsproxy_common::stats::ObservedRoute::Proxy(proxy_id) => {
+                RoutingResovled::ProxyResovled {
+                    target,
+                    id: proxy_id.clone(),
+                }
+            }
+        }
+    }));
 }
 
 async fn serve_worker_runtime(
@@ -3045,7 +3322,6 @@ fn cmd_serve(
     simple: Option<nsproxy_common::routing::ProxyNym>,
     no_default: bool,
     log: Option<LevelFilter>,
-    _clash: Option<String>,
     no_dns_capture: Option<bool>,
     control_socket: Option<PathBuf>,
     set_log: &mut dyn FnMut(LevelFilter) -> Result<()>,
@@ -3348,7 +3624,7 @@ fn cmd_serve(
                         let _ = hot_tx.send(initial_hot.clone());
                     }
 
-                    apply_hot_route_to_uplink(&mut hub, &initial_hot.route);
+                    apply_hot_route_to_uplink(&mut hub, &initial_hot);
 
                     let mut router = nsproxy_core::uplink::router::Router::new(
                         dev,
@@ -3357,11 +3633,6 @@ fn cmd_serve(
                         Some(st_sx),
                         shared_hot,
                     )?;
-
-                    let selected_proxy = match &initial_hot.route {
-                        HotRoute::None => None,
-                        HotRoute::SimpleProxy { proxy_id } => Some(proxy_id.clone()),
-                    };
 
                     router.init_diag(&diag_path).await?;
                     let uplink = router.uplink.clone();
@@ -3442,6 +3713,7 @@ fn cmd_serve(
                         let diag_srv = router.diag_handle();
                         let dns_handle = router.dns_handle();
                         let live_hot_cmd = live_hot.clone();
+                        let host_connections_cmd = router.host_connection_control();
                         tokio::spawn(nsproxy_common::trace_spawn_result(
                             "serve parent diag command loop",
                             scope_for_cmd.scope(async move {
@@ -3452,13 +3724,17 @@ fn cmd_serve(
                                         std::process::exit(0);
                                     }
                                     diag::ControlCommand::ReloadUplink => {
-                                        if let Ok(hub) = nsproxy_core::cmd_uplink::load_saved_uplink_hub() {
-                                            let mut hub = hub;
-                                            let current_hot = live_hot_cmd.read().await.clone();
-                                            apply_hot_route_to_uplink(&mut hub, &current_hot.route);
-                                            let mut u = uplink_cmd.write().await;
-                                            *u = hub;
-                                            info!("uplink reloaded via diag cmd");
+                                        match nsproxy_core::cmd_uplink::load_saved_uplink_hub() {
+                                            Ok(mut hub) => {
+                                                let current_hot = live_hot_cmd.read().await.clone();
+                                                apply_hot_route_to_uplink(&mut hub, &current_hot);
+                                                let mut u = uplink_cmd.write().await;
+                                                *u = hub;
+                                                info!("uplink reloaded via diag cmd");
+                                            }
+                                            Err(err) => {
+                                                warn!(%err, "failed to reload uplink via diag cmd");
+                                            }
                                         }
                                     }
                                     diag::ControlCommand::ReloadHotConfig => {
@@ -3503,11 +3779,61 @@ fn cmd_serve(
                                         next_hot.route = HotRoute::SimpleProxy {
                                             proxy_id: proxy_id.clone(),
                                         };
-                                        let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                        let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
                                             source: "route",
                                             persist_backup: true,
                                             config: Arc::new(next_hot),
-                                        }).await;
+                                        };
+                                        if let Err(err) = reload_tx.send(trigger).await {
+                                            warn!("simple route reload enqueue error: {err}");
+                                            diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
+                                                ts: diag::Timestamp::now(),
+                                                ok: false,
+                                                changed: false,
+                                                source: "route".to_string(),
+                                                error: Some(err.to_string()),
+                                            });
+                                        }
+                                    }
+                                    diag::ControlCommand::SetGroupRouting { group_id } => {
+                                        let mut next_hot = live_hot_cmd.read().await.clone();
+                                        next_hot.route = HotRoute::Group {
+                                            group_id: group_id.clone(),
+                                        };
+                                        let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                            source: "route",
+                                            persist_backup: true,
+                                            config: Arc::new(next_hot),
+                                        };
+                                        if let Err(err) = reload_tx.send(trigger).await {
+                                            warn!("group route reload enqueue error: {err}");
+                                            diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
+                                                ts: diag::Timestamp::now(),
+                                                ok: false,
+                                                changed: false,
+                                                source: "route".to_string(),
+                                                error: Some(err.to_string()),
+                                            });
+                                        }
+                                    }
+                                    diag::ControlCommand::SetNoProxyRouting => {
+                                        let mut next_hot = live_hot_cmd.read().await.clone();
+                                        next_hot.route = HotRoute::NoProxy;
+                                        let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                            source: "route",
+                                            persist_backup: true,
+                                            config: Arc::new(next_hot),
+                                        };
+                                        if let Err(err) = reload_tx.send(trigger).await {
+                                            warn!("no-proxy route reload enqueue error: {err}");
+                                            diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
+                                                ts: diag::Timestamp::now(),
+                                                ok: false,
+                                                changed: false,
+                                                source: "route".to_string(),
+                                                error: Some(err.to_string()),
+                                            });
+                                        }
                                     }
                                     diag::ControlCommand::QueryDnsState => {
                                         let stats = dns_handle.stats();
@@ -3523,14 +3849,22 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::QueryRoutingState => {
                                         let current_hot = live_hot_cmd.read().await.clone();
-                                        let selected_proxy = match &current_hot.route {
-                                            HotRoute::None => None,
-                                            HotRoute::SimpleProxy { proxy_id } => Some(proxy_id.clone()),
+                                        let (selected_proxy, selected_group, no_proxy) = match &current_hot.route {
+                                            HotRoute::None => (None, None, false),
+                                            HotRoute::NoProxy => (None, None, true),
+                                            HotRoute::SimpleProxy { proxy_id } => {
+                                                (Some(proxy_id.clone()), None, false)
+                                            }
+                                            HotRoute::Group { group_id } => {
+                                                (None, Some(group_id.clone()), false)
+                                            }
                                         };
                                         diag_srv.emit(diag::DiagEvent::RoutingState {
                                             ts: diag::Timestamp::now(),
                                             state: diag::RoutingState {
                                                 selected_proxy,
+                                                selected_group,
+                                                no_proxy,
                                             },
                                         });
                                     }
@@ -3604,11 +3938,85 @@ fn cmd_serve(
                                             }
                                         }
                                     }
+                                    diag::ControlCommand::SetHostRoute { host, target } => {
+                                        let host = host.canonicalized();
+                                        let mut cfg = live_hot_cmd.read().await.clone();
+                                        cfg.host_routes
+                                            .retain(|rule| rule.host.canonicalized() != host);
+                                        cfg.host_routes.push(nsproxy_core::HostRouteRule {
+                                            host,
+                                            target,
+                                        });
+                                        match cfg.process_and_save(&hot_conf_cmd) {
+                                            Ok(()) => {
+                                                *live_hot_cmd.write().await = cfg.clone();
+                                                let content = match serde_json::to_string_pretty(&cfg) {
+                                                    Ok(content) => content,
+                                                    Err(err) => {
+                                                        diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                            ts: diag::Timestamp::now(),
+                                                            ok: false,
+                                                            content: None,
+                                                            error: Some(err.to_string()),
+                                                        });
+                                                        continue;
+                                                    }
+                                                };
+                                                if let Err(err) = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                                    source: "host-route",
+                                                    persist_backup: false,
+                                                    config: Arc::new(cfg),
+                                                }).await {
+                                                    diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                        ts: diag::Timestamp::now(),
+                                                        ok: false,
+                                                        content: Some(content),
+                                                        error: Some(err.to_string()),
+                                                    });
+                                                    warn!("host route reload enqueue error: {err}");
+                                                } else {
+                                                    diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                        ts: diag::Timestamp::now(),
+                                                        ok: true,
+                                                        content: Some(content),
+                                                        error: None,
+                                                    });
+                                                }
+                                            }
+                                            Err(err) => {
+                                                diag_srv.emit(diag::DiagEvent::HotConfigSnapshot {
+                                                    ts: diag::Timestamp::now(),
+                                                    ok: false,
+                                                    content: None,
+                                                    error: Some(err.to_string()),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    diag::ControlCommand::KillHostConnections { host } => {
+                                        let killed = host_connections_cmd.kill_host(&host);
+                                        info!(
+                                            host = %host.display_host(),
+                                            killed,
+                                            "killed active host connections"
+                                        );
+                                    }
                                     diag::ControlCommand::QueryUplinkStats => {
                                         let hub = uplink_cmd.read().await;
                                         diag_srv.emit(diag::DiagEvent::UplinkStatsSnapshot {
                                             ts: diag::Timestamp::now(),
                                             stats: hub.stats.clone(),
+                                        });
+                                    }
+                                    diag::ControlCommand::QueryHostRouteStats => {
+                                        let ts = diag::Timestamp::now();
+                                        let stats = {
+                                            let hub = uplink_cmd.read().await;
+                                            hub.host_route_metrics(ts)
+                                        };
+                                        diag_srv.emit(diag::DiagEvent::HostRouteStatsSnapshot {
+                                            ts,
+                                            stats,
                                         });
                                     }
                                     diag::ControlCommand::ClearStats => {
@@ -3624,6 +4032,10 @@ fn cmd_serve(
                                         diag_srv.emit(diag::DiagEvent::UplinkStatsSnapshot {
                                             ts: diag::Timestamp::now(),
                                             stats: hub.stats.clone(),
+                                        });
+                                        diag_srv.emit(diag::DiagEvent::HostRouteStatsSnapshot {
+                                            ts: diag::Timestamp::now(),
+                                            stats: hub.host_route_metrics(diag::Timestamp::now()),
                                         });
                                     }
                                     diag::ControlCommand::QueryRecentLogs { limit } => {
@@ -3652,7 +4064,7 @@ fn cmd_serve(
                             let cfg = route_rx.borrow().clone();
                             {
                                 let mut uplink = uplink_route.write().await;
-                                apply_hot_route_to_uplink(&mut uplink, &cfg.route);
+                                apply_hot_route_to_uplink(&mut uplink, &cfg);
                             }
                             if route_rx.changed().await.is_err() {
                                 warn!("serve parent route watch exiting after hot-config watch closed");
@@ -5151,7 +5563,14 @@ fn spawn_cli_process(
                 dbus_system_address.as_deref(),
             )?;
 
-            let _ = execve(&to_cstr(exe_s.as_ref()), &argv, &envs);
+            if let Err(err) = execve(&to_cstr(exe_s.as_ref()), &argv, &envs) {
+                warn!(
+                    executable = %exe_s,
+                    memfd = fd,
+                    error = %err,
+                    "failed to exec memfd CLI handoff"
+                );
+            }
             exit_with_warn(127, "cli memfd handoff exec failed in child");
         }
     }
@@ -5259,6 +5678,7 @@ fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
         diag::RootDaemonOp::CreateDirAll { .. } => "create_dir_all",
         diag::RootDaemonOp::ReadFile { .. } => "read_file",
         diag::RootDaemonOp::WriteFile { .. } => "write_file",
+        diag::RootDaemonOp::ImportClashGroup { .. } => "import_clash_group",
         diag::RootDaemonOp::CreateProfile { .. } => "create_profile",
     }
 }
@@ -5344,6 +5764,20 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 op = op_name,
                 path = %path.display(),
                 create_parent,
+                "root daemon op received"
+            );
+        }
+        diag::RootDaemonOp::ImportClashGroup {
+            group_id,
+            path,
+            replace,
+        } => {
+            info!(
+                op_id,
+                op = op_name,
+                group = %group_id,
+                path = %path.display(),
+                replace,
                 "root daemon op received"
             );
         }
@@ -5456,6 +5890,53 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 }
             })
         }
+        diag::RootDaemonOp::ImportClashGroup {
+            group_id,
+            path,
+            replace,
+        } => RootDaemonAction::Reply({
+            let result = (|| -> Result<nsproxy_core::uplink::clash::GroupImportReport> {
+                if !std::fs::metadata(&path)?.is_file() {
+                    bail!("Clash config path is not a file: {}", path.display());
+                }
+                nsproxy_core::cmd_uplink::import_clash_group(
+                    group_id.clone(),
+                    path.clone(),
+                    replace,
+                )
+            })();
+            match result {
+                Ok(report) => {
+                    let action = if replace { "Replaced" } else { "Added" };
+                    info!(
+                        op_id,
+                        group = %group_id,
+                        proxies = report.proxies,
+                        replace,
+                        "Clash group import completed"
+                    );
+                    daemon_ok(
+                        op_id,
+                        format!(
+                            "{action} Clash group '{group_id}' ({} proxies)",
+                            report.proxies
+                        ),
+                        None,
+                        Some(path),
+                    )
+                }
+                Err(err) => {
+                    warn!(
+                        op_id,
+                        group = %group_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to import Clash group"
+                    );
+                    daemon_err(op_id, err.to_string(), None, Some(path))
+                }
+            }
+        }),
         diag::RootDaemonOp::CreateProfile {
             name,
             profile_content,

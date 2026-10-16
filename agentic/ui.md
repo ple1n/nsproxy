@@ -6,11 +6,12 @@ Load this note for egui layout, widgets, profile editors, process/traffic views,
 
 Most rendering is in `crates/nsproxy-ui/src/main.rs`.
 
-- Sidebar: `egui::SidePanel::left`, `sidebar_box`, `sidebar_box_width`.
+- Sidebar: `egui::SidePanel::left`, `sidebar_box`, `sidebar_box_width`; its contents scroll within the panel's available height.
 - Main tabs: `render_proxies_tab`, `render_processes_tab`, `render_traffic_tab`, `render_diagnostics_tab`, `render_dns_tab`, `render_hotconfig_tab`, `render_profile_editor_tab`.
 - Proxy table/details: `render_proxies_table`, `render_proxy_row`, `render_proxy_detail_window`, `render_mini_sparkline`.
 - Process controls: `render_process_controls`, `render_units_table`, `render_hotconfig_daemons_section`, `render_run_command_section`.
 - Traffic: `TrafficSubview`, `selected_traffic_conn`, `diag_event_log`, `render_diag_event_row`.
+- Proxies table: imported Clash proxies belong to user-owned groups. The import controls add a new group (defaulting its name to the file stem) or replace all data in an existing group. Group rows are collapsed by default; `App.expanded_proxy_groups` is the UI-owned expansion state, exposed as toggles below Sort Frequency. Group rows can select the whole group for routing; runtime selection prefers success rate, then latency, and retries another group member after failures. `HotRoute::Group` and `RoutingState.selected_group` carry the group selection. A separate NoProxy row selects `HotRoute::NoProxy`; `HotRoute::None` remains the no-route state. Route selection is backend-confirmed: the UI updates only after serve emits `RoutingState` for the successfully applied hot config.
 - Form widgets: `render_optional_u32`, `render_optional_text`, `render_path_field`, `render_mount_list`, `render_chmod_list`, `render_env_map`, `render_string_map`, `render_u32_map`, `render_path_map`, `render_shell_args_list`, `render_shell_args`.
 
 ## Render-pass cost boundary
@@ -61,6 +62,13 @@ renderer and extend the shared convention when the semantic role matches.
 - The shared veth card has an `on container creation` toggle. Enabled cards serialize to `HotConfig.veth`; `sp up` reconciles those entries when the profile becomes alive. Disabled cards remain temporary UI state and `Create veth pair` sends the same command immediately without modifying `hot.json`.
 - The veth command launches `nsproxy` with `MainCommand::Veth`, which resolves both running namespace endpoints, removes stale same-name links, allocates a free `100.64.0.0/10` subnet, creates the link with netlink, moves each endpoint into its namespace, and configures both addresses.
 - `sp up` persists per-entry startup results in `veth_status.json`; the UI loads the latest persisted result after restart and overlays temporary request results while they are active. A failed attempt is reported and logged; it is not silently retried or assigned a different address.
+
+## Traffic connection view
+
+- The Traffic Connections sub-view renders supervisor-precomputed newest-first active and recently-finished ID lists; keep filtering and ordering out of egui render functions.
+- Rows summarize the lifecycle phase and retain the last useful non-drop route. The `Routing` phase is displayed as `connecting`: the route decision has been selected and the upstream connection has not yet emitted `Connected`. Hovering the Route cell shows the final state/error and a bounded, scrollable transition timeline with relative age and local `HH:MM` timestamps.
+- Finished TCP/UDP rows remain according to `HotConfig.diag_conn_persist_secs`; `ConnectionsExpired` deltas remove them promptly. The Traffic view also displays up to 512 of the most recently observed serve-computed TCP latency, success-rate, and separate TCP/UDP directional throughput estimates, keyed by full SOCKS5 `WireAddress` target and exact route. Throughput cells show the decayed estimate and expose the latest qualified event-window sample on hover; the UI does not calculate rates.
+- The host/route table covers TCP and UDP and exposes Kill/Route actions only from the Route label's interactive egui tooltip, aligned to the right of the hovered label with `RectAlign::RIGHT_START`. Both the host/route action tooltip and connection-history Route tooltip summarize proxy routes with the matched proxy's name, redacted endpoint, latency, connection health, and UDP capability; resolve the route ID through the existing proxy catalog rather than formatting only its ID. The Traffic tab scopes `tooltip_delay = 0` and disables the still-pointer gate for that render pass so both popups open immediately. Attach tooltips directly to their label responses and register them every render pass; do not gate them on `hovered()` or `is_tooltip_open()`. Use native egui tooltip anchoring rather than custom pointer-position popup state. The "Click button to route to" popup includes a search field and selectable route keys with direct-route or proxy-URL summaries; it closes on outside clicks, stays open while clicking the search input, and reserves stable content height. Route display/filter data is prepared when proxy snapshots change, and filtered row indexes are rebuilt outside the egui render pass. Route applies a host-wide HotConfig override through `sp serve`; Kill closes active TCP/UDP flows for that host.
 
 ## Editing convention
 

@@ -397,6 +397,7 @@ fn event_timestamp(event: &DiagEvent) -> Timestamp {
         DiagEvent::Accept { ts, .. }
         | DiagEvent::Route { ts, .. }
         | DiagEvent::Connected { ts, .. }
+        | DiagEvent::AttemptFailed { ts, .. }
         | DiagEvent::Finished { ts, .. }
         | DiagEvent::DnsResolved { ts, .. }
         | DiagEvent::DnsQuery { ts, .. }
@@ -413,6 +414,7 @@ fn connection_id(event: &DiagEvent) -> Option<ConnId> {
         | DiagEvent::Dispatched { id, .. }
         | DiagEvent::Route { id, .. }
         | DiagEvent::Connected { id, .. }
+        | DiagEvent::AttemptFailed { id, .. }
         | DiagEvent::Finished { id, .. }
         | DiagEvent::DnsResolved { id, .. }
         | DiagEvent::DnsQuery { id, .. }
@@ -1297,7 +1299,7 @@ mod tests {
     async fn route_endpoint_returns_the_router_decision() {
         let handler: RouteQueryHandler = Arc::new(|query| {
             Box::pin(async move {
-                Ok(RoutingResovled::Direct(SocketAddr::new(query.dst, query.port)))
+                Ok(RoutingResovled::NoProxy(SocketAddr::new(query.dst, query.port)))
             }) as RouteQueryFuture
         });
         let request = "GET /v1/route?dst=192.0.2.8&src=192.0.2.1&port=123&protocol=udp HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -1308,7 +1310,7 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(response["query"]["port"], 123);
-        assert!(response["route"].get("Direct").is_some());
+        assert!(response["route"].get("NoProxy").is_some());
     }
 
     #[test]

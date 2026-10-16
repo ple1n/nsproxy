@@ -123,7 +123,8 @@ fn cmd_stats() -> Result<()> {
 
 fn cmd_clash(cmd: ClashOps) -> Result<()> {
     match cmd {
-        ClashOps::ConfigAdd { group_id, path } => clash_config_add(group_id, path),
+        ClashOps::ConfigAdd { group_id, path } => clash_config_import(group_id, path, false),
+        ClashOps::ConfigReplace { group_id, path } => clash_config_import(group_id, path, true),
         ClashOps::List => clash_list(),
         ClashOps::ConfigExplain { path } => clash_config_explain(path),
         ClashOps::Resolve {
@@ -135,46 +136,44 @@ fn cmd_clash(cmd: ClashOps) -> Result<()> {
     }
 }
 
-fn clash_config_add(group_id: String, path: std::path::PathBuf) -> Result<()> {
-    println!("Importing Clash profile");
-    println!("  Group: {}", group_id);
-    println!("  Config: {:?}", path);
+pub fn import_clash_group(
+    group_id: String,
+    path: std::path::PathBuf,
+    replace: bool,
+) -> Result<crate::uplink::clash::GroupImportReport> {
+    use crate::uplink::clash::{ClashImport, ClashState, GroupId};
 
-    let mut hub = crate::uplink::UplinkHub::new();
-    let _ = hub.hydrate_from_persisted()?;
-    let mut clash_state = hub.load_clash_state()?.clone();
+    let import = ClashImport::load_file(&path)?;
+    let mut state = ClashState::load_or_default()?;
+    let report = if replace {
+        state.replace_group_import(&import, GroupId::from(group_id))?
+    } else {
+        state.add_group_import(&import, GroupId::from(group_id))?
+    };
+    state.save_atomic()?;
+    Ok(report)
+}
 
-    let clash_profile = crate::uplink::clash::ClashProfile::load_file(&path)?;
+fn print_clash_group_import(
+    group_id: &str,
+    path: &std::path::Path,
+    report: crate::uplink::clash::GroupImportReport,
+    replace: bool,
+) {
+    let action = if replace { "Replaced" } else { "Added" };
+    println!("{action} Clash group '{group_id}' from {:?}", path);
+    println!("  Tier1 nameservers: {}", report.tier1_nameservers);
+    println!("  Tier2 nameservers: {}", report.tier2_nameservers);
+    println!("  Trojan proxies: {}", report.proxies);
+}
 
-    let append_report = clash_state.append_profile_to_group(
-        &clash_profile,
-        crate::uplink::clash::GroupId::from(group_id),
-    )?;
-    hub.set_clash_state(clash_state)?;
-
-    println!("\n✓ Profile imported");
-    println!(
-        "  Tier1 nameservers: {}",
-        clash_profile.tier1_nameservers.len()
-    );
-    println!(
-        "  Tier2 nameservers: {}",
-        clash_profile.tier2_nameservers.len()
-    );
-    println!("  Proxy servers: {}", clash_profile.proxy_domains.len());
-    println!(
-        "  Appended tier1 nameservers: {}",
-        append_report.added_tier1_nameservers
-    );
-    println!(
-        "  Appended tier2 nameservers: {}",
-        append_report.added_tier2_nameservers
-    );
-    println!(
-        "  Appended trojan proxies: {}",
-        append_report.added_trojan_proxies
-    );
-
+fn clash_config_import(
+    group_id: String,
+    path: std::path::PathBuf,
+    replace: bool,
+) -> Result<()> {
+    let report = import_clash_group(group_id.clone(), path.clone(), replace)?;
+    print_clash_group_import(&group_id, &path, report, replace);
     Ok(())
 }
 
@@ -186,8 +185,16 @@ fn clash_list() -> Result<()> {
     }
 
     println!("Clash Groups: {}", state.groups.len());
-    println!("Tracked proxy domains: {}", state.domain_group.len());
-    println!("Tracked trojan proxies: {}", state.trojan_proxies.len());
+    println!("Tracked proxy domains: {}", state.proxy_domain_count());
+    println!("Tracked trojan proxies: {}", state.all_proxy_configs().len());
+    for (group_id, group) in &state.groups {
+        println!(
+            "  - {} ({} proxies, {} proxy domains)",
+            group_id.as_str(),
+            group.proxy_configs.len(),
+            group.proxy_domains.len()
+        );
+    }
 
     let mut hub = crate::uplink::UplinkHub::new();
     match hub.load_clash_proxies() {
@@ -276,10 +283,18 @@ fn clash_resolve(direct: bool, refresh: bool, backup: Option<std::path::PathBuf>
                 }
 
                 let unresolved_before = state
-                    .domain_group
-                    .iter()
-                    .filter(|(domain, gid)| gid == &&group_id && state.get_latest_proxy_ips(domain.as_str()).is_none())
-                    .count();
+                    .groups
+                    .get(&group_id)
+                    .map(|group| {
+                        group
+                            .proxy_domains
+                            .iter()
+                            .filter(|domain| {
+                                state.get_latest_proxy_ips(domain.as_str()).is_none()
+                            })
+                            .count()
+                    })
+                    .unwrap_or_default();
 
                 println!(
                     "Resolving group: {} (unresolved proxy domains before resolve: {})",
@@ -333,7 +348,7 @@ fn clash_resolve(direct: bool, refresh: bool, backup: Option<std::path::PathBuf>
 
         let mut hub = crate::uplink::UplinkHub::new();
         let count = hub.hydrate_from_persisted()?;
-        println!("Loaded {} proxies from resolved profiles", count);
+        println!("Loaded {} proxies from resolved Clash groups", count);
 
         Ok::<bool, anyhow::Error>(false)
     })?;
@@ -397,7 +412,7 @@ fn clash_test_resolve(direct: bool, query: String) -> Result<()> {
 fn clash_config_explain(path: std::path::PathBuf) -> Result<()> {
     use clash_config::Config;
 
-    println!("{}", "Clash Profile Analysis".bold().bright_cyan());
+    println!("{}", "Clash Config Analysis".bold().bright_cyan());
     println!();
     println!("  {}: {}", "Config".dimmed(), path.display());
     println!();
@@ -975,7 +990,7 @@ fn cmd_export(path: std::path::PathBuf) -> Result<()> {
         + snapshot
             .clash
             .as_ref()
-            .map(|c| c.trojan_proxies.len())
+            .map(|c| c.all_proxy_configs().len())
             .unwrap_or(0);
     println!("✓ Exported uplink snapshot to {:?}", path);
     println!("  proxy configs: {}", proxy_count);

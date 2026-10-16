@@ -41,8 +41,8 @@ pub enum VDNSRES {
 pub enum RoutingDecision {
     /// Warning: the connection is made by TUN process, which exists in SRC NS
     NATByTUN(SocketAddr),
-    /// Direct connection to the given address
-    Direct(SocketAddr),
+    /// Connection made without using a proxy.
+    NoProxy(SocketAddr),
     Drop(DropReason),
     // ::File can be converted to ::Proxy where ::File is represented as ProxyID::for_file(path.as_path()),
     File(PathBuf),
@@ -55,14 +55,16 @@ pub enum RoutingDecision {
 pub enum RoutingResovled {
     /// Warning: the connection is made by TUN process, which exists in SRC NS
     NATByTUN(SocketAddr),
-    /// Direct connection to the given address
-    Direct(SocketAddr),
+    /// Connection made without using a proxy.
+    NoProxy(SocketAddr),
     /// Route through a specific proxy identified in the UplinkHub, including full target info
     ProxyResovled {
         target: WireAddress,
         id: ProxyID,
     },
     Drop(DropReason),
+    /// No-proxy connection to a domain that must be resolved by the serve process.
+    NoProxyDomain { host: String, port: u16 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
