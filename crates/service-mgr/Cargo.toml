@@ -7,8 +7,8 @@ repository.workspace = true
 
 [dependencies]
 alacritty_terminal = "0.25.1"
-eframe = "0.33.3"
-egui = "0.33.3"
+eframe = "0.36.2"
+egui = "0.36.2"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 term-view = { path = "../term-view", default-features = false, features = ["egui-renderer"] }

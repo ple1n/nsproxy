@@ -1147,7 +1147,7 @@ impl DemoApp {
                         );
                     };
                     match viewport_class {
-                        egui::ViewportClass::Embedded => {
+                        egui::ViewportClass::EmbeddedWindow => {
                             egui::Window::new(format!("service {} terminal", key.1))
                                 .show(popup_ctx, |ui| render(ui));
                         }
@@ -1164,9 +1164,10 @@ impl DemoApp {
 }
 
 impl eframe::App for DemoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         let frame_started = Instant::now();
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("root pipe job").clicked() {
                     self.spawn_pipe(0);
@@ -1188,9 +1189,9 @@ impl eframe::App for DemoApp {
             });
         });
 
-        egui::SidePanel::right("event-log")
-            .default_width(360.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("event-log")
+            .default_size(360.0)
+            .show(ui, |ui| {
                 ui.heading("Replayable event journal");
                 ui.label("Live events are retained by each manager's bounded output hub.");
                 ui.separator();
@@ -1209,7 +1210,7 @@ impl eframe::App for DemoApp {
                 self.logs.show(ui);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Nested service managers");
             ui.label("The root manager owns profile-manager services; each profile manager owns its own PTY and pipe services.");
             ui.separator();
@@ -1219,11 +1220,11 @@ impl eframe::App for DemoApp {
             ui.separator();
             self.render_terminal(ui);
         });
-        self.render_popups(ctx);
+        self.render_popups(&ctx);
 
         egui::Area::new(egui::Id::new("service_mgr_frame_watermark"))
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 let color = if self.last_frame_ms <= 16 {
                     egui::Color32::from_rgba_unmultiplied(120, 220, 120, 150)
                 } else if self.last_frame_ms <= 33 {

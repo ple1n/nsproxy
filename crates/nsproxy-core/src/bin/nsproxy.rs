@@ -724,6 +724,13 @@ fn build_spawn_env_cstrings(
         .map_err(Into::into)
 }
 
+fn serve_rust_backtrace_override(cli: &Cli) -> Option<bool> {
+    match &cli.cmd {
+        MainCommand::Serve { rust_backtrace, .. } => *rust_backtrace,
+        _ => None,
+    }
+}
+
 /// Outcome of checking a recorded basis-namespace entry against the namespaces
 /// we currently observe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1099,6 +1106,15 @@ fn main() -> anyhow::Result<()> {
             Cli::parse()
         }
     };
+    if let MainCommand::Serve {
+        rust_backtrace: Some(enabled),
+        ..
+    } = &cli.cmd
+    {
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", if *enabled { "1" } else { "0" });
+        }
+    }
     if let Some(root) = cli.root.clone() {
         state_paths::set_persist_root(root.clone());
         info!("Using state root: {:?}", root);
@@ -2447,6 +2463,7 @@ fn main() -> anyhow::Result<()> {
             simple,
             no_default,
             log,
+            rust_backtrace: _,
             no_dns_capture,
             internal_dns_server,
             history_listen,
@@ -3175,7 +3192,7 @@ async fn serve_worker_runtime(
     let nl = tokio_netlink_conn()?;
     nl.up_lo().await?;
 
-    let txqueuelen = 500_000u32;
+    let txqueuelen = 32_000u32;
     warn!(
         "setting TUN txqueuelen to {} for high throughput",
         txqueuelen
@@ -3509,7 +3526,7 @@ fn cmd_serve(
                             match result {
                                 Ok(()) => exit_with_warn(0, "serve worker exited cleanly"),
                                 Err(ref e) => {
-                                    warn!(%e, "serve worker exited with error");
+                                    warn!(error = ?e, "serve worker exited with error");
                                     exit_with_warn(1, "serve worker exited with error");
                                 }
                             }
@@ -5557,11 +5574,18 @@ fn spawn_cli_process(
             let fd_str = fd.to_string();
             let exe_s = exe.to_string_lossy();
             let argv = [to_cstr(exe_s.as_ref()), to_cstr(&fd_str)];
-            let envs = build_spawn_env_cstrings(
+            let mut envs = build_spawn_env_cstrings(
                 ns_alive,
                 dbus_session_address.as_deref(),
                 dbus_system_address.as_deref(),
             )?;
+            if let Some(enabled) = serve_rust_backtrace_override(cli) {
+                envs.retain(|entry| !entry.to_bytes().starts_with(b"RUST_BACKTRACE="));
+                envs.push(std::ffi::CString::new(format!(
+                    "RUST_BACKTRACE={}",
+                    if enabled { "1" } else { "0" }
+                ))?);
+            }
 
             if let Err(err) = execve(&to_cstr(exe_s.as_ref()), &argv, &envs) {
                 warn!(

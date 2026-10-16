@@ -3,6 +3,7 @@ members = [
     "crates/clash-config",
     "crates/common",
     "crates/diag",
+    "crates/egui_log_viewer",
     "crates/id_alloc",
     "crates/nsproxy-core",
     "crates/nsproxy-ui",

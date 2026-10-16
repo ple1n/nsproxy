@@ -379,7 +379,8 @@ impl TermWindowApp {
 }
 
 impl eframe::App for TermWindowApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if self.shared.take_close_request() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -387,7 +388,7 @@ impl eframe::App for TermWindowApp {
 
         self.sync_target_state(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if let Some(session) = self.session.as_mut() {
                 pump_pty_io(&self.ipc, session);
                 let mut input_frames = Vec::new();

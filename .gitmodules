@@ -64,3 +64,7 @@
 [submodule "crates/busd"]
 	path = crates/busd
 	url = https://github.com/z-galaxy/busd.git
+[submodule "crates/egui_log_viewer"]
+	path = crates/egui_log_viewer
+	url = git@github.com:ple1n/egui_log_viewer.git
+	branch = main

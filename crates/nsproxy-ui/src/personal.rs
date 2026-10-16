@@ -776,10 +776,9 @@ pub fn render_actions_tab(app: &mut crate::App, ui: &mut egui::Ui) {
         .id_source("actions-constants-json")
         .with_rows(12)
         .with_theme(ColorTheme::GRUVBOX)
-        .with_syntax(crate::json_syntax())
         .with_numlines(true)
         .with_ui_fontsize(ui);
-    editor.show(ui, &mut constants_editor_json);
+    editor.show(ui, &mut constants_editor_json, &crate::json_syntax());
     if constants_editor_json != state.constants_editor_json {
         app.personal_state.set_constants_json(constants_editor_json);
     }

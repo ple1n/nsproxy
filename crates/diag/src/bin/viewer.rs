@@ -336,11 +336,12 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_simple_native(
+    eframe::run_ui_native(
         &format!("nsp-diag: {}", instance_name),
         options,
-        move |ctx, _frame| {
-            egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        move |ui, _frame| {
+            let ctx = ui.ctx().clone();
+            egui::Panel::top("header").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("nsproxy diagnostics");
                     ui.separator();
@@ -373,7 +374,7 @@ fn main() -> eframe::Result<()> {
                 });
             });
 
-            egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            egui::Panel::bottom("bottom_panel").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("DNS Server:");
                     {
@@ -692,7 +693,7 @@ fn main() -> eframe::Result<()> {
                 }
             });
 
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let acc = accumulator.lock().unwrap();
                 let selected = *selected_conn.lock().unwrap();
                 let row_height = 18.0;

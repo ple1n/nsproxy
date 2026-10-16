@@ -10,6 +10,7 @@ Most rendering is in `crates/nsproxy-ui/src/main.rs`.
 - Main tabs: `render_proxies_tab`, `render_processes_tab`, `render_traffic_tab`, `render_diagnostics_tab`, `render_dns_tab`, `render_hotconfig_tab`, `render_profile_editor_tab`.
 - Proxy table/details: `render_proxies_table`, `render_proxy_row`, `render_proxy_detail_window`, `render_mini_sparkline`.
 - Process controls: `render_process_controls`, `render_units_table`, `render_hotconfig_daemons_section`, `render_run_command_section`.
+- In the Processes tab, the profile heading expands to a `RUST_BACKTRACE=1/0` toggle. The setting applies to subsequent UI launches of both `sp up` and `sp serve`; it defaults to `0`. Direct terminal launches continue to honor the shell's `RUST_BACKTRACE` environment.
 - Traffic: `TrafficSubview`, `selected_traffic_conn`, `diag_event_log`, `render_diag_event_row`.
 - Proxies table: imported Clash proxies belong to user-owned groups. The import controls add a new group (defaulting its name to the file stem) or replace all data in an existing group. Group rows are collapsed by default; `App.expanded_proxy_groups` is the UI-owned expansion state, exposed as toggles below Sort Frequency. Group rows can select the whole group for routing; runtime selection prefers success rate, then latency, and retries another group member after failures. `HotRoute::Group` and `RoutingState.selected_group` carry the group selection. A separate NoProxy row selects `HotRoute::NoProxy`; `HotRoute::None` remains the no-route state. Route selection is backend-confirmed: the UI updates only after serve emits `RoutingState` for the successfully applied hot config.
 - Form widgets: `render_optional_u32`, `render_optional_text`, `render_path_field`, `render_mount_list`, `render_chmod_list`, `render_env_map`, `render_string_map`, `render_u32_map`, `render_path_map`, `render_shell_args_list`, `render_shell_args`.
@@ -40,6 +41,23 @@ For live or potentially large text, retain one bounded append-only buffer in the
 UI actor, send ordered deltas from the producer, and expose only a bounded
 suffix to the widget. Do not rebuild the full text, generate a full line-number
 gutter, or drive polling through periodic egui repaint requests.
+
+`egui_log_viewer` is the independent, generic row viewer for structured logs.
+It virtualizes rows with cached measured heights, tracks drag and Shift-click/
+drag selection as an inclusive row range, paints the range with a subdued
+rounded highlight and accent edge, and edge-scrolls while dragging outside the
+viewport. Wheel/scrollbar scrolling remain available during selection
+(drag-to-scroll is disabled). Render rich row contents through its callback;
+egui label text selection is disabled by default throughout the callback UI, so
+dragging selects rows instead of text. Ctrl+C copies the selected rows in the
+plain-text format supplied by the caller; the widget handles selection,
+focus, and clipboard output. Callback content gets compact default spacing
+(8 points horizontally, 3 vertically) and rows have a 4-point gap; callbacks
+can override their own `ui.spacing_mut()` when needed. Run
+`cargo run -p egui_log_viewer --example interactive` to compare the nsproxy
+log presentation (source, level, target, ANSI-highlighted message, and fields)
+with a regular multiline editor. Nsproxy log rows and the interactive example
+share a One Dark-inspired syntax palette on a near-black background.
 
 ## Compact removal controls
 

@@ -66,7 +66,7 @@ pub struct LogEntryOf {
 #[derive(Clone, Debug)]
 pub struct RenderedLogEntry {
     pub entry: LogEntryOf,
-    pub ansi_parts: Arc<Vec<egui::RichText>>,
+    pub ansi_parts: Arc<egui::text::LayoutJob>,
 }
 
 /// Source of a [`LogEntryOf`] entry.
@@ -176,7 +176,10 @@ impl LevelLogView {
 
     fn render_entry(src: LogSource, entry: LogEntry) -> RenderedLogEntry {
         RenderedLogEntry {
-            ansi_parts: Arc::new(egui_sgr::ansi_to_rich_text(&entry.message)),
+            ansi_parts: Arc::new(egui_sgr::ansi_to_layout_job(
+                &entry.message,
+                crate::log_ansi_theme(),
+            )),
             entry: LogEntryOf {
                 hash: fast_hash_log_entry(&entry),
                 log: entry,
@@ -364,9 +367,11 @@ pub enum SupervisorCommand {
     },
     StartUp {
         profile: ContainerName,
+        rust_backtrace: bool,
     },
     StartServe {
         profile: ContainerName,
+        rust_backtrace: bool,
     },
     StopServe {
         profile: ContainerName,
@@ -671,6 +676,7 @@ impl SupervisorHandle {
         }
         self.send(SupervisorCommand::StartUp {
             profile: profile.to_string(),
+            rust_backtrace: false,
         });
         let _ = self
             .wait_for_snapshot(|snapshot| {
@@ -955,8 +961,8 @@ fn command_name(cmd: &SupervisorCommand) -> &'static str {
 
 fn command_profile(cmd: &SupervisorCommand) -> Option<&str> {
     match cmd {
-        SupervisorCommand::StartUp { profile }
-        | SupervisorCommand::StartServe { profile }
+        SupervisorCommand::StartUp { profile, .. }
+        | SupervisorCommand::StartServe { profile, .. }
         | SupervisorCommand::StopServe { profile }
         | SupervisorCommand::SaveHotconfigPrivileged { profile, .. }
         | SupervisorCommand::SaveProfilePrivileged { profile, .. }
@@ -1137,7 +1143,7 @@ impl Supervisor {
         }
     }
 
-    fn start_up_profile(&mut self, profile: ContainerName) {
+    fn start_up_profile(&mut self, profile: ContainerName, rust_backtrace: bool) {
         info!(profile = profile.as_str(), "starting sp up flow");
         self.set_container_lifecycle(&profile, ContainerLifecycleState::Starting);
         // Clear stale process list from any previous sp up instance so restart
@@ -1176,7 +1182,7 @@ impl Supervisor {
                 fields: Vec::new(),
             },
         );
-        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli, Some(rust_backtrace)) {
             Ok(spawned) => {
                 spawn_bootstrap_log_reader(
                     profile.clone(),
@@ -1563,7 +1569,7 @@ impl Supervisor {
             },
         };
 
-        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli, None) {
             Ok(spawned) => {
                 spawn_child_log_reader(
                     profile.clone(),
@@ -1641,7 +1647,7 @@ impl Supervisor {
                 detail: format!("creation requested ({reason})"),
             }],
         );
-        match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+        match spawn_nsproxy_cli(&self.nsproxy_path, &cli, None) {
             Ok(spawned) => {
                 spawn_child_log_reader(
                     profile.clone(),
@@ -1821,10 +1827,16 @@ impl Supervisor {
         let started = std::time::Instant::now();
         info!(command, profile, "supervisor handling command");
         match cmd {
-            SupervisorCommand::StartUp { profile } => {
-                self.start_up_profile(profile);
+            SupervisorCommand::StartUp {
+                profile,
+                rust_backtrace,
+            } => {
+                self.start_up_profile(profile, rust_backtrace);
             }
-            SupervisorCommand::StartServe { profile } => {
+            SupervisorCommand::StartServe {
+                profile,
+                rust_backtrace,
+            } => {
                 info!(
                     profile = profile.as_str(),
                     "starting sp serve via up daemon"
@@ -1855,6 +1867,7 @@ impl Supervisor {
                         simple: None,
                         no_default: false,
                         log: None,
+                        rust_backtrace: Some(rust_backtrace),
                         no_dns_capture: None,
                         internal_dns_server: None,
                         history_listen: DEFAULT_HISTORY_LISTEN
@@ -2063,7 +2076,7 @@ impl Supervisor {
                         rm: true,
                     },
                 };
-                match spawn_nsproxy_cli(&self.nsproxy_path, &cli) {
+                match spawn_nsproxy_cli(&self.nsproxy_path, &cli, None) {
                     Ok(spawned) => {
                         spawn_child_log_reader(
                             profile.clone(),
@@ -5065,7 +5078,11 @@ struct SpawnedCli {
 }
 
 /// Direct spawning by UI
-fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<SpawnedCli> {
+fn spawn_nsproxy_cli(
+    path: &Path,
+    cli: &Cli,
+    rust_backtrace: Option<bool>,
+) -> Result<SpawnedCli> {
     let fd_file = cli_to_inheritable_fd(cli)?;
     let fd = fd_file.as_raw_fd();
 
@@ -5081,6 +5098,24 @@ fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<SpawnedCli> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
+
+    let mut env_vars: Vec<_> = std::env::vars().collect();
+    if let Some(enabled) = rust_backtrace {
+        env_vars.retain(|(key, _)| key != "RUST_BACKTRACE");
+        env_vars.push((
+            "RUST_BACKTRACE".to_string(),
+            if enabled { "1" } else { "0" }.to_string(),
+        ));
+    }
+    let envs: Vec<_> = env_vars
+        .into_iter()
+        .map(|(key, value)| {
+            let mut entry = key;
+            entry.push('=');
+            entry.push_str(&value);
+            to_cstr(&entry)
+        })
+        .collect();
 
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
@@ -5109,14 +5144,6 @@ fn spawn_nsproxy_cli(path: &Path, cli: &Cli) -> Result<SpawnedCli> {
             }
             let fd_str = fd.to_string();
             let argv = [to_cstr(path.to_string_lossy().as_ref()), to_cstr(&fd_str)];
-            let envs: Vec<_> = std::env::vars()
-                .map(|(k, v)| {
-                    let mut s = k;
-                    s.push('=');
-                    s.push_str(&v);
-                    to_cstr(&s)
-                })
-                .collect();
             let _ = execve(&to_cstr(path.to_string_lossy().as_ref()), &argv, &envs);
             std::process::exit(127);
         }

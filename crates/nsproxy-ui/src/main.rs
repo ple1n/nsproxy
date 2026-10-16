@@ -37,6 +37,56 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PROCESS_LOG_EDITOR_MAX_BYTES: usize = 64 * 1024;
 const PROCESS_LOG_EDITOR_COMPACT_AFTER_BYTES: usize = 1024 * 1024;
 
+const LOG_EDITOR_BACKGROUND: Color32 = Color32::from_rgb(12, 13, 16);
+const LOG_SYNTAX_RED: Color32 = Color32::from_rgb(224, 108, 117);
+const LOG_SYNTAX_GREEN: Color32 = Color32::from_rgb(152, 195, 121);
+const LOG_SYNTAX_YELLOW: Color32 = Color32::from_rgb(229, 192, 123);
+const LOG_SYNTAX_BLUE: Color32 = Color32::from_rgb(97, 175, 239);
+const LOG_SYNTAX_PURPLE: Color32 = Color32::from_rgb(198, 120, 221);
+const LOG_SYNTAX_CYAN: Color32 = Color32::from_rgb(86, 182, 194);
+const LOG_SYNTAX_FOREGROUND: Color32 = Color32::from_rgb(171, 178, 191);
+const LOG_SYNTAX_MUTED: Color32 = Color32::from_rgb(92, 99, 112);
+
+fn log_level_color(level: &str) -> Color32 {
+    match level {
+        "ERROR" => LOG_SYNTAX_RED,
+        "WARN" => LOG_SYNTAX_YELLOW,
+        "INFO" => LOG_SYNTAX_CYAN,
+        "DEBUG" => LOG_SYNTAX_GREEN,
+        "TRACE" => LOG_SYNTAX_MUTED,
+        _ => LOG_SYNTAX_FOREGROUND,
+    }
+}
+
+fn log_ansi_theme() -> &'static egui_sgr::EguiAnsiTheme {
+    static THEME: std::sync::OnceLock<egui_sgr::EguiAnsiTheme> = std::sync::OnceLock::new();
+    THEME.get_or_init(|| {
+        let mut theme = egui_sgr::EguiAnsiTheme::default();
+        theme.default_foreground = LOG_SYNTAX_FOREGROUND;
+        theme.default_format.color = LOG_SYNTAX_FOREGROUND;
+        theme.default_background = LOG_EDITOR_BACKGROUND;
+        theme.palette[..16].copy_from_slice(&[
+            LOG_EDITOR_BACKGROUND,
+            LOG_SYNTAX_RED,
+            LOG_SYNTAX_GREEN,
+            LOG_SYNTAX_YELLOW,
+            LOG_SYNTAX_BLUE,
+            LOG_SYNTAX_PURPLE,
+            LOG_SYNTAX_CYAN,
+            LOG_SYNTAX_FOREGROUND,
+            LOG_SYNTAX_MUTED,
+            LOG_SYNTAX_RED,
+            LOG_SYNTAX_GREEN,
+            LOG_SYNTAX_YELLOW,
+            LOG_SYNTAX_BLUE,
+            LOG_SYNTAX_PURPLE,
+            LOG_SYNTAX_CYAN,
+            Color32::WHITE,
+        ]);
+        theme
+    })
+}
+
 #[derive(Default)]
 struct ProcessLogTextBuffer {
     text: String,
@@ -123,11 +173,11 @@ impl egui::TextBuffer for ProcessLogTextBuffer {
         self.visible_text()
     }
 
-    fn insert_text(&mut self, _text: &str, _char_index: usize) -> usize {
+    fn insert_text(&mut self, _text: &str, _char_index: egui::text::CharIndex) -> usize {
         0
     }
 
-    fn delete_char_range(&mut self, _char_range: std::ops::Range<usize>) {}
+    fn delete_char_range(&mut self, _char_range: std::ops::Range<egui::text::CharIndex>) {}
 
     fn type_id(&self) -> std::any::TypeId {
         std::any::TypeId::of::<Self>()
@@ -1131,6 +1181,8 @@ struct App {
     traffic_route_filter_applied: String,
     filtered_traffic_route_target_indices: Vec<usize>,
     traffic_subscription_profile: Option<ContainerName>,
+    /// Whether newly started `sp up` and `sp serve` processes should capture backtraces.
+    rust_backtrace: bool,
     /// Which process's raw logs are currently being inspected (profile, slot-pid).
     selected_process_logs: Option<(ContainerName, u32)>,
     process_log_editor_target: Option<(ContainerName, u32)>,
@@ -1788,6 +1840,7 @@ impl App {
             traffic_route_filter_applied: String::new(),
             filtered_traffic_route_target_indices,
             traffic_subscription_profile: None,
+            rust_backtrace: false,
             selected_process_logs: None,
             process_log_editor_target: None,
             process_log_editor_next_seq: None,
@@ -2048,7 +2101,6 @@ impl App {
         };
 
         let mut text_edit = egui::TextEdit::singleline(value);
-        text_edit = text_edit.frame(true);
         let visuals = ui.visuals_mut();
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
@@ -2074,7 +2126,6 @@ impl App {
         };
 
         let mut text_edit = egui::TextEdit::singleline(value);
-        text_edit = text_edit.frame(true);
         let visuals = ui.visuals_mut();
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
@@ -2099,7 +2150,6 @@ impl App {
         };
 
         let mut text_edit = egui::TextEdit::singleline(value);
-        text_edit = text_edit.frame(true);
         let visuals = ui.visuals_mut();
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
@@ -2121,7 +2171,7 @@ impl App {
         let visuals = ui.visuals_mut();
         let old_bg = visuals.extreme_bg_color;
         visuals.extreme_bg_color = bg_color;
-        let response = ui.add(egui::TextEdit::singleline(value).frame(true));
+        let response = ui.add(egui::TextEdit::singleline(value));
         ui.visuals_mut().extreme_bg_color = old_bg;
         response
     }
@@ -2420,7 +2470,7 @@ impl App {
         ui: &mut egui::Ui,
         label: &str,
         path: &mut std::path::PathBuf,
-        id_salt: impl std::hash::Hash,
+        id_salt: impl std::hash::Hash + std::fmt::Debug,
     ) -> bool {
         let mut changed = false;
         let mut value = path.display().to_string();
@@ -3456,10 +3506,9 @@ impl App {
                                 .id_source(format!("{}-json-editor", id_prefix))
                                 .with_rows(40)
                                 .with_theme(ColorTheme::GRUVBOX)
-                                .with_syntax(json_syntax())
                                 .with_numlines(true)
                                 .with_ui_fontsize(ui)
-                                .show(ui, &mut display_json);
+                                .show(ui, &mut display_json, &json_syntax());
                         });
                     });
             });
@@ -3490,10 +3539,9 @@ impl App {
                         .id_source(format!("{}-json-editor", id_prefix))
                         .with_rows(40)
                         .with_theme(ColorTheme::GRUVBOX)
-                        .with_syntax(json_syntax())
                         .with_numlines(true)
                         .with_ui_fontsize(ui);
-                    let output = editor.show(ui, json_text);
+                    let (output, _) = editor.show(ui, json_text, &json_syntax());
                     if output.response.changed() {
                         match serde_json::from_str::<HotConfig>(json_text) {
                             Ok(parsed) => {
@@ -3855,7 +3903,7 @@ impl App {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.profile_editor_template.schema)
-                        .clamp_range(1..=u32::MAX),
+                        .range(1..=u32::MAX),
                 )
                 .changed()
             {
@@ -4457,9 +4505,10 @@ where
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         use egui::Color32;
 
+        let ctx = ui.ctx().clone();
         let frame_started = Instant::now();
         self.ui_frame_seq = self.ui_frame_seq.wrapping_add(1);
         if self.last_frame_progress_log.elapsed() >= Duration::from_secs(5) {
@@ -4606,7 +4655,7 @@ impl eframe::App for App {
         let delete_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         let delete_requested = self.remove_containers_armed
             && self.selected_profile.is_some()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_shortcut(&delete_shortcut));
         if delete_requested {
             if let Some(profile_name) = self.selected_profile.clone() {
@@ -4620,15 +4669,15 @@ impl eframe::App for App {
             }
         }
 
-        egui::SidePanel::left("left_sidebar")
+        egui::Panel::left("left_sidebar")
             .resizable(false)
-            .default_width(280.0)
+            .default_size(280.0)
             .frame(
                 egui::Frame::new()
-                    .fill(ctx.style().visuals.panel_fill)
+                    .fill(ui.style().visuals.panel_fill)
                     .inner_margin(Margin::same(8)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("left_sidebar_content")
                     .auto_shrink([false, false])
@@ -4734,7 +4783,7 @@ impl eframe::App for App {
 
                 ui.add_space(6.0);
 
-                egui::Frame::none().show(ui, |ui| {
+                egui::Frame::NONE.show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.heading("Namespaces");
@@ -4832,17 +4881,17 @@ impl eframe::App for App {
             });
 
         let tab_fill = {
-            let base = ctx.style().visuals.panel_fill;
+            let base = ui.style().visuals.panel_fill;
             Color32::from_rgb(
                 base.r().saturating_add(15),
                 base.g().saturating_add(15),
                 base.b().saturating_add(15),
             )
         };
-        egui::TopBottomPanel::top("tab_bar")
+        egui::Panel::top("tab_bar")
             .show_separator_line(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(tab_fill)
                     .inner_margin(egui::Margin {
                         left: 8,
@@ -4851,7 +4900,7 @@ impl eframe::App for App {
                         bottom: 10,
                     }),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .selectable_label(self.right_tab == RightTab::Proxies, "Proxies")
@@ -4977,7 +5026,7 @@ impl eframe::App for App {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.right_tab == RightTab::Manage {
                 // Manage tab manages its own scroll + bottom panel
                 self.render_manage_tab(ui);
@@ -5002,15 +5051,15 @@ impl eframe::App for App {
             }
         });
 
-        self.render_external_pty_window(ctx);
-        self.render_proxy_detail_window(ctx);
-        self.render_log_editor_popup(ctx);
+        self.render_external_pty_window(&ctx);
+        self.render_proxy_detail_window(&ctx);
+        self.render_log_editor_popup(&ctx);
 
         // Minimal dev-only watermark at bottom-left: non-intrusive, low-contrast
         egui::Area::new(egui::Id::new("dev_frame_watermark"))
             .anchor(egui::Align2::LEFT_BOTTOM, egui::Vec2::new(8.0, -8.0))
             .movable(false)
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 ui.horizontal(|ui| {
                     let ms = self.last_frame_elapsed_ms as f32;
                     let fps = self.last_fps;
@@ -6087,10 +6136,22 @@ impl App {
         let profile_name = self.selected_profile.clone();
 
         if let Some(profile_name) = profile_name.as_ref() {
-            ui.heading(format!(
-                "Processes - {}",
-                self.display_text(profile_name.as_str())
-            ));
+            egui::CollapsingHeader::new(
+                RichText::new(format!(
+                    "Processes - {}",
+                    self.display_text(profile_name.as_str())
+                ))
+                .strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                let rust_backtrace_label =
+                    format!("RUST_BACKTRACE={}", if self.rust_backtrace { 1 } else { 0 });
+                ui.checkbox(&mut self.rust_backtrace, rust_backtrace_label)
+                    .on_hover_text(
+                        "Set RUST_BACKTRACE for the next sp up and sp serve launches.",
+                    );
+            });
             ui.add_space(6.0);
             self.render_process_controls(ui, profile_name);
         } else {
@@ -6129,8 +6190,8 @@ impl App {
         total_entries: usize,
     ) -> Option<String> {
         let mut open_editor = false;
-        egui::Frame::none()
-            .fill(Color32::from_gray(18))
+        egui::Frame::NONE
+            .fill(LOG_EDITOR_BACKGROUND)
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::Vec2::new(ui.available_width(), 160.0));
@@ -6161,68 +6222,83 @@ impl App {
                 });
 
                 ui.add_space(6.0);
+                if total_entries == 0 {
+                    ui.colored_label(Color32::from_gray(110), empty_message);
+                    return;
+                }
+
+                if entries.is_empty() {
+                    ui.colored_label(Color32::from_gray(110), no_level_message);
+                    return;
+                }
 
                 let row_h = ui.text_style_height(&egui::TextStyle::Body);
 
-                egui::ScrollArea::both()
-                    .id_salt(format!("log_panel_{}", panel_id))
-                    .max_height(500.0)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, total, |ui, row_range| {
-                        if total_entries == 0 {
-                            ui.colored_label(Color32::from_gray(110), empty_message);
-                            return;
+                egui_log_viewer::LogViewer::show_rows(
+                    ui,
+                    (
+                        "log_panel",
+                        panel_id,
+                        log_panel_min_level.label(),
+                        entries.front().map(|entry| entry.entry.hash),
+                    ),
+                    entries,
+                    row_h,
+                    500.0,
+                    |entry| {
+                        let source = match &entry.entry.src {
+                            LogSource::Serve => "serve".to_owned(),
+                            LogSource::Up => "up".to_owned(),
+                            LogSource::RootDaemon => "daemon".to_owned(),
+                            LogSource::Pid(_) => "pid".to_owned(),
+                        };
+                        let log = &entry.entry.log;
+                        let mut text = format!(
+                            "{source} {} [{}] {}",
+                            log.level, log.target, log.message
+                        );
+                        for field in &log.fields {
+                            text.push_str(&format!("\n{}={}", field.name, field.value));
                         }
+                        text
+                    },
+                    |ui, _row_index, entry, _selected| {
+                        let (badge_text, badge_color) = match entry.entry.src {
+                            LogSource::Serve => ("serve", LOG_SYNTAX_GREEN),
+                            LogSource::Up => ("up", LOG_SYNTAX_BLUE),
+                            LogSource::RootDaemon => ("daemon", LOG_SYNTAX_PURPLE),
+                            LogSource::Pid(_) => ("pid", LOG_SYNTAX_YELLOW),
+                        };
+                        ui.style_mut().interaction.selectable_labels = false;
+                        ui.horizontal(|ui| {
+                            ui.colored_label(badge_color, badge_text);
 
-                        if entries.is_empty() {
-                            ui.colored_label(Color32::from_gray(110), no_level_message);
-                            return;
-                        }
+                            ui.colored_label(
+                                log_level_color(&entry.entry.log.level),
+                                &entry.entry.log.level,
+                            );
 
-                        let mut row_index = row_range.start;
-                        while row_index < row_range.end {
-                            let Some(entry) = entries.get(row_index) else {
-                                break;
-                            };
-                            let (badge_text, badge_color) = match entry.entry.src {
-                                LogSource::Serve => ("serve", Color32::from_rgb(100, 180, 130)),
-                                LogSource::Up => ("up", Color32::from_rgb(100, 150, 210)),
-                                LogSource::RootDaemon => {
-                                    ("daemon", Color32::from_rgb(210, 140, 90))
-                                }
-                                LogSource::Pid(_) => ("pid", Color32::from_rgb(140, 140, 220)),
-                            };
-                            ui.horizontal(|ui| {
-                                ui.colored_label(badge_color, badge_text);
+                            ui.colored_label(
+                                LOG_SYNTAX_BLUE,
+                                format!("[{}]", entry.entry.log.target),
+                            );
 
-                                let level_color = match entry.entry.log.level.as_str() {
-                                    "ERROR" => Color32::from_rgb(220, 80, 80),
-                                    "WARN" => Color32::from_rgb(210, 160, 60),
-                                    "DEBUG" | "TRACE" => Color32::from_gray(120),
-                                    _ => Color32::from_gray(200),
-                                };
-                                ui.colored_label(level_color, &entry.entry.log.level);
-
+                            ui.label(entry.ansi_parts.as_ref().clone());
+                            for field in &entry.entry.log.fields {
+                                ui.add_space(6.0);
                                 ui.colored_label(
-                                    Color32::from_gray(100),
-                                    format!("[{}]", entry.entry.log.target),
+                                    LOG_SYNTAX_CYAN,
+                                    format!("{}=", field.name),
                                 );
-
-                                for part in entry.ansi_parts.iter() {
-                                    ui.label(part.clone());
-                                }
-                                for field in &entry.entry.log.fields {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(
-                                        Color32::from_gray(110),
-                                        format!("{}=", field.name),
-                                    );
-                                    ui.monospace(&field.value);
-                                }
-                            });
-                            row_index += 1;
-                        }
-                    });
+                                ui.label(
+                                    RichText::new(&field.value)
+                                        .monospace()
+                                        .color(LOG_SYNTAX_GREEN),
+                                );
+                            }
+                        });
+                    },
+                );
             });
         open_editor.then(|| {
             let mut text = ProcessLogTextBuffer::default();
@@ -6552,6 +6628,7 @@ impl App {
                             );
                             self.supervisor.send(SupervisorCommand::StartUp {
                                 profile: profile_name.clone(),
+                                rust_backtrace: self.rust_backtrace,
                             });
                         }
                         supervisor::ContainerLifecycleState::Starting
@@ -6562,6 +6639,7 @@ impl App {
                             );
                             self.supervisor.send(SupervisorCommand::StartUp {
                                 profile: profile_name.clone(),
+                                rust_backtrace: self.rust_backtrace,
                             });
                         }
                         supervisor::ContainerLifecycleState::Stopping { .. }
@@ -6635,6 +6713,7 @@ impl App {
                     info!(profile = profile_name.as_str(), "ui clicked Start TUN");
                     self.supervisor.send(SupervisorCommand::StartServe {
                         profile: profile_name.clone(),
+                        rust_backtrace: self.rust_backtrace,
                     });
                 }
             }
@@ -6715,13 +6794,11 @@ impl App {
                     .id_source("structured_log_editor")
                     .with_rows(32)
                     .with_theme(ColorTheme::GRUVBOX)
-                    .with_syntax(
-                        Syntax::new("log")
-                            .with_keywords(["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]),
-                    )
                     .with_numlines(true)
                     .with_ui_fontsize(ui);
-                let _ = editor.show(ui, &mut popup.text);
+                let syntax =
+                    Syntax::new("log").with_keywords(["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]);
+                let _ = editor.show(ui, &mut popup.text, &syntax);
             });
 
         if !open {
@@ -6752,7 +6829,7 @@ impl App {
             .and_then(|snap| snap.procs.get(&slot_pid))
             .cloned();
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(16))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| match maybe_entry {
@@ -7378,7 +7455,7 @@ impl App {
             });
         });
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(15))
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
@@ -7393,11 +7470,10 @@ impl App {
                             .id_source(format!("raw_logs_editor_{}_{}", profile, slot_pid))
                             .with_rows(1)
                             .with_theme(ColorTheme::GRUVBOX)
-                            .with_syntax(Syntax::new("text"))
                             .with_numlines(false)
                             .with_ui_fontsize(ui)
                             .stick_to_bottom(true);
-                        let _ = editor.show(ui, &mut self.process_log_editor_text);
+                        let _ = editor.show(ui, &mut self.process_log_editor_text, &Syntax::new("text"));
                     },
                 );
             });
@@ -7556,8 +7632,8 @@ impl App {
                             };
                             ui.colored_label(Color32::from_gray(110), message);
                         } else {
-                            egui::Frame::none()
-                                .fill(Color32::from_gray(18))
+                            egui::Frame::NONE
+                                .fill(LOG_EDITOR_BACKGROUND)
                                 .inner_margin(egui::Margin::same(6))
                                 .show(ui, |ui| {
                                     ui.set_min_size(egui::Vec2::new(ui.available_width(), 220.0));
@@ -7579,46 +7655,36 @@ impl App {
                                                     };
                                                     ui.horizontal(|ui| {
                                                         ui.colored_label(
-                                                            Color32::from_rgb(140, 140, 220),
+                                                            LOG_SYNTAX_BLUE,
                                                             "saved",
                                                         );
-                                                        let level_color =
-                                                            match entry.log.level.as_str() {
-                                                                "ERROR" => {
-                                                                    Color32::from_rgb(220, 80, 80)
-                                                                }
-                                                                "WARN" => {
-                                                                    Color32::from_rgb(210, 160, 60)
-                                                                }
-                                                                "DEBUG" | "TRACE" => {
-                                                                    Color32::from_gray(120)
-                                                                }
-                                                                _ => Color32::from_gray(200),
-                                                            };
                                                         ui.colored_label(
-                                                            level_color,
+                                                            log_level_color(&entry.log.level),
                                                             &entry.log.level,
                                                         );
                                                         ui.colored_label(
-                                                            Color32::from_gray(90),
+                                                            LOG_SYNTAX_MUTED,
                                                             format_timestamp_age(entry.log.ts),
                                                         );
                                                         ui.colored_label(
-                                                            Color32::from_gray(100),
+                                                            LOG_SYNTAX_BLUE,
                                                             format!("[{}]", entry.log.target),
                                                         );
-                                                        for part in egui_sgr::ansi_to_rich_text(
+                                                        ui.label(egui_sgr::ansi_to_layout_job(
                                                             &entry.log.message,
-                                                        ) {
-                                                            ui.label(part);
-                                                        }
+                                                            log_ansi_theme(),
+                                                        ));
                                                         for field in &entry.log.fields {
                                                             ui.add_space(6.0);
                                                             ui.colored_label(
-                                                                Color32::from_gray(110),
+                                                                LOG_SYNTAX_CYAN,
                                                                 format!("{}=", field.name),
                                                             );
-                                                            ui.monospace(&field.value);
+                                                            ui.label(
+                                                                RichText::new(&field.value)
+                                                                    .monospace()
+                                                                    .color(LOG_SYNTAX_GREEN),
+                                                            );
                                                         }
                                                     });
                                                 }
@@ -7642,7 +7708,7 @@ impl App {
         ui.separator();
         ui.add_space(4.0);
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8))
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
@@ -7856,15 +7922,15 @@ impl App {
 
     fn render_traffic_tab(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let original_style = ctx.style();
-        let mut immediate_tooltip_style = (*original_style).clone();
+        let original_style = (**ui.style()).clone();
+        let mut immediate_tooltip_style = original_style.clone();
         immediate_tooltip_style.interaction.tooltip_delay = 0.0;
         immediate_tooltip_style
             .interaction
             .show_tooltips_only_when_still = false;
-        ctx.set_style(immediate_tooltip_style);
+        *ui.style_mut() = immediate_tooltip_style;
         self.render_traffic_tab_contents(ui);
-        ctx.set_style(original_style);
+        *ui.style_mut() = original_style;
     }
 
     fn render_traffic_tab_contents(&mut self, ui: &mut egui::Ui) {
@@ -8829,9 +8895,9 @@ impl App {
         let mode = self.manage_wizard.mode.clone();
 
         // Read keyboard shortcuts before any mutable borrow of ui
-        let key_back = !ui.ctx().wants_keyboard_input()
+        let key_back = !ui.ctx().egui_wants_keyboard_input()
             && ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowLeft));
-        let key_next = !ui.ctx().wants_keyboard_input()
+        let key_next = !ui.ctx().egui_wants_keyboard_input()
             && ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowRight));
 
         // Compute back/next step for this step
@@ -8873,10 +8939,10 @@ impl App {
         let mut do_create = false;
 
         if back_step.is_some() || step == WizardStep::Name {
-            egui::TopBottomPanel::bottom("wizard_bottom_nav")
-                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(8, 8)))
+            egui::Panel::bottom("wizard_bottom_nav")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 8)))
                 .show_separator_line(false)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     // Draw top border
                     let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
                     let r = ui.max_rect();
@@ -9037,7 +9103,7 @@ impl App {
             ui.add_space(6.0);
 
             // ── Overlay — Basic ───────────────────────────────────
-            let resp = egui::Frame::none()
+            let resp = egui::Frame::NONE
                 .fill(overlay_fill)
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
@@ -9060,7 +9126,7 @@ impl App {
             ui.add_space(4.0);
 
             // ── Pivot ─────────────────────────────────────────────────
-            let resp = egui::Frame::none()
+            let resp = egui::Frame::NONE
                 .fill(pivot_fill)
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
@@ -9240,7 +9306,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             } else {
                 pivot_fill
             };
-            let resp = egui::Frame::none()
+            let resp = egui::Frame::NONE
                 .fill(fill)
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
@@ -9617,10 +9683,9 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                         .id_source("wizard-review-preview-editor")
                         .with_rows(18)
                         .with_theme(ColorTheme::GRUVBOX)
-                        .with_syntax(json_syntax())
                         .with_numlines(true)
                         .with_ui_fontsize(ui);
-                    let _ = editor.show(ui, &mut preview_json_display);
+                    let _ = editor.show(ui, &mut preview_json_display, &json_syntax());
                 });
         });
         ui.add_space(8.0);
@@ -10096,7 +10161,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
             });
         }
         ui.add_space(4.0);
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(18))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
@@ -10136,7 +10201,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         match sandbox_status.as_ref() {
             Some(status) => self.render_sandbox_status_panel(ui, status),
             None => {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(Color32::from_gray(18))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
@@ -10184,7 +10249,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
     }
 
     fn render_sandbox_status_panel(&self, ui: &mut egui::Ui, status: &SandboxStatus) {
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(18))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
@@ -10346,10 +10411,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         // ── Header ────────────────────────────────────────────────────────────
         ui.heading(format!("State — {}", self.display_text(&profile_name)));
         ui.add_space(4.0);
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(22))
             .inner_margin(egui::Margin::same(10))
-            .rounding(egui::Rounding::same(6))
+            .corner_radius(egui::CornerRadius::same(6))
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
@@ -10363,10 +10428,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         ui.add_space(8.0);
 
         // ── Sandbox Mode ──────────────────────────────────────────────────────
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(Color32::from_gray(18))
             .inner_margin(egui::Margin::same(10))
-            .rounding(egui::Rounding::same(6))
+            .corner_radius(egui::CornerRadius::same(6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Filesystem isolation mode:").strong());
@@ -10792,7 +10857,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                      access to host services.",
                 );
                 ui.add_space(4.0);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(Color32::from_gray(14))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
@@ -11012,10 +11077,10 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                         .id_source("profile-editor-template-json")
                         .with_rows(42)
                         .with_theme(ColorTheme::GRUVBOX)
-                        .with_syntax(json_syntax())
                         .with_numlines(true)
                         .with_ui_fontsize(ui);
-                    let output = editor.show(ui, &mut self.profile_editor_json);
+                    let (output, _) =
+                        editor.show(ui, &mut self.profile_editor_json, &json_syntax());
                     if output.response.changed() {
                         match serde_json::from_str::<TemplateConfig>(&self.profile_editor_json) {
                             Ok(parsed) => {
@@ -11848,22 +11913,21 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
             ui.label(detail);
         }
         diag::DiagEvent::Log(entry) => {
-            let level_color = match entry.level.as_str() {
-                "ERROR" => Color32::from_rgb(220, 80, 80),
-                "WARN" => Color32::from_rgb(210, 160, 60),
-                "DEBUG" | "TRACE" => Color32::from_gray(120),
-                _ => Color32::from_gray(200),
-            };
-            ui.colored_label(level_color, &entry.level);
-            ui.colored_label(Color32::from_gray(100), format!("[{}]", entry.target));
+            ui.colored_label(log_level_color(&entry.level), &entry.level);
+            ui.colored_label(LOG_SYNTAX_BLUE, format!("[{}]", entry.target));
             ui.horizontal_wrapped(|ui| {
-                for part in egui_sgr::ansi_to_rich_text(&entry.message) {
-                    ui.label(part);
-                }
+                ui.label(egui_sgr::ansi_to_layout_job(
+                    &entry.message,
+                    log_ansi_theme(),
+                ));
                 for field in &entry.fields {
                     ui.add_space(6.0);
-                    ui.colored_label(Color32::from_gray(110), format!("{}=", field.name));
-                    ui.monospace(&field.value);
+                    ui.colored_label(LOG_SYNTAX_CYAN, format!("{}=", field.name));
+                    ui.label(
+                        RichText::new(&field.value)
+                            .monospace()
+                            .color(LOG_SYNTAX_GREEN),
+                    );
                 }
             });
         }
@@ -12446,7 +12510,7 @@ fn section_frame<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
@@ -12676,7 +12740,7 @@ fn setup_cjk_font(ctx: &egui::Context) {
 fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
     setup_cjk_font(&cc.egui_ctx);
     // Set every text style to 16px for consistent sizing.
-    cc.egui_ctx.style_mut(|style| {
+    cc.egui_ctx.style_mut_of(cc.egui_ctx.theme(), |style| {
         for ts in &[
             egui::TextStyle::Heading,
             egui::TextStyle::Body,

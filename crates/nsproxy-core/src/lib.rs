@@ -2513,6 +2513,9 @@ pub enum MainCommand {
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         #[serde(default = "default_history_max_bytes")]
         history_max_bytes: usize,
+        #[arg(skip)]
+        #[serde(default)]
+        rust_backtrace: Option<bool>,
     },
     /// Run the private `dbus-daemon` session bus for an already-up container.
     Dbus {
@@ -2848,6 +2851,7 @@ mod cli_fd_tests {
                 simple: Some(nsproxy_common::routing::ProxyNym("geph".into())),
                 no_default: false,
                 log: Some(LevelFilter::DEBUG),
+                rust_backtrace: Some(true),
                 no_dns_capture: Some(true),
                 internal_dns_server: Some(false),
                 history_listen: default_history_listen(),
