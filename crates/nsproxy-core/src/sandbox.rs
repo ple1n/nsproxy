@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount2};
-use nix::unistd::{Gid, Uid, chown};
+use nix::unistd::{Gid, Uid, chown, getuid};
 use nsproxy_common::{ExactNS, NSFrom, PidPath, UniqueFile, current_boot_id};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
@@ -369,7 +369,6 @@ pub fn apply_pivot(template: &TemplateConfig, profile_name: &str) -> Result<()> 
         let vars = PathExpansionState::without_instance().with_dst_chroot(&new_root);
         apply_chmod(&vars, &template.chmod)?;
     }
-
     info!("pivoting root into {:?}", new_root);
     info!(
         "pivot_root_into(new_root={:?}, put_old={:?})",
@@ -379,6 +378,70 @@ pub fn apply_pivot(template: &TemplateConfig, profile_name: &str) -> Result<()> 
     info!("pivot complete — now inside sandbox root");
 
     Ok(())
+}
+
+pub fn prepare_fcitx_profile_mount(
+    profile_config_dir: &Path,
+    rootfs: &Path,
+    template: &TemplateConfig,
+) -> Result<Option<ProfileMount>> {
+    use uzers::os::unix::UserExt;
+
+    let Some(input_method) = template.fcitx_default_input_method.as_deref() else {
+        return Ok(None);
+    };
+    let uid = template.sargs.uid.unwrap_or_else(|| getuid().as_raw());
+    let user = uzers::get_user_by_uid(uid)
+        .ok_or_else(|| anyhow::anyhow!("cannot find Fcitx profile user with uid {uid}"))?;
+    let home = user.home_dir();
+    let relative_home = home
+        .strip_prefix("/")
+        .map_err(|_| anyhow::anyhow!("Fcitx profile home must be absolute"))?;
+    let fcitx_dir = profile_config_dir.join("fcitx5");
+    let profile_path = fcitx_dir.join("profile");
+    if !profile_path.exists() {
+        std::fs::create_dir_all(&fcitx_dir)?;
+        let existing_profile = rootfs
+            .join(relative_home)
+            .join(".config/fcitx5/profile");
+        if existing_profile.exists() {
+            std::fs::copy(existing_profile, &profile_path)?;
+        } else {
+            std::fs::write(&profile_path, fcitx_profile_contents(input_method))?;
+        }
+    }
+
+    let gid = template.sargs.gid.unwrap_or_else(|| user.primary_group_id());
+    chown(
+        &fcitx_dir,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )?;
+    chown(
+        &profile_path,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )?;
+    std::fs::set_permissions(&fcitx_dir, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o644))?;
+    Ok(Some(ProfileMount {
+        source: profile_path,
+        target: home.join(".config/fcitx5/profile"),
+        read_only: false,
+        recursive: false,
+        skip_missing: false,
+    }))
+}
+
+fn fcitx_profile_contents(input_method: &str) -> String {
+    let mut contents = format!(
+        "[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM={input_method}\n\n[Groups/0/Items/0]\nName=keyboard-us\n"
+    );
+    if input_method != "keyboard-us" {
+        contents.push_str(&format!("\n[Groups/0/Items/1]\nName={input_method}\n"));
+    }
+    contents.push_str("\n[GroupOrder]\n0=Default\n");
+    contents
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -497,6 +560,54 @@ pub fn inspect_path(path: &Path) -> SandboxPathStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeded_fcitx_profile_mount_uses_profile_config_and_existing_rootfs_state() {
+        use uzers::os::unix::UserExt;
+
+        let base = unique_temp_dir();
+        let profile_config = base.join("config/profile");
+        let root = base.join("rootfs");
+        std::fs::create_dir_all(&profile_config).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let uid = getuid().as_raw();
+        let user = uzers::get_user_by_uid(uid).unwrap();
+        let rootfs_profile = root
+            .join(user.home_dir().strip_prefix("/").unwrap())
+            .join(".config/fcitx5/profile");
+        std::fs::create_dir_all(rootfs_profile.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs_profile, "existing-profile\n").unwrap();
+        let mut template = TemplateConfig::default();
+        template.sargs.uid = Some(uid);
+        template.fcitx_default_input_method = Some("rime".to_string());
+        let mount = prepare_fcitx_profile_mount(&profile_config, &root, &template)
+            .unwrap()
+            .unwrap();
+        let profile_path = profile_config.join("fcitx5/profile");
+        let profile = std::fs::read_to_string(&profile_path).unwrap();
+        assert_eq!(profile, "existing-profile\n");
+        assert_eq!(mount.source, profile_path);
+        std::fs::write(&profile_path, "user-config\n").unwrap();
+        prepare_fcitx_profile_mount(&profile_config, &root, &template)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap(),
+            "user-config\n"
+        );
+        let fresh_config = base.join("fresh/config");
+        let fresh_rootfs = base.join("fresh/rootfs");
+        std::fs::create_dir_all(&fresh_config).unwrap();
+        std::fs::create_dir_all(&fresh_rootfs).unwrap();
+        let fresh_mount = prepare_fcitx_profile_mount(&fresh_config, &fresh_rootfs, &template)
+            .unwrap()
+            .unwrap();
+        let fresh_profile = std::fs::read_to_string(fresh_mount.source).unwrap();
+        assert!(fresh_profile.contains("DefaultIM=rime"));
+        assert!(fresh_profile.contains("Name=keyboard-us"));
+        assert!(fresh_profile.contains("Name=rime"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     fn unique_temp_dir() -> PathBuf {
         let mut path = std::env::temp_dir();

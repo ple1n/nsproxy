@@ -75,6 +75,7 @@ pub enum LogSource {
     Up,
     Serve,
     RootDaemon,
+    Fcitx,
     Pid(u32),
 }
 
@@ -116,7 +117,7 @@ impl LevelLogView {
         &self.visible_by_min_level[slot]
     }
 
-    fn push_entry(&mut self, src: LogSource, entry: LogEntry) {
+    pub fn push_entry(&mut self, src: LogSource, entry: LogEntry) {
         let shared = Arc::new(Self::render_entry(src, entry));
         self.entries.push_back(shared.clone());
 
@@ -253,6 +254,8 @@ pub struct ContainerState {
     /// Serve-computed per-target, per-route TCP performance estimates.
     #[serde(skip)]
     pub host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
+    #[serde(skip)]
+    pub recent_host_routes: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
     /// Render-ready newest-first indexes for the connection tables.
     #[serde(skip)]
     pub active_conn_ids: Vec<diag::ConnId>,
@@ -839,6 +842,7 @@ struct DiagState {
     routing_state: Option<diag::RoutingState>,
     proxy_stats: HashMap<ProxyID, ProxyStats>,
     host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
+    recent_host_routes: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
     host_route_snapshot_at: diag::Timestamp,
     /// Rolling local copy of raw `DiagEvent`s (traffic log).
     /// Gets pre-populated via `QueryRecentDiagEvents` when first accessed.
@@ -907,6 +911,7 @@ impl Default for DiagState {
             routing_state: None,
             proxy_stats: HashMap::new(),
             host_route_stats: Arc::new(Vec::new()),
+            recent_host_routes: Arc::new(Vec::new()),
             host_route_snapshot_at: diag::Timestamp::default(),
             diag_event_log: VecDeque::new(),
             conns_state: diag::ConnsState::default(),
@@ -2612,6 +2617,14 @@ impl Supervisor {
                 let state = self.diag_state.entry(profile.clone()).or_default();
                 state.accumulator.ingest(&event);
                 state.conns_state.apply_event(&event);
+                let refresh_recent_host_routes = matches!(
+                    &event,
+                    DiagEvent::Route { .. }
+                        | DiagEvent::ConnsStateSnapshot { .. }
+                        | DiagEvent::ConnectionsExpired { .. }
+                        | DiagEvent::HostRouteStatsSnapshot { .. }
+                        | DiagEvent::HostRouteStatsUpdated { .. }
+                );
                 const MAX_DIAG_EVENTS: usize = 512;
                 match &event {
                     DiagEvent::RecentDiagEvents(_)
@@ -2726,6 +2739,9 @@ impl Supervisor {
                         state.conns_state = snap;
                     }
                     _ => {}
+                }
+                if refresh_recent_host_routes {
+                    refresh_recent_host_routes_for_state(state);
                 }
             }
             SupervisorEvent::ConnectionUpdate {
@@ -3837,6 +3853,12 @@ impl Supervisor {
                     proxy_stats: diag.map(|d| d.proxy_stats.clone()).unwrap_or_default(),
                     host_route_stats: if self.is_traffic_subscribed(profile.as_str()) {
                         diag.map(|d| d.host_route_stats.clone())
+                            .unwrap_or_else(|| Arc::new(Vec::new()))
+                    } else {
+                        Arc::new(Vec::new())
+                    },
+                    recent_host_routes: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| d.recent_host_routes.clone())
                             .unwrap_or_else(|| Arc::new(Vec::new()))
                     } else {
                         Arc::new(Vec::new())
@@ -5005,6 +5027,65 @@ fn sort_host_route_metrics(metrics: &mut Vec<nsproxy_common::stats::HostRouteMet
             .then_with(|| left.key.cmp(&right.key))
     });
     metrics.truncate(MAX_TRAFFIC_HOST_ROUTE_METRICS);
+}
+
+fn refresh_recent_host_routes_for_state(state: &mut DiagState) {
+    use nsproxy_common::{
+        routing::RoutingResovled,
+        stats::{HostRouteKey, HostRouteMetric, ObservedRoute},
+    };
+
+    let mut by_key: HashMap<HostRouteKey, HostRouteMetric> =
+        state.host_route_stats.iter().cloned().map(|m| (m.key.clone(), m)).collect();
+    for entry in state.conns_state.conns.values() {
+        let Some(route) = &entry.route else {
+            continue;
+        };
+        let observed_route = match route {
+            RoutingResovled::ProxyResovled { id, .. } => ObservedRoute::Proxy(id.clone()),
+            RoutingResovled::NATByTUN(_)
+            | RoutingResovled::NoProxy(_)
+            | RoutingResovled::NoProxyDomain { .. } => ObservedRoute::NoProxy,
+            RoutingResovled::Drop(_) => continue,
+        };
+        let key = HostRouteKey::new(entry.dst.clone(), observed_route);
+        by_key.entry(key.clone()).or_insert_with(|| {
+            let observed_at = entry
+                .history
+                .iter()
+                .rev()
+                .find_map(|transition| match &transition.kind {
+                    diag::ConnTransitionKind::Route(observed) if observed == route => {
+                        Some(transition.ts)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(entry.accepted_at);
+            HostRouteMetric {
+                key,
+                observed_at,
+                last_observed: None,
+                connect_latency_ms: None,
+                connect_success_rate: None,
+                upload_bytes_per_sec: None,
+                download_bytes_per_sec: None,
+                upload_rate_summary: None,
+                download_rate_summary: None,
+                upload_sample: None,
+                download_sample: None,
+                udp_upload_bytes_per_sec: None,
+                udp_download_bytes_per_sec: None,
+                udp_upload_rate_summary: None,
+                udp_download_rate_summary: None,
+                udp_upload_sample: None,
+                udp_download_sample: None,
+            }
+        });
+    }
+    let mut metrics: Vec<_> = by_key.into_values().collect();
+    metrics.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+    metrics.truncate(MAX_TRAFFIC_HOST_ROUTE_METRICS);
+    state.recent_host_routes = Arc::new(metrics);
 }
 
 fn build_diag_summary(state: &DiagState) -> Option<DiagSummary> {

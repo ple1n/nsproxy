@@ -214,6 +214,91 @@ mod tests {
         assert_eq!(decoded.host_routes, config.host_routes);
     }
 
+    #[test]
+    fn template_v2_migrates_and_accepts_declarative_fcitx_default() {
+        let old = TemplateConfigV2 {
+            schema: TemplateConfigV2::VERSION,
+            sandbox_mode: SandboxMode::Pivot,
+            mounts: Vec::new(),
+            chmod: Vec::new(),
+            env: HashMap::new(),
+            inherit_env: true,
+            hot: PathBuf::from("/tmp/hot.json"),
+            hot_init: None,
+            sargs: ShellArgs::default(),
+            browser_profile: None,
+            dbus: DbusMode::Container,
+            rootfs: Rootfs::Default,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "nsproxy-template-schema-test-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let mut migrated = TemplateConfig::load(&path).unwrap();
+        assert_eq!(migrated.schema, TemplateConfig::VERSION);
+        assert_eq!(migrated.fcitx_default_input_method, None);
+        migrated.fcitx_default_input_method = Some("rime".to_string());
+        migrated.validate().unwrap();
+        std::fs::write(&path, serde_json::to_vec(&migrated).unwrap()).unwrap();
+        assert_eq!(
+            TemplateConfig::load(&path)
+                .unwrap()
+                .fcitx_default_input_method
+                .as_deref(),
+            Some("rime")
+        );
+        migrated.fcitx_default_input_method = Some("rime\nName=broken".to_string());
+        assert!(migrated.validate().is_err());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn routing_prefs_serialize_symbols_and_routes() {
+        let prefs = RoutingPrefs {
+            symbols: vec![
+                RoutingSymbol {
+                    name: "direct".to_string(),
+                    comment: Some("Direct connection".to_string()),
+                },
+                RoutingSymbol {
+                    name: "alternate".to_string(),
+                    comment: Some("Alternate route".to_string()),
+                },
+            ],
+            routes: vec![
+                RoutingPrefRule {
+                    destination: None,
+                    symbol: "direct".to_string(),
+                },
+                RoutingPrefRule {
+                    destination: Some(RoutingDestination::DomainAddress(
+                        "huggingface.co".to_string(),
+                        443,
+                    )),
+                    symbol: "alternate".to_string(),
+                },
+            ],
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"symbols":[{"name":"direct","comment":"Direct connection"},{"name":"alternate","comment":"Alternate route"}],"routes":[{"symbol":"direct"},{"destination":{"DomainAddress":["huggingface.co",443]},"symbol":"alternate"}]}"#
+        );
+        let decoded: RoutingPrefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, prefs);
+    }
+
+    #[test]
+    fn routing_prefs_default_to_empty_symbol_and_route_lists() {
+        let prefs = RoutingPrefs::default();
+        assert!(prefs.symbols.is_empty());
+        assert!(prefs.routes.is_empty());
+    }
+
     /// Verify that the no_dns_capture sentinel ("0.0.0.0/32") matches no real IP.
     #[test]
     fn test_no_dns_capture_sentinel_matches_nothing() {
@@ -285,7 +370,7 @@ mod tests {
             .expect("HOME must be set for expansion tests");
 
         let mut profile = TemplateConfig {
-            schema: TemplateConfigV2::VERSION,
+            schema: TemplateConfig::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: vec![ProfileMount {
                 source: PathBuf::from("@/mnt-src"),
@@ -338,6 +423,7 @@ mod tests {
             browser_profile: None,
             dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
+            fcitx_default_input_method: None,
         };
 
         profile.expand_placeholders(&instance_root);
@@ -1040,6 +1126,52 @@ pub enum HotRoute {
 
 impl HotRoute {}
 
+/// A named variable used by routing preference rules.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RoutingSymbol {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// A final destination matched by a workflow route rule.
+///
+/// Unlike an ingress IP, this identifies the resolved destination endpoint,
+/// including its port.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum RoutingDestination {
+    SocketAddress(SocketAddr),
+    DomainAddress(String, u16),
+}
+
+impl From<socks5_impl::protocol::WireAddress> for RoutingDestination {
+    fn from(address: socks5_impl::protocol::WireAddress) -> Self {
+        match address {
+            socks5_impl::protocol::WireAddress::SocketAddress(address) => Self::SocketAddress(address),
+            socks5_impl::protocol::WireAddress::DomainAddress(host, port) => {
+                Self::DomainAddress(host, port)
+            }
+        }
+    }
+}
+
+/// A routing rule targeting a symbol by name. `destination: None` is the default route.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RoutingPrefRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<RoutingDestination>,
+    pub symbol: String,
+}
+
+/// Reusable higher-order routing preferences over named symbols.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct RoutingPrefs {
+    #[serde(default)]
+    pub symbols: Vec<RoutingSymbol>,
+    #[serde(default)]
+    pub routes: Vec<RoutingPrefRule>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HostRouteRule {
     pub host: nsproxy_common::stats::HostRouteHost,
@@ -1566,14 +1698,14 @@ pub fn write_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
 // [schema-bump] To add schema VN:
 //   1. Rename this type alias to point at `TemplateConfigVN` — the compiler
 //      will flag every struct literal that has stale/missing fields.
-//   2. Freeze the current `TemplateConfigV2` (remove `pub` fields you want
-//      hidden, keep it `Deserialize`-only).
+//   2. Freeze the previous version (remove `pub` fields you want hidden,
+//      keep it `Deserialize`-only).
 //   3. Add `TemplateConfigVN` with the new shape + `VERSION` const.
 //   4. Add `From<TemplateConfigV(N-1)> for TemplateConfigVN`.
 //   5. Add the new arm in `TemplateConfig::load()`.
 //   6. In nsproxy-ui/src/main.rs search `[schema-bump:wizard]` for the
 //      wizard factory sites.
-pub type TemplateConfig = TemplateConfigV2;
+pub type TemplateConfig = TemplateConfigV3;
 
 /// Explicit, stable profile config for filesystem isolation and app launch
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1612,6 +1744,55 @@ pub struct TemplateConfigV2 {
 
 impl TemplateConfigV2 {
     pub const VERSION: u32 = 2;
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TemplateConfigV3 {
+    pub schema: u32,
+    pub sandbox_mode: SandboxMode,
+    pub mounts: Vec<ProfileMount>,
+    #[serde(default)]
+    pub chmod: Vec<ProfileChmod>,
+    pub env: HashMap<String, String>,
+    #[serde(default = "default_inherit_env")]
+    pub inherit_env: bool,
+    pub hot: PathBuf,
+    #[serde(default)]
+    pub hot_init: Option<HotConfig>,
+    #[serde(default)]
+    pub sargs: ShellArgs,
+    #[serde(default)]
+    pub browser_profile: Option<String>,
+    #[serde(default)]
+    pub dbus: DbusMode,
+    #[serde(default)]
+    pub rootfs: Rootfs,
+    #[serde(default)]
+    pub fcitx_default_input_method: Option<String>,
+}
+
+impl TemplateConfigV3 {
+    pub const VERSION: u32 = 3;
+}
+
+impl From<TemplateConfigV2> for TemplateConfigV3 {
+    fn from(v2: TemplateConfigV2) -> Self {
+        Self {
+            schema: Self::VERSION,
+            sandbox_mode: v2.sandbox_mode,
+            mounts: v2.mounts,
+            chmod: v2.chmod,
+            env: v2.env,
+            inherit_env: v2.inherit_env,
+            hot: v2.hot,
+            hot_init: v2.hot_init,
+            sargs: v2.sargs,
+            browser_profile: v2.browser_profile,
+            dbus: v2.dbus,
+            rootfs: v2.rootfs,
+            fcitx_default_input_method: None,
+        }
+    }
 }
 
 /// Schema-1 profile config. The `dbus` field was a plain `bool`:
@@ -1655,7 +1836,7 @@ fn schema_one() -> u32 {
 impl From<TemplateConfigV1> for TemplateConfigV2 {
     fn from(v1: TemplateConfigV1) -> Self {
         TemplateConfigV2 {
-            schema: TemplateConfigV2::VERSION,
+            schema: TemplateConfig::VERSION,
             sandbox_mode: v1.sandbox_mode,
             mounts: v1.mounts,
             chmod: v1.chmod,
@@ -1703,9 +1884,9 @@ pub enum Rootfs {
     Path(PathBuf),
 }
 
-impl Default for TemplateConfigV2 {
+impl Default for TemplateConfigV3 {
     fn default() -> Self {
-        Self {
+        TemplateConfigV3::from(TemplateConfigV2 {
             schema: TemplateConfigV2::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: Vec::new(),
@@ -1718,7 +1899,7 @@ impl Default for TemplateConfigV2 {
             browser_profile: None,
             dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
-        }
+        })
     }
 }
 
@@ -1786,9 +1967,14 @@ impl TemplateConfig {
         let conf = match schema {
             s if s < TemplateConfigV2::VERSION => {
                 // V1: dbus was a plain bool. Migrate via TemplateConfigV1 → TemplateConfigV2.
-                TemplateConfigV2::from(serde_json::from_str::<TemplateConfigV1>(&content)?)
+                TemplateConfigV3::from(TemplateConfigV2::from(
+                    serde_json::from_str::<TemplateConfigV1>(&content)?,
+                ))
             }
-            _ => serde_json::from_str::<TemplateConfigV2>(&content)?,
+            s if s < TemplateConfigV3::VERSION => TemplateConfigV3::from(
+                serde_json::from_str::<TemplateConfigV2>(&content)?,
+            ),
+            _ => serde_json::from_str::<TemplateConfigV3>(&content)?,
         };
         conf.validate()?;
         Ok(conf)
@@ -1802,6 +1988,21 @@ impl TemplateConfig {
             is_absolute_or_variable(&self.hot, true, true),
             "hot must be absolute or use ~/@ placeholder"
         );
+        if let Some(input_method) = &self.fcitx_default_input_method {
+            ensure!(
+                self.dbus == DbusMode::Container,
+                "fcitx_default_input_method requires dbus = \"container\""
+            );
+            ensure!(
+                !input_method.is_empty()
+                    && input_method
+                        .chars()
+                        .all(|character| {
+                            character.is_ascii_alphanumeric() || "-_.".contains(character)
+                        }),
+                "fcitx_default_input_method must contain only ASCII letters, digits, '.', '-' or '_'"
+            );
+        }
         for m in &self.mounts {
             ensure!(
                 is_absolute_or_variable(&m.source, true, true),
@@ -1890,7 +2091,7 @@ impl TemplateConfig {
             .collect();
 
         Ok(TemplateConfig {
-            schema: TemplateConfigV2::VERSION,
+            schema: TemplateConfig::VERSION,
             sandbox_mode: SandboxMode::Overlay,
             mounts: vec![],
             env: HashMap::new(),
@@ -1909,6 +2110,7 @@ impl TemplateConfig {
             browser_profile: None,
             dbus: DbusMode::Container,
             rootfs: Rootfs::Default,
+            fcitx_default_input_method: None,
         })
     }
 }

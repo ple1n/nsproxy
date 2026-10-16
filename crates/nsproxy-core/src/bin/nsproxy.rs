@@ -589,12 +589,41 @@ fn maybe_system_bus_address(ns_alive: &nsproxy_core::NsAlive) -> Option<String> 
     }
 }
 
-/// Apply the correct D-Bus environment to `shell_prefs` based on the profile's DbusMode.
+/// Apply the correct D-Bus and input-method environment for a profile.
 /// Must be called AFTER `shell_prefs.adjust()`:
 /// - Block: strip DBUS_SESSION_BUS_ADDRESS (adjust() captured it from parent env)
 /// - Pass:  do nothing (already inherited from parent env via adjust())
-/// - Container: replace with the private per-profile dbus-daemon socket address
-fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive) {
+/// - Container: use the private per-profile D-Bus and Fcitx session
+const PRIVATE_FCITX_ENV: [(&str, &str); 3] = [
+    ("GTK_IM_MODULE", "fcitx"),
+    ("QT_IM_MODULE", "fcitx"),
+    ("XMODIFIERS", "@im=fcitx"),
+];
+
+fn private_fcitx_env() -> HashMap<String, String> {
+    PRIVATE_FCITX_ENV
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+fn apply_private_fcitx_env(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| {
+        !PRIVATE_FCITX_ENV
+            .iter()
+            .any(|(fcitx_key, _)| key == fcitx_key)
+    });
+    env.extend(
+        PRIVATE_FCITX_ENV
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+    );
+}
+
+fn apply_dbus_env(
+    shell_prefs: &mut ShellPrefs,
+    ns_alive: &nsproxy_core::NsAlive,
+) -> Result<()> {
     match dbus_mode_for_profile(ns_alive) {
         nsproxy_core::DbusMode::Block => shell_prefs.strip_dbus_env(),
         nsproxy_core::DbusMode::Pass => {}
@@ -606,8 +635,10 @@ fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive
                 shell_prefs.set_dbus_session_bus_env(&profile_bus_address(profile));
                 shell_prefs.set_dbus_system_bus_env(&profile_system_bus_address(profile));
             }
+            shell_prefs.set_env_with_inheritance(private_fcitx_env())?;
         }
     }
+    Ok(())
 }
 
 /// Run one self-contained session bus for a container.
@@ -655,6 +686,9 @@ fn run_container_dbus_daemon(socket_path: &Path, system: bool) -> Result<()> {
         // Do not preserve the host bus addresses in their inherited env.
         .env_remove(ENV_DBUS_SESSION_BUS_ADDRESS);
     command.env_remove(ENV_DBUS_SYSTEM_BUS_ADDRESS);
+    if !system {
+        command.envs(PRIVATE_FCITX_ENV);
+    }
 
     let status = command.status()?;
     let _ = fs::remove_file(socket_path);
@@ -694,6 +728,9 @@ fn build_spawn_env_pairs(
     env_pairs.push((ENV_CONTAINER.to_string(), container_val));
     env_pairs.push((ENV_PROFILE.to_string(), profile_val));
     env_pairs.push((ENV_NS.to_string(), ns_val));
+    if dbus_mode_for_profile(ns_alive) == nsproxy_core::DbusMode::Container {
+        apply_private_fcitx_env(&mut env_pairs);
+    }
     if let Some(address) = dbus_session_address {
         unsafe {
             std::env::set_var(ENV_DBUS_SESSION_BUS_ADDRESS, address);
@@ -943,7 +980,7 @@ fn run_temp_command(eargs: nsproxy_core::shell::EnterArgs) -> Result<()> {
         shell_prefs.take_enter_args(eargs);
         shell_prefs.adjust()?;
         apply_ns_env(&mut shell_prefs, &ns_alive);
-        apply_dbus_env(&mut shell_prefs, &ns_alive);
+        apply_dbus_env(&mut shell_prefs, &ns_alive)?;
 
         let bind_mount = state_paths::profile_netns_bind(&profile);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1022,6 +1059,26 @@ fn cleanup_temp_profile(
 #[cfg(test)]
 mod temp_command_tests {
     use super::*;
+
+    #[test]
+    fn private_fcitx_environment_overrides_parent_values() {
+        let mut env = vec![
+            ("GTK_IM_MODULE".to_string(), "ibus".to_string()),
+            ("QT_IM_MODULE".to_string(), "ibus".to_string()),
+            ("XMODIFIERS".to_string(), "@im=ibus".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ];
+
+        apply_private_fcitx_env(&mut env);
+
+        assert!(env.contains(&("GTK_IM_MODULE".to_string(), "fcitx".to_string())));
+        assert!(env.contains(&("QT_IM_MODULE".to_string(), "fcitx".to_string())));
+        assert!(env.contains(&("XMODIFIERS".to_string(), "@im=fcitx".to_string())));
+        assert!(env.contains(&("LANG".to_string(), "C.UTF-8".to_string())));
+        for key in ["GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"] {
+            assert_eq!(env.iter().filter(|(entry, _)| entry == key).count(), 1);
+        }
+    }
 
     #[test]
     fn generated_profile_name_is_filesystem_safe() {
@@ -1496,7 +1553,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 enter_ns_sandboxed(&ns_alive, &sandbox_status, &resolved_path)?;
                 apply_ns_env(&mut shell_prefs, &ns_alive);
-                apply_dbus_env(&mut shell_prefs, &ns_alive);
+                apply_dbus_env(&mut shell_prefs, &ns_alive)?;
             }
 
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2632,6 +2689,19 @@ fn main() -> anyhow::Result<()> {
             let mut profile_conf = TemplateConfig::load(&profile_path)?;
             let instance_root = state_paths::profile_dir(&profile);
             profile_conf.expand_placeholders(&instance_root);
+            let configured_rootfs = match &profile_conf.rootfs {
+                nsproxy_core::Rootfs::Default => state_paths::profile_rootfs_dir(&profile),
+                nsproxy_core::Rootfs::Tempfs => state_paths::pivot_root_mem(&profile),
+                nsproxy_core::Rootfs::Path(path) => path.clone(),
+            };
+            let fcitx_mount = nsproxy_core::sandbox::prepare_fcitx_profile_mount(
+                &instance_root,
+                &configured_rootfs,
+                &profile_conf,
+            )?;
+            if let Some(mount) = &fcitx_mount {
+                profile_conf.mounts.push(mount.clone());
+            }
 
             // The UI's older create path wrote profile.json without the CLI
             // profile-create initialization step. Reconcile the declared source
@@ -2677,6 +2747,12 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mut status_mounts = profile_conf.mounts.clone();
+            if !is_pivot_mode {
+                if let Some(mount) = &fcitx_mount {
+                    let vars = nsproxy_core::PathExpansionState::for_instance(&instance_root);
+                    nsproxy_core::sandbox::apply_mounts(&vars, std::slice::from_ref(mount))?;
+                }
+            }
 
             // Resolve the hot config path (already expanded).
             let hot_path = profile_conf.hot.clone();

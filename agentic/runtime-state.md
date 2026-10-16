@@ -9,6 +9,7 @@ Load this note for CLI commands, profile persistence, configuration, namespace e
 - `NsAlive` records `child_pid`, `up_pid`, `serve_pid`, bind-mount state, and optional browser profile. Definition: `crates/common/src/lib.rs`; namespace-entry uses: `crates/nsproxy-core/src/cmd_common.rs`.
 - The standardized state interface is `PersistentState`; path helpers are under `state_paths`. Search `profile_ns_meta` and `state_blueprint.rs`.
 - `HotConfig` owns DNS, TUN, devices, mounts, locals, daemon fields, and `diag_conn_persist_secs`, which configures finished TCP/UDP diagnostic retention in `sp serve` (default 300 seconds; updated live). `TemplateConfig` owns sandbox mode, mounts, chmod, env, and hot-config linkage.
+- `TemplateConfigV3.fcitx_default_input_method` is the declarative seed for a private-profile Fcitx default. `sp sandbox` stores the seed under that profile's persistent config directory and bind-mounts it at the user's Fcitx profile path, including for Overlay profiles. An existing profile file is copied on first seeding and subsequent Fcitx edits persist in the profile config directory.
 - A HotConfig update with no network/service deltas still refreshes `sp serve`'s live config watch; runtime-only diagnostics settings must not depend on `calculate_hot_diff` producing an operation.
 - Stateful path expansion uses `PathExpansionState::{expand_with,expand_source,expand_target}`.
 - Domains use canonical trailing-dot normalization via `normalize_domain` in `crates/common/src/lib.rs`.

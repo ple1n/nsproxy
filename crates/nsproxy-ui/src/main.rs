@@ -221,6 +221,7 @@ use tracing_subscriber::EnvFilter;
 use which;
 
 mod alacritty_window;
+mod fcitx;
 mod personal;
 mod profile_loader;
 mod supervisor;
@@ -539,6 +540,7 @@ impl ProxyType {
 enum RightTab {
     Proxies,
     Daemon,
+    Dbus,
     Logs,
     Actions,
     Processes,
@@ -548,6 +550,125 @@ enum RightTab {
     State,
     Manage,
     Meta,
+}
+
+struct FcitxTabState {
+    profile: Option<ContainerName>,
+    state: Option<fcitx::FcitxState>,
+    pending: bool,
+    pending_action: Option<fcitx::FcitxAction>,
+    input_method_search: String,
+    logs: supervisor::SharedLevelLogRings,
+    result_tx: flume::Sender<(ContainerName, Result<fcitx::FcitxState, String>)>,
+    result_rx: flume::Receiver<(ContainerName, Result<fcitx::FcitxState, String>)>,
+}
+
+impl FcitxTabState {
+    fn new() -> Self {
+        let (result_tx, result_rx) = flume::unbounded();
+        Self {
+            profile: None,
+            state: None,
+            pending: false,
+            pending_action: None,
+            input_method_search: String::new(),
+            logs: Arc::new(RwLock::new(supervisor::LevelLogView::default())),
+            result_tx,
+            result_rx,
+        }
+    }
+
+    fn log(&mut self, message: impl Into<String>, is_error: bool) {
+        let mut logs = self.logs.write().unwrap_or_else(|e| e.into_inner());
+        logs.push_entry(
+            LogSource::Fcitx,
+            diag::LogEntry {
+                ts: Timestamp::now(),
+                level: if is_error { "ERROR" } else { "INFO" }.to_string(),
+                target: "fcitx".to_string(),
+                message: message.into(),
+                fields: Vec::new(),
+            },
+        );
+    }
+
+    fn poll(&mut self) {
+        while let Ok((profile, result)) = self.result_rx.try_recv() {
+            if self.profile.as_ref() != Some(&profile) {
+                continue;
+            }
+            self.pending = false;
+            let action = self.pending_action.take();
+            match result {
+                Ok(state) => {
+                    self.log(
+                        format!(
+                            "{}: {} / {} ({:?})",
+                            action
+                                .as_ref()
+                                .map(fcitx_action_label)
+                                .unwrap_or_else(|| "Refreshed".to_string()),
+                            state.current_group,
+                            state.current_input_method,
+                            state.status
+                        ),
+                        false,
+                    );
+                    self.state = Some(state);
+                }
+                Err(error) => {
+                    self.log(error.clone(), true);
+                }
+            }
+        }
+    }
+
+    fn request(
+        &mut self,
+        runtime: &Runtime,
+        profile: ContainerName,
+        action: Option<fcitx::FcitxAction>,
+    ) {
+        if self.pending {
+            return;
+        }
+        self.profile = Some(profile.clone());
+        self.pending = true;
+        self.pending_action = action.clone();
+        self.log(
+            action
+                .as_ref()
+                .map(fcitx_action_label)
+                .unwrap_or_else(|| "Refresh requested".to_string()),
+            false,
+        );
+        let result_tx = self.result_tx.clone();
+        runtime.spawn(async move {
+            let result = match action {
+                Some(action) => fcitx::act(profile.as_str(), action).await,
+                None => fcitx::query(profile.as_str()).await,
+            }
+            .map_err(|error| format!("{error:#}"));
+            let _ = result_tx.send((profile, result));
+        });
+    }
+}
+
+fn fcitx_action_label(action: &fcitx::FcitxAction) -> String {
+    match action {
+        fcitx::FcitxAction::SetActive(true) => "Activate requested".to_string(),
+        fcitx::FcitxAction::SetActive(false) => "Deactivate requested".to_string(),
+        fcitx::FcitxAction::SetGroup(group) => format!("Group change requested: {group}"),
+        fcitx::FcitxAction::SetInputMethod(input_method) => {
+            format!("Input method change requested: {input_method}")
+        }
+        fcitx::FcitxAction::AddInputMethod(input_method) => {
+            format!("Add and select input method requested: {input_method}")
+        }
+        fcitx::FcitxAction::ConfigureInputMethod(input_method) => {
+            format!("Configuration window requested for {input_method}")
+        }
+    }
 }
 
 // ── Manage / creation wizard ──────────────────────────────────────────────────
@@ -1153,6 +1274,7 @@ struct App {
     hide_secret: bool,
     cover_text: String,
     tokio_rt: Option<Runtime>,
+    fcitx_tab: FcitxTabState,
     detail_proxy_id: Option<ProxyID>,
     expanded_ip_rows: HashSet<ProxyID>,
     last_sort_time: Instant,
@@ -1813,6 +1935,7 @@ impl App {
             hide_secret: false,
             cover_text: "redacted".to_string(),
             tokio_rt: Some(tokio_rt),
+            fcitx_tab: FcitxTabState::new(),
             detail_proxy_id: None,
             expanded_ip_rows: HashSet::new(),
             last_sort_time: Instant::now(),
@@ -1878,6 +2001,7 @@ impl App {
         match self.right_tab {
             RightTab::Proxies => "Proxies",
             RightTab::Daemon => "Daemon",
+            RightTab::Dbus => "Dbus",
             RightTab::Logs => "Logs",
             RightTab::Actions => "Actions",
             RightTab::Processes => "Processes",
@@ -4215,6 +4339,7 @@ fn wizard_template_overlay_basic() -> (TemplateConfig, HotConfig) {
         browser_profile: None,
         dbus: DbusMode::Container,
         rootfs: Rootfs::Default,
+        fcitx_default_input_method: None,
     };
     (template, hot)
 }
@@ -4418,6 +4543,7 @@ fn wizard_build_pivot_template(
         browser_profile,
         dbus,
         rootfs: Rootfs::Default,
+        fcitx_default_input_method: None,
     };
     (template, hot)
 }
@@ -4924,6 +5050,12 @@ impl eframe::App for App {
                         self.right_tab = RightTab::Daemon;
                     }
                     if ui
+                        .selectable_label(self.right_tab == RightTab::Dbus, "Dbus")
+                        .clicked()
+                    {
+                        self.right_tab = RightTab::Dbus;
+                    }
+                    if ui
                         .selectable_label(self.right_tab == RightTab::Logs, "Logs")
                         .clicked()
                     {
@@ -5038,6 +5170,7 @@ impl eframe::App for App {
                     .show(ui, |ui| match self.right_tab {
                         RightTab::Proxies => self.render_proxies_tab(ui),
                         RightTab::Daemon => self.render_daemon_tab(ui),
+                        RightTab::Dbus => self.render_dbus_tab(ui),
                         RightTab::Logs => self.render_logs_tab(ui),
                         RightTab::Actions => self.render_actions_tab(ui),
                         RightTab::Processes => self.render_processes_tab(ui),
@@ -6250,6 +6383,7 @@ impl App {
                             LogSource::Serve => "serve".to_owned(),
                             LogSource::Up => "up".to_owned(),
                             LogSource::RootDaemon => "daemon".to_owned(),
+                            LogSource::Fcitx => "fcitx".to_owned(),
                             LogSource::Pid(_) => "pid".to_owned(),
                         };
                         let log = &entry.entry.log;
@@ -6267,6 +6401,7 @@ impl App {
                             LogSource::Serve => ("serve", LOG_SYNTAX_GREEN),
                             LogSource::Up => ("up", LOG_SYNTAX_BLUE),
                             LogSource::RootDaemon => ("daemon", LOG_SYNTAX_PURPLE),
+                            LogSource::Fcitx => ("fcitx", LOG_SYNTAX_CYAN),
                             LogSource::Pid(_) => ("pid", LOG_SYNTAX_YELLOW),
                         };
                         ui.style_mut().interaction.selectable_labels = false;
@@ -6309,6 +6444,7 @@ impl App {
                         LogSource::Serve => "serve",
                         LogSource::Up => "up",
                         LogSource::RootDaemon => "daemon",
+                        LogSource::Fcitx => "fcitx",
                         LogSource::Pid(_) => "pid",
                     },
                     entry.entry.log.level,
@@ -6321,6 +6457,278 @@ impl App {
             }
             text.visible_text().to_string()
         })
+    }
+
+    fn render_dbus_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(profile) = self.selected_profile.clone() else {
+            ui.heading("Input Methods");
+            ui.label("Select a profile to control its private Fcitx session.");
+            return;
+        };
+        if self.fcitx_tab.profile.as_ref() != Some(&profile) {
+            self.fcitx_tab.profile = Some(profile.clone());
+            self.fcitx_tab.state = None;
+            self.fcitx_tab.pending = false;
+            if let Some(runtime) = self.tokio_rt.as_ref() {
+                self.fcitx_tab.request(runtime, profile.clone(), None);
+            }
+        }
+        let uses_private_bus = self
+            .snapshot
+            .profiles
+            .get(&profile)
+            .is_some_and(|state| state.template.dbus == DbusMode::Container);
+        if !uses_private_bus {
+            ui.heading("Input Methods");
+            ui.label("Input-method controls require this profile's private D-Bus session.");
+            return;
+        }
+
+        self.fcitx_tab.poll();
+        ui.horizontal(|ui| {
+            ui.heading("Input Methods");
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .add_enabled(!self.fcitx_tab.pending, egui::Button::new("Refresh"))
+                        .clicked()
+                    {
+                        if let Some(runtime) = self.tokio_rt.as_ref() {
+                            self.fcitx_tab.request(runtime, profile.clone(), None);
+                        }
+                    }
+                },
+            );
+        });
+        let Some(state) = self.fcitx_tab.state.clone() else {
+            self.render_fcitx_log_panel(ui);
+            return;
+        };
+
+        egui::Frame::NONE
+            .fill(Color32::from_gray(30))
+            .stroke(egui::Stroke::NONE)
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(egui::CornerRadius::same(4))
+            .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (status, color) = match state.status {
+                    fcitx::FcitxStatus::Disabled => ("Disabled", Color32::GRAY),
+                    fcitx::FcitxStatus::Inactive => {
+                        ("Inactive (ready to activate)", Color32::LIGHT_YELLOW)
+                    }
+                    fcitx::FcitxStatus::Active => ("Active", Color32::LIGHT_GREEN),
+                };
+                ui.add_sized(
+                    egui::vec2(270.0, 20.0),
+                    egui::Label::new(
+                        egui::RichText::new(format!("Fcitx: {status}")).color(color),
+                    ),
+                );
+                let button = match state.status {
+                    fcitx::FcitxStatus::Active => "Deactivate",
+                    fcitx::FcitxStatus::Disabled | fcitx::FcitxStatus::Inactive => "Activate",
+                };
+                if ui
+                    .add_enabled(!self.fcitx_tab.pending, egui::Button::new(button))
+                    .clicked()
+                {
+                    if let Some(runtime) = self.tokio_rt.as_ref() {
+                        self.fcitx_tab.request(
+                            runtime,
+                            profile.clone(),
+                            Some(fcitx::FcitxAction::SetActive(
+                                state.status != fcitx::FcitxStatus::Active,
+                            )),
+                        );
+                    }
+                }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Input-method group");
+                let mut selected_group = state.current_group.clone();
+                egui::ComboBox::from_id_salt("fcitx_input_method_group")
+                    .selected_text(&state.current_group)
+                    .show_ui(ui, |ui| {
+                        for group in &state.groups {
+                            let label = if group.layout.is_empty() {
+                                group.name.clone()
+                            } else {
+                                format!("{} ({})", group.name, group.layout)
+                            };
+                            ui.selectable_value(&mut selected_group, group.name.clone(), label);
+                        }
+                    });
+                if selected_group != state.current_group {
+                    if let Some(runtime) = self.tokio_rt.as_ref() {
+                        self.fcitx_tab.request(
+                            runtime,
+                            profile.clone(),
+                            Some(fcitx::FcitxAction::SetGroup(selected_group)),
+                        );
+                    }
+                }
+            });
+        });
+
+        let current_group = state
+            .groups
+            .iter()
+            .find(|group| group.name == state.current_group);
+        let pending = self.fcitx_tab.pending;
+        let mut requested_action = None;
+        ui.add_space(8.0);
+        ui.columns(2, |columns| {
+            egui::Frame::NONE
+                .fill(Color32::from_gray(22))
+                .stroke(egui::Stroke::NONE)
+                .inner_margin(egui::Margin::same(10))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(&mut columns[0], |ui| {
+                ui.heading("Configured methods");
+                ui.small("Select a method to switch. Configure opens its options window.");
+                ui.small("The current marker appears only while a container app has an input context.");
+                if let Some(group) = current_group {
+                    egui::ScrollArea::vertical()
+                        .id_salt("fcitx_configured_methods")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for input_method in &group.input_methods {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !pending,
+                                            egui::Button::selectable(
+                                                state.status == fcitx::FcitxStatus::Active
+                                                    && state.current_input_method == *input_method,
+                                                input_method,
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        requested_action = Some(
+                                            fcitx::FcitxAction::SetInputMethod(
+                                                input_method.clone(),
+                                            ),
+                                        );
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !pending,
+                                            egui::Button::new("Configure"),
+                                        )
+                                        .on_hover_text(format!(
+                                            "Open {}'s configuration window",
+                                            input_method
+                                        ))
+                                        .clicked()
+                                    {
+                                        requested_action = Some(
+                                            fcitx::FcitxAction::ConfigureInputMethod(
+                                                input_method.clone(),
+                                            ),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                } else {
+                    ui.weak("This group has no configured methods.");
+                }
+                });
+
+            egui::Frame::NONE
+                .fill(Color32::from_gray(22))
+                .stroke(egui::Stroke::NONE)
+                .inner_margin(egui::Margin::same(10))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(&mut columns[1], |ui| {
+                ui.heading("Add installed method");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fcitx_tab.input_method_search)
+                        .hint_text("Search by name, language, or ID")
+                        .desired_width(f32::INFINITY),
+                );
+                let search = self.fcitx_tab.input_method_search.trim().to_lowercase();
+                if search.is_empty() {
+                    ui.weak("Type to search available methods.");
+                } else if let Some(group) = current_group {
+                    let candidates: Vec<_> = state
+                        .available_input_methods
+                        .iter()
+                        .filter(|method| {
+                            !group.input_methods.contains(&method.id)
+                                && (method.id.to_lowercase().contains(&search)
+                                    || method.name.to_lowercase().contains(&search)
+                                    || method.language.to_lowercase().contains(&search))
+                        })
+                        .take(20)
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        ui.weak("No matching unconfigured methods.");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("fcitx_available_input_methods")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for method in candidates {
+                                    let label = if method.language.is_empty() {
+                                        format!("{} ({})", method.name, method.id)
+                                    } else {
+                                        format!(
+                                            "{} ({}, {})",
+                                            method.name, method.id, method.language
+                                        )
+                                    };
+                                    if ui
+                                        .add_enabled(!pending, egui::Button::new(label))
+                                        .clicked()
+                                    {
+                                        requested_action = Some(
+                                            fcitx::FcitxAction::AddInputMethod(method.id),
+                                        );
+                                    }
+                                }
+                                });
+                    }
+                }
+            });
+        });
+        if let (Some(action), Some(runtime)) = (requested_action, self.tokio_rt.as_ref()) {
+            self.fcitx_tab
+                .request(runtime, profile.clone(), Some(action));
+        }
+        self.render_fcitx_log_panel(ui);
+    }
+
+    fn render_fcitx_log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading("Fcitx logs");
+        let logs = self
+            .fcitx_tab
+            .logs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let entries = logs.entries_for_min_level(self.log_panel_min_level.rank_value());
+        let total_entries = logs.total_entries();
+        let mut min_level = self.log_panel_min_level;
+        if let Some(text) = Self::render_structured_log_panel(
+            ui,
+            "fcitx",
+            "No Fcitx activity yet.",
+            format!("No Fcitx logs at or above {}", min_level.label()),
+            &mut min_level,
+            entries,
+            total_entries,
+        ) {
+            self.log_editor_popup = Some(LogEditorPopup {
+                title: format!("{} Fcitx logs", self.selected_profile.as_deref().unwrap_or("")),
+                text,
+            });
+        }
     }
 
     fn render_daemon_tab(&mut self, ui: &mut egui::Ui) {
@@ -8664,7 +9072,7 @@ impl App {
         ui.add_space(6.0);
         egui::CollapsingHeader::new(format!(
             "Recent host / route performance ({})",
-            profile.host_route_stats.len()
+            profile.recent_host_routes.len()
         ))
         .default_open(true)
         .show(ui, |ui| {
@@ -8674,7 +9082,7 @@ impl App {
             let route_target = &mut self.traffic_route_target;
             let route_filter = &mut self.traffic_route_filter;
             let filtered_route_target_indices = &self.filtered_traffic_route_target_indices;
-            ui.weak("Showing up to 512 most recently observed TCP and UDP target/route estimates.");
+            ui.weak("Showing up to 512 recent TCP and UDP target/routes, including routes before measurements are available.");
             ui.horizontal(|ui| {
                 ui.label("Click button to route to");
                 egui::ComboBox::from_id_salt("traffic_host_route_target")
@@ -8747,8 +9155,8 @@ impl App {
                     *route_target = target.route.clone();
                 }
             });
-            if profile.host_route_stats.is_empty() {
-                ui.weak("No host / route measurements yet.");
+            if profile.recent_host_routes.is_empty() {
+                ui.weak("No recent host / route activity yet.");
                 return;
             }
             let selected_route = route_target.clone();
@@ -8794,8 +9202,8 @@ impl App {
                     });
                 })
                 .body(|mut body| {
-                    body.rows(row_height, profile.host_route_stats.len(), |mut row| {
-                        let metric = &profile.host_route_stats[row.index()];
+                    body.rows(row_height, profile.recent_host_routes.len(), |mut row| {
+                        let metric = &profile.recent_host_routes[row.index()];
                         row.col(|ui| {
                             ui.label(metric.key.target.to_string());
                         });
