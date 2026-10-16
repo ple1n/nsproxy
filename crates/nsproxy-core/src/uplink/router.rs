@@ -56,8 +56,6 @@ enum RelayOp {
 struct TcpRelayOutcome {
     bytes_up: u128,
     bytes_down: u128,
-    upload_sample: Option<TransferRateSample>,
-    download_sample: Option<TransferRateSample>,
 }
 
 #[derive(Debug)]
@@ -69,6 +67,7 @@ enum RelayError {
         op: RelayOp,
         source: std::io::Error,
     },
+    StatsChannelClosed { flow: &'static str },
 }
 
 impl std::fmt::Display for RelayError {
@@ -95,6 +94,9 @@ impl std::fmt::Display for RelayError {
                 };
                 write!(f, "{} {}", flow, source)
             }
+            RelayError::StatsChannelClosed { flow } => {
+                write!(f, "{flow} rate-statistics channel closed")
+            }
         }
     }
 }
@@ -103,6 +105,7 @@ impl std::error::Error for RelayError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             RelayError::Io { source, .. } => Some(source),
+            RelayError::StatsChannelClosed { .. } => None,
         }
     }
 }
@@ -629,19 +632,6 @@ impl Router {
                                 s.record_attempt(true);
                                 s.record_traffic(relay.bytes_up, relay.bytes_down);
                             };
-                            if relay.upload_sample.is_some() || relay.download_sample.is_some() {
-                                let metric =
-                                    uplink.write().await.record_host_route_transfer_samples(
-                                        stats_target.clone(),
-                                        ObservedRoute::Proxy(id.clone()),
-                                        relay.upload_sample,
-                                        relay.download_sample,
-                                    );
-                                diag.emit(DiagEvent::HostRouteStatsUpdated {
-                                    ts: metric.observed_at,
-                                    stat: metric,
-                                });
-                            }
                             diag.emit(DiagEvent::Finished {
                                 id: conn_id,
                                 ts: Timestamp::now(),
@@ -743,8 +733,8 @@ impl Router {
             let elapsed = transfer_start.elapsed();
             if elapsed.saturating_sub(last_rate_update) >= Duration::from_secs(1) {
                 let observed_at = Timestamp::now();
-                let upload_sample = upload_tracker.sample(observed_at);
-                let download_sample = download_tracker.sample(observed_at);
+                let upload_sample = upload_tracker.sample(observed_at, elapsed);
+                let download_sample = download_tracker.sample(observed_at, elapsed);
                 if upload_sample.is_some() || download_sample.is_some() {
                     Self::publish_udp_rate_samples(
                         &uplink,
@@ -766,8 +756,8 @@ impl Router {
             &diag,
             &stats_target,
             &route,
-            upload_tracker.sample(observed_at),
-            download_tracker.sample(observed_at),
+            upload_tracker.sample(observed_at, transfer_start.elapsed()),
+            download_tracker.sample(observed_at, transfer_start.elapsed()),
         )
         .await;
         Ok((bytes_up, bytes_down))
@@ -806,6 +796,31 @@ impl Router {
         });
     }
 
+    async fn publish_tcp_rate_sample(
+        uplink: &Arc<RwLock<UplinkHub>>,
+        diag: &DiagServer,
+        stats_target: &WireAddress,
+        route: &ObservedRoute,
+        sample: TransferRateSample,
+        upload: bool,
+    ) {
+        let (upload_sample, download_sample) = if upload {
+            (Some(sample), None)
+        } else {
+            (None, Some(sample))
+        };
+        let metric = uplink.write().await.record_host_route_transfer_samples(
+            stats_target.clone(),
+            route.clone(),
+            upload_sample,
+            download_sample,
+        );
+        diag.emit(DiagEvent::HostRouteStatsUpdated {
+            ts: metric.observed_at,
+            stat: metric,
+        });
+    }
+
     async fn relay_tcp_with_cause<A, B>(
         left: &mut A,
         right: &mut B,
@@ -820,8 +835,8 @@ impl Router {
         A: AsyncRead + AsyncWrite + Unpin + ?Sized,
         B: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
-        let (upload_rate_tx, mut upload_rate_rx) = watch::channel(None);
-        let (download_rate_tx, mut download_rate_rx) = watch::channel(None);
+        let (upload_rate_tx, mut upload_rate_rx) = mpsc::channel(8);
+        let (download_rate_tx, mut download_rate_rx) = mpsc::channel(8);
         let relay = Self::relay_tcp_copy(
             left,
             right,
@@ -832,43 +847,50 @@ impl Router {
         );
         tokio::pin!(relay);
 
+        let mut relay_result = None;
+        let mut upload_closed = false;
+        let mut download_closed = false;
         loop {
             tokio::select! {
                 biased;
-                result = &mut relay => return result,
-                changed = upload_rate_rx.changed() => {
-                    if changed.is_ok() {
-                        let sample = *upload_rate_rx.borrow_and_update();
-                        if let Some(sample) = sample {
-                            let metric = uplink.write().await.record_host_route_transfer_samples(
-                                stats_target.clone(),
-                                route.clone(),
-                                Some(sample),
-                                None,
-                            );
-                            diag.emit(DiagEvent::HostRouteStatsUpdated {
-                                ts: metric.observed_at,
-                                stat: metric,
-                            });
-                        }
+                result = &mut relay, if relay_result.is_none() => {
+                    relay_result = Some(result);
+                }
+                sample = upload_rate_rx.recv(), if !upload_closed => {
+                    if let Some(sample) = sample {
+                        Self::publish_tcp_rate_sample(
+                            &uplink,
+                            &diag,
+                            &stats_target,
+                            &route,
+                            sample,
+                            true,
+                        )
+                        .await;
+                    } else {
+                        upload_closed = true;
                     }
                 }
-                changed = download_rate_rx.changed() => {
-                    if changed.is_ok() {
-                        let sample = *download_rate_rx.borrow_and_update();
-                        if let Some(sample) = sample {
-                            let metric = uplink.write().await.record_host_route_transfer_samples(
-                                stats_target.clone(),
-                                route.clone(),
-                                None,
-                                Some(sample),
-                            );
-                            diag.emit(DiagEvent::HostRouteStatsUpdated {
-                                ts: metric.observed_at,
-                                stat: metric,
-                            });
-                        }
+                sample = download_rate_rx.recv(), if !download_closed => {
+                    if let Some(sample) = sample {
+                        Self::publish_tcp_rate_sample(
+                            &uplink,
+                            &diag,
+                            &stats_target,
+                            &route,
+                            sample,
+                            false,
+                        )
+                        .await;
+                    } else {
+                        download_closed = true;
                     }
+                }
+            }
+
+            if relay_result.is_some() && upload_closed && download_closed {
+                if let Some(result) = relay_result.take() {
+                    return result;
                 }
             }
         }
@@ -879,8 +901,8 @@ impl Router {
         right: &mut B,
         left_to_right_flow: &'static str,
         right_to_left_flow: &'static str,
-        upload_rate_tx: watch::Sender<Option<TransferRateSample>>,
-        download_rate_tx: watch::Sender<Option<TransferRateSample>>,
+        upload_rate_tx: mpsc::Sender<TransferRateSample>,
+        download_rate_tx: mpsc::Sender<TransferRateSample>,
     ) -> std::result::Result<TcpRelayOutcome, RelayError>
     where
         A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -921,12 +943,9 @@ impl Router {
         };
 
         let (bytes_up, bytes_down) = tokio::try_join!(up, down)?;
-        let observed_at = Timestamp::now();
         Ok(TcpRelayOutcome {
             bytes_up,
             bytes_down,
-            upload_sample: upload_tracker.sample(observed_at),
-            download_sample: download_tracker.sample(observed_at),
         })
     }
 
@@ -938,7 +957,7 @@ impl Router {
         flow: &'static str,
         transfer_start: Instant,
         rate_tracker: &mut TransferRateTracker,
-        rate_updates: watch::Sender<Option<TransferRateSample>>,
+        rate_updates: mpsc::Sender<TransferRateSample>,
     ) -> std::result::Result<u128, RelayError>
     where
         R: AsyncRead + Unpin + ?Sized,
@@ -990,16 +1009,24 @@ impl Router {
                 let elapsed = transfer_start.elapsed();
                 rate_tracker.record(n as u128, elapsed);
                 if elapsed.saturating_sub(last_rate_update) >= Duration::from_secs(1) {
-                    if let Some(sample) = rate_tracker.sample(Timestamp::now()) {
-                        rate_updates.send_replace(Some(sample));
+                    if let Some(sample) = rate_tracker.sample(Timestamp::now(), elapsed) {
+                        rate_updates
+                            .send(sample)
+                            .await
+                            .map_err(|_| RelayError::StatsChannelClosed { flow })?;
                         last_rate_update = elapsed;
                     }
                 }
             }
         }
 
-        if let Some(sample) = rate_tracker.sample(Timestamp::now()) {
-            rate_updates.send_replace(Some(sample));
+        if let Some(sample) =
+            rate_tracker.sample(Timestamp::now(), transfer_start.elapsed())
+        {
+            rate_updates
+                .send(sample)
+                .await
+                .map_err(|_| RelayError::StatsChannelClosed { flow })?;
         }
 
         if let Err(source) = writer.shutdown().await {
@@ -1072,18 +1099,6 @@ impl Router {
         .await
         {
             Ok(relay) => {
-                if relay.upload_sample.is_some() || relay.download_sample.is_some() {
-                    let metric = uplink.write().await.record_host_route_transfer_samples(
-                        stats_target,
-                        ObservedRoute::NoProxy,
-                        relay.upload_sample,
-                        relay.download_sample,
-                    );
-                    diag.emit(DiagEvent::HostRouteStatsUpdated {
-                        ts: metric.observed_at,
-                        stat: metric,
-                    });
-                }
                 diag.emit(DiagEvent::Finished {
                     id: conn_id.clone(),
                     ts: Timestamp::now(),
@@ -1561,14 +1576,16 @@ mod tests {
     async fn tcp_relay_preserves_bidirectional_copy_and_half_close() {
         let (mut left, mut left_peer) = tokio::io::duplex(1024);
         let (mut right, mut right_peer) = tokio::io::duplex(1024);
+        let (upload_rate_tx, mut upload_rate_rx) = mpsc::channel(8);
+        let (download_rate_tx, mut download_rate_rx) = mpsc::channel(8);
 
         let relay = Router::relay_tcp_copy(
             &mut left,
             &mut right,
             "left->right",
             "right->left",
-            watch::channel(None).0,
-            watch::channel(None).0,
+            upload_rate_tx,
+            download_rate_tx,
         );
         let left_task = async {
             left_peer.write_all(b"request").await.unwrap();
@@ -1591,24 +1608,27 @@ mod tests {
         assert_eq!(relay.bytes_down, 8);
         assert_eq!(response, b"response");
         assert_eq!(request, b"request");
-        assert_eq!(relay.upload_sample, None);
-        assert_eq!(relay.download_sample, None);
+        assert_eq!(upload_rate_rx.try_recv().unwrap().bytes, 7);
+        assert_eq!(download_rate_rx.try_recv().unwrap().bytes, 8);
     }
 
     #[tokio::test]
-    async fn tcp_relay_samples_spaced_forwarded_writes() {
+    async fn tcp_relay_publishes_rate_samples_before_returning() {
         let (mut left, mut left_peer) = tokio::io::duplex(1024);
         let (mut right, mut right_peer) = tokio::io::duplex(1024);
-        let (upload_rate_tx, upload_rate_rx) = watch::channel(None);
-        let (download_rate_tx, _) = watch::channel(None);
+        let uplink = Arc::new(RwLock::new(UplinkHub::new()));
+        let target = WireAddress::DomainAddress("rates.example".to_string(), 443);
+        let route = ObservedRoute::NoProxy;
 
-        let relay = Router::relay_tcp_copy(
+        let relay = Router::relay_tcp_with_cause(
             &mut left,
             &mut right,
             "left->right",
             "right->left",
-            upload_rate_tx,
-            download_rate_tx,
+            target.clone(),
+            route.clone(),
+            uplink.clone(),
+            DiagServer::noop(),
         );
         let left_task = async {
             for _ in 0..3 {
@@ -1628,11 +1648,19 @@ mod tests {
 
         let (relay, (), request) = tokio::join!(relay, left_task, right_task);
         let relay = relay.unwrap();
-        let sample = (*upload_rate_rx.borrow()).unwrap();
         assert_eq!(relay.bytes_up, 30);
         assert_eq!(request, b"012345678901234567890123456789");
+        let metric = uplink
+            .read()
+            .await
+            .host_route_metrics(Timestamp::now())
+            .into_iter()
+            .find(|metric| metric.key.target == target && metric.key.route == route)
+            .unwrap();
+        let sample = metric.upload_sample.unwrap();
         assert_eq!(sample.bytes, 30);
         assert_eq!(sample.event_count, 3);
         assert!(sample.bytes_per_sec() < 1_000_000.0);
+        assert_eq!(metric.upload_rate_summary.unwrap().sample_count, 1);
     }
 }

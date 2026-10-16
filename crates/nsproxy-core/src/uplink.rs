@@ -2230,7 +2230,7 @@ mod tests {
             tracker.record(bytes - 2, Duration::ZERO);
             tracker.record(1, Duration::from_secs(1));
             tracker.record(1, Duration::from_secs(2));
-            tracker.sample(Timestamp(0)).unwrap()
+            tracker.sample(Timestamp(0), Duration::from_secs(2)).unwrap()
         }
 
         let mut hub = UplinkHub::new();
@@ -2293,7 +2293,9 @@ mod tests {
         tracker.record(10, Duration::ZERO);
         tracker.record(10, Duration::from_secs(1));
         tracker.record(10, Duration::from_secs(2));
-        let sample = tracker.sample(Timestamp::now()).unwrap();
+        let sample = tracker
+            .sample(Timestamp::now(), Duration::from_secs(2))
+            .unwrap();
         let transferred = hub.record_host_route_transfer_samples(
             target,
             ObservedRoute::NoProxy,

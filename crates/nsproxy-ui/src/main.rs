@@ -8767,6 +8767,7 @@ impl App {
                             render_transfer_rate_cell(
                                 ui,
                                 metric.upload_bytes_per_sec,
+                                metric.upload_rate_summary,
                                 metric.upload_sample,
                             );
                         });
@@ -8774,6 +8775,7 @@ impl App {
                             render_transfer_rate_cell(
                                 ui,
                                 metric.download_bytes_per_sec,
+                                metric.download_rate_summary,
                                 metric.download_sample,
                             );
                         });
@@ -8781,6 +8783,7 @@ impl App {
                             render_transfer_rate_cell(
                                 ui,
                                 metric.udp_upload_bytes_per_sec,
+                                metric.udp_upload_rate_summary,
                                 metric.udp_upload_sample,
                             );
                         });
@@ -8788,6 +8791,7 @@ impl App {
                             render_transfer_rate_cell(
                                 ui,
                                 metric.udp_download_bytes_per_sec,
+                                metric.udp_download_rate_summary,
                                 metric.udp_download_sample,
                             );
                         });
@@ -11300,22 +11304,57 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 fn render_transfer_rate_cell(
     ui: &mut egui::Ui,
     bytes_per_sec: Option<f64>,
+    summary: Option<nsproxy_common::stats::TransferRateSummary>,
     sample: Option<TransferRateSample>,
 ) {
-    let response = ui.label(
-        bytes_per_sec
-            .map(format_bytes_per_sec)
-            .unwrap_or_else(|| "—".to_string()),
-    );
+    const LIVE_RATE_AGE: Duration = Duration::from_secs(2);
+    let now = Timestamp::now();
+    let live_sample =
+        sample.filter(|sample| now.elapsed_since(sample.observed_at) <= LIVE_RATE_AGE);
+    let displayed_rate = live_sample
+        .map(TransferRateSample::bytes_per_sec)
+        .or(bytes_per_sec);
+    let text = displayed_rate
+        .map(format_bytes_per_sec)
+        .unwrap_or_else(|| "—".to_string());
+    let response = if live_sample.is_some() {
+        ui.label(text)
+    } else if bytes_per_sec.is_some() {
+        ui.colored_label(Color32::LIGHT_BLUE, text)
+    } else {
+        ui.label(text)
+    };
+
+    let mut details = Vec::new();
+    if let Some(summary) = summary {
+        details.push(format!(
+            "Average: {}",
+            format_bytes_per_sec(summary.average_bytes_per_sec)
+        ));
+        details.push(format!(
+            "Minimum: {}",
+            format_bytes_per_sec(summary.min_bytes_per_sec)
+        ));
+        details.push(format!(
+            "Maximum: {}",
+            format_bytes_per_sec(summary.max_bytes_per_sec)
+        ));
+        details.push(format!("Rate observations: {}", summary.sample_count));
+    }
     if let Some(sample) = sample {
-        response.on_hover_text(format!(
-            "Latest qualified sample: {} bytes over {:.2}s ({} write events), observed {}",
-            sample.bytes,
+        details.push(format!(
+            "Latest lower-bound estimate: {} over {:.2}s elapsed ({:.2}s between data events; {} forwarded events), observed {}",
+            format_bytes_per_sec(sample.bytes_per_sec()),
             sample.duration_secs(),
+            sample.data_span_secs(),
             sample.event_count,
             format_timestamp_age(sample.observed_at)
         ));
     }
+    if details.is_empty() {
+        details.push("No transfer rate observations yet.".to_string());
+    }
+    response.on_hover_text(details.join("\n"));
 }
 
 fn list_persisted_log_files() -> Vec<PersistedLogFileInfo> {

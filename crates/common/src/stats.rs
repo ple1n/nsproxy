@@ -19,10 +19,6 @@ const MAX_RETENTION_US: u64 = 4 * WEEK_US;
 const SLOT_QUOTA: usize = 256;
 const ROUTE_AVERAGE_HALF_LIFE: Duration = Duration::from_secs(30);
 const MIN_ROUTE_AVERAGE_WEIGHT: f64 = 0.1;
-const ROUTE_RATE_WINDOW: Duration = Duration::from_secs(5);
-const ROUTE_RATE_BUCKET: Duration = Duration::from_millis(100);
-const MIN_ROUTE_RATE_SPAN: Duration = Duration::from_secs(1);
-const MIN_ROUTE_RATE_EVENTS: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyProtocol {
@@ -111,18 +107,31 @@ pub struct HostRouteMetric {
     pub connect_success_rate: Option<f64>,
     pub upload_bytes_per_sec: Option<f64>,
     pub download_bytes_per_sec: Option<f64>,
+    pub upload_rate_summary: Option<TransferRateSummary>,
+    pub download_rate_summary: Option<TransferRateSummary>,
     pub upload_sample: Option<TransferRateSample>,
     pub download_sample: Option<TransferRateSample>,
     pub udp_upload_bytes_per_sec: Option<f64>,
     pub udp_download_bytes_per_sec: Option<f64>,
+    pub udp_upload_rate_summary: Option<TransferRateSummary>,
+    pub udp_download_rate_summary: Option<TransferRateSummary>,
     pub udp_upload_sample: Option<TransferRateSample>,
     pub udp_download_sample: Option<TransferRateSample>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TransferRateSummary {
+    pub average_bytes_per_sec: f64,
+    pub min_bytes_per_sec: f64,
+    pub max_bytes_per_sec: f64,
+    pub sample_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TransferRateSample {
     pub bytes: u128,
     pub duration_micros: u64,
+    pub data_span_micros: u64,
     pub event_count: u64,
     pub observed_at: Timestamp,
 }
@@ -135,80 +144,110 @@ impl TransferRateSample {
     pub fn duration_secs(self) -> f64 {
         self.duration_micros as f64 / 1_000_000.0
     }
+
+    pub fn data_span_secs(self) -> f64 {
+        self.data_span_micros as f64 / 1_000_000.0
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TransferRateBucket {
-    id: u128,
-    first_at: Duration,
-    last_at: Duration,
-    bytes: u128,
-    events: u64,
+#[derive(Debug, Clone, Default)]
+struct TransferRateAccumulator {
+    total_bytes: u128,
+    total_duration_micros: u128,
+    min_bytes_per_sec: Option<f64>,
+    max_bytes_per_sec: Option<f64>,
+    sample_count: u64,
+}
+
+impl TransferRateAccumulator {
+    fn observe(&mut self, sample: TransferRateSample) {
+        let rate = sample.bytes_per_sec();
+        if !rate.is_finite() || rate < 0.0 {
+            return;
+        }
+
+        self.total_bytes = self.total_bytes.saturating_add(sample.bytes);
+        self.total_duration_micros = self
+            .total_duration_micros
+            .saturating_add(sample.duration_micros as u128);
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.min_bytes_per_sec = Some(
+            self.min_bytes_per_sec
+                .map_or(rate, |minimum| minimum.min(rate)),
+        );
+        self.max_bytes_per_sec = Some(
+            self.max_bytes_per_sec
+                .map_or(rate, |maximum| maximum.max(rate)),
+        );
+    }
+
+    fn summary(&self) -> Option<TransferRateSummary> {
+        if self.sample_count == 0 || self.total_duration_micros == 0 {
+            return None;
+        }
+        Some(TransferRateSummary {
+            average_bytes_per_sec: self.total_bytes as f64 * 1_000_000.0
+                / self.total_duration_micros as f64,
+            min_bytes_per_sec: self.min_bytes_per_sec?,
+            max_bytes_per_sec: self.max_bytes_per_sec?,
+            sample_count: self.sample_count,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TransferRateTracker {
-    buckets: VecDeque<TransferRateBucket>,
+    interval_first_at: Option<Duration>,
+    last_at: Option<Duration>,
+    sampled_at: Duration,
+    bytes: u128,
+    event_count: u64,
 }
 
 impl TransferRateTracker {
     pub fn record(&mut self, bytes: u128, at: Duration) {
-        if bytes == 0
-            || self
-                .buckets
-                .back()
-                .is_some_and(|bucket| at < bucket.last_at)
-        {
+        if bytes == 0 || self.last_at.is_some_and(|last_at| at < last_at) {
             return;
         }
 
-        let bucket_id = at.as_millis() / ROUTE_RATE_BUCKET.as_millis();
-        match self.buckets.back_mut() {
-            Some(bucket) if bucket.id == bucket_id => {
-                bucket.last_at = at;
-                bucket.bytes = bucket.bytes.saturating_add(bytes);
-                bucket.events = bucket.events.saturating_add(1);
-            }
-            _ => self.buckets.push_back(TransferRateBucket {
-                id: bucket_id,
-                first_at: at,
-                last_at: at,
-                bytes,
-                events: 1,
-            }),
-        }
-
-        while self
-            .buckets
-            .front()
-            .is_some_and(|bucket| at.saturating_sub(bucket.first_at) > ROUTE_RATE_WINDOW)
-        {
-            self.buckets.pop_front();
-        }
+        self.interval_first_at.get_or_insert(at);
+        self.last_at = Some(at);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.event_count = self.event_count.saturating_add(1);
     }
 
-    pub fn sample(&self, observed_at: Timestamp) -> Option<TransferRateSample> {
-        let first = self.buckets.front()?;
-        let last = self.buckets.back()?;
-        let duration = last.last_at.checked_sub(first.first_at)?;
-        let event_count = self
-            .buckets
-            .iter()
-            .fold(0u64, |count, bucket| count.saturating_add(bucket.events));
-        if duration < MIN_ROUTE_RATE_SPAN || event_count < MIN_ROUTE_RATE_EVENTS {
+    pub fn sample(
+        &mut self,
+        observed_at: Timestamp,
+        elapsed: Duration,
+    ) -> Option<TransferRateSample> {
+        if self.bytes == 0 {
             return None;
         }
 
-        let bytes = self
-            .buckets
-            .iter()
-            .fold(0u128, |total, bucket| total.saturating_add(bucket.bytes));
-        Some(TransferRateSample {
-            bytes,
-            duration_micros: duration.as_micros().min(u64::MAX as u128) as u64,
-            event_count,
+        let first_at = self.interval_first_at?;
+        let last_at = self.last_at?;
+        let sample_elapsed = elapsed.max(last_at);
+        let duration_micros = sample_elapsed
+            .saturating_sub(self.sampled_at)
+            .as_micros()
+            .max(1)
+            .min(u64::MAX as u128) as u64;
+        let sample = TransferRateSample {
+            bytes: self.bytes,
+            duration_micros,
+            data_span_micros: last_at
+                .saturating_sub(first_at)
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+            event_count: self.event_count,
             observed_at,
-        })
+        };
+        self.sampled_at = sample_elapsed;
+        self.interval_first_at = None;
+        self.bytes = 0;
+        self.event_count = 0;
+        Some(sample)
     }
 }
 
@@ -257,12 +296,12 @@ impl TimeDecayedAverage {
 pub struct HostRouteStats {
     connect_latency_secs: TimeDecayedAverage,
     connect_success_rate: TimeDecayedAverage,
-    upload_bytes_per_sec: TimeDecayedAverage,
-    download_bytes_per_sec: TimeDecayedAverage,
+    upload_rate: TransferRateAccumulator,
+    download_rate: TransferRateAccumulator,
     upload_sample: Option<TransferRateSample>,
     download_sample: Option<TransferRateSample>,
-    udp_upload_bytes_per_sec: TimeDecayedAverage,
-    udp_download_bytes_per_sec: TimeDecayedAverage,
+    udp_upload_rate: TransferRateAccumulator,
+    udp_download_rate: TransferRateAccumulator,
     udp_upload_sample: Option<TransferRateSample>,
     udp_download_sample: Option<TransferRateSample>,
     pub last_observed: Option<Timestamp>,
@@ -300,14 +339,12 @@ impl HostRouteStats {
 
         if let Some(mut sample) = upload_sample {
             sample.observed_at = at;
-            self.upload_bytes_per_sec
-                .observe(sample.bytes_per_sec(), sample.duration_secs(), at);
+            self.upload_rate.observe(sample);
             self.upload_sample = Some(sample);
         }
         if let Some(mut sample) = download_sample {
             sample.observed_at = at;
-            self.download_bytes_per_sec
-                .observe(sample.bytes_per_sec(), sample.duration_secs(), at);
+            self.download_rate.observe(sample);
             self.download_sample = Some(sample);
         }
     }
@@ -324,14 +361,12 @@ impl HostRouteStats {
 
         if let Some(mut sample) = upload_sample {
             sample.observed_at = at;
-            self.udp_upload_bytes_per_sec
-                .observe(sample.bytes_per_sec(), sample.duration_secs(), at);
+            self.udp_upload_rate.observe(sample);
             self.udp_upload_sample = Some(sample);
         }
         if let Some(mut sample) = download_sample {
             sample.observed_at = at;
-            self.udp_download_bytes_per_sec
-                .observe(sample.bytes_per_sec(), sample.duration_secs(), at);
+            self.udp_download_rate.observe(sample);
             self.udp_download_sample = Some(sample);
         }
     }
@@ -346,27 +381,43 @@ impl HostRouteStats {
         self.connect_success_rate.estimate(at)
     }
 
-    pub fn upload_bytes_per_sec(&self, at: Timestamp) -> Option<f64> {
-        self.upload_bytes_per_sec.estimate(at)
+    pub fn upload_bytes_per_sec(&self, _at: Timestamp) -> Option<f64> {
+        self.upload_rate
+            .summary()
+            .map(|summary| summary.average_bytes_per_sec)
     }
 
-    pub fn download_bytes_per_sec(&self, at: Timestamp) -> Option<f64> {
-        self.download_bytes_per_sec.estimate(at)
+    pub fn download_bytes_per_sec(&self, _at: Timestamp) -> Option<f64> {
+        self.download_rate
+            .summary()
+            .map(|summary| summary.average_bytes_per_sec)
     }
 
     pub fn metric(&self, key: HostRouteKey, at: Timestamp) -> HostRouteMetric {
+        let upload_rate_summary = self.upload_rate.summary();
+        let download_rate_summary = self.download_rate.summary();
+        let udp_upload_rate_summary = self.udp_upload_rate.summary();
+        let udp_download_rate_summary = self.udp_download_rate.summary();
         HostRouteMetric {
             key,
             observed_at: at,
             last_observed: self.last_observed,
             connect_latency_ms: self.connect_latency_ms(at),
             connect_success_rate: self.connect_success_rate(at),
-            upload_bytes_per_sec: self.upload_bytes_per_sec(at),
-            download_bytes_per_sec: self.download_bytes_per_sec(at),
+            upload_bytes_per_sec: upload_rate_summary
+                .map(|summary| summary.average_bytes_per_sec),
+            download_bytes_per_sec: download_rate_summary
+                .map(|summary| summary.average_bytes_per_sec),
+            upload_rate_summary,
+            download_rate_summary,
             upload_sample: self.upload_sample,
             download_sample: self.download_sample,
-            udp_upload_bytes_per_sec: self.udp_upload_bytes_per_sec.estimate(at),
-            udp_download_bytes_per_sec: self.udp_download_bytes_per_sec.estimate(at),
+            udp_upload_bytes_per_sec: udp_upload_rate_summary
+                .map(|summary| summary.average_bytes_per_sec),
+            udp_download_bytes_per_sec: udp_download_rate_summary
+                .map(|summary| summary.average_bytes_per_sec),
+            udp_upload_rate_summary,
+            udp_download_rate_summary,
             udp_upload_sample: self.udp_upload_sample,
             udp_download_sample: self.udp_download_sample,
         }
@@ -716,8 +767,8 @@ mod tests {
         let mut stats = HostRouteStats::default();
         stats.record_tcp_connection(
             Duration::from_millis(250),
-            upload.sample(Timestamp(0)),
-            download.sample(Timestamp(0)),
+            upload.sample(Timestamp(0), Duration::from_secs(2)),
+            download.sample(Timestamp(0), Duration::from_secs(2)),
             Timestamp(0),
         );
 
@@ -742,26 +793,91 @@ mod tests {
     }
 
     #[test]
-    fn transfer_rate_uses_data_event_span_and_ignores_trailing_idle() {
+    fn transfer_rate_lower_bound_includes_idle_and_reports_data_span() {
         let mut tracker = TransferRateTracker::default();
         for index in 0..10 {
             tracker.record(100, Duration::from_millis(index * 200));
         }
 
-        let sample = tracker.sample(Timestamp(10 * MICROS_PER_SEC)).unwrap();
+        let sample = tracker
+            .sample(Timestamp(10 * MICROS_PER_SEC), Duration::from_secs(5))
+            .unwrap();
         assert_eq!(sample.bytes, 1_000);
-        assert_eq!(sample.duration_micros, 1_800_000);
+        assert_eq!(sample.duration_micros, 5_000_000);
+        assert_eq!(sample.data_span_micros, 1_800_000);
         assert_eq!(sample.event_count, 10);
-        assert!((sample.bytes_per_sec() - (1_000.0 / 1.8)).abs() < 0.001);
+        assert_eq!(sample.bytes_per_sec(), 200.0);
     }
 
     #[test]
-    fn transfer_rate_rejects_short_bursts_and_drops_old_events() {
+    fn transfer_rate_produces_a_lower_bound_for_short_high_volume_transfers() {
+        let mut tracker = TransferRateTracker::default();
+        for index in 0..10_000 {
+            tracker.record(
+                1_300,
+                Duration::from_micros(index * 1_300_000 / 9_999),
+            );
+        }
+
+        let sample = tracker
+            .sample(Timestamp(0), Duration::from_micros(1_300_000))
+            .unwrap();
+        assert_eq!(sample.bytes, 13_000_000);
+        assert_eq!(sample.duration_micros, 1_300_000);
+        assert_eq!(sample.data_span_micros, 1_300_000);
+        assert_eq!(sample.event_count, 10_000);
+        assert!((sample.bytes_per_sec() - 10_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn transfer_rate_samples_are_non_overlapping_intervals() {
+        let mut tracker = TransferRateTracker::default();
+        tracker.record(1_000, Duration::ZERO);
+        tracker.record(1_000, Duration::from_secs(1));
+        let first = tracker
+            .sample(Timestamp(MICROS_PER_SEC), Duration::from_secs(1))
+            .unwrap();
+        tracker.record(3_000, Duration::from_secs(2));
+        let second = tracker
+            .sample(Timestamp(2 * MICROS_PER_SEC), Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(first.bytes, 2_000);
+        assert_eq!(first.duration_micros, MICROS_PER_SEC);
+        assert_eq!(second.bytes, 3_000);
+        assert_eq!(second.duration_micros, MICROS_PER_SEC);
+
+        let mut stats = HostRouteStats::default();
+        stats.record_tcp_transfer_samples(Some(first), None, first.observed_at);
+        stats.record_tcp_transfer_samples(Some(second), None, second.observed_at);
+        let summary = stats
+            .metric(
+                HostRouteKey::new(
+                    WireAddress::DomainAddress("intervals.example".to_string(), 443),
+                    ObservedRoute::NoProxy,
+                ),
+                second.observed_at,
+            )
+            .upload_rate_summary
+            .unwrap();
+        assert_eq!(summary.average_bytes_per_sec, 2_500.0);
+        assert_eq!(summary.min_bytes_per_sec, 2_000.0);
+        assert_eq!(summary.max_bytes_per_sec, 3_000.0);
+        assert_eq!(summary.sample_count, 2);
+    }
+
+    #[test]
+    fn transfer_rate_keeps_all_observations_without_time_expiry() {
         let mut burst = TransferRateTracker::default();
         for index in 0..10 {
             burst.record(100, Duration::from_millis(index));
         }
-        assert_eq!(burst.sample(Timestamp(0)), None);
+        let burst_sample = burst
+            .sample(Timestamp(0), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(burst_sample.bytes, 1_000);
+        assert_eq!(burst_sample.event_count, 10);
+        assert_eq!(burst_sample.duration_micros, MICROS_PER_SEC);
 
         let mut tracker = TransferRateTracker::default();
         tracker.record(1_000_000, Duration::ZERO);
@@ -771,10 +887,45 @@ mod tests {
         tracker.record(1_000_000, Duration::from_millis(7_500));
         tracker.record(1, Duration::from_secs(8));
 
-        let sample = tracker.sample(Timestamp(0)).unwrap();
-        assert_eq!(sample.bytes, 1_000_002);
-        assert_eq!(sample.duration_micros, 1_000_000);
-        assert_eq!(sample.event_count, 3);
+        let sample = tracker
+            .sample(Timestamp(0), Duration::from_secs(8))
+            .unwrap();
+        assert_eq!(sample.bytes, 3_000_003);
+        assert_eq!(sample.duration_micros, 8_000_000);
+        assert_eq!(sample.data_span_micros, 8_000_000);
+        assert_eq!(sample.event_count, 6);
+    }
+
+    #[test]
+    fn transfer_rate_summary_keeps_average_min_and_max_indefinitely() {
+        let sample = |bytes, at| TransferRateSample {
+            bytes,
+            duration_micros: 1_000_000,
+            data_span_micros: 1_000_000,
+            event_count: 10,
+            observed_at: Timestamp(at),
+        };
+        let mut stats = HostRouteStats::default();
+        stats.record_tcp_transfer_samples(Some(sample(1_000, 0)), None, Timestamp(0));
+        stats.record_tcp_transfer_samples(
+            Some(sample(3_000, 86_400 * MICROS_PER_SEC)),
+            None,
+            Timestamp(86_400 * MICROS_PER_SEC),
+        );
+
+        let metric = stats.metric(
+            HostRouteKey::new(
+                WireAddress::DomainAddress("stats.example".to_string(), 443),
+                ObservedRoute::NoProxy,
+            ),
+            Timestamp(10 * 86_400 * MICROS_PER_SEC),
+        );
+        let summary = metric.upload_rate_summary.unwrap();
+        assert_eq!(summary.average_bytes_per_sec, 2_000.0);
+        assert_eq!(summary.min_bytes_per_sec, 1_000.0);
+        assert_eq!(summary.max_bytes_per_sec, 3_000.0);
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(metric.upload_bytes_per_sec, Some(2_000.0));
     }
 
     #[test]
@@ -783,7 +934,7 @@ mod tests {
         tracker.record(2_000_000, Duration::ZERO);
         tracker.record(1_000_000, Duration::from_secs(1));
         tracker.record(1_000_000, Duration::from_secs(2));
-        let sample = tracker.sample(Timestamp(0));
+        let sample = tracker.sample(Timestamp(0), Duration::from_secs(2));
         let mut stats = HostRouteStats::default();
         stats.record_udp_transfer_samples(sample, sample, Timestamp(0));
 
