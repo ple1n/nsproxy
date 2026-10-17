@@ -12,8 +12,8 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -63,12 +63,14 @@ pub mod cmd_uplink;
 pub mod env;
 pub mod hot_reload;
 pub mod internal_dns;
+pub mod migration;
 pub mod personal;
 pub mod prelude;
 pub mod route_map;
 pub mod sandbox;
 pub mod shell;
 pub mod state_blueprint;
+pub mod state_file;
 pub mod sys;
 pub mod utils;
 
@@ -187,17 +189,15 @@ pub fn octets_to_addr(a: &[u8], prefix: u8) -> Result<Option<IpNetwork>> {
 mod tests {
     use super::*;
     use ipnetwork::{IpNetwork, Ipv4Network};
-    use std::os::unix::fs::MetadataExt;
     use std::net::Ipv4Addr;
+    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
     #[test]
     fn hotconfig_defaults_connection_retention_to_five_minutes() {
         assert_eq!(HotConfig::default().diag_conn_persist_secs, 300);
-        let old_config: HotConfig = serde_json::from_str(
-            r#"{"dns":{},"tun":{},"devs":{},"mnt":{},"locals":{}}"#,
-        )
-        .unwrap();
+        let old_config: HotConfig =
+            serde_json::from_str(r#"{"dns":{},"tun":{},"devs":{},"mnt":{},"locals":{}}"#).unwrap();
         assert_eq!(old_config.diag_conn_persist_secs, 300);
         assert!(old_config.route_map.is_empty());
     }
@@ -281,14 +281,8 @@ mod tests {
             } if profile == "route-test"
         ));
 
-        let export = Cli::try_parse_from([
-            "sp",
-            "route",
-            "export",
-            "plein",
-            "routes.json",
-        ])
-        .unwrap();
+        let export =
+            Cli::try_parse_from(["sp", "route", "export", "plein", "routes.json"]).unwrap();
         assert!(matches!(
             export.cmd,
             MainCommand::Route {
@@ -296,6 +290,84 @@ mod tests {
                 ..
             } if container == "plein"
         ));
+    }
+
+    #[test]
+    fn migrate_cli_accepts_remove_target_mode() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "sp",
+            "--state",
+            "/tmp/source-state",
+            "migrate",
+            "--to",
+            "/tmp/staged-state",
+            "--rm",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            MainCommand::Migrate {
+                to: Some(ref target),
+                finish: false,
+                rm: true,
+            } if target == Path::new("/tmp/staged-state")
+        ));
+
+        let materialize = Cli::try_parse_from([
+            "sp",
+            "--state",
+            "/tmp/source-state",
+            "migrate",
+            "--to",
+            "/tmp/staged-state",
+            "--finish",
+        ])
+        .unwrap();
+        assert!(matches!(
+            materialize.cmd,
+            MainCommand::Migrate {
+                to: Some(ref target),
+                finish: true,
+                rm: false,
+            } if target == Path::new("/tmp/staged-state")
+        ));
+
+        let replace_and_materialize = Cli::try_parse_from([
+            "sp",
+            "--state",
+            "/tmp/source-state",
+            "migrate",
+            "--to",
+            "/tmp/staged-state",
+            "--rm",
+            "--finish",
+        ])
+        .unwrap();
+        assert!(matches!(
+            replace_and_materialize.cmd,
+            MainCommand::Migrate {
+                to: Some(ref target),
+                finish: true,
+                rm: true,
+            } if target == Path::new("/tmp/staged-state")
+        ));
+    }
+
+    #[test]
+    fn rm_cli_accepts_recursive_short_and_long_flags() {
+        use clap::Parser;
+
+        for args in [
+            vec!["sp", "rm", "/tmp/state", "-r"],
+            vec!["sp", "rm", "/tmp/state", "--recurse"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args).unwrap().cmd,
+                MainCommand::Rm { recurse: true, .. }
+            ));
+        }
     }
 
     #[test]
@@ -337,7 +409,7 @@ mod tests {
         migrated.fcitx_default_input_method = Some("rime\nName=broken".to_string());
         assert!(migrated.validate().is_err());
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -460,6 +532,7 @@ mod tests {
             inherit_env: true,
             hot: PathBuf::from("@/hot.json"),
             hot_init: Some(HotConfig {
+                updated_at_ns: 0,
                 dns: HashMap::new(),
                 x11: false,
                 wayland: false,
@@ -579,7 +652,12 @@ mod tests {
 
         assert_eq!(hot.mounts, first);
         assert_eq!(hot.mounts.len(), 1);
-        assert!(hot.mounts[0].source.to_string_lossy().ends_with("wayland-0"));
+        assert!(
+            hot.mounts[0]
+                .source
+                .to_string_lossy()
+                .ends_with("wayland-0")
+        );
         assert_eq!(hot.mounts[0].source, hot.mounts[0].target);
     }
 
@@ -588,16 +666,54 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "nsp3-hotconfig-test-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let mut hot = HotConfig::default();
         hot.process_and_save(&path).unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
+        let updated_at_ns = hot.updated_at_ns;
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<u128>(persisted["updated_at_ns"].clone()).unwrap(),
+            updated_at_ns
+        );
+        assert!(persisted.get("value").is_none());
 
         hot.process_and_save(&path).unwrap();
 
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(hot.updated_at_ns, updated_at_ns);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+    }
+
+    #[test]
+    fn test_hotconfig_process_and_save_initializes_zero_timestamp() {
+        let path = std::env::temp_dir().join(format!(
+            "nsp3-hotconfig-uninitialized-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut hot = HotConfig::default();
+        hot.dns
+            .insert("example.test.".to_string(), "127.0.0.1".to_string());
+        std::fs::write(&path, serde_json::to_vec_pretty(&hot).unwrap()).unwrap();
+
+        hot.process_and_save(&path).unwrap();
+
+        assert!(hot.updated_at_ns > 0);
+        assert_eq!(
+            serde_json::from_slice::<HotConfig>(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .dns,
+            hot.dns
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
     }
 
     #[test]
@@ -1201,10 +1317,8 @@ impl HotRoute {}
 pub struct RoutePrefs {
     pub default_route: HotRoute,
     #[serde(with = "route_map_serde")]
-    pub route_map: BTreeMap<
-        nsproxy_common::routing::RoutingKey,
-        nsproxy_common::routing::RoutingResovled,
-    >,
+    pub route_map:
+        BTreeMap<nsproxy_common::routing::RoutingKey, nsproxy_common::routing::RoutingResovled>,
 }
 
 /// An application that can be launched on demand from a profile's Actions UI.
@@ -1223,6 +1337,8 @@ pub struct LaunchableApp {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HotConfig {
+    #[serde(default)]
+    pub updated_at_ns: u128,
     /// Commands Virtual DNS to directly A to B
     pub dns: HashMap<String, String>,
     /// Bind the host X11 socket and Xauthority file into the sandbox.
@@ -1254,10 +1370,8 @@ pub struct HotConfig {
     /// Per-host routing decisions applied before the profile-wide route.
     /// Host keys and domain targets use lowercase fully-qualified DNS names.
     #[serde(default, with = "route_map_serde")]
-    pub route_map: BTreeMap<
-        nsproxy_common::routing::RoutingKey,
-        nsproxy_common::routing::RoutingResovled,
-    >,
+    pub route_map:
+        BTreeMap<nsproxy_common::routing::RoutingKey, nsproxy_common::routing::RoutingResovled>,
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
@@ -1278,6 +1392,7 @@ pub struct HotConfig {
 impl Default for HotConfig {
     fn default() -> Self {
         Self {
+            updated_at_ns: 0,
             dns: HashMap::new(),
             x11: false,
             wayland: false,
@@ -1295,6 +1410,16 @@ impl Default for HotConfig {
             veth: Vec::new(),
             diag_conn_persist_secs: default_diag_conn_persist_secs(),
         }
+    }
+}
+
+impl state_file::SimpleCRDT for HotConfig {
+    fn field_updated(&self) -> u128 {
+        self.updated_at_ns
+    }
+
+    fn set_field_updated(&mut self, updated_at_ns: u128) {
+        self.updated_at_ns = updated_at_ns;
     }
 }
 
@@ -1321,10 +1446,7 @@ mod route_map_serde {
     pub fn deserialize<'de, D>(
         deserializer: D,
     ) -> std::result::Result<
-        BTreeMap<
-            nsproxy_common::routing::RoutingKey,
-            nsproxy_common::routing::RoutingResovled,
-        >,
+        BTreeMap<nsproxy_common::routing::RoutingKey, nsproxy_common::routing::RoutingResovled>,
         D::Error,
     >
     where
@@ -1525,8 +1647,7 @@ impl HotConfig {
         nsproxy_common::routing::normalize_route_map_domains(&mut self.route_map)
             .map_err(anyhow::Error::msg)?;
         self.process();
-        let json = serde_json::to_vec_pretty(self)?;
-        write_file_atomic(path, &json)
+        self.save(path)
     }
 
     pub fn expand_placeholders(&mut self, instance_root: &Path) {
@@ -1601,9 +1722,7 @@ impl HotConfig {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
-                libc::getuid()
-            })));
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
         let display = std::env::var_os("WAYLAND_DISPLAY")
             .filter(|name| !name.is_empty())
             .map(PathBuf::from)
@@ -1732,12 +1851,14 @@ impl HotConfig {
     }
 
     /// Serialize and persist this config to `path`.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let mut normalized = self.clone();
-        nsproxy_common::routing::normalize_route_map_domains(&mut normalized.route_map)
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        nsproxy_common::routing::normalize_route_map_domains(&mut self.route_map)
             .map_err(anyhow::Error::msg)?;
-        let json = serde_json::to_vec_pretty(&normalized)?;
-        write_file_atomic(path, &json)
+        let normalized = self.clone();
+        *self = state_file::update(path, |current: &mut HotConfig| {
+            *current = normalized.clone();
+        })?;
+        Ok(())
     }
 }
 
@@ -2053,13 +2174,13 @@ impl TemplateConfig {
         let conf = match schema {
             s if s < TemplateConfigV2::VERSION => {
                 // V1: dbus was a plain bool. Migrate via TemplateConfigV1 → TemplateConfigV2.
-                TemplateConfigV3::from(TemplateConfigV2::from(
-                    serde_json::from_str::<TemplateConfigV1>(&content)?,
-                ))
+                TemplateConfigV3::from(TemplateConfigV2::from(serde_json::from_str::<
+                    TemplateConfigV1,
+                >(&content)?))
             }
-            s if s < TemplateConfigV3::VERSION => TemplateConfigV3::from(
-                serde_json::from_str::<TemplateConfigV2>(&content)?,
-            ),
+            s if s < TemplateConfigV3::VERSION => {
+                TemplateConfigV3::from(serde_json::from_str::<TemplateConfigV2>(&content)?)
+            }
             _ => serde_json::from_str::<TemplateConfigV3>(&content)?,
         };
         conf.validate()?;
@@ -2081,11 +2202,9 @@ impl TemplateConfig {
             );
             ensure!(
                 !input_method.is_empty()
-                    && input_method
-                        .chars()
-                        .all(|character| {
-                            character.is_ascii_alphanumeric() || "-_.".contains(character)
-                        }),
+                    && input_method.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "-_.".contains(character)
+                    }),
                 "fcitx_default_input_method must contain only ASCII letters, digits, '.', '-' or '_'"
             );
         }
@@ -2467,7 +2586,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub conf: Option<PathBuf>,
     /// State root, defaults to /nsp3
-    #[arg(short, long)]
+    #[arg(long = "state", visible_aliases = ["root", "as"], global = true)]
     pub root: Option<PathBuf>,
     #[arg(short, long)]
     pub no_wrap_check: bool,
@@ -2659,8 +2778,14 @@ pub enum MainCommand {
         #[arg(long)]
         fish: bool,
     },
-    /// Remove a bind-mount file
-    Rm { file: PathBuf },
+    /// Unmount a bind-mount target; use --recurse to remove a directory tree.
+    Rm {
+        file: PathBuf,
+        /// Recursively unmount and remove a directory tree.
+        #[arg(short = 'r', long = "recurse")]
+        #[serde(default)]
+        recurse: bool,
+    },
     #[command(alias = "c")]
     Clean {
         /// Does a simple removal of default veth
@@ -2847,6 +2972,24 @@ pub enum MainCommand {
     },
     /// Print a typed blueprint tree for global state paths
     StateTree,
+    /// Stage a separate state root or materialize a staged root.
+    Migrate {
+        /// New root to stage; with --rm, remove any existing target first.
+        #[arg(long, required_unless_present = "finish")]
+        to: Option<PathBuf>,
+        /// Materialize staged symlinks in the current root, or in --to if supplied.
+        #[arg(long)]
+        finish: bool,
+        /// Remove the existing target recursively, then stage the migration there.
+        #[arg(long, requires = "to")]
+        #[serde(default)]
+        rm: bool,
+    },
+    /// Inspect and recover state from append-only metadata logs.
+    Meta {
+        #[command(subcommand)]
+        cmd: MetaCommand,
+    },
     /// Print build identity (BLAKE3 source tree hash + build epoch timestamp)
     #[command(alias = "v")]
     Version,
@@ -2887,6 +3030,14 @@ sp route export <CONTAINER> <DESTINATION>"
         #[command(flatten)]
         args: RouteArgs,
     },
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+pub enum MetaCommand {
+    /// List live processes recorded in the process WAL.
+    Processes,
+    /// Send SIGTERM to a recorded process after interactive confirmation.
+    Kill { pid: u32 },
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -551,6 +552,89 @@ impl PtyWakeState {
 /// supervisor can repaint only that viewport (not the main window).
 type SharedPtyViewportId = Arc<Mutex<Option<egui::ViewportId>>>;
 
+fn control_socket_filename() -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_le_bytes();
+    let digest = blake3::hash(&timestamp);
+    let hash = URL_SAFE_NO_PAD.encode(&digest.as_bytes()[..3]);
+    format!("ui_{hash}.sock")
+}
+
+fn control_socket_runtime_dir() -> Result<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }))
+        });
+    let metadata = std::fs::symlink_metadata(&runtime_dir)
+        .with_context(|| format!("inspect UI runtime directory {}", runtime_dir.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "UI runtime directory {} must be a private directory owned by the current user",
+        runtime_dir.display()
+    );
+    Ok(runtime_dir)
+}
+
+fn bind_control_socket_at(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("refusing to replace non-socket control path {}", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::os::unix::net::UnixListener::bind(path)
+}
+
+fn bind_control_socket_in_state_root_or_runtime(
+    state_root: &Path,
+    filename: &str,
+    runtime_dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<(std::os::unix::net::UnixListener, PathBuf)> {
+    let state_path = state_root.join(filename);
+    match bind_control_socket_at(&state_path) {
+        Ok(listener) => Ok((listener, state_path)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            let runtime_path = runtime_dir()?.join(filename);
+            let listener = bind_control_socket_at(&runtime_path).with_context(|| {
+                format!(
+                    "state-root bind {} failed ({error}); fallback bind {} failed",
+                    state_path.display(),
+                    runtime_path.display()
+                )
+            })?;
+            warn!(
+                state_root_socket = %state_path.display(),
+                runtime_socket = %runtime_path.display(),
+                "state root is not writable; using the UI runtime directory for the control socket"
+            );
+            Ok((listener, runtime_path))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("bind UI control socket {}", state_path.display())),
+    }
+}
+
 #[derive(Clone)]
 pub struct SupervisorHandle {
     cmd_tx: mpsc::UnboundedSender<SupervisorCommand>,
@@ -562,7 +646,15 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    pub fn new(ectx: egui::Context) -> (Self, SupervisorTask) {
+    pub fn new(ectx: egui::Context) -> Result<(Self, SupervisorTask)> {
+        let (control_listener, control_sock_path) =
+            bind_control_socket_in_state_root_or_runtime(
+                &state_paths::persist_root(),
+                &control_socket_filename(),
+                control_socket_runtime_dir,
+            )?;
+        control_listener.set_nonblocking(true)?;
+
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(SupervisorSnapshot {
             profiles: BTreeMap::new(),
@@ -585,7 +677,7 @@ impl SupervisorHandle {
         let pty_wake_state: SharedPtyWakeState = Arc::new(PtyWakeState::new());
         let pty_viewport_id: SharedPtyViewportId = Arc::new(Mutex::new(None));
         let cmd_tx_for_self = cmd_tx.clone();
-        (
+        Ok((
             Self {
                 cmd_tx: cmd_tx_for_self,
                 snapshot_rx: std::sync::Arc::new(std::sync::Mutex::new(snapshot_rx)),
@@ -603,8 +695,10 @@ impl SupervisorHandle {
                 pty_buf,
                 pty_wake_state,
                 pty_viewport_id,
+                control_listener,
+                control_sock_path,
             },
-        )
+        ))
     }
 
     pub fn send(&self, cmd: SupervisorCommand) {
@@ -812,6 +906,8 @@ pub struct SupervisorTask {
     pty_buf: SharedPtyBuf,
     pty_wake_state: SharedPtyWakeState,
     pty_viewport_id: SharedPtyViewportId,
+    control_listener: std::os::unix::net::UnixListener,
+    control_sock_path: PathBuf,
 }
 
 impl SupervisorTask {
@@ -826,6 +922,8 @@ impl SupervisorTask {
             self.pty_buf,
             self.pty_wake_state,
             self.pty_viewport_id,
+            self.control_listener,
+            self.control_sock_path,
         );
         if let Err(err) = supervisor.run().await {
             error!("supervisor stopped: {err:?}");
@@ -1116,6 +1214,7 @@ struct Supervisor {
     auto_open_logs_token: u64,
     /// Path to the UI-side control socket.  Spawned processes connect here.
     control_sock_path: PathBuf,
+    control_listener: Option<std::os::unix::net::UnixListener>,
     /// Wall-clock time recorded immediately after successfully forking `sp up`.
     /// Used by `up_pid_alive` to reject PIDs belonging to a different process
     /// that happened to reuse the same PID after the original `sp up` exited.
@@ -1155,7 +1254,7 @@ impl Supervisor {
         self.reset_backoff(&profile);
         let cli = Cli {
             conf: None,
-            root: None,
+            root: Some(state_paths::persist_root()),
             no_wrap_check: false,
             control_socket: Some(self.control_sock_path.clone()),
             cmd: MainCommand::Up {
@@ -1237,11 +1336,44 @@ impl Supervisor {
             PendingRootDaemonOp::ImportClashGroup { .. } => None,
             PendingRootDaemonOp::CreateProfile { name } => Some(name.clone()),
         };
+        let message = message.into();
+        if !ok {
+            let operation = match op {
+                PendingRootDaemonOp::SaveHotconfig { .. } => "HotConfig save",
+                PendingRootDaemonOp::SaveProfile { .. } => "profile save",
+                PendingRootDaemonOp::SaveConstants => "constants save",
+                PendingRootDaemonOp::LoadConstants => "constants load",
+                PendingRootDaemonOp::ImportClashGroup { .. } => "Clash group import",
+                PendingRootDaemonOp::CreateProfile { .. } => "profile creation",
+                PendingRootDaemonOp::InitializeBasisNamespace => "basis namespace initialization",
+            };
+            let profile_name = profile
+                .as_ref()
+                .map(|profile| profile.as_str())
+                .unwrap_or("<global>");
+            warn!(
+                operation,
+                profile = profile_name,
+                error = %message,
+                "privileged UI operation failed"
+            );
+            push_global_log(
+                &self.root_daemon_logs,
+                LogSource::RootDaemon,
+                diag::LogEntry {
+                    ts: diag::Timestamp::now(),
+                    level: "ERROR".to_string(),
+                    target: "root_daemon".to_string(),
+                    message: format!("{operation} failed: {message}"),
+                    fields: Vec::new(),
+                },
+            );
+        }
         let status = EditorStatus {
             token,
             ok,
             profile,
-            message: message.into(),
+            message,
         };
         match op {
             PendingRootDaemonOp::InitializeBasisNamespace => {}
@@ -1280,10 +1412,10 @@ impl Supervisor {
         pty_buf: SharedPtyBuf,
         pty_wake_state: SharedPtyWakeState,
         pty_viewport_id: SharedPtyViewportId,
+        control_listener: std::os::unix::net::UnixListener,
+        control_sock_path: PathBuf,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let control_sock_path =
-            state_paths::persist_root().join(format!("nsproxy-ui-{}.sock", std::process::id()));
         Self {
             cmd_rx,
             event_tx,
@@ -1335,6 +1467,7 @@ impl Supervisor {
             auto_open_logs_target: None,
             auto_open_logs_token: 0,
             control_sock_path,
+            control_listener: Some(control_listener),
             up_start_time: HashMap::new(),
             traffic_subscription: None,
         }
@@ -1564,7 +1697,7 @@ impl Supervisor {
 
         let cli = Cli {
             conf: None,
-            root: None,
+            root: Some(state_paths::persist_root()),
             no_wrap_check: false,
             control_socket: None,
             cmd: MainCommand::Sandbox {
@@ -1630,7 +1763,7 @@ impl Supervisor {
     ) {
         let cli = Cli {
             conf: None,
-            root: None,
+            root: Some(state_paths::persist_root()),
             no_wrap_check: false,
             control_socket: None,
             cmd: MainCommand::Veth {
@@ -1745,12 +1878,15 @@ impl Supervisor {
     async fn run(&mut self) -> Result<()> {
         info!("supervisor run loop entered");
         self.emit_snapshot();
-        // Bind the control socket and spawn the accept loop.
-        // Spawned processes connect here and identify themselves with a ControlSocketGreeting.
-        let ctrl_path = self.control_sock_path.clone();
+        let std_listener = self
+            .control_listener
+            .take()
+            .context("UI control socket listener already consumed")?;
+        let ctrl_listener = tokio::net::UnixListener::from_std(std_listener)?;
+        info!(path = %self.control_sock_path.display(), "UI control socket listening");
         let event_tx_ctrl = self.event_tx.clone();
         tokio::spawn(async move {
-            control_socket_accept_loop(ctrl_path, event_tx_ctrl).await;
+            control_socket_accept_loop(ctrl_listener, event_tx_ctrl).await;
         });
         // Deduplicated PTY repaint task.  Many notify_one() calls while the
         // task is already running coalesce into a single pending wake-up, so
@@ -1861,7 +1997,7 @@ impl Supervisor {
                 );
                 let cli = Cli {
                     conf: None,
-                    root: None,
+                    root: Some(state_paths::persist_root()),
                     no_wrap_check: false,
                     control_socket: Some(self.control_sock_path.clone()),
                     cmd: MainCommand::Serve {
@@ -1972,15 +2108,41 @@ impl Supervisor {
                     Ok(mut hotconfig) => {
                         self.merge_live_route_into_hotconfig(&profile, &mut hotconfig);
                         hotconfig.process();
-                        serde_json::to_string_pretty(&hotconfig).unwrap_or(content)
+                        match serde_json::to_string_pretty(&hotconfig) {
+                            Ok(content) => content,
+                            Err(err) => {
+                                let op = PendingRootDaemonOp::SaveHotconfig {
+                                    profile: profile.clone(),
+                                };
+                                let token = self.next_editor_status_token();
+                                self.publish_editor_status(
+                                    &op,
+                                    false,
+                                    token,
+                                    format!("failed to serialize hotconfig: {err}"),
+                                );
+                                return;
+                            }
+                        }
                     }
-                    Err(_) => content,
+                    Err(err) => {
+                        let op = PendingRootDaemonOp::SaveHotconfig {
+                            profile: profile.clone(),
+                        };
+                        let token = self.next_editor_status_token();
+                        self.publish_editor_status(
+                            &op,
+                            false,
+                            token,
+                            format!("invalid hotconfig: {err}"),
+                        );
+                        return;
+                    }
                 };
                 self.queue_root_daemon_op(
-                    diag::RootDaemonOp::WriteFile {
-                        path: state_paths::hot_config(profile.as_str()),
-                        content: content.into_bytes(),
-                        create_parent: true,
+                    diag::RootDaemonOp::WriteHotConfig {
+                        profile: profile.clone(),
+                        content,
                     },
                     PendingRootDaemonOp::SaveHotconfig { profile },
                 );
@@ -2071,7 +2233,7 @@ impl Supervisor {
                 );
                 let cli = Cli {
                     conf: None,
-                    root: None,
+                    root: Some(state_paths::persist_root()),
                     no_wrap_check: false,
                     control_socket: None,
                     cmd: MainCommand::Down {
@@ -2364,13 +2526,18 @@ impl Supervisor {
             SupervisorCommand::ReloadHotconfig(profile) => {
                 info!(profile = profile.as_str(), "reloading hotconfig");
                 self.refresh_config_cache(&profile);
-                if let Ok(list) = load_hotconfig_daemons(profile.as_str()) {
-                    info!(
-                        profile = profile.as_str(),
-                        daemon_count = list.len(),
-                        "loaded hotconfig daemons from disk"
-                    );
-                    self.daemon_catalog.insert(profile.clone(), list);
+                match load_hotconfig_daemons(profile.as_str()) {
+                    Ok(list) => {
+                        info!(
+                            profile = profile.as_str(),
+                            daemon_count = list.len(),
+                            "loaded hotconfig daemons from disk"
+                        );
+                        self.daemon_catalog.insert(profile.clone(), list);
+                    }
+                    Err(err) => {
+                        warn!(profile = profile.as_str(), %err, "failed to load hotconfig daemons from disk");
+                    }
                 }
                 let _ = self.send_diag_cmd(&profile, ControlCommand::QueryHotConfig);
             }
@@ -2445,8 +2612,13 @@ impl Supervisor {
                     }
                     TabKind::ProfileEditor => {
                         self.refresh_config_cache(&profile);
-                        if let Ok(list) = load_hotconfig_daemons(profile.as_str()) {
-                            self.daemon_catalog.insert(profile.clone(), list);
+                        match load_hotconfig_daemons(profile.as_str()) {
+                            Ok(list) => {
+                                self.daemon_catalog.insert(profile.clone(), list);
+                            }
+                            Err(err) => {
+                                warn!(profile = profile.as_str(), %err, "failed to load hotconfig daemons from disk");
+                            }
                         }
                     }
                     TabKind::Dns => {
@@ -3063,16 +3235,28 @@ impl Supervisor {
                         self.namespace_warning = (!current.ino_eq(&basis_ns))
                             .then(|| "UI namespace differs from recorded basis".to_owned());
                     }
-                    diag::RootDaemonResult::Ok {
-                        message, profile, ..
-                    } => {
+                    diag::RootDaemonResult::Ok { message, .. } => {
                         if let Some(op) = pending.as_ref() {
-                            self.publish_editor_status(op, true, event.op_id, message.clone());
+                            let mut status_message = message;
                             match op {
                                 PendingRootDaemonOp::InitializeBasisNamespace => {}
                                 PendingRootDaemonOp::SaveHotconfig { profile } => {
                                     self.refresh_config_cache(profile);
                                     self.refresh_profile_status(profile);
+                                    if self.send_diag_cmd(
+                                        profile,
+                                        ControlCommand::ReloadHotConfig,
+                                    ) {
+                                        status_message.push_str("; runtime reload requested");
+                                    } else {
+                                        warn!(
+                                            profile = profile.as_str(),
+                                            "HotConfig saved, but runtime reload request could not be sent"
+                                        );
+                                        status_message.push_str(
+                                            "; runtime reload request could not be sent",
+                                        );
+                                    }
                                 }
                                 PendingRootDaemonOp::SaveProfile { profile } => {
                                     self.refresh_config_cache(profile);
@@ -3087,6 +3271,7 @@ impl Supervisor {
                                     self.refresh_profile_status(name);
                                 }
                             }
+                            self.publish_editor_status(op, true, event.op_id, status_message);
                         }
                     }
                     diag::RootDaemonResult::Error {
@@ -3094,10 +3279,30 @@ impl Supervisor {
                     } => {
                         if let Some(op) = pending.as_ref() {
                             if matches!(op, PendingRootDaemonOp::InitializeBasisNamespace) {
-                                self.namespace_warning = Some(message);
-                            } else {
-                                self.publish_editor_status(op, false, event.op_id, message);
+                                self.namespace_warning = Some(message.clone());
                             }
+                            self.publish_editor_status(op, false, event.op_id, message);
+                        } else {
+                            warn!(
+                                op_id = event.op_id,
+                                profile = profile.as_deref().unwrap_or("<global>"),
+                                error = %message,
+                                "root daemon returned an error for an unknown operation"
+                            );
+                            push_global_log(
+                                &self.root_daemon_logs,
+                                LogSource::RootDaemon,
+                                diag::LogEntry {
+                                    ts: diag::Timestamp::now(),
+                                    level: "ERROR".to_string(),
+                                    target: "root_daemon".to_string(),
+                                    message: format!(
+                                        "untracked operation {} failed: {message}",
+                                        event.op_id
+                                    ),
+                                    fields: Vec::new(),
+                                },
+                            );
                         }
                     }
                 }
@@ -4276,19 +4481,9 @@ async fn verify_root_daemon_stream(
 /// and then the normal wire protocol takes over in the supervisor's client loops
 /// via inject channels.
 async fn control_socket_accept_loop(
-    path: PathBuf,
+    listener: tokio::net::UnixListener,
     event_tx: mpsc::UnboundedSender<SupervisorEvent>,
 ) {
-    // Remove a stale socket from a previous session if present.
-    let _ = std::fs::remove_file(&path);
-    let listener = match tokio::net::UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(err) => {
-            warn!(path = %path.display(), error = %err, "failed to bind UI control socket; event-triggered connections disabled");
-            return;
-        }
-    };
-    info!(path = %path.display(), "UI control socket listening");
     loop {
         match listener.accept().await {
             Ok((mut stream, _addr)) => {
@@ -5031,6 +5226,48 @@ mod traffic_connection_tests {
     }
 }
 
+#[cfg(test)]
+mod control_socket_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::bind_control_socket_in_state_root_or_runtime;
+
+    #[test]
+    fn read_only_state_root_uses_runtime_socket_path() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "nsproxy-ui-control-socket-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state_root = base.join("state");
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (listener, socket_path) = bind_control_socket_in_state_root_or_runtime(
+            &state_root,
+            "ui_test.sock",
+            || Ok(runtime_dir.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(socket_path, runtime_dir.join("ui_test.sock"));
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+        drop(listener);
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
 fn sort_host_route_metrics(metrics: &mut Vec<nsproxy_common::stats::HostRouteMetric>) {
     let mut by_key: HashMap<
         nsproxy_common::stats::HostRouteKey,
@@ -5263,7 +5500,7 @@ fn spawn_nsproxy_cli(
 fn spawn_root_daemon_process(nsproxy_path: &Path, control_sock_path: &Path) -> Result<()> {
     let cli = Cli {
         conf: None,
-        root: None,
+        root: Some(state_paths::persist_root()),
         no_wrap_check: false,
         control_socket: Some(control_sock_path.to_path_buf()),
         cmd: MainCommand::Daemon { cmd: None },
@@ -5392,24 +5629,17 @@ fn spawn_child_waiter<F>(
 
 fn load_hotconfig_daemons(profile: &str) -> Result<Vec<ShellArgs>> {
     let path = state_paths::hot_config(profile);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(&path)?;
-    let hot: HotConfig = serde_json::from_str(&content)?;
-    Ok(hot.daemons)
+    Ok(nsproxy_core::state_file::read::<HotConfig>(&path)?
+        .map(|hot| hot.daemons)
+        .unwrap_or_default())
 }
 
 fn load_hotconfig_from_disk(profile: &ContainerName) -> Option<HotConfig> {
     let path = state_paths::hot_config(profile.as_str());
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(_) => return Some(HotConfig::default()),
-    };
-    match serde_json::from_str::<HotConfig>(&content) {
-        Ok(hot) => Some(hot),
+    match nsproxy_core::state_file::read::<HotConfig>(&path) {
+        Ok(hot) => Some(hot.unwrap_or_default()),
         Err(err) => {
-            warn!("invalid hotconfig JSON on disk for {}: {err}", profile);
+            warn!("failed to load hotconfig from disk for {}: {err}", profile);
             Some(HotConfig::default())
         }
     }

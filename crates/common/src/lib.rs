@@ -64,9 +64,9 @@ pub mod state_paths {
         persist_root().join("config")
     }
 
-    /// Root directory for container rootfs trees used by pivot_root.
+    /// Global root directory for container rootfs trees used by pivot_root.
     pub fn rootfs_root() -> PathBuf {
-        persist_root().join("rootfs")
+        PathBuf::from("/rootfs")
     }
 
     /// Get persistent config directory for a named profile.
@@ -213,6 +213,16 @@ pub mod state_paths {
     /// Boot ID associated with [`process_log`].
     pub fn process_log_boot() -> PathBuf {
         persist_root().join("nsproxy-process-log.boot")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rootfs_root;
+
+        #[test]
+        fn rootfs_root_is_global() {
+            assert_eq!(rootfs_root(), std::path::PathBuf::from("/rootfs"));
+        }
     }
 }
 

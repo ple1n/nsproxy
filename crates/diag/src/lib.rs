@@ -281,6 +281,10 @@ pub enum RootDaemonOp {
         profile_content: String,
         hot_content: Option<String>,
     },
+    WriteHotConfig {
+        profile: String,
+        content: String,
+    },
 }
 
 /// Response emitted by the global privileged `sp daemon` service.

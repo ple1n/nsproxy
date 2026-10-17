@@ -1,6 +1,6 @@
 //! Misc low-level code
 
-use anyhow::{bail, ensure};
+use anyhow::{Context, bail, ensure};
 use clone3::Clone3;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use libc::{pid_t, stat, syscall, uid_t};
@@ -621,9 +621,39 @@ pub fn rm_mount(dst: &Path) -> Result<()> {
     }
 
     if path_is_mountpoint(dst)? {
-        umount(dst)?;
+        match umount(dst) {
+            Ok(()) | Err(Errno::EINVAL) | Err(Errno::ENOENT) => {}
+            Err(Errno::EBUSY) => umount2(dst, MntFlags::MNT_DETACH)
+                .with_context(|| format!("detaching busy mount {}", dst.display()))?,
+            Err(err) => return Err(err.into()),
+        }
     }
 
+    Ok(())
+}
+
+pub fn remove_path_recursive(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+
+    rm_mount(path).with_context(|| format!("unmounting {}", path.display()))?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in read_dir(path).with_context(|| format!("listing {}", path.display()))? {
+            let entry = entry?;
+            remove_path_recursive(&entry.path())?;
+        }
+        remove_dir(path).with_context(|| format!("removing directory {}", path.display()))?;
+    } else {
+        remove_file(path).with_context(|| format!("removing file {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -729,6 +759,29 @@ pub fn replace_mount_resolv_conf(nameserver: &str, direct_write: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursive_remove_unmounts_paths_and_does_not_follow_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "nsproxy-rm-recursive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = root.join("target");
+        let external = root.join("external");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        std::fs::write(target.join("nested/file"), "remove").unwrap();
+        std::fs::write(&external, "preserve").unwrap();
+        std::os::unix::fs::symlink(&external, target.join("external-link")).unwrap();
+
+        remove_path_recursive(&target).unwrap();
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "preserve");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn write_resolv_conf_explicit_writes_file() {

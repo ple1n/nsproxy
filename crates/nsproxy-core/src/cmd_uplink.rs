@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use owo_colors::OwoColorize;
 use socks5_impl::protocol::WireAddress;
-use tracing::warn;
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
@@ -12,6 +11,7 @@ use std::{
     },
     time::Duration,
 };
+use tracing::warn;
 use tun2socks5::{ArgProxy, ProxyType};
 
 use crate::{ClashOps, RemoteOps, UplinkCommand, UplinkInstanceCommand, state_paths};
@@ -167,11 +167,7 @@ fn print_clash_group_import(
     println!("  Trojan proxies: {}", report.proxies);
 }
 
-fn clash_config_import(
-    group_id: String,
-    path: std::path::PathBuf,
-    replace: bool,
-) -> Result<()> {
+fn clash_config_import(group_id: String, path: std::path::PathBuf, replace: bool) -> Result<()> {
     let report = import_clash_group(group_id.clone(), path.clone(), replace)?;
     print_clash_group_import(&group_id, &path, report, replace);
     Ok(())
@@ -186,7 +182,10 @@ fn clash_list() -> Result<()> {
 
     println!("Clash Groups: {}", state.groups.len());
     println!("Tracked proxy domains: {}", state.proxy_domain_count());
-    println!("Tracked trojan proxies: {}", state.all_proxy_configs().len());
+    println!(
+        "Tracked trojan proxies: {}",
+        state.all_proxy_configs().len()
+    );
     for (group_id, group) in &state.groups {
         println!(
             "  - {} ({} proxies, {} proxy domains)",

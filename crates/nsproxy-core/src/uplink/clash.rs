@@ -715,12 +715,9 @@ impl ClashState {
     }
 
     pub fn group_for_domain(&self, domain: &Domain) -> Option<&GroupId> {
-        self.groups.iter().find_map(|(group_id, group)| {
-            group
-                .proxy_domains
-                .contains(domain)
-                .then_some(group_id)
-        })
+        self.groups
+            .iter()
+            .find_map(|(group_id, group)| group.proxy_domains.contains(domain).then_some(group_id))
     }
 
     pub fn remove_private_ips(&mut self) {
@@ -787,11 +784,7 @@ impl ClashState {
         Ok(())
     }
 
-    fn store_group_import(
-        &mut self,
-        import: &ClashImport,
-        group_id: GroupId,
-    ) -> GroupImportReport {
+    fn store_group_import(&mut self, import: &ClashImport, group_id: GroupId) -> GroupImportReport {
         let replaced_domains = self
             .groups
             .get(&group_id)
@@ -2200,15 +2193,15 @@ mod group_import_tests {
         let import = import("example", "proxy.example.test");
         let first_group = GroupId::from("first");
         let second_group = GroupId::from("second");
-        let proxy_id = ProxyID::for_trojan_domain(
-            "proxy.example.test",
-            443,
-            "password-example",
-        );
+        let proxy_id = ProxyID::for_trojan_domain("proxy.example.test", 443, "password-example");
         let mut state = ClashState::default();
 
-        state.add_group_import(&import, first_group.clone()).unwrap();
-        state.add_group_import(&import, second_group.clone()).unwrap();
+        state
+            .add_group_import(&import, first_group.clone())
+            .unwrap();
+        state
+            .add_group_import(&import, second_group.clone())
+            .unwrap();
 
         assert_eq!(
             state.proxy_group_memberships().get(&proxy_id),
@@ -2231,15 +2224,10 @@ mod group_import_tests {
         let mut replacement = import("replacement", "replacement.example.test");
         let first_group = GroupId::from("first");
         let second_group = GroupId::from("second");
-        let old_id =
-            ProxyID::for_trojan_domain("first.example.test", 443, "password-first");
-        let replacement_id = ProxyID::for_trojan_domain(
-            "replacement.example.test",
-            443,
-            "password-replacement",
-        );
-        let second_id =
-            ProxyID::for_trojan_domain("second.example.test", 443, "password-second");
+        let old_id = ProxyID::for_trojan_domain("first.example.test", 443, "password-first");
+        let replacement_id =
+            ProxyID::for_trojan_domain("replacement.example.test", 443, "password-replacement");
+        let second_id = ProxyID::for_trojan_domain("second.example.test", 443, "password-second");
         let old_dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
         let new_dns: SocketAddr = "8.8.8.8:53".parse().unwrap();
         first.tier1_nameservers.insert(
@@ -2265,7 +2253,9 @@ mod group_import_tests {
         let mut state = ClashState::default();
 
         state.add_group_import(&first, first_group.clone()).unwrap();
-        state.add_group_import(&second, second_group.clone()).unwrap();
+        state
+            .add_group_import(&second, second_group.clone())
+            .unwrap();
         state.add_proxy_resolution(
             "first.example.test",
             BTreeSet::from(["192.0.2.10".parse().unwrap()]),
@@ -2274,30 +2264,36 @@ mod group_import_tests {
             .replace_group_import(&replacement, first_group.clone())
             .unwrap();
 
-        assert!(!state.groups[&first_group]
-            .proxy_configs
-            .contains_key(&old_id));
-        assert!(state.groups[&first_group]
-            .proxy_configs
-            .contains_key(&replacement_id));
-        assert!(state.groups[&second_group]
-            .proxy_configs
-            .contains_key(&second_id));
-        assert!(state.groups[&first_group]
-            .tier1_nameservers
-            .contains_key(&new_dns));
-        assert!(!state.groups[&first_group]
-            .tier1_nameservers
-            .contains_key(&old_dns));
+        assert!(
+            !state.groups[&first_group]
+                .proxy_configs
+                .contains_key(&old_id)
+        );
+        assert!(
+            state.groups[&first_group]
+                .proxy_configs
+                .contains_key(&replacement_id)
+        );
+        assert!(
+            state.groups[&second_group]
+                .proxy_configs
+                .contains_key(&second_id)
+        );
+        assert!(
+            state.groups[&first_group]
+                .tier1_nameservers
+                .contains_key(&new_dns)
+        );
+        assert!(
+            !state.groups[&first_group]
+                .tier1_nameservers
+                .contains_key(&old_dns)
+        );
         assert_eq!(
             state.group_for_domain(&Domain::from("first.example.test")),
             None
         );
-        assert!(
-            state
-                .get_latest_proxy_ips("first.example.test")
-                .is_none()
-        );
+        assert!(state.get_latest_proxy_ips("first.example.test").is_none());
         assert_eq!(
             state.group_for_domain(&Domain::from("replacement.example.test")),
             Some(&first_group)
@@ -2327,11 +2323,7 @@ mod group_import_tests {
             .replace_group_import(&replacement, first_group)
             .unwrap();
 
-        assert!(
-            state
-                .get_latest_proxy_ips("shared.example.test")
-                .is_some()
-        );
+        assert!(state.get_latest_proxy_ips("shared.example.test").is_some());
         assert_eq!(
             state.group_for_domain(&Domain::from("shared.example.test")),
             Some(&second_group)

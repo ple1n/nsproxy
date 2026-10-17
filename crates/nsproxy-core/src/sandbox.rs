@@ -401,9 +401,7 @@ pub fn prepare_fcitx_profile_mount(
     let profile_path = fcitx_dir.join("profile");
     if !profile_path.exists() {
         std::fs::create_dir_all(&fcitx_dir)?;
-        let existing_profile = rootfs
-            .join(relative_home)
-            .join(".config/fcitx5/profile");
+        let existing_profile = rootfs.join(relative_home).join(".config/fcitx5/profile");
         if existing_profile.exists() {
             std::fs::copy(existing_profile, &profile_path)?;
         } else {
@@ -411,7 +409,10 @@ pub fn prepare_fcitx_profile_mount(
         }
     }
 
-    let gid = template.sargs.gid.unwrap_or_else(|| user.primary_group_id());
+    let gid = template
+        .sargs
+        .gid
+        .unwrap_or_else(|| user.primary_group_id());
     chown(
         &fcitx_dir,
         Some(Uid::from_raw(uid)),

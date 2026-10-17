@@ -63,6 +63,9 @@ can override their own `ui.spacing_mut()` when needed. Run
 log presentation (source, level, target, ANSI-highlighted message, and fields)
 with a regular multiline editor. Nsproxy log rows and the interactive example
 share a One Dark-inspired syntax palette on a near-black background.
+The Daemon tab has its own minimum-level filter initialized to `DEBUG`, so
+daemon `INFO` operation records are visible by default without changing other
+log panels' filters.
 
 ## Compact removal controls
 
@@ -81,7 +84,7 @@ renderer and extend the shared convention when the semantic role matches.
 ## Hotconfig and veth editor lifecycle
 
 - Form edits mutate `hotconfig_editor_value` and regenerate the JSON editor text; valid JSON edits do the reverse. The UI shows `unsaved` beside `Apply Sandbox` when the editor differs from the loaded profile snapshot or has a JSON error.
-- `Save` serializes the editor value and sends `SupervisorCommand::SaveHotconfigPrivileged`. The supervisor preserves the live proxy route, writes `hot.json` through the privileged root daemon, and refreshes its cache. Pivot sandbox reconciliation is manual through `Apply Sandbox`.
+- `Save` serializes the editor value and sends `SupervisorCommand::SaveHotconfigPrivileged`. The supervisor preserves the live proxy route, writes `hot.json` through the privileged root daemon, refreshes its cache, then sends `ControlCommand::ReloadHotConfig` to the running serve process so the saved file is applied immediately. The daemon logs the resolved target path in its receive/completion records and the success response. Pivot sandbox reconciliation is manual through `Apply Sandbox`.
 - The shared veth card has an `on container creation` toggle. Enabled cards serialize to `HotConfig.veth`; `sp up` reconciles those entries when the profile becomes alive. Disabled cards remain temporary UI state and `Create veth pair` sends the same command immediately without modifying `hot.json`.
 - The veth command launches `nsproxy` with `MainCommand::Veth`, which resolves both running namespace endpoints, removes stale same-name links, allocates a free `100.64.0.0/10` subnet, creates the link with netlink, moves each endpoint into its namespace, and configures both addresses.
 - `sp up` persists per-entry startup results in `veth_status.json`; the UI loads the latest persisted result after restart and overlays temporary request results while they are active. A failed attempt is reported and logged; it is not silently retried or assigned a different address.

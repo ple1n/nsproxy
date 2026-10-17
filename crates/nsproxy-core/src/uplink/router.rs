@@ -67,7 +67,9 @@ enum RelayError {
         op: RelayOp,
         source: std::io::Error,
     },
-    StatsChannelClosed { flow: &'static str },
+    StatsChannelClosed {
+        flow: &'static str,
+    },
 }
 
 impl std::fmt::Display for RelayError {
@@ -155,12 +157,7 @@ impl HostConnectionControl {
             .count()
     }
 
-    fn register(
-        &self,
-        host: HostRouteHost,
-        id: ConnId,
-        sender: watch::Sender<bool>,
-    ) -> Result<()> {
+    fn register(&self, host: HostRouteHost, id: ConnId, sender: watch::Sender<bool>) -> Result<()> {
         let mut connections = self
             .inner
             .lock()
@@ -248,9 +245,8 @@ impl Router {
     /// Initialize diagnostic monitoring.
     /// After calling this, use [`Router::take_cmd_rx`] to obtain the control-command receiver.
     pub async fn init_diag(&mut self, sock_path: &PathBuf) -> Result<()> {
-        let initial_persist = Duration::from_secs(
-            u64::from(self.conf.borrow().diag_conn_persist_secs),
-        );
+        let initial_persist =
+            Duration::from_secs(u64::from(self.conf.borrow().diag_conn_persist_secs));
         match DiagServer::start(sock_path.as_path(), initial_persist).await {
             Ok((srv, cmd_rx)) => {
                 info!("diag server started at {:?}", sock_path);
@@ -259,9 +255,8 @@ impl Router {
                 let mut conf = (*self.conf).clone();
                 tokio::spawn(async move {
                     while conf.changed().await.is_ok() {
-                        let persist = Duration::from_secs(
-                            u64::from(conf.borrow().diag_conn_persist_secs),
-                        );
+                        let persist =
+                            Duration::from_secs(u64::from(conf.borrow().diag_conn_persist_secs));
                         if let Err(err) = srv.set_conn_persist(persist).await {
                             warn!("failed to update diagnostic connection retention: {err}");
                             break;
@@ -1020,9 +1015,7 @@ impl Router {
             }
         }
 
-        if let Some(sample) =
-            rate_tracker.sample(Timestamp::now(), transfer_start.elapsed())
-        {
+        if let Some(sample) = rate_tracker.sample(Timestamp::now(), transfer_start.elapsed()) {
             rate_updates
                 .send(sample)
                 .await
@@ -1526,10 +1519,8 @@ mod tests {
     #[test]
     fn udp_idle_timeout_is_normal_relay_termination() {
         assert_eq!(
-            Router::udp_read_result(Err(std::io::Error::from(
-                std::io::ErrorKind::TimedOut
-            )))
-            .unwrap(),
+            Router::udp_read_result(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
+                .unwrap(),
             None
         );
         assert_eq!(Router::udp_read_result(Ok(12)).unwrap(), Some(12));

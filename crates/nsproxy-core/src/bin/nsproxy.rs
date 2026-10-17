@@ -26,7 +26,6 @@ use tokio::{
 };
 
 use futures_lite::future::block_on;
-use fs4::fs_std::FileExt;
 use hardware_address::MacAddr;
 use ipnetwork::{IpNetwork, Ipv4Network};
 use libc::KERN_HOTPLUG;
@@ -41,8 +40,8 @@ use nix::{
 };
 use notify::{Event, EventKind, RecommendedWatcher, Watcher, event::ModifyKind};
 use nsproxy_common::{
-    ExactNS, Inode, NSFrom, NSSource, NamespacesRegistry, PERSIST_ROOT, PidPath,
-    ProfileNamespaces, UniqueFile, forever,
+    ExactNS, Inode, NSFrom, NSSource, NamespacesRegistry, PERSIST_ROOT, PidPath, ProfileNamespaces,
+    UniqueFile, forever,
 };
 use nsproxy_core::{
     BasisCommand, Cli, DaemonCliRequest, HotConfig, MainCommand, NetlinkOps, NsproxyConfig, Paths,
@@ -60,7 +59,7 @@ use nsproxy_core::{
         apply_chmod, apply_mounts, assert_mount_ns_matches, collect_sandbox_status,
         ensure_sandbox_status_for_mnt, read_sandbox_status, write_sandbox_status,
     },
-    shell::{ShellPrefs, ShellArgs},
+    shell::{ShellArgs, ShellPrefs},
     state_paths,
     sys::{
         Clone3Result, NSEnter, check_capsys, check_selfns, enable_ping_all, mount_bind,
@@ -389,10 +388,8 @@ fn replace_standard_session_service_dirs(contents: &str, service_dir: &Path) -> 
 
 fn prepare_container_session_bus_config(runtime_dir: &Path) -> Result<PathBuf> {
     let service_dir = runtime_dir.join("session-services");
-    let installed = populate_container_session_service_dir(
-        &container_session_service_dirs(),
-        &service_dir,
-    )?;
+    let installed =
+        populate_container_session_service_dir(&container_session_service_dirs(), &service_dir)?;
     let system_config = Path::new("/usr/share/dbus-1/session.conf");
     let system_config_contents = fs::read_to_string(system_config)?;
     let config = replace_standard_session_service_dirs(&system_config_contents, &service_dir)
@@ -445,11 +442,9 @@ mod container_session_bus_tests {
         )
         .unwrap();
 
-        let installed = populate_container_session_service_dir(
-            std::slice::from_ref(&source_dir),
-            &service_dir,
-        )
-        .unwrap();
+        let installed =
+            populate_container_session_service_dir(std::slice::from_ref(&source_dir), &service_dir)
+                .unwrap();
         let names = fs::read_dir(&service_dir)
             .unwrap()
             .map(|entry| {
@@ -461,7 +456,11 @@ mod container_session_bus_tests {
         assert_eq!(installed, 2);
         assert!(names.iter().any(|name| name == "org.kde.kwalletd6"));
         assert!(names.iter().any(|name| name == "org.example.Other"));
-        assert!(!names.iter().any(|name| name == "org.freedesktop.Notifications"));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "org.freedesktop.Notifications")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -503,11 +502,8 @@ mod container_session_bus_tests {
             "[D-BUS Service]\nName=org.kde.kwalletd6\nExec=/bin/true\n",
         )
         .unwrap();
-        populate_container_session_service_dir(
-            std::slice::from_ref(&source_dir),
-            &service_dir,
-        )
-        .unwrap();
+        populate_container_session_service_dir(std::slice::from_ref(&source_dir), &service_dir)
+            .unwrap();
         let system_config = fs::read_to_string("/usr/share/dbus-1/session.conf").unwrap();
         let config = replace_standard_session_service_dirs(&system_config, &service_dir).unwrap();
         let config_path = root.join("session.conf");
@@ -620,10 +616,7 @@ fn apply_private_fcitx_env(env: &mut Vec<(String, String)>) {
     );
 }
 
-fn apply_dbus_env(
-    shell_prefs: &mut ShellPrefs,
-    ns_alive: &nsproxy_core::NsAlive,
-) -> Result<()> {
+fn apply_dbus_env(shell_prefs: &mut ShellPrefs, ns_alive: &nsproxy_core::NsAlive) -> Result<()> {
     match dbus_mode_for_profile(ns_alive) {
         nsproxy_core::DbusMode::Block => shell_prefs.strip_dbus_env(),
         nsproxy_core::DbusMode::Pass => {}
@@ -807,9 +800,7 @@ fn initialize_basis_namespace(
 ) -> anyhow::Result<nsproxy_common::NamespaceRegistryInit> {
     let persist_root = state_paths::persist_root();
     std::fs::create_dir_all(&persist_root)?;
-    if persist_root == Path::new(PERSIST_ROOT) {
-        std::fs::set_permissions(&persist_root, Permissions::from_mode(0o777))?;
-    }
+    std::fs::set_permissions(&persist_root, Permissions::from_mode(0o777))?;
 
     let current = ProfileNamespaces {
         // Mount namespaces are recorded via a /proc path source since they are
@@ -827,14 +818,16 @@ fn initialize_basis_namespace(
         None => BasisValidity::Empty,
     };
     match &validity {
-        BasisValidity::Empty => println!(
-            "basis namespace empty: nothing recorded, recording current namespace"
-        ),
+        BasisValidity::Empty => {
+            println!("basis namespace empty: nothing recorded, recording current namespace")
+        }
         BasisValidity::Invalid(drifted) => println!(
             "basis namespace invalid: {} identity no longer matches current, updating record",
             drifted
         ),
-        BasisValidity::Valid => println!("basis namespace valid: recorded identity matches current"),
+        BasisValidity::Valid => {
+            println!("basis namespace valid: recorded identity matches current")
+        }
     }
     let replace = force || matches!(validity, BasisValidity::Empty | BasisValidity::Invalid(_));
     let basis = if replace {
@@ -903,8 +896,7 @@ fn temp_profile_name(command: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     let timestamp = chrono::Utc::now();
-    let timestamp_text =
-        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let timestamp_text = timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     let timestamp_hash = blake3::hash(timestamp_text.as_bytes());
     let timestamp_suffix = URL_SAFE_NO_PAD.encode(timestamp_hash.as_bytes());
     format!("{}-{}", temp_command_slug(command), &timestamp_suffix[..4])
@@ -952,10 +944,8 @@ fn run_temp_command(eargs: nsproxy_core::shell::EnterArgs) -> Result<()> {
             state_paths::profile_config(&profile),
             serde_json::to_vec_pretty(&template)?,
         )?;
-        fs::write(
-            &profile_hot_path,
-            serde_json::to_vec_pretty(&nsproxy_core::default_hotconfig())?,
-        )?;
+        let mut hot = nsproxy_core::default_hotconfig();
+        hot.save(&profile_hot_path)?;
 
         let executable = std::env::current_exe()?;
         up_child = Some(
@@ -1037,7 +1027,11 @@ fn run_route_command(
             nsproxy_core::route_map::ApplyMode::Merge
         };
         let path = nsproxy_core::route_map::apply_to_container(container, &preferences, mode)?;
-        println!("applied {} to {container} ({})", file.display(), path.display());
+        println!(
+            "applied {} to {container} ({})",
+            file.display(),
+            path.display()
+        );
         return Ok(());
     }
 
@@ -1095,16 +1089,12 @@ fn run_route_make_container(
                 state_paths::profile_config(name),
                 serde_json::to_vec_pretty(&template)?,
             )?;
-            fs::write(
-                &hot_path,
-                serde_json::to_vec_pretty(&nsproxy_core::default_hotconfig())?,
-            )?;
+            let mut hot = nsproxy_core::default_hotconfig();
+            hot.save(&hot_path)?;
         }
 
-        let content = fs::read(&hot_path)
-            .with_context(|| format!("failed to read {}", hot_path.display()))?;
-        let mut hot: HotConfig = serde_json::from_slice(&content)
-            .with_context(|| format!("invalid {}", hot_path.display()))?;
+        let mut hot = nsproxy_core::state_file::read::<HotConfig>(&hot_path)?
+            .with_context(|| format!("missing hot config {}", hot_path.display()))?;
         nsproxy_core::route_map::apply_to_hotconfig(
             &mut hot,
             &preferences,
@@ -1150,12 +1140,8 @@ fn run_route_make_container(
     if !args.destroy && run_result.is_ok() {
         return Ok(());
     }
-    let cleanup_result = cleanup_temp_profile(
-        name,
-        &state_root,
-        profile_dir_created,
-        up_child.as_mut(),
-    );
+    let cleanup_result =
+        cleanup_temp_profile(name, &state_root, profile_dir_created, up_child.as_mut());
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(run_error), Ok(())) => Err(run_error),
@@ -1313,41 +1299,250 @@ fn log_process_invocation(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let log_path = state_paths::process_log();
-    let boot_path = state_paths::process_log_boot();
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let lock_path = boot_path.with_extension("lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
-    lock.lock_exclusive()?;
-
-    let boot_id = nsproxy_common::current_boot_id()?;
-    let previous_boot = fs::read_to_string(&boot_path).ok();
-    if previous_boot.as_deref() != Some(boot_id.as_str()) {
-        fs::File::create(&log_path)?;
-        fs::write(&boot_path, &boot_id)?;
-    }
-
     let netns = ExactNS::from_source((PidPath::Selfproc, "net"))?.unique;
     let entry = serde_json::json!({
         "type": "process_start",
         "pid": std::process::id(),
+        "start_ticks": process_start_ticks(std::process::id())?,
         "nsid": netns,
         "args": serde_json::to_value(cli)?,
     });
-    let mut log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    serde_json::to_writer(&mut log, &entry)?;
-    log.write_all(b"\n")?;
+    nsproxy_core::state_file::append_wal_record(
+        &state_paths::process_log(),
+        &state_paths::process_log_boot(),
+        &entry,
+    )
+}
+
+fn wal_process_records() -> anyhow::Result<Vec<serde_json::Value>> {
+    nsproxy_core::state_file::read_wal(&state_paths::process_log())
+}
+
+fn logged_live_nsproxy(pid: u32) -> anyhow::Result<bool> {
+    let records = wal_process_records()?;
+    let Some(start_ticks) = records.iter().rev().find_map(|record| {
+        (record.get("pid").and_then(serde_json::Value::as_u64) == Some(pid as u64))
+            .then(|| {
+                record
+                    .get("start_ticks")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .flatten()
+    }) else {
+        return Ok(false);
+    };
+    if process_start_ticks(pid).ok() != Some(start_ticks) {
+        return Ok(false);
+    }
+    Ok(process_is_nsproxy(pid))
+}
+
+fn process_is_nsproxy(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| {
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name == "nsproxy" || name == "sproxy" || name == "sp")
+    })
+}
+
+fn process_start_ticks(pid: u32) -> anyhow::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .context("malformed /proc/<pid>/stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields
+        .get(19)
+        .context("missing start time in /proc/<pid>/stat")?
+        .parse()
+        .context("invalid process start time")
+}
+
+fn confirm_process_action(prompt: &str) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn migrate_state_root(output: &std::path::Path, finish: bool) -> anyhow::Result<()> {
+    let root = state_paths::persist_root();
+    stop_wal_processes()?;
+    nsproxy_core::migration::stage_state_root(&root, output)?;
+    if finish {
+        finish_migrate_target(output)?;
+    } else {
+        println!(
+            "Staged state root {} using links to {}. The source remains unchanged; run `sp --state {} migrate --finish` to materialize the new root.",
+            output.display(),
+            root.display(),
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_migrate_target(target: &std::path::Path) -> anyhow::Result<()> {
+    let source = state_paths::persist_root();
+    let target = nsproxy_core::migration::validate_removable_state_root(&source, target)?;
+    stop_wal_processes_for_root(&target, "removing the staged target")?;
+    nsproxy_core::migration::remove_state_root(&source, &target)?;
+    println!(
+        "Removed staged target {}. Source state root {} was left untouched.",
+        target.display(),
+        source.display()
+    );
+    Ok(())
+}
+
+fn migrate_target_exists(target: &std::path::Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(target) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn finish_migrate_target(target: &std::path::Path) -> anyhow::Result<()> {
+    let source = state_paths::persist_root();
+    let target = nsproxy_core::migration::validate_removable_state_root(&source, target)?;
+    stop_wal_processes()?;
+    stop_wal_processes_for_root(&target, "materializing the migration target")?;
+    nsproxy_core::migration::finish_state_root(&target, &state_paths::rootfs_root())?;
+    println!(
+        "Moved state from {} to {} and legacy rootfs data to {}.",
+        source.display(),
+        target.display(),
+        state_paths::rootfs_root().display()
+    );
+    Ok(())
+}
+
+fn stop_wal_processes() -> anyhow::Result<()> {
+    stop_wal_processes_for_root(&state_paths::persist_root(), "migration")
+}
+
+fn stop_wal_processes_for_root(
+    selected_root: &std::path::Path,
+    action: &str,
+) -> anyhow::Result<()> {
+    let process_log = selected_root.join("nsproxy-process-log.jsonl");
+    let records: Vec<serde_json::Value> =
+        nsproxy_core::state_file::read_wal(&process_log)?;
+    let mut active = Vec::new();
+    for record in &records {
+        let Some(pid) = record.get("pid").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let pid = pid as u32;
+        if pid != std::process::id()
+            && record_belongs_to_root(record, &selected_root)
+            && process_is_nsproxy(pid)
+            && !active.iter().any(|(active_pid, _)| *active_pid == pid)
+        {
+            active.push((
+                pid,
+                record
+                    .get("start_ticks")
+                    .and_then(serde_json::Value::as_u64),
+            ));
+        }
+    }
+    for (pid, start_ticks) in &mut active {
+        if start_ticks.is_none() {
+            *start_ticks = process_start_ticks(*pid).ok();
+        }
+    }
+    if !active.is_empty() {
+        let pids = active.iter().map(|(pid, _)| pid).collect::<Vec<_>>();
+        eprintln!("Active nsproxy processes recorded in the state WAL: {pids:?}");
+        if !confirm_process_action(&format!(
+            "Send SIGTERM to these processes before {action}?"
+        ))? {
+            anyhow::bail!("{action} cancelled; stop the listed processes and retry");
+        }
+        for (pid, start_ticks) in &active {
+            let Some(start_ticks) = start_ticks else {
+                anyhow::bail!(
+                    "{action} refused: PID {pid} has no recorded start-time identity; stop it manually and retry"
+                );
+            };
+            anyhow::ensure!(
+                process_start_ticks(*pid).ok() == Some(*start_ticks) && process_is_nsproxy(*pid),
+                "{action} refused: PID {pid} identity changed since it was recorded"
+            );
+            nix::sys::signal::kill(
+                Pid::from_raw(*pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            )?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let still_active = active
+            .iter()
+            .filter_map(|(pid, start_ticks)| {
+                (process_is_nsproxy(*pid) && process_start_ticks(*pid).ok() == *start_ticks)
+                    .then_some(*pid)
+            })
+            .collect::<Vec<_>>();
+        if !still_active.is_empty() {
+            anyhow::bail!(
+                "{action} refused: processes remain active after SIGTERM: {still_active:?}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn record_belongs_to_root(record: &serde_json::Value, selected_root: &std::path::Path) -> bool {
+    let recorded_root = record
+        .get("args")
+        .and_then(|args| args.get("root"))
+        .and_then(serde_json::Value::as_str);
+    match recorded_root {
+        Some(root) => std::path::Path::new(root) == selected_root,
+        None => selected_root == std::path::Path::new(nsproxy_core::PERSIST_ROOT),
+    }
+}
+
+fn list_wal_processes() -> anyhow::Result<()> {
+    for record in wal_process_records()? {
+        let pid = record.get("pid").and_then(serde_json::Value::as_u64);
+        let alive = pid
+            .map(|pid| logged_live_nsproxy(pid as u32))
+            .transpose()?
+            .unwrap_or(false);
+        println!(
+            "pid={} live={} record={}",
+            pid.map(|pid| pid.to_string()).unwrap_or_else(|| "?".into()),
+            alive,
+            record
+        );
+    }
+    Ok(())
+}
+
+fn kill_wal_process(pid: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        logged_live_nsproxy(pid)?,
+        "PID {pid} is not a live nsproxy process recorded in this state root"
+    );
+    if !confirm_process_action(&format!("Send SIGTERM to recorded nsproxy PID {pid}?"))? {
+        anyhow::bail!("process termination cancelled");
+    }
+    anyhow::ensure!(
+        logged_live_nsproxy(pid)?,
+        "process identity changed before signal was sent"
+    );
+    nix::sys::signal::kill(Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM)?;
     Ok(())
 }
 
@@ -1435,8 +1630,12 @@ fn main() -> anyhow::Result<()> {
                 aok!()
             })?;
         }
-        MainCommand::Rm { file } => {
-            rm_mount(&file)?;
+        MainCommand::Rm { file, recurse } => {
+            if recurse {
+                nsproxy_core::sys::remove_path_recursive(&file)?;
+            } else {
+                rm_mount(&file)?;
+            }
         }
         MainCommand::Id { pid } => {
             // Keep this command output clean and human-focused.
@@ -1722,10 +1921,7 @@ fn main() -> anyhow::Result<()> {
                 // otherwise treat as an explicit path if it starts with /, ./, or ~/
                 let (resolved_path, nsdata) = {
                     let t = &target;
-                    if t.starts_with('/')
-                        || t.starts_with("./")
-                        || t.starts_with("~/")
-                        || t == "~"
+                    if t.starts_with('/') || t.starts_with("./") || t.starts_with("~/") || t == "~"
                     {
                         let vars = PathExpansionState::without_instance();
                         let p = vars.expand(Path::new(t));
@@ -1740,8 +1936,7 @@ fn main() -> anyhow::Result<()> {
 
                 let ns_alive = read_ns_alive(&nsdata)?;
                 let profile = ns_alive.profile_name.as_deref().unwrap_or(target.as_str());
-                let profile_conf =
-                    TemplateConfig::load(&state_paths::profile_config(profile))?;
+                let profile_conf = TemplateConfig::load(&state_paths::profile_config(profile))?;
                 let sandbox_status = if let Some(child_pid) = ns_alive.child_pid {
                     NSSource::Pid(child_pid as i32).enter(CloneFlags::CLONE_NEWNS)?;
                     let expected_mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))?.unique;
@@ -1882,10 +2077,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
         MainCommand::Gen { save_to } => {
-            let conf = HotConfig::default();
+            let mut conf = HotConfig::default();
             let json = serde_json::to_string_pretty(&conf)?;
 
-            std::fs::write(&save_to, json)?;
+            if is_managed_hot_config_path(&save_to) {
+                conf.save(&save_to)?;
+            } else {
+                std::fs::write(&save_to, json)?;
+            }
         }
         MainCommand::Init { force } => {
             let init = initialize_basis_namespace(force)?;
@@ -2201,11 +2400,13 @@ fn main() -> anyhow::Result<()> {
                 info!("Setting up hot config...");
                 if profile.hot.exists() && profile.hot != hot_path {
                     info!("Copying hot config from {:?}", profile.hot);
-                    std::fs::copy(&profile.hot, &hot_path)?;
+                    let mut hot = nsproxy_core::state_file::read::<HotConfig>(&profile.hot)?
+                        .with_context(|| format!("missing hot config {}", profile.hot.display()))?;
+                    hot.save(&hot_path)?;
                     warn!("Copied hot config: {:?} -> {:?}", profile.hot, hot_path);
                 } else if !hot_path.exists() {
                     info!("Creating hot config from profile.hot_init");
-                    let hot = profile.hot_init.clone().unwrap_or_default();
+                    let mut hot = profile.hot_init.clone().unwrap_or_default();
                     hot.save(&hot_path)?;
                     warn!("Created hot config: {:?}", hot_path);
                 }
@@ -2263,7 +2464,7 @@ fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&target_dir)?;
 
             let mut profile = TemplateConfig::load(&source_profile_path)?;
-            let hot = load_hot_config_from_disk_or_default(&source_hot_path);
+            let mut hot = load_hot_config_from_disk_or_default(&source_hot_path);
 
             hot.save(&target_hot_path)?;
             profile.hot = PathBuf::from("@/hot.json");
@@ -2439,8 +2640,7 @@ fn main() -> anyhow::Result<()> {
                             );
                         }
 
-                        let expected_mnt =
-                            ExactNS::from_source((PidPath::Selfproc, "mnt"))?.unique;
+                        let expected_mnt = ExactNS::from_source((PidPath::Selfproc, "mnt"))?.unique;
                         match profile_conf.sandbox_mode {
                             SandboxMode::Pivot => {
                                 ensure_sandbox_status_for_mnt(
@@ -2572,16 +2772,17 @@ fn main() -> anyhow::Result<()> {
 
                         if profile_conf.sandbox_mode == SandboxMode::Pivot {
                             let sandbox_status_path = state_paths::sandbox_status(&profile);
-                            let sandbox_status = nsproxy_core::sandbox::read_sandbox_status_for_mnt(
-                                profile.as_str(),
-                                &child_mnt.unique,
-                            )
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "sandbox status was not written for profile '{}'",
-                                    profile
+                            let sandbox_status =
+                                nsproxy_core::sandbox::read_sandbox_status_for_mnt(
+                                    profile.as_str(),
+                                    &child_mnt.unique,
                                 )
-                            })?;
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "sandbox status was not written for profile '{}'",
+                                        profile
+                                    )
+                                })?;
                             match sandbox_status.detected_state {
                                 nsproxy_core::sandbox::SandboxState::Pivoted => {
                                     warn!(
@@ -2836,7 +3037,15 @@ fn main() -> anyhow::Result<()> {
                     .map_err(|_| anyhow!("dbus daemon thread panicked"))??;
             }
         }
-        MainCommand::Veth { src, dst, veth_name, src_ip4, dst_ip4, prefix_len, log } => {
+        MainCommand::Veth {
+            src,
+            dst,
+            veth_name,
+            src_ip4,
+            dst_ip4,
+            prefix_len,
+            log,
+        } => {
             if let Some(log) = log {
                 reload_handle.modify(|k| *k.filter_mut() = log)?;
             }
@@ -2882,6 +3091,39 @@ fn main() -> anyhow::Result<()> {
             let tree = nsproxy_core::state_blueprint::global_state_tree();
             println!("{}", tree.render_tree());
         }
+        MainCommand::Migrate { to, finish, rm } => {
+            if let Some(target) = to {
+                let target_exists = migrate_target_exists(&target)?;
+                if rm {
+                    if target_exists {
+                        remove_migrate_target(&target)?;
+                    }
+                }
+                if finish {
+                    if target_exists && !rm {
+                        finish_migrate_target(&target)?;
+                    } else {
+                        migrate_state_root(&target, true)?;
+                    }
+                } else {
+                    migrate_state_root(&target, false)?;
+                }
+            } else if finish {
+                stop_wal_processes()?;
+                nsproxy_core::migration::finish_state_root(
+                    &state_paths::persist_root(),
+                    &state_paths::rootfs_root(),
+                )?;
+            } else {
+                anyhow::bail!(
+                    "use `sp --state <source> migrate --to <target> [--rm]` or `sp --state <target> migrate --finish`"
+                );
+            }
+        }
+        MainCommand::Meta { cmd } => match cmd {
+            nsproxy_core::MetaCommand::Processes => list_wal_processes()?,
+            nsproxy_core::MetaCommand::Kill { pid } => kill_wal_process(pid)?,
+        },
         MainCommand::Version => {
             println!("hash={}", nsproxy_core::build_tree_hash());
             println!("epoch={}", nsproxy_core::build_epoch_secs());
@@ -2981,15 +3223,14 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             if hot_path.exists() {
-                let fc = std::fs::read_to_string(&hot_path)?;
-                if let Ok(mut hot) = serde_json::from_str::<HotConfig>(&fc) {
-                    hot.process_and_save(&hot_path)?;
-                    hot.expand_with(&hot_vars);
-                    if let Ok(mounts) = hot.merged_mounts() {
-                        if !mounts.is_empty() {
-                            nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
-                            status_mounts.extend(mounts);
-                        }
+                let mut hot = nsproxy_core::state_file::read::<HotConfig>(&hot_path)?
+                    .with_context(|| format!("missing hot config {}", hot_path.display()))?;
+                hot.process_and_save(&hot_path)?;
+                hot.expand_with(&hot_vars);
+                if let Ok(mounts) = hot.merged_mounts() {
+                    if !mounts.is_empty() {
+                        nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
+                        status_mounts.extend(mounts);
                     }
                 }
             }
@@ -3085,26 +3326,21 @@ fn exit_with_warn(code: i32, reason: &'static str) -> ! {
 }
 
 fn load_hot_config_from_disk_or_default(path: &Path) -> HotConfig {
-    match std::fs::read_to_string(path) {
-        Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
-            Ok(mut conf) => {
-                if let Err(err) = conf.process_and_save(path) {
-                    warn!(?path, %err, "failed to persist normalized hot config");
-                }
-                conf
+    match nsproxy_core::state_file::read::<HotConfig>(path) {
+        Ok(Some(mut conf)) => {
+            if let Err(err) = conf.process_and_save(path) {
+                warn!(?path, %err, "failed to persist normalized hot config");
             }
-            Err(e) => {
-                warn!(
-                    "failed to parse hot config {:?} at startup: {}, using default",
-                    path, e
-                );
-                HotConfig::default()
-            }
-        },
-        Err(e) => {
+            conf
+        }
+        Ok(None) => {
+            warn!("hot config {:?} is missing at startup, using default", path);
+            HotConfig::default()
+        }
+        Err(err) => {
             warn!(
                 "failed to read hot config {:?} at startup: {}, using default",
-                path, e
+                path, err
             );
             HotConfig::default()
         }
@@ -3122,8 +3358,8 @@ fn create_veth_pair(
     warn!("make veth {:?} -> {:?}", src, dst);
     let src_endpoint = resolve_veth_endpoint(&src)?;
     let dst_endpoint = resolve_veth_endpoint(&dst)?;
-    let vname = veth_name
-        .unwrap_or_else(|| format!("{}_{}", src_endpoint.label, dst_endpoint.label));
+    let vname =
+        veth_name.unwrap_or_else(|| format!("{}_{}", src_endpoint.label, dst_endpoint.label));
     let v_src = veth_interface_name(&vname, "src");
     let v_dst = veth_interface_name(&vname, "dst");
     let veth_net: Ipv4Network = "100.64.0.0/10".parse()?;
@@ -3135,7 +3371,9 @@ fn create_veth_pair(
     }
     let host_bits = 32 - prefix_len;
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         let nl = tokio_netlink_conn()?;
         remove_link_if_exists_in_namespace(src_endpoint.source.clone(), &v_src).await?;
@@ -3161,7 +3399,10 @@ fn create_veth_pair(
             (None, None) => {
                 let subnet = find_vacant_ipv4_subnet(used, veth_net, host_bits)
                     .ok_or_else(|| anyhow!("cannot find any vacant ip"))?;
-                (veth_addr_for(subnet, host_bits, true), veth_addr_for(subnet, host_bits, false))
+                (
+                    veth_addr_for(subnet, host_bits, true),
+                    veth_addr_for(subnet, host_bits, false),
+                )
             }
             _ => unreachable!(),
         };
@@ -3224,24 +3465,26 @@ fn reconcile_configured_veths(profile: &str) {
         }
     };
     for spec in hot.veth {
-        let result = run_in_netns_clone3_source(
-            basis_source.clone(),
-            || {
-                create_veth_pair(
-                    spec.src.parse().map_err(|e: String| anyhow!(e))?,
-                    spec.dst.parse().map_err(|e: String| anyhow!(e))?,
-                    spec.veth_name.clone(),
-                    spec.src_ip4,
-                    spec.dst_ip4,
-                    spec.prefix_len,
-                )
-            },
-        );
+        let result = run_in_netns_clone3_source(basis_source.clone(), || {
+            create_veth_pair(
+                spec.src.parse().map_err(|e: String| anyhow!(e))?,
+                spec.dst.parse().map_err(|e: String| anyhow!(e))?,
+                spec.veth_name.clone(),
+                spec.src_ip4,
+                spec.dst_ip4,
+                spec.prefix_len,
+            )
+        });
         snapshot.entries.push(VethStatus {
             spec,
             success: result.is_ok(),
-            detail: result.map(|_| "veth ready".to_string()).unwrap_or_else(|e| e.to_string()),
-            updated_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            detail: result
+                .map(|_| "veth ready".to_string())
+                .unwrap_or_else(|e| e.to_string()),
+            updated_at_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         });
     }
     if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
@@ -3300,7 +3543,12 @@ fn resolve_ps_netns(target: &str) -> Result<UniqueFile> {
         .values()
         .find(|profile| profile.mnt.unique == mount_ns.unique)
         .map(|profile| profile.net.unique)
-        .ok_or_else(|| anyhow!("no registered container matches mount namespace {:?}", target))
+        .ok_or_else(|| {
+            anyhow!(
+                "no registered container matches mount namespace {:?}",
+                target
+            )
+        })
 }
 
 fn scan_processes_in_netns(netns: UniqueFile) -> Vec<NamespaceProcess> {
@@ -3355,13 +3603,13 @@ fn cmd_ps(target: &str, kill: bool, force: bool) -> Result<()> {
         };
         for process in processes {
             if process.pid == self_pid {
-                warn!(pid = process.pid, "skipping current process during namespace kill");
+                warn!(
+                    pid = process.pid,
+                    "skipping current process during namespace kill"
+                );
                 continue;
             }
-            match nix::sys::signal::kill(
-                Pid::from_raw(process.pid as i32),
-                signal,
-            ) {
+            match nix::sys::signal::kill(Pid::from_raw(process.pid as i32), signal) {
                 Ok(()) => println!(
                     "sent {} to {:>6} {}",
                     if force { "SIGKILL" } else { "SIGTERM" },
@@ -3467,18 +3715,16 @@ mod hotconfig_routing_tests {
         let json = serde_json::to_vec(&encoded).unwrap();
         let loaded: HotConfig = serde_json::from_slice(&json).unwrap();
         assert!(
-            loaded.route_map.contains_key(&RoutingKey::host(
-                "packages.redhat.com.",
-                Some(443)
-            ))
+            loaded
+                .route_map
+                .contains_key(&RoutingKey::host("packages.redhat.com.", Some(443)))
         );
         assert_eq!(
             loaded.route_map[&RoutingKey::host("packages.redhat.com", Some(443))],
             expected.clone()
         );
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &loaded);
         assert_eq!(
             uplink.route(&context(
@@ -3490,9 +3736,8 @@ mod hotconfig_routing_tests {
             expected
         );
 
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &loaded);
 
         let request = context(
@@ -3540,9 +3785,8 @@ mod hotconfig_routing_tests {
         );
         nsproxy_common::routing::normalize_route_map_domains(&mut hot.route_map).unwrap();
 
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &hot);
 
         let request = context(
@@ -3575,9 +3819,8 @@ mod hotconfig_routing_tests {
         );
         nsproxy_common::routing::normalize_route_map_domains(&mut hot.route_map).unwrap();
 
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &hot);
 
         let host = |port| {
@@ -3609,13 +3852,15 @@ mod hotconfig_routing_tests {
             wildcard.clone(),
         );
 
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &hot);
 
         assert_eq!(uplink.route(&context(443, VDNSRES::NormalProxying)), exact);
-        assert_eq!(uplink.route(&context(8443, VDNSRES::NormalProxying)), wildcard);
+        assert_eq!(
+            uplink.route(&context(8443, VDNSRES::NormalProxying)),
+            wildcard
+        );
     }
 
     #[test]
@@ -3629,9 +3874,8 @@ mod hotconfig_routing_tests {
             RoutingResovled::Drop(nsproxy_common::routing::DropReason::MaxRetry),
         );
 
-        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
-            nsproxy_core::uplink::no_routing(),
-        );
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
         apply_hot_route_to_uplink(&mut uplink, &hot);
 
         let request = context(443, VDNSRES::NormalProxying);
@@ -4222,30 +4466,28 @@ fn cmd_serve(
                                         }
                                     }
                                     diag::ControlCommand::ReloadHotConfig => {
-                                        match tokio::fs::read_to_string(&hot_conf_cmd).await {
-                                            Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
-                                                Ok(cfg) => {
-                                                    let mut cfg = cfg;
-                                                    if let Err(err) = cfg.process_and_save(&hot_conf_cmd) {
-                                                        warn!(%err, "failed to persist normalized hot config");
-                                                    }
-                                                    let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
-                                                        source: "direct",
-                                                        persist_backup: false,
-                                                        config: Arc::new(cfg),
-                                                    }).await;
+                                        match nsproxy_core::state_file::read::<HotConfig>(&hot_conf_cmd) {
+                                            Ok(Some(mut cfg)) => {
+                                                if let Err(err) = cfg.process_and_save(&hot_conf_cmd) {
+                                                    warn!(%err, "failed to persist normalized hot config");
                                                 }
-                                                Err(e) => {
-                                                    diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
-                                                        ts: diag::Timestamp::now(),
-                                                        ok: false,
-                                                        changed: false,
-                                                        source: "direct".to_string(),
-                                                        error: Some(e.to_string()),
-                                                    });
-                                                    warn!("hot config parse error: {e}");
-                                                }
-                                            },
+                                                let _ = reload_tx.send(nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
+                                                    source: "direct",
+                                                    persist_backup: false,
+                                                    config: Arc::new(cfg),
+                                                }).await;
+                                            }
+                                            Ok(None) => {
+                                                let e = anyhow!("hot config file was removed");
+                                                diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
+                                                    ts: diag::Timestamp::now(),
+                                                    ok: false,
+                                                    changed: false,
+                                                    source: "direct".to_string(),
+                                                    error: Some(e.to_string()),
+                                                });
+                                                warn!("hot config read error: {e}");
+                                            }
                                             Err(e) => {
                                                 diag_srv.emit(diag::DiagEvent::HotConfigReloaded {
                                                     ts: diag::Timestamp::now(),
@@ -4828,7 +5070,7 @@ async fn run_up_daemon(
             if template.dbus == nsproxy_core::DbusMode::Container {
                 let cli = Cli {
                     conf: None,
-                    root: None,
+                    root: Some(state_paths::persist_root()),
                     no_wrap_check: false,
                     control_socket: None,
                     cmd: MainCommand::Dbus {
@@ -5266,7 +5508,7 @@ async fn handle_up_client(
                             if template.dbus == nsproxy_core::DbusMode::Container {
                                 let cli = Cli {
                                     conf: None,
-                                    root: None,
+                                    root: Some(state_paths::persist_root()),
                                     no_wrap_check: false,
                                     control_socket: None,
                                     cmd: MainCommand::Dbus {
@@ -6118,6 +6360,28 @@ fn ensure_daemon_path_allowed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_managed_hot_config_path(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("hot.json") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(relative_parent) = parent.strip_prefix(state_paths::config_root()) else {
+        return false;
+    };
+    let mut components = relative_parent.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn persist_hot_config(path: &Path, content: &[u8]) -> Result<()> {
+    ensure_daemon_path_allowed(path)?;
+    let mut hot: HotConfig =
+        serde_json::from_slice(content).context("invalid hot config content")?;
+    hot.process_and_save(path)?;
+    Ok(())
+}
+
 fn daemon_ok(
     op_id: u64,
     message: String,
@@ -6165,6 +6429,7 @@ fn root_daemon_op_name(op: &diag::RootDaemonOp) -> &'static str {
         diag::RootDaemonOp::WriteFile { .. } => "write_file",
         diag::RootDaemonOp::ImportClashGroup { .. } => "import_clash_group",
         diag::RootDaemonOp::CreateProfile { .. } => "create_profile",
+        diag::RootDaemonOp::WriteHotConfig { .. } => "write_hot_config",
     }
 }
 
@@ -6269,6 +6534,16 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
         diag::RootDaemonOp::CreateProfile { name, .. } => {
             info!(op_id, op = op_name, profile = %name, "root daemon op received");
         }
+        diag::RootDaemonOp::WriteHotConfig { profile, .. } => {
+            let path = state_paths::hot_config(profile);
+            info!(
+                op_id,
+                op = op_name,
+                profile = %profile,
+                path = %path.display(),
+                "root daemon op received"
+            );
+        }
     }
     match req.op {
         diag::RootDaemonOp::Ping => {
@@ -6299,8 +6574,8 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 None,
             ))
         }
-        diag::RootDaemonOp::InitializeBasisNamespace => RootDaemonAction::Reply(
-            match initialize_basis_namespace(false) {
+        diag::RootDaemonOp::InitializeBasisNamespace => {
+            RootDaemonAction::Reply(match initialize_basis_namespace(false) {
                 Ok(init) => diag::RootDaemonEvent {
                     op_id,
                     result: diag::RootDaemonResult::NamespaceInitialized {
@@ -6310,8 +6585,8 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                     },
                 },
                 Err(err) => daemon_err(op_id, err.to_string(), None, None),
-            },
-        ),
+            })
+        }
         diag::RootDaemonOp::CreateDirAll { path } => RootDaemonAction::Reply(
             match ensure_daemon_path_allowed(&path)
                 .and_then(|_| std::fs::create_dir_all(&path).map_err(anyhow::Error::from))
@@ -6332,9 +6607,16 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
             },
         ),
         diag::RootDaemonOp::ReadFile { path } => RootDaemonAction::Reply(
-            match ensure_daemon_path_allowed(&path)
-                .and_then(|_| std::fs::read_to_string(&path).map_err(anyhow::Error::from))
-            {
+            match (|| -> Result<String> {
+                ensure_daemon_path_allowed(&path)?;
+                if is_managed_hot_config_path(&path) {
+                    let hot = nsproxy_core::state_file::read::<HotConfig>(&path)?
+                        .ok_or_else(|| anyhow!("hot config does not exist: {}", path.display()))?;
+                    Ok(serde_json::to_string_pretty(&hot)?)
+                } else {
+                    Ok(std::fs::read_to_string(&path)?)
+                }
+            })() {
                 Ok(content) => {
                     info!(op_id, op = op_name, path = %path.display(), "root daemon op completed");
                     diag::RootDaemonEvent {
@@ -6361,8 +6643,12 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                nsproxy_core::write_file_atomic(&path, &content)?;
-                Ok(())
+                if is_managed_hot_config_path(&path) {
+                    persist_hot_config(&path, &content)
+                } else {
+                    nsproxy_core::write_file_atomic(&path, &content)?;
+                    Ok(())
+                }
             })();
             RootDaemonAction::Reply(match result {
                 Ok(()) => {
@@ -6372,6 +6658,40 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 Err(err) => {
                     warn!(op_id, op = op_name, path = %path.display(), error = %err, "root daemon op failed");
                     daemon_err(op_id, err.to_string(), None, Some(path))
+                }
+            })
+        }
+        diag::RootDaemonOp::WriteHotConfig { profile, content } => {
+            let path = state_paths::hot_config(&profile);
+            let result = (|| -> Result<()> {
+                ensure!(
+                    !profile.is_empty()
+                        && profile != "."
+                        && profile != ".."
+                        && !profile.contains('/'),
+                    "invalid profile name `{profile}`"
+                );
+                persist_hot_config(&path, content.as_bytes())
+            })();
+            RootDaemonAction::Reply(match result {
+                Ok(()) => {
+                    info!(
+                        op_id,
+                        op = op_name,
+                        profile = %profile,
+                        path = %path.display(),
+                        "root daemon op completed"
+                    );
+                    daemon_ok(
+                        op_id,
+                        format!("saved hot config for {profile} at {}", path.display()),
+                        Some(profile),
+                        Some(path),
+                    )
+                }
+                Err(err) => {
+                    warn!(op_id, op = op_name, profile = %profile, error = %err, "root daemon op failed");
+                    daemon_err(op_id, err.to_string(), Some(profile), Some(path))
                 }
             })
         }
@@ -6447,7 +6767,9 @@ fn handle_root_daemon_request(req: diag::RootDaemonRequest) -> RootDaemonAction 
                 std::fs::create_dir_all(&profile_dir)?;
                 std::fs::write(&profile_path, profile_content.as_bytes())?;
                 if let Some(hot_content) = hot_content {
-                    std::fs::write(&hot_path, hot_content.as_bytes())?;
+                    let mut hot: HotConfig =
+                        serde_json::from_str(&hot_content).context("invalid profile hot config")?;
+                    hot.process_and_save(&hot_path)?;
                 }
                 create_profile_mount_sources(&template)?;
                 Ok(())
@@ -7083,9 +7405,12 @@ fn resolve_veth_endpoint(arg: &NsArg) -> Result<VethEndpoint> {
         NsArg::Basis | NsArg::Container(_) => {
             let registry = NamespacesRegistry::load_locked()?;
             let (label, namespaces) = match arg {
-                NsArg::Basis => ("basis".to_string(), registry.basis_ns.ok_or_else(|| {
-                    anyhow!("basis namespace is not recorded; run 'sp init' first")
-                })?),
+                NsArg::Basis => (
+                    "basis".to_string(),
+                    registry.basis_ns.ok_or_else(|| {
+                        anyhow!("basis namespace is not recorded; run 'sp init' first")
+                    })?,
+                ),
                 NsArg::Container(profile) => (
                     sanitize_veth_label(profile),
                     registry.profiles.get(profile).cloned().ok_or_else(|| {
@@ -7096,13 +7421,17 @@ fn resolve_veth_endpoint(arg: &NsArg) -> Result<VethEndpoint> {
             };
             let source = namespaces.net.source;
             let target = match &source {
-                NSSource::Pid(pid) => VethNamespaceTarget::Pid(u32::try_from(*pid)
-                    .map_err(|_| anyhow!("recorded {} namespace has invalid pid {}", label, pid))?),
-                NSSource::Path(path) => {
-                    VethNamespaceTarget::Fd(Arc::new(fs::File::open(path)?))
+                NSSource::Pid(pid) => {
+                    VethNamespaceTarget::Pid(u32::try_from(*pid).map_err(|_| {
+                        anyhow!("recorded {} namespace has invalid pid {}", label, pid)
+                    })?)
                 }
+                NSSource::Path(path) => VethNamespaceTarget::Fd(Arc::new(fs::File::open(path)?)),
                 NSSource::Unavail(_) => {
-                    bail!("recorded {} namespace has no usable process or namespace file", label)
+                    bail!(
+                        "recorded {} namespace has no usable process or namespace file",
+                        label
+                    )
                 }
             };
             Ok(VethEndpoint {
@@ -7496,17 +7825,14 @@ async fn watch_hot_mounts(hot_path: &Path, vars: nsproxy_core::PathExpansionStat
     let mut prev_hot: Option<HotConfig> = None;
 
     while let Some(()) = rx.recv().await {
-        let fc = match tokio::fs::read_to_string(hot_path).await {
-            Ok(fc) => fc,
-            Err(e) => {
-                warn!("failed to read hot config: {}", e);
+        let mut hot = match nsproxy_core::state_file::read::<HotConfig>(hot_path) {
+            Ok(Some(hot)) => hot,
+            Ok(None) => {
+                warn!("hot config was removed: {}", hot_path.display());
                 continue;
             }
-        };
-        let mut hot: HotConfig = match serde_json::from_str(&fc) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("failed to parse hot config: {}", e);
+            Err(err) => {
+                warn!("failed to read hot config: {}", err);
                 continue;
             }
         };

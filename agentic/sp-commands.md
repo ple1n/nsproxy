@@ -5,7 +5,7 @@ Agent-facing reference for the `sp` executable in this repository.
 ## Invocation rules
 
 - Run `sp --help` against the checked-out/build-selected binary before relying on a command not listed here; the CLI is evolving.
-- Global options precede the command: `-c, --conf <PATH>` selects configuration, `-r, --root <PATH>` selects the persistent state root (default `/nsp3`), and `-n, --no-wrap-check` disables wrapper checks.
+- Global options precede the command: `-c, --conf <PATH>` selects configuration, `--state <PATH>` selects the persistent state root (default `/nsp3`; `--root` remains an alias), and `-n, --no-wrap-check` disables wrapper checks.
 - Profile names resolve under `<root>/config/<profile>`. A profile normally has `profile.json`, `hot.json`, namespace metadata, and runtime files.
 - Commands that change namespaces, mounts, veths, daemon state, or global state may require the privileged wrapper. The binary reports `sudo check disabled` in this development environment; do not infer that an operation succeeded from that line alone.
 - Use `--help` on any command for the authoritative syntax. Do not invent `status` or `diag` subcommands; runtime diagnostics are exposed through profile state, `enter`, and the diagnostic/UI paths.
@@ -78,12 +78,14 @@ For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resol
 - `sp temp [OPTIONS] <COMMAND> [ARGS]`: create an Overlay profile named from a filesystem-safe command prefix (up to five characters) and a four-character URL-safe Base64 prefix of the current timestamp's BLAKE3 digest in the normal state root and namespace registry (so it is visible in the UI while running). It runs with `sp enter`-style options, then tears down and removes the profile and its config when it exits. Put options before the command, e.g. `sp temp -u 0 fish`.
 - `sp install [DIR]`: install binaries/scripts into `DIR` (default `./install`).
 - `sp completions --fish`: install fish completions under `~/.config/fish/completions`.
-- `sp rm <FILE>`: remove a bind-mount file.
+- `sp rm <PATH> [-r|--recurse]`: unmount a bind-mount target. With `-r` / `--recurse`, detach mounts and recursively remove the directory tree without following symlinks.
 - `sp clean [--veth]`: clean runtime state; `--veth` also removes the default veth.
 - `sp netlink`: print all IPv4 addresses through the netlink test path.
 - `sp udp [HOST:PORT] [--socks5 HOST:PORT|URL] [--timeout-secs SECONDS]`: test UDP connectivity with an NTP request. Defaults to `time.cloudflare.com:123`; `--socks5` accepts a proxy address or a `socks5://[user:pass@]host:port` URL. Run it inside the target container to test that container's network namespace.
 - `sp gen <SAVE_TO>`: generate an empty config file.
 - `sp init`: record the current process namespaces as the basis namespace set.
+- `sp --state <SOURCE> migrate --to <TARGET>`: stage a separate state root using top-level symlinks, preserving the source until finalization. Unix socket files are excluded. `--rm` removes an existing target through recursive unmount/removal, then stages the migration there. `--finish` removes staged links, moves source entries into the target without traversing nested symlinks, and moves legacy `<state-root>/rootfs` to global `/rootfs`. It can be combined with `--to` to stage and finalize in one operation, or run on an existing staged target. Migration and target removal check the selected root's WAL and prompt before stopping attributable active nsproxy processes.
+- `sp --state <ROOT> meta processes|kill <PID>`: inspect or interactively terminate processes verified against the append-only process WAL.
 - `sp id [PID]`: identify the current net namespace, or the namespace associated with `PID`.
 - `sp state-tree`: print the typed persistent-state blueprint.
 - `sp version`: print build identity, including source-tree BLAKE3 and build epoch.

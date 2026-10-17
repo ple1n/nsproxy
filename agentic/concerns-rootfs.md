@@ -2,7 +2,7 @@
 
 ## Rootfs backing and persistence
 
-- `Rootfs::Default` pivots into `/nsp3/rootfs/{profile}`. Unbound paths in that rootfs are backed by the persistent filesystem and survive reboot.
+- `Rootfs::Default` pivots into `/rootfs/{profile}`, independent of the selected state root. Unbound paths in that rootfs are backed by the persistent filesystem and survive reboot.
 - `Rootfs::Tempfs` mounts a fresh tmpfs at `/tmp/nsproxy_{profile}` before building the pivot root. Unbound files there are RAM-backed and disappear when the mount is destroyed, including across reboot.
 - `Rootfs::Path(path)` uses the filesystem backing the configured path, so persistence depends on that filesystem.
 - The container's `/tmp` and `/run` are separate fresh tmpfs mounts in every pivot mode and are ephemeral.

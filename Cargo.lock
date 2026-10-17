@@ -4162,7 +4162,9 @@ version = "0.3.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "base64 0.21.7",
  "bincode",
+ "blake3",
  "chrono",
  "clap",
  "diag",

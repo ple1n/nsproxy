@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{HotConfig, RoutePrefs, state_paths};
+use crate::{HotConfig, RoutePrefs, state_file, state_paths};
 
 fn validate_container_name(container: &str) -> Result<()> {
     ensure!(
@@ -49,22 +49,18 @@ pub fn apply_to_container(
 ) -> Result<PathBuf> {
     validate_container_name(container)?;
     let path = state_paths::hot_config(container);
-    let content =
-        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut config: HotConfig =
-        serde_json::from_slice(&content).with_context(|| format!("invalid {}", path.display()))?;
-    apply_to_hotconfig(&mut config, preferences, mode)?;
-    config.save(&path)?;
+    state_file::try_update(&path, |config: &mut HotConfig| {
+        apply_to_hotconfig(config, preferences, mode)
+    })
+    .with_context(|| format!("updating {}", path.display()))?;
     Ok(path)
 }
 
 pub fn export_container(container: &str, destination: &Path, force: bool) -> Result<PathBuf> {
     validate_container_name(container)?;
     let hot_path = state_paths::hot_config(container);
-    let content = std::fs::read(&hot_path)
-        .with_context(|| format!("failed to read {}", hot_path.display()))?;
-    let config: HotConfig = serde_json::from_slice(&content)
-        .with_context(|| format!("invalid {}", hot_path.display()))?;
+    let config: HotConfig = state_file::read(&hot_path)?
+        .with_context(|| format!("missing hot config {}", hot_path.display()))?;
     let destination = if destination.is_dir() {
         destination.join(format!("{container}.json"))
     } else {

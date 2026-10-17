@@ -776,30 +776,30 @@ pub async fn watch_hot(
                         break;
                     }
 
-                    match tokio::fs::read_to_string(&conf).await {
-                        Ok(fc) => match serde_json::from_str::<HotConfig>(&fc) {
-                            Ok(mut cfg) => {
-                                cfg.process_and_save(&conf)?;
-                                if ignored_backup.as_ref() == Some(&cfg) {
-                                    ignored_backup = None;
-                                    continue;
-                                }
-                                source = Some("file");
-                                cfg
-                            }
-                            Err(err) => {
-                                warn!("config changed, but is invalid: {err}");
-                                diag.emit(DiagEvent::HotConfigReloaded {
-                                    ts: Timestamp::now(),
-                                    ok: false,
-                                    changed: false,
-                                    source: "file".to_string(),
-                                    error: Some(err.to_string()),
-                                });
+                    match crate::state_file::read::<HotConfig>(&conf) {
+                        Ok(Some(mut cfg)) => {
+                            cfg.process_and_save(&conf)?;
+                            if ignored_backup.as_ref() == Some(&cfg) {
+                                ignored_backup = None;
                                 continue;
                             }
-                        },
+                            source = Some("file");
+                            cfg
+                        }
+                        Ok(None) => {
+                            let err = anyhow::anyhow!("config file was removed");
+                            warn!("config changed, but is invalid: {err}");
+                            diag.emit(DiagEvent::HotConfigReloaded {
+                                ts: Timestamp::now(),
+                                ok: false,
+                                changed: false,
+                                source: "file".to_string(),
+                                error: Some(err.to_string()),
+                            });
+                            continue;
+                        }
                         Err(err) => {
+                            warn!("config changed, but is invalid: {err}");
                             diag.emit(DiagEvent::HotConfigReloaded {
                                 ts: Timestamp::now(),
                                 ok: false,

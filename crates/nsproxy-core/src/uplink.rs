@@ -410,9 +410,7 @@ pub fn no_proxy_routing() -> RoutingFunction {
             VDNSRES::NormalProxying => {
                 RoutingResovled::NoProxy(SocketAddr::new(ctx.target_ip, ctx.target_port))
             }
-            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => {
-                RoutingResovled::NATByTUN(*sock)
-            }
+            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => RoutingResovled::NATByTUN(*sock),
             VDNSRES::Opine(RoutingDecision::NoProxy(sock))
             | VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => {
                 RoutingResovled::NoProxy(*sock)
@@ -426,9 +424,7 @@ pub fn no_proxy_routing() -> RoutingFunction {
             VDNSRES::Opine(RoutingDecision::File(_)) => {
                 RoutingResovled::NoProxy(SocketAddr::new(ctx.target_ip, ctx.target_port))
             }
-            VDNSRES::Opine(RoutingDecision::Drop(reason)) => {
-                RoutingResovled::Drop(reason.clone())
-            }
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => RoutingResovled::Drop(reason.clone()),
             VDNSRES::ERR => {
                 RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed("vdns error")))
             }
@@ -2117,7 +2113,10 @@ mod tests {
             no_proxy_routing()(&context, &hub),
             RoutingResovled::NoProxy(SocketAddr::new(context.target_ip, context.target_port))
         );
-        assert!(matches!(no_routing()(&context, &hub), RoutingResovled::Drop(_)));
+        assert!(matches!(
+            no_routing()(&context, &hub),
+            RoutingResovled::Drop(_)
+        ));
     }
 
     #[test]
@@ -2230,7 +2229,9 @@ mod tests {
             tracker.record(bytes - 2, Duration::ZERO);
             tracker.record(1, Duration::from_secs(1));
             tracker.record(1, Duration::from_secs(2));
-            tracker.sample(Timestamp(0), Duration::from_secs(2)).unwrap()
+            tracker
+                .sample(Timestamp(0), Duration::from_secs(2))
+                .unwrap()
         }
 
         let mut hub = UplinkHub::new();
@@ -2267,10 +2268,7 @@ mod tests {
         );
         assert_eq!(no_proxy.connect_latency_ms, Some(100.0));
         assert_eq!(no_proxy.download_bytes_per_sec, Some(1_000_000.0));
-        assert_eq!(
-            hub.host_route_metrics(Timestamp::now()).len(),
-            3
-        );
+        assert_eq!(hub.host_route_metrics(Timestamp::now()).len(), 3);
     }
 
     #[test]

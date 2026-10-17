@@ -114,6 +114,9 @@ use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 #[derive(Debug, Parser)]
 #[command(author, version, about = "nsproxy UI dashboard", long_about = None)]
 struct UiCli {
+    /// State root, defaults to /nsp3.
+    #[arg(long)]
+    state: Option<PathBuf>,
     /// Override the advertised build hash for protocol/version handshakes.
     #[arg(long)]
     build_hash: Option<String>,
@@ -1219,6 +1222,7 @@ struct App {
     fps_window_count: u32,
     last_fps: f32,
     log_panel_min_level: LogMinLevel,
+    daemon_log_min_level: LogMinLevel,
     log_editor_popup: Option<LogEditorPopup>,
     /// State for the Manage (creation wizard) tab.
     manage_wizard: ManageWizard,
@@ -1315,10 +1319,7 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
             .unwrap_or_default();
 
         // Get groups for this proxy from clash state
-        let groups: HashSet<GroupId> = proxy_groups
-            .get(id)
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let groups: HashSet<GroupId> = proxy_groups.get(id).map(|g| g.clone()).unwrap_or_default();
 
         proxies.insert(
             id.clone(),
@@ -1349,12 +1350,9 @@ fn load_proxies_from_persisted() -> ProxySnapshot {
 
 fn load_hotconfig_daemons(profile: &str) -> anyhow::Result<Vec<ShellArgs>> {
     let path = state_paths::hot_config(profile);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(path)?;
-    let hot: HotConfig = serde_json::from_str(&content)?;
-    Ok(hot.daemons)
+    Ok(nsproxy_core::state_file::read::<HotConfig>(&path)?
+        .map(|hot| hot.daemons)
+        .unwrap_or_default())
 }
 
 fn format_shell_args(args: &ShellArgs) -> String {
@@ -1576,7 +1574,8 @@ impl App {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for ui supervisor");
-        let (supervisor, supervisor_task) = SupervisorHandle::new(ectx.clone());
+        let (supervisor, supervisor_task) = SupervisorHandle::new(ectx.clone())
+            .expect("failed to initialize UI supervisor control socket");
         let personal_state = personal::PersonalUiState::default();
         tokio_rt.spawn(supervisor_task.run());
         personal::install_personal_actor(&tokio_rt, supervisor.clone(), personal_state.clone());
@@ -1869,6 +1868,7 @@ impl App {
             fps_window_count: 0,
             last_fps: 0.0,
             log_panel_min_level: LogMinLevel::default(),
+            daemon_log_min_level: LogMinLevel::Debug,
             log_editor_popup: None,
             manage_wizard: ManageWizard::default(),
             action_launching: Arc::new(Mutex::new(HashSet::new())),
@@ -1978,15 +1978,11 @@ impl App {
         section_frame(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Namespaces");
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if Self::refresh_button(ui, "Refresh namespace view").clicked() {
-                            self.supervisor
-                                .send(SupervisorCommand::RefreshNamespaces);
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::refresh_button(ui, "Refresh namespace view").clicked() {
+                        self.supervisor.send(SupervisorCommand::RefreshNamespaces);
+                    }
+                });
             });
             ui.add_space(3.0);
             ui.small("Namespace IDs for the UI and the selected container.");
@@ -2049,10 +2045,7 @@ impl App {
                     }
                     if up_pid.is_none() && child_pid.is_none() {
                         ui.add_space(8.0);
-                        ui.colored_label(
-                            Color32::GRAY,
-                            "Selected profile has no live pid yet",
-                        );
+                        ui.colored_label(Color32::GRAY, "Selected profile has no live pid yet");
                     }
                 }
             } else {
@@ -3768,8 +3761,7 @@ impl App {
                 if ui
                     .add_sized(
                         egui::vec2(
-                            (ui.available_width() - 24.0)
-                                .clamp(0.0, SPAWN_ARGS_TEXT_WIDTH),
+                            (ui.available_width() - 24.0).clamp(0.0, SPAWN_ARGS_TEXT_WIDTH),
                             ui.spacing().interact_size.y,
                         ),
                         egui::TextEdit::singleline(arg),
@@ -3824,12 +3816,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut uid_gid_value_changed = false;
                         if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Root").monospace().size(11.0),
-                                )
-                                .small(),
-                            )
+                            .add(egui::Button::new("root"))
                             .on_hover_text("uid=0, gid=0, clear gids")
                             .clicked()
                         {
@@ -3841,10 +3828,7 @@ impl App {
                         }
                         ui.add_space(4.0);
                         if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("Current user").size(11.0))
-                                    .small(),
-                            )
+                            .add(egui::Button::new("current user"))
                             .on_hover_text("Reset uid/gid to current user")
                             .clicked()
                         {
@@ -3898,22 +3882,12 @@ impl App {
 
             ui.add_space(6.0);
             ui.weak("Identity");
-            if Self::render_optional_u32(
-                ui,
-                int_input,
-                "uid",
-                &mut args.uid,
-                uid_gid_value_changed,
-            ) {
+            if Self::render_optional_u32(ui, int_input, "uid", &mut args.uid, uid_gid_value_changed)
+            {
                 changed = true;
             }
-            if Self::render_optional_u32(
-                ui,
-                int_input,
-                "gid",
-                &mut args.gid,
-                uid_gid_value_changed,
-            ) {
+            if Self::render_optional_u32(ui, int_input, "gid", &mut args.gid, uid_gid_value_changed)
+            {
                 changed = true;
             }
             if Self::render_optional_text_with_width(
@@ -3952,7 +3926,7 @@ impl App {
                                 SPAWN_ARGS_TEXT_WIDTH.min(ui.available_width().max(0.0)),
                                 ui.spacing().interact_size.y,
                             ),
-                            egui::TextEdit::singleline(&mut cwd_text)
+                            egui::TextEdit::singleline(&mut cwd_text),
                         )
                         .changed()
                     {
@@ -4598,23 +4572,21 @@ fn load_profile_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>) 
 
 fn load_hotconfig_json<F: FnOnce() -> String>(profile: &str, fallback: Option<F>) -> LoadResult {
     let path = state_paths::hot_config(profile);
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => {
-            return LoadResult {
-                text: fallback.map_or_else(|| default_hotconfig_text(), |f| f()),
-                error: None,
-            };
-        }
-    };
-    match serde_json::from_str::<HotConfig>(&content) {
-        Ok(parsed) => LoadResult {
-            text: serde_json::to_string_pretty(&parsed).unwrap_or(content),
+    match nsproxy_core::state_file::read::<HotConfig>(&path) {
+        Ok(Some(parsed)) => match serde_json::to_string_pretty(&parsed) {
+            Ok(text) => LoadResult { text, error: None },
+            Err(err) => LoadResult {
+                text: default_hotconfig_text(),
+                error: Some(format!("Could not format hotconfig from disk: {err}")),
+            },
+        },
+        Ok(None) => LoadResult {
+            text: fallback.map_or_else(|| default_hotconfig_text(), |f| f()),
             error: None,
         },
         Err(err) => LoadResult {
             text: default_hotconfig_text(),
-            error: Some(format!("Invalid hotconfig JSON on disk: {err}")),
+            error: Some(format!("Could not load hotconfig from disk: {err}")),
         },
     }
 }
@@ -4813,106 +4785,105 @@ impl eframe::App for App {
                     .id_salt("left_sidebar_content")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.heading("Containers");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.heading("Containers");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                        ui.add_space(5.);
+                                    ui.add_space(5.);
                                     if Self::refresh_button(ui, "Reload all container status")
                                         .clicked()
                                     {
-                            self.reload_all_ns_alive();
-                        }
+                                        self.reload_all_ns_alive();
+                                    }
                                     if Self::remove_armed_button(ui, self.remove_containers_armed)
                                         .clicked()
                                     {
                                         self.remove_containers_armed =
                                             !self.remove_containers_armed;
-                        }
+                                    }
                                 },
                             );
-                });
+                        });
 
-                ui.add_space(6.0);
+                        ui.add_space(6.0);
 
-                // Global configuration box at the top
-                let global_selected = self.selected_profile.is_none();
-                let global_status_color = egui::Color32::from_rgb(100, 150, 240);
+                        // Global configuration box at the top
+                        let global_selected = self.selected_profile.is_none();
+                        let global_status_color = egui::Color32::from_rgb(100, 150, 240);
                         if sidebar_box(ui, "all", "", global_selected, global_status_color)
                             .clicked()
                         {
-                    self.selected_profile = None;
-                }
+                            self.selected_profile = None;
+                        }
 
-                ui.add_space(6.0);
-                // Profiles
-                if self.snapshot.profiles.is_empty() {
+                        ui.add_space(6.0);
+                        // Profiles
+                        if self.snapshot.profiles.is_empty() {
                             ui.label(
                                 egui::RichText::new("No profiles found").color(egui::Color32::GRAY),
                             );
-                    ui.small(format!(
-                        "Create profiles in {}",
-                        self.display_path(&state_paths::persist_root())
-                    ));
-                } else {
-                    for (profile_name, profile_snapshot) in &self.snapshot.profiles {
+                            ui.small(format!(
+                                "Create profiles in {}",
+                                self.display_path(&state_paths::persist_root())
+                            ));
+                        } else {
+                            for (profile_name, profile_snapshot) in &self.snapshot.profiles {
                                 let is_selected =
                                     self.selected_profile.as_ref() == Some(profile_name);
 
-                        let running = profile_snapshot.container_lifecycle.is_active()
-                            || profile_snapshot.serve_alive;
+                                let running = profile_snapshot.container_lifecycle.is_active()
+                                    || profile_snapshot.serve_alive;
 
-                        let unpivoted_warning = running
-                            && profile_snapshot.template.sandbox_mode == SandboxMode::Pivot
+                                let unpivoted_warning = running
+                                    && profile_snapshot.template.sandbox_mode == SandboxMode::Pivot
                                     && profile_snapshot.sandbox_status.as_ref().map_or(true, |s| {
                                         s.detected_state == SandboxState::NoPivot
                                     });
 
-                        let status_color = if unpivoted_warning {
-                            Color32::from_rgb(255, 185, 0)
-                        } else if running {
-                            Color32::LIGHT_GREEN
-                        } else {
-                            Color32::LIGHT_RED
-                        };
-                        let status_text = if unpivoted_warning {
-                            "unpivoted"
-                        } else {
-                            match profile_snapshot.container_lifecycle {
-                                supervisor::ContainerLifecycleState::Stopped => "stopped",
-                                supervisor::ContainerLifecycleState::Starting => "starting",
-                                supervisor::ContainerLifecycleState::Running => "running",
+                                let status_color = if unpivoted_warning {
+                                    Color32::from_rgb(255, 185, 0)
+                                } else if running {
+                                    Color32::LIGHT_GREEN
+                                } else {
+                                    Color32::LIGHT_RED
+                                };
+                                let status_text = if unpivoted_warning {
+                                    "unpivoted"
+                                } else {
+                                    match profile_snapshot.container_lifecycle {
+                                        supervisor::ContainerLifecycleState::Stopped => "stopped",
+                                        supervisor::ContainerLifecycleState::Starting => "starting",
+                                        supervisor::ContainerLifecycleState::Running => "running",
                                         supervisor::ContainerLifecycleState::Stopping {
                                             ..
                                         } => "stopping",
                                         supervisor::ContainerLifecycleState::Killing { .. } => {
                                             "killing"
                                         }
-                            }
-                        };
+                                    }
+                                };
 
-                        let box_resp = sidebar_box(
-                            ui,
-                            &self.display_text(profile_name.as_str()),
-                            status_text,
-                            is_selected,
-                            status_color,
-                        );
-                        if box_resp.clicked() {
-                            self.selected_profile = Some(profile_name.clone());
+                                let box_resp = sidebar_box(
+                                    ui,
+                                    &self.display_text(profile_name.as_str()),
+                                    status_text,
+                                    is_selected,
+                                    status_color,
+                                );
+                                if box_resp.clicked() {
+                                    self.selected_profile = Some(profile_name.clone());
                                     self.supervisor.send(
                                         supervisor::SupervisorCommand::LoadProfile(
-                                    profile_name.clone(),
+                                            profile_name.clone(),
                                         ),
                                     );
+                                }
+                                ui.add_space(6.0);
+                            }
                         }
-                        ui.add_space(6.0);
-                    }
-                }
-
-            });
+                    });
             });
 
         let tab_fill = {
@@ -4925,16 +4896,12 @@ impl eframe::App for App {
         };
         egui::Panel::top("tab_bar")
             .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(tab_fill)
-                    .inner_margin(egui::Margin {
-                        left: 8,
-                        right: 8,
-                        top: 10,
-                        bottom: 10,
-                    }),
-            )
+            .frame(egui::Frame::NONE.fill(tab_fill).inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: 10,
+                bottom: 10,
+            }))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -5389,13 +5356,13 @@ impl App {
         };
 
         let (result_tx, result_rx) = flume::bounded(1);
-            self.clash_import_result_rx = Some(result_rx);
-            self.supervisor.send(SupervisorCommand::ImportClashGroup {
-                group_id: group_id.clone(),
-                path,
-                replace,
-                result_tx,
-            });
+        self.clash_import_result_rx = Some(result_rx);
+        self.supervisor.send(SupervisorCommand::ImportClashGroup {
+            group_id: group_id.clone(),
+            path,
+            replace,
+            result_tx,
+        });
         self.clash_import_pending = true;
         self.clash_import_status = Some(format!("Importing into '{group_id}'…"));
     }
@@ -5414,10 +5381,7 @@ impl App {
                         }
                     });
                     ctx.data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("clash_group_import_completion"),
-                            completion,
-                        )
+                        data.insert_temp(egui::Id::new("clash_group_import_completion"), completion)
                     });
                     ctx.request_repaint();
                 });
@@ -5443,9 +5407,8 @@ impl App {
                     match self.reload_tx.try_send(()) {
                         Ok(()) | Err(flume::TrySendError::Full(())) => {}
                         Err(flume::TrySendError::Disconnected(())) => {
-                            self.clash_import_status = Some(format!(
-                                "{message}; failed to refresh the proxy group list"
-                            ));
+                            self.clash_import_status =
+                                Some(format!("{message}; failed to refresh the proxy group list"));
                         }
                     }
                     for (profile, state) in &self.snapshot.profiles {
@@ -5458,8 +5421,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.clash_import_status =
-                        Some(format!("Clash group import failed: {error}"));
+                    self.clash_import_status = Some(format!("Clash group import failed: {error}"));
                 }
             }
         }
@@ -5663,7 +5625,6 @@ impl App {
                 }
             });
         }
-
     }
 
     fn render_proxies_table(&mut self, ui: &mut egui::Ui) {
@@ -5701,12 +5662,7 @@ impl App {
                 .profiles
                 .get(profile_name)
                 .and_then(|profile| profile.routing_state.as_ref())
-                .and_then(|routing| {
-                    routing
-                        .selected_group
-                        .as_deref()
-                        .map(GroupId::from)
-                })
+                .and_then(|routing| routing.selected_group.as_deref().map(GroupId::from))
         });
         let no_proxy_route_selected = self.selected_profile.as_ref().is_some_and(|profile_name| {
             self.snapshot
@@ -5960,7 +5916,7 @@ impl App {
                     });
                 }
             } else {
-            ui.label("Group");
+                ui.label("Group");
             }
         });
     }
@@ -6183,9 +6139,7 @@ impl App {
                 let rust_backtrace_label =
                     format!("RUST_BACKTRACE={}", if self.rust_backtrace { 1 } else { 0 });
                 ui.checkbox(&mut self.rust_backtrace, rust_backtrace_label)
-                    .on_hover_text(
-                        "Set RUST_BACKTRACE for the next sp up and sp serve launches.",
-                    );
+                    .on_hover_text("Set RUST_BACKTRACE for the next sp up and sp serve launches.");
             });
             ui.add_space(6.0);
             self.render_process_controls(ui, profile_name);
@@ -6289,10 +6243,8 @@ impl App {
                             LogSource::Pid(_) => "pid".to_owned(),
                         };
                         let log = &entry.entry.log;
-                        let mut text = format!(
-                            "{source} {} [{}] {}",
-                            log.level, log.target, log.message
-                        );
+                        let mut text =
+                            format!("{source} {} [{}] {}", log.level, log.target, log.message);
                         for field in &log.fields {
                             text.push_str(&format!("\n{}={}", field.name, field.value));
                         }
@@ -6323,10 +6275,7 @@ impl App {
                             ui.label(entry.ansi_parts.as_ref().clone());
                             for field in &entry.entry.log.fields {
                                 ui.add_space(6.0);
-                                ui.colored_label(
-                                    LOG_SYNTAX_CYAN,
-                                    format!("{}=", field.name),
-                                );
+                                ui.colored_label(LOG_SYNTAX_CYAN, format!("{}=", field.name));
                                 ui.label(
                                     RichText::new(&field.value)
                                         .monospace()
@@ -6392,19 +6341,16 @@ impl App {
         self.fcitx_tab.poll();
         ui.horizontal(|ui| {
             ui.heading("Input Methods");
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .add_enabled(!self.fcitx_tab.pending, egui::Button::new("Refresh"))
-                        .clicked()
-                    {
-                        if let Some(runtime) = self.tokio_rt.as_ref() {
-                            self.fcitx_tab.request(runtime, profile.clone(), None);
-                        }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.fcitx_tab.pending, egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    if let Some(runtime) = self.tokio_rt.as_ref() {
+                        self.fcitx_tab.request(runtime, profile.clone(), None);
                     }
-                },
-            );
+                }
+            });
         });
         let Some(state) = self.fcitx_tab.state.clone() else {
             self.render_fcitx_log_panel(ui);
@@ -6417,65 +6363,65 @@ impl App {
             .inner_margin(egui::Margin::same(8))
             .corner_radius(egui::CornerRadius::same(4))
             .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (status, color) = match state.status {
-                    fcitx::FcitxStatus::Disabled => ("Disabled", Color32::GRAY),
-                    fcitx::FcitxStatus::Inactive => {
-                        ("Inactive (ready to activate)", Color32::LIGHT_YELLOW)
-                    }
-                    fcitx::FcitxStatus::Active => ("Active", Color32::LIGHT_GREEN),
-                };
-                ui.add_sized(
-                    egui::vec2(270.0, 20.0),
-                    egui::Label::new(
-                        egui::RichText::new(format!("Fcitx: {status}")).color(color),
-                    ),
-                );
-                let button = match state.status {
-                    fcitx::FcitxStatus::Active => "Deactivate",
-                    fcitx::FcitxStatus::Disabled | fcitx::FcitxStatus::Inactive => "Activate",
-                };
-                if ui
-                    .add_enabled(!self.fcitx_tab.pending, egui::Button::new(button))
-                    .clicked()
-                {
-                    if let Some(runtime) = self.tokio_rt.as_ref() {
-                        self.fcitx_tab.request(
-                            runtime,
-                            profile.clone(),
-                            Some(fcitx::FcitxAction::SetActive(
-                                state.status != fcitx::FcitxStatus::Active,
-                            )),
-                        );
-                    }
-                }
-                });
-            ui.horizontal(|ui| {
-                ui.label("Input-method group");
-                let mut selected_group = state.current_group.clone();
-                egui::ComboBox::from_id_salt("fcitx_input_method_group")
-                    .selected_text(&state.current_group)
-                    .show_ui(ui, |ui| {
-                        for group in &state.groups {
-                            let label = if group.layout.is_empty() {
-                                group.name.clone()
-                            } else {
-                                format!("{} ({})", group.name, group.layout)
-                            };
-                            ui.selectable_value(&mut selected_group, group.name.clone(), label);
+                ui.horizontal(|ui| {
+                    let (status, color) = match state.status {
+                        fcitx::FcitxStatus::Disabled => ("Disabled", Color32::GRAY),
+                        fcitx::FcitxStatus::Inactive => {
+                            ("Inactive (ready to activate)", Color32::LIGHT_YELLOW)
                         }
-                    });
-                if selected_group != state.current_group {
-                    if let Some(runtime) = self.tokio_rt.as_ref() {
-                        self.fcitx_tab.request(
-                            runtime,
-                            profile.clone(),
-                            Some(fcitx::FcitxAction::SetGroup(selected_group)),
-                        );
+                        fcitx::FcitxStatus::Active => ("Active", Color32::LIGHT_GREEN),
+                    };
+                    ui.add_sized(
+                        egui::vec2(270.0, 20.0),
+                        egui::Label::new(
+                            egui::RichText::new(format!("Fcitx: {status}")).color(color),
+                        ),
+                    );
+                    let button = match state.status {
+                        fcitx::FcitxStatus::Active => "Deactivate",
+                        fcitx::FcitxStatus::Disabled | fcitx::FcitxStatus::Inactive => "Activate",
+                    };
+                    if ui
+                        .add_enabled(!self.fcitx_tab.pending, egui::Button::new(button))
+                        .clicked()
+                    {
+                        if let Some(runtime) = self.tokio_rt.as_ref() {
+                            self.fcitx_tab.request(
+                                runtime,
+                                profile.clone(),
+                                Some(fcitx::FcitxAction::SetActive(
+                                    state.status != fcitx::FcitxStatus::Active,
+                                )),
+                            );
+                        }
                     }
-                }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Input-method group");
+                    let mut selected_group = state.current_group.clone();
+                    egui::ComboBox::from_id_salt("fcitx_input_method_group")
+                        .selected_text(&state.current_group)
+                        .show_ui(ui, |ui| {
+                            for group in &state.groups {
+                                let label = if group.layout.is_empty() {
+                                    group.name.clone()
+                                } else {
+                                    format!("{} ({})", group.name, group.layout)
+                                };
+                                ui.selectable_value(&mut selected_group, group.name.clone(), label);
+                            }
+                        });
+                    if selected_group != state.current_group {
+                        if let Some(runtime) = self.tokio_rt.as_ref() {
+                            self.fcitx_tab.request(
+                                runtime,
+                                profile.clone(),
+                                Some(fcitx::FcitxAction::SetGroup(selected_group)),
+                            );
+                        }
+                    }
+                });
             });
-        });
 
         let current_group = state
             .groups
@@ -6630,7 +6576,10 @@ impl App {
             total_entries,
         ) {
             self.log_editor_popup = Some(LogEditorPopup {
-                title: format!("{} Fcitx logs", self.selected_profile.as_deref().unwrap_or("")),
+                title: format!(
+                    "{} Fcitx logs",
+                    self.selected_profile.as_deref().unwrap_or("")
+                ),
                 text,
             });
         }
@@ -6640,23 +6589,21 @@ impl App {
         ui.heading("sp daemon");
         ui.add_space(6.0);
 
+        let mut min_level = self.daemon_log_min_level;
         let guard = self
             .snapshot
             .root_daemon_logs
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let entries = guard.entries_for_min_level(self.log_panel_min_level.rank_value());
+        let entries = guard.entries_for_min_level(min_level.rank_value());
         let total_entries = guard.total_entries();
 
         if let Some(text) = Self::render_structured_log_panel(
             ui,
             "root_daemon",
             "no daemon logs yet",
-            format!(
-                "no daemon logs at or above {}",
-                self.log_panel_min_level.label()
-            ),
-            &mut self.log_panel_min_level,
+            format!("no daemon logs at or above {}", min_level.label()),
+            &mut min_level,
             entries,
             total_entries,
         ) {
@@ -6665,6 +6612,7 @@ impl App {
                 text,
             });
         }
+        self.daemon_log_min_level = min_level;
 
         ui.add_space(10.0);
         ui.separator();
@@ -7968,10 +7916,7 @@ impl App {
                                                         continue;
                                                     };
                                                     ui.horizontal(|ui| {
-                                                        ui.colored_label(
-                                                            LOG_SYNTAX_BLUE,
-                                                            "saved",
-                                                        );
+                                                        ui.colored_label(LOG_SYNTAX_BLUE, "saved");
                                                         ui.colored_label(
                                                             log_level_color(&entry.log.level),
                                                             &entry.log.level,
@@ -8198,19 +8143,17 @@ impl App {
                         }
                     };
                     let decision = match selected_route {
-                        nsproxy_common::stats::ObservedRoute::NoProxy => {
-                            match &metric.key.target {
-                                nsproxy_common::routing::WireAddress::SocketAddress(address) => {
-                                    nsproxy_common::routing::RoutingResovled::NoProxy(*address)
-                                }
-                                nsproxy_common::routing::WireAddress::DomainAddress(host, port) => {
-                                    nsproxy_common::routing::RoutingResovled::NoProxyDomain {
-                                        host: host.clone(),
-                                        port: *port,
-                                    }
+                        nsproxy_common::stats::ObservedRoute::NoProxy => match &metric.key.target {
+                            nsproxy_common::routing::WireAddress::SocketAddress(address) => {
+                                nsproxy_common::routing::RoutingResovled::NoProxy(*address)
+                            }
+                            nsproxy_common::routing::WireAddress::DomainAddress(host, port) => {
+                                nsproxy_common::routing::RoutingResovled::NoProxyDomain {
+                                    host: host.clone(),
+                                    port: *port,
                                 }
                             }
-                        }
+                        },
                         nsproxy_common::stats::ObservedRoute::Proxy(proxy_id) => {
                             nsproxy_common::routing::RoutingResovled::ProxyResovled {
                                 target: metric.key.target.clone(),
@@ -8220,10 +8163,7 @@ impl App {
                     };
                     supervisor.send(SupervisorCommand::Ctrl {
                         profile: profile_name.to_string(),
-                        cmd: diag::ControlCommand::SetHostRoute {
-                            key,
-                            decision,
-                        },
+                        cmd: diag::ControlCommand::SetHostRoute { key, decision },
                     });
                 }
             });
@@ -9580,10 +9520,15 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                     match TemplateConfig::load(&profile_path) {
                         Ok(tmpl) => {
                             self.manage_wizard.template = tmpl;
-                            let mut hot: HotConfig = std::fs::read_to_string(&hot_path)
-                                .ok()
-                                .and_then(|s| serde_json::from_str(&s).ok())
-                                .unwrap_or_default();
+                            let mut hot: HotConfig = match nsproxy_core::state_file::read(&hot_path)
+                            {
+                                Ok(hot) => hot.unwrap_or_default(),
+                                Err(err) => {
+                                    self.manage_wizard.status =
+                                        Some(format!("Could not load source hot config: {err}"));
+                                    return;
+                                }
+                            };
                             if let Some(route) = self.live_route_for_profile(&src) {
                                 hot.default_route = route;
                             }
@@ -10034,31 +9979,30 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                 ui.text_edit_singleline(&mut self.manage_wizard.merge_path);
                 if ui.button("Merge").clicked() {
                     let path = self.manage_wizard.merge_path.trim().to_string();
-                    match std::fs::read_to_string(&path) {
-                        Ok(content) => match serde_json::from_str::<HotConfig>(&content) {
-                            Ok(imported) => {
-                                // Merge: union dns, locals, mounts; overwrite route/resolv if non-empty
-                                self.manage_wizard.hot.dns.extend(imported.dns);
-                                self.manage_wizard.hot.locals.extend(imported.locals);
-                                self.manage_wizard.hot.mounts.extend(imported.mounts);
-                                if !imported.resolv_conf_dns.is_empty() {
-                                    self.manage_wizard.hot.resolv_conf_dns =
-                                        imported.resolv_conf_dns;
-                                }
-                                if !matches!(imported.default_route, nsproxy_core::HotRoute::None) {
-                                    self.manage_wizard.hot.default_route = imported.default_route;
-                                }
-                                self.manage_wizard.hot_json =
-                                    serde_json::to_string_pretty(&self.manage_wizard.hot)
-                                        .unwrap_or_default();
-                                self.manage_wizard.merge_error = None;
+                    match nsproxy_core::state_file::read::<HotConfig>(std::path::Path::new(&path)) {
+                        Ok(Some(imported)) => {
+                            // Merge: union dns, locals, mounts; overwrite route/resolv if non-empty
+                            self.manage_wizard.hot.dns.extend(imported.dns);
+                            self.manage_wizard.hot.locals.extend(imported.locals);
+                            self.manage_wizard.hot.mounts.extend(imported.mounts);
+                            if !imported.resolv_conf_dns.is_empty() {
+                                self.manage_wizard.hot.resolv_conf_dns = imported.resolv_conf_dns;
                             }
-                            Err(e) => {
-                                self.manage_wizard.merge_error = Some(format!("Parse error: {e}"));
+                            if !matches!(imported.default_route, nsproxy_core::HotRoute::None) {
+                                self.manage_wizard.hot.default_route = imported.default_route;
                             }
-                        },
+                            self.manage_wizard.hot_json =
+                                serde_json::to_string_pretty(&self.manage_wizard.hot)
+                                    .unwrap_or_default();
+                            self.manage_wizard.merge_error = None;
+                        }
+                        Ok(None) => {
+                            self.manage_wizard.merge_error =
+                                Some(format!("No hot config found at {path}"));
+                        }
                         Err(e) => {
-                            self.manage_wizard.merge_error = Some(format!("Read error: {e}"));
+                            self.manage_wizard.merge_error =
+                                Some(format!("Could not load hot config: {e}"));
                         }
                     }
                 }
@@ -13115,6 +13059,9 @@ fn protocol_build_hash(args: &UiCli) -> String {
 
 fn main() {
     let args = UiCli::parse();
+    if let Some(root) = args.state.as_ref() {
+        state_paths::set_persist_root(root.clone());
+    }
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
