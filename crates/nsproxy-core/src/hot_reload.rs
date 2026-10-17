@@ -39,7 +39,7 @@ pub enum HotReloadTrigger {
 }
 
 fn routing_state_for_config(config: &HotConfig) -> diag::RoutingState {
-    match &config.route {
+    match &config.default_route {
         HotRoute::None => diag::RoutingState {
             selected_proxy: None,
             selected_group: None,
@@ -77,13 +77,13 @@ mod route_state_tests {
         assert!(state.selected_group.is_none());
         assert!(!state.no_proxy);
 
-        config.route = HotRoute::NoProxy;
+        config.default_route = HotRoute::NoProxy;
         let state = routing_state_for_config(&config);
         assert!(state.selected_proxy.is_none());
         assert!(state.selected_group.is_none());
         assert!(state.no_proxy);
 
-        config.route = HotRoute::SimpleProxy {
+        config.default_route = HotRoute::SimpleProxy {
             proxy_id: proxy_id.clone(),
         };
         let state = routing_state_for_config(&config);
@@ -91,7 +91,7 @@ mod route_state_tests {
         assert!(state.selected_group.is_none());
         assert!(!state.no_proxy);
 
-        config.route = HotRoute::Group {
+        config.default_route = HotRoute::Group {
             group_id: "fedora".to_string(),
         };
         let state = routing_state_for_config(&config);
@@ -326,7 +326,7 @@ fn derive_desired_state(conf: &HotConfig) -> DesiredHotState {
         locals: conf.locals.iter().map(|(src, dst)| (*src, *dst)).collect(),
         dns_capture: conf.dns_capture.clone(),
         resolv_conf_dns: conf.resolv_conf_dns.clone(),
-        route: conf.route.clone(),
+        route: conf.default_route.clone(),
         mounts: conf.mounts.clone(),
         daemons: conf.daemons.clone(),
     }

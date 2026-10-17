@@ -53,7 +53,20 @@ cat /nsp3/config/<profile>/hot.json
 sp enter <profile> -s sh --args -c 'cat /etc/resolv.conf'
 ```
 
-`hot.json` owns `dns`, `tun`, `devs`, `mnt`/`mounts`, `locals`, `dns_capture`, `resolv_conf_dns`, `route`, `daemons`, `applications`, and `veth`. Empty `dns_capture` means capture all DNS source IPs; a disabled sentinel captures none. A `dns` entry maps a name directly to an IPv4 address and is pinned into Virtual DNS. Synthesized A/AAAA answers for virtual domains have a 300-second DNS TTL; their in-process address mappings remain subject to the virtual-DNS LRU capacity. A `tun` entry routes through TUN or a file server. Hot changes are watched and applied to the running serve process; invalid JSON is rejected and does not replace the active config.
+`hot.json` owns `dns`, `tun`, `devs`, `mnt`/`mounts`, `locals`, `dns_capture`, `resolv_conf_dns`, `default_route`, `route_map`, `daemons`, `applications`, and `veth`. Empty `dns_capture` means capture all DNS source IPs; a disabled sentinel captures none. A `dns` entry maps a name directly to an IPv4 address and is pinned into Virtual DNS. Synthesized A/AAAA answers for virtual domains have a 300-second DNS TTL; their in-process address mappings remain subject to the virtual-DNS LRU capacity. A `tun` entry routes through TUN or a file server. Hot changes are watched and applied to the running serve process; invalid JSON is rejected and does not replace the active config.
+
+### Route-map transfer
+
+`sp route` imports and exports a `RoutePrefs` document containing `default_route` and a `route_map` array of concrete per-host/IP decisions. The map uses the same key/decision representation as `hot.json`; it does not contain symbolic names or proxy bindings.
+
+```fish
+sp route routes.json --apply-to <PROFILE>
+sp route routes.json --apply-to <PROFILE> --replace
+sp route export <PROFILE> routes.json
+sp route routes.json --make-container <NAME> [--template <TEMPLATE>] [--destroy] -- <COMMAND> [ARGS...]
+```
+
+Apply merges entries by key; `--replace` clears the profile's route map first. Export refuses to overwrite an existing file unless `--force` is supplied; a directory destination receives `<PROFILE>.json`. `--make-container` creates and starts a profile with the imported map, then runs the command inside it. The new profile remains running by default; `--destroy` removes it when the command exits. Use `--help` for the current option details.
 
 For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resolv_conf_dns` inside the profile points at the intended DNS server; `dns_capture` includes the query source; `veth_status.json` says `success: true`; the target address is reachable from the profile namespace; and the serve process was running when the change was applied. The internal IPv4-only DNS forwarder preserves AAAA questions and removes AAAA records from responses, yielding a valid no-data response instead of `FORMERR`. `sp enter` is the supported namespace check.
 

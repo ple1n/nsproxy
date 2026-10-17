@@ -871,7 +871,7 @@ fn should_log_process(cli: &Cli) -> bool {
                 cmd: BasisCommand::Enter { .. }
             }
             | MainCommand::Daemon { cmd: None }
-    )
+    ) || matches!(&cli.cmd, MainCommand::Route { args, .. } if args.make_container.is_some())
 }
 
 fn temp_command_slug(command: &str) -> String {
@@ -1008,6 +1008,215 @@ fn run_temp_command(eargs: nsproxy_core::shell::EnterArgs) -> Result<()> {
             "{run_error:#}; temporary profile cleanup also failed: {cleanup_error:#}"
         )),
     }
+}
+
+fn run_route_command(
+    cmd: Option<nsproxy_core::RouteCommand>,
+    args: nsproxy_core::RouteArgs,
+) -> Result<()> {
+    if let Some(nsproxy_core::RouteCommand::Export {
+        container,
+        destination,
+        force,
+    }) = cmd
+    {
+        let output = nsproxy_core::route_map::export_container(&container, &destination, force)?;
+        println!("{}", output.display());
+        return Ok(());
+    }
+
+    let file = args
+        .file
+        .as_deref()
+        .ok_or_else(|| anyhow!("sp route requires a ROUTE_MAP_FILE"))?;
+    let preferences = nsproxy_core::route_map::read(file)?;
+    if let Some(container) = &args.apply_to {
+        let mode = if args.replace {
+            nsproxy_core::route_map::ApplyMode::Replace
+        } else {
+            nsproxy_core::route_map::ApplyMode::Merge
+        };
+        let path = nsproxy_core::route_map::apply_to_container(container, &preferences, mode)?;
+        println!("applied {} to {container} ({})", file.display(), path.display());
+        return Ok(());
+    }
+
+    let name = args
+        .make_container
+        .as_deref()
+        .ok_or_else(|| anyhow!("sp route requires --make-container or --apply-to"))?;
+    run_route_make_container(name, &args, preferences)
+}
+
+fn run_route_make_container(
+    name: &str,
+    args: &nsproxy_core::RouteArgs,
+    preferences: nsproxy_core::RoutePrefs,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    ensure!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "container name `{name}` may only contain ASCII letters, digits, `-` and `_`"
+    );
+    ensure!(
+        !state_paths::profile_dir(name).exists(),
+        "container `{name}` already exists; use `sp route FILE --apply-to {name}`"
+    );
+    let state_root = state_paths::persist_root();
+    let executable = std::env::current_exe()?;
+    let mut up_child = None;
+    let mut profile_dir_created = false;
+    let run_result = (|| {
+        fs::create_dir_all(state_paths::config_root())?;
+        let hot_path = state_paths::hot_config(name);
+        if let Some(template) = &args.template {
+            profile_dir_created = true;
+            let status = Command::new(&executable)
+                .arg("--root")
+                .arg(&state_root)
+                .arg("template")
+                .arg(template)
+                .arg(name)
+                .status()?;
+            ensure!(
+                status.success(),
+                "creating `{name}` from template {} failed with status {status}",
+                template.display()
+            );
+        } else {
+            fs::create_dir(state_paths::profile_dir(name))?;
+            profile_dir_created = true;
+            let template = TemplateConfig::template(name, &hot_path)?;
+            fs::write(
+                state_paths::profile_config(name),
+                serde_json::to_vec_pretty(&template)?,
+            )?;
+            fs::write(
+                &hot_path,
+                serde_json::to_vec_pretty(&nsproxy_core::default_hotconfig())?,
+            )?;
+        }
+
+        let content = fs::read(&hot_path)
+            .with_context(|| format!("failed to read {}", hot_path.display()))?;
+        let mut hot: HotConfig = serde_json::from_slice(&content)
+            .with_context(|| format!("invalid {}", hot_path.display()))?;
+        nsproxy_core::route_map::apply_to_hotconfig(
+            &mut hot,
+            &preferences,
+            nsproxy_core::route_map::ApplyMode::Replace,
+        )?;
+        hot.save(&hot_path)
+            .with_context(|| format!("failed to write {}", hot_path.display()))?;
+
+        up_child = Some(
+            Command::new(&executable)
+                .arg("--root")
+                .arg(&state_root)
+                .arg("up")
+                .arg(name)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()?,
+        );
+        wait_for_temp_profile(name, up_child.as_mut().unwrap())?;
+        start_route_serve(name, &state_root)?;
+
+        let ns_alive = read_ns_alive(&state_paths::profile_ns_meta(name))?;
+        let mut shell_prefs = ShellPrefs::default();
+        shell_prefs.take_enter_args(args.enter.clone().unwrap_or_default());
+        shell_prefs.adjust()?;
+        apply_ns_env(&mut shell_prefs, &ns_alive);
+        apply_dbus_env(&mut shell_prefs, &ns_alive)?;
+
+        let bind_mount = state_paths::profile_netns_bind(name);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let child = shell_prefs.spawn_in_ns(&ns_alive, &bind_mount)?;
+            child.wait_for_child().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    })();
+
+    if !args.destroy && run_result.is_ok() {
+        return Ok(());
+    }
+    let cleanup_result = cleanup_temp_profile(
+        name,
+        &state_root,
+        profile_dir_created,
+        up_child.as_mut(),
+    );
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(run_error), Err(cleanup_error)) => Err(anyhow!(
+            "{run_error:#}; removing container `{name}` also failed: {cleanup_error:#}"
+        )),
+    }
+}
+
+fn start_route_serve(name: &str, state_root: &Path) -> Result<()> {
+    let cli = Cli {
+        conf: None,
+        root: Some(state_root.to_path_buf()),
+        no_wrap_check: false,
+        control_socket: None,
+        cmd: MainCommand::Serve {
+            profile: name.to_string(),
+            tun_name: None,
+            simple: None,
+            no_default: false,
+            log: None,
+            no_dns_capture: None,
+            internal_dns_server: None,
+            history_listen: nsproxy_core::DEFAULT_HISTORY_LISTEN
+                .parse()
+                .expect("valid default history address"),
+            history_max_bytes: nsproxy_core::DEFAULT_HISTORY_MAX_BYTES,
+            rust_backtrace: None,
+        },
+    };
+    let request = diag::DaemonRequest::SpawnCli {
+        cli_bincode: bincode::serialize(&cli)?,
+        ns: diag::NamespaceSpawn::Outside,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let mut stream = diag::connect_up_daemon(&diag::up_sock_path(name)).await?;
+        stream.send_unstable_request(&request).await?;
+        if let Some(diag::UpWireEvent::Unstable(diag::DaemonEvent::Error { msg })) =
+            stream.next_event().await?
+        {
+            bail!("starting serve for `{name}` failed: {msg}");
+        }
+        let socket = diag::diag_sock_path(name);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if socket.exists() && diag::connect(&socket).await.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for serve of `{name}` to listen on {}",
+                    socket.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
 }
 
 fn cleanup_temp_profile(
@@ -1569,6 +1778,9 @@ fn main() -> anyhow::Result<()> {
         }
         MainCommand::Temp { eargs } => {
             run_temp_command(eargs)?;
+        }
+        MainCommand::Route { cmd, args } => {
+            run_route_command(cmd, args)?;
         }
         MainCommand::Install { dir: dstdir } => {
             if !dstdir.exists() {
@@ -3173,13 +3385,9 @@ fn cmd_ps(target: &str, kill: bool, force: bool) -> Result<()> {
 }
 
 fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, hot: &HotConfig) {
-    use nsproxy_common::routing::{
-        DropReason, RoutingDecision, RoutingResovled, VDNSRES,
-    };
-    use nsproxy_common::stats::HostRouteHost;
-    use std::{borrow::Cow, net::SocketAddr, sync::Arc};
+    use std::sync::Arc;
 
-    let fallback = match &hot.route {
+    let fallback = match &hot.default_route {
         HotRoute::None => nsproxy_core::uplink::no_routing(),
         HotRoute::NoProxy => nsproxy_core::uplink::no_proxy_routing(),
         HotRoute::SimpleProxy { proxy_id } => {
@@ -3189,66 +3397,249 @@ fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, hot: 
             nsproxy_core::uplink::clash::GroupId::from(group_id.clone()),
         ),
     };
-    let host_routes: std::collections::HashMap<_, _> = hot
-        .host_routes
-        .iter()
-        .map(|rule| (rule.host.canonicalized(), rule.target.clone()))
-        .collect();
+    let route_map = hot.route_map.clone();
     uplink.set_routing(Arc::new(move |ctx, hub| {
-        let host = match &ctx.dns {
-            VDNSRES::Opine(RoutingDecision::HostOverProxy(domain)) => {
-                HostRouteHost::domain(domain)
-            }
-            _ => HostRouteHost::Ip(ctx.target_ip),
-        };
-        let Some(route_target) = host_routes.get(&host) else {
-            return fallback(ctx, hub);
-        };
-
-        if ctx.attempt_num > 0 {
-            return RoutingResovled::Drop(DropReason::MaxRetry);
+        if let Some(decision) = nsproxy_common::routing::route_map_match(&route_map, ctx) {
+            return decision.clone();
         }
-
-        let target = match &ctx.dns {
-            VDNSRES::NormalProxying => {
-                WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port))
-            }
-            VDNSRES::Opine(RoutingDecision::HostOverProxy(domain)) => {
-                WireAddress::DomainAddress(domain.clone(), ctx.target_port)
-            }
-            VDNSRES::Opine(RoutingDecision::SocketOverProxy(address))
-            | VDNSRES::Opine(RoutingDecision::NoProxy(address))
-            | VDNSRES::Opine(RoutingDecision::NATByTUN(address)) => {
-                WireAddress::SocketAddress(*address)
-            }
-            VDNSRES::Opine(RoutingDecision::File(_)) => {
-                return fallback(ctx, hub);
-            }
-            VDNSRES::Opine(RoutingDecision::Drop(reason)) => {
-                return RoutingResovled::Drop(reason.clone());
-            }
-            VDNSRES::ERR => {
-                return RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed(
-                    "vdns error",
-                )));
-            }
-        };
-
-        match route_target {
-            nsproxy_common::stats::ObservedRoute::NoProxy => match target {
-                WireAddress::SocketAddress(address) => RoutingResovled::NoProxy(address),
-                WireAddress::DomainAddress(host, port) => {
-                    RoutingResovled::NoProxyDomain { host, port }
-                }
-            },
-            nsproxy_common::stats::ObservedRoute::Proxy(proxy_id) => {
-                RoutingResovled::ProxyResovled {
-                    target,
-                    id: proxy_id.clone(),
-                }
-            }
-        }
+        fallback(ctx, hub)
     }));
+}
+
+#[cfg(test)]
+mod hotconfig_routing_tests {
+    use super::*;
+    use nsproxy_common::routing::{
+        RoutingContext, RoutingDecision, RoutingKey, RoutingProtocol, RoutingResovled, TargetKey,
+        VDNSRES,
+    };
+    use std::collections::HashSet;
+
+    fn context(port: u16, dns: VDNSRES) -> RoutingContext {
+        RoutingContext {
+            target_ip: "203.0.113.7".parse().unwrap(),
+            target_port: port,
+            source_ip: "192.0.2.4".parse().unwrap(),
+            protocol: RoutingProtocol::Tcp,
+            tried_proxies: HashSet::new(),
+            attempt_num: 0,
+            dns,
+        }
+    }
+
+    fn hotconfig_with_route_map() -> (HotConfig, RoutingResovled) {
+        let proxy_id = nsproxy_common::routing::ProxyID([7; 32]);
+        let raw_resolved = RoutingResovled::ProxyResovled {
+            target: WireAddress::DomainAddress("packages.redhat.com".to_string(), 443),
+            id: proxy_id.clone(),
+        };
+        let expected = RoutingResovled::ProxyResovled {
+            target: WireAddress::DomainAddress("packages.redhat.com.".to_string(), 443),
+            id: proxy_id,
+        };
+        let mut hot = HotConfig {
+            default_route: HotRoute::NoProxy,
+            ..HotConfig::default()
+        };
+        hot.route_map.insert(
+            RoutingKey::Host("Packages.RedHat.COM".to_string(), Some(443)),
+            raw_resolved,
+        );
+        (hot, expected)
+    }
+
+    #[test]
+    fn hotconfig_trailing_dot_host_matches_after_json_roundtrip() {
+        let (hot, expected) = hotconfig_with_route_map();
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&hot).unwrap()).unwrap();
+        assert_eq!(
+            encoded["route_map"][0][0]["Host"][0],
+            "packages.redhat.com."
+        );
+        assert_eq!(
+            encoded["route_map"][0][1]["ProxyResovled"]["target"]["DomainAddress"][0],
+            "packages.redhat.com."
+        );
+        encoded["route_map"][0][0]["Host"][0] = serde_json::json!("Packages.RedHat.COM");
+        encoded["route_map"][0][1]["ProxyResovled"]["target"]["DomainAddress"][0] =
+            serde_json::json!("Packages.RedHat.COM");
+        let json = serde_json::to_vec(&encoded).unwrap();
+        let loaded: HotConfig = serde_json::from_slice(&json).unwrap();
+        assert!(
+            loaded.route_map.contains_key(&RoutingKey::host(
+                "packages.redhat.com.",
+                Some(443)
+            ))
+        );
+        assert_eq!(
+            loaded.route_map[&RoutingKey::host("packages.redhat.com", Some(443))],
+            expected.clone()
+        );
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &loaded);
+        assert_eq!(
+            uplink.route(&context(
+                443,
+                VDNSRES::Opine(RoutingDecision::HostOverProxy(
+                    "packages.redhat.com.".to_string(),
+                )),
+            )),
+            expected
+        );
+
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &loaded);
+
+        let request = context(
+            443,
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(
+                "packages.redhat.com.".to_string(),
+            )),
+        );
+        assert_eq!(uplink.route(&request), expected);
+    }
+
+    #[test]
+    fn serve_startup_loader_preserves_route_prefs_from_disk() {
+        let (hot, expected) = hotconfig_with_route_map();
+        let path = std::env::temp_dir().join(format!(
+            "nsproxy-hotconfig-route-startup-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, serde_json::to_vec(&hot).unwrap()).unwrap();
+
+        let loaded = load_hot_config_from_disk_or_default(&path);
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.default_route, HotRoute::NoProxy);
+        assert_eq!(
+            loaded.route_map[&RoutingKey::host("packages.redhat.com", Some(443))],
+            expected
+        );
+    }
+
+    #[test]
+    fn hotconfig_host_route_map_uses_any_port_entry_when_exact_port_is_absent() {
+        let mut hot = HotConfig {
+            default_route: HotRoute::NoProxy,
+            ..HotConfig::default()
+        };
+        let expected = RoutingResovled::NoProxyDomain {
+            host: "packages.redhat.com.".to_string(),
+            port: 80,
+        };
+        hot.route_map.insert(
+            RoutingKey::host("packages.redhat.com", None),
+            expected.clone(),
+        );
+        nsproxy_common::routing::normalize_route_map_domains(&mut hot.route_map).unwrap();
+
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &hot);
+
+        let request = context(
+            8443,
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(
+                "packages.redhat.com".to_string(),
+            )),
+        );
+        assert_eq!(uplink.route(&request), expected);
+    }
+
+    #[test]
+    fn hotconfig_exact_host_port_precedes_the_wildcard_entry() {
+        let mut hot = HotConfig::default();
+        let exact = RoutingResovled::NoProxyDomain {
+            host: "packages.redhat.com.".to_string(),
+            port: 443,
+        };
+        let wildcard = RoutingResovled::NoProxyDomain {
+            host: "packages.redhat.com.".to_string(),
+            port: 80,
+        };
+        hot.route_map.insert(
+            RoutingKey::host("packages.redhat.com", Some(443)),
+            exact.clone(),
+        );
+        hot.route_map.insert(
+            RoutingKey::host("packages.redhat.com", None),
+            wildcard.clone(),
+        );
+        nsproxy_common::routing::normalize_route_map_domains(&mut hot.route_map).unwrap();
+
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &hot);
+
+        let host = |port| {
+            context(
+                port,
+                VDNSRES::Opine(RoutingDecision::HostOverProxy(
+                    "Packages.RedHat.COM.".to_string(),
+                )),
+            )
+        };
+        assert_eq!(uplink.route(&host(443)), exact);
+        assert_eq!(uplink.route(&host(8443)), wildcard);
+    }
+
+    #[test]
+    fn hotconfig_ip_exact_and_any_port_keys_are_used_for_normal_proxying() {
+        let address: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let exact = RoutingResovled::NoProxy("203.0.113.7:443".parse().unwrap());
+        let wildcard = RoutingResovled::NoProxy("198.51.100.9:80".parse().unwrap());
+        let mut hot = HotConfig::default();
+        hot.route_map.insert(
+            RoutingKey::Addr(TargetKey::for_final_destination(
+                "203.0.113.7:443".parse().unwrap(),
+            )),
+            exact.clone(),
+        );
+        hot.route_map.insert(
+            RoutingKey::Addr(TargetKey::for_any_port(address)),
+            wildcard.clone(),
+        );
+
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &hot);
+
+        assert_eq!(uplink.route(&context(443, VDNSRES::NormalProxying)), exact);
+        assert_eq!(uplink.route(&context(8443, VDNSRES::NormalProxying)), wildcard);
+    }
+
+    #[test]
+    fn hotconfig_default_route_is_used_when_no_route_map_key_matches() {
+        let mut hot = HotConfig {
+            default_route: HotRoute::NoProxy,
+            ..HotConfig::default()
+        };
+        hot.route_map.insert(
+            RoutingKey::Addr(TargetKey::for_any_port("198.51.100.8".parse().unwrap())),
+            RoutingResovled::Drop(nsproxy_common::routing::DropReason::MaxRetry),
+        );
+
+        let mut uplink = nsproxy_core::uplink::UplinkHub::with_routing(
+            nsproxy_core::uplink::no_routing(),
+        );
+        apply_hot_route_to_uplink(&mut uplink, &hot);
+
+        let request = context(443, VDNSRES::NormalProxying);
+        assert_eq!(
+            uplink.route(&request),
+            RoutingResovled::NoProxy("203.0.113.7:443".parse().unwrap())
+        );
+    }
 }
 
 async fn serve_worker_runtime(
@@ -3712,7 +4103,7 @@ fn cmd_serve(
                         let proxy_id = hub.nym_map.get(&nym).cloned().ok_or_else(|| {
                             anyhow!("Simple route proxy not found for nym {}", nym)
                         })?;
-                        initial_hot.route = HotRoute::SimpleProxy { proxy_id };
+                        initial_hot.default_route = HotRoute::SimpleProxy { proxy_id };
                         initial_hot.save(&hot_conf)?;
                         let _ = hot_tx.send(initial_hot.clone());
                     }
@@ -3869,7 +4260,7 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::SetSimpleRouting { proxy_id } => {
                                         let mut next_hot = live_hot_cmd.read().await.clone();
-                                        next_hot.route = HotRoute::SimpleProxy {
+                                        next_hot.default_route = HotRoute::SimpleProxy {
                                             proxy_id: proxy_id.clone(),
                                         };
                                         let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
@@ -3890,7 +4281,7 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::SetGroupRouting { group_id } => {
                                         let mut next_hot = live_hot_cmd.read().await.clone();
-                                        next_hot.route = HotRoute::Group {
+                                        next_hot.default_route = HotRoute::Group {
                                             group_id: group_id.clone(),
                                         };
                                         let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
@@ -3911,7 +4302,7 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::SetNoProxyRouting => {
                                         let mut next_hot = live_hot_cmd.read().await.clone();
-                                        next_hot.route = HotRoute::NoProxy;
+                                        next_hot.default_route = HotRoute::NoProxy;
                                         let trigger = nsproxy_core::hot_reload::HotReloadTrigger::ApplyConfig {
                                             source: "route",
                                             persist_backup: true,
@@ -3942,7 +4333,7 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::QueryRoutingState => {
                                         let current_hot = live_hot_cmd.read().await.clone();
-                                        let (selected_proxy, selected_group, no_proxy) = match &current_hot.route {
+                                        let (selected_proxy, selected_group, no_proxy) = match &current_hot.default_route {
                                             HotRoute::None => (None, None, false),
                                             HotRoute::NoProxy => (None, None, true),
                                             HotRoute::SimpleProxy { proxy_id } => {
@@ -4031,15 +4422,9 @@ fn cmd_serve(
                                             }
                                         }
                                     }
-                                    diag::ControlCommand::SetHostRoute { host, target } => {
-                                        let host = host.canonicalized();
+                                    diag::ControlCommand::SetHostRoute { key, decision } => {
                                         let mut cfg = live_hot_cmd.read().await.clone();
-                                        cfg.host_routes
-                                            .retain(|rule| rule.host.canonicalized() != host);
-                                        cfg.host_routes.push(nsproxy_core::HostRouteRule {
-                                            host,
-                                            target,
-                                        });
+                                        cfg.route_map.insert(key, decision);
                                         match cfg.process_and_save(&hot_conf_cmd) {
                                             Ok(()) => {
                                                 *live_hot_cmd.write().await = cfg.clone();

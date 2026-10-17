@@ -238,10 +238,10 @@ pub enum ControlCommand {
     QueryConnsState,
     /// Request serve-computed per-target, per-route performance estimates.
     QueryHostRouteStats,
-    /// Set or replace a host-wide routing override and persist it through `sp serve`.
+    /// Set or replace a routing-key override and persist it through `sp serve`.
     SetHostRoute {
-        host: HostRouteHost,
-        target: ObservedRoute,
+        key: nsproxy_common::routing::RoutingKey,
+        decision: RoutingResovled,
     },
     /// Close all active TCP and UDP connections for a host.
     KillHostConnections { host: HostRouteHost },

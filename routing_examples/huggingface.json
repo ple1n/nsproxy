@@ -1,0 +1,24 @@
+{
+  "default_route": "NoProxy",
+  "route_map": [
+    [
+      {
+        "Host": [
+          "huggingface.co.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "huggingface.co.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ]
+  ]
+}

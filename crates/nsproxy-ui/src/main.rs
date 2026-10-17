@@ -34,8 +34,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PROCESS_LOG_EDITOR_MAX_BYTES: usize = 64 * 1024;
-const PROCESS_LOG_EDITOR_COMPACT_AFTER_BYTES: usize = 1024 * 1024;
+const PROCESS_LOG_VIEWER_MAX_BYTES: usize = 64 * 1024;
 
 const LOG_EDITOR_BACKGROUND: Color32 = Color32::from_rgb(12, 13, 16);
 const LOG_SYNTAX_RED: Color32 = Color32::from_rgb(224, 108, 117);
@@ -46,6 +45,8 @@ const LOG_SYNTAX_PURPLE: Color32 = Color32::from_rgb(198, 120, 221);
 const LOG_SYNTAX_CYAN: Color32 = Color32::from_rgb(86, 182, 194);
 const LOG_SYNTAX_FOREGROUND: Color32 = Color32::from_rgb(171, 178, 191);
 const LOG_SYNTAX_MUTED: Color32 = Color32::from_rgb(92, 99, 112);
+const SPAWN_ARGS_NUMBER_WIDTH: f32 = 220.0;
+const SPAWN_ARGS_TEXT_WIDTH: f32 = 480.0;
 
 fn log_level_color(level: &str) -> Color32 {
     match level {
@@ -87,134 +88,11 @@ fn log_ansi_theme() -> &'static egui_sgr::EguiAnsiTheme {
     })
 }
 
-#[derive(Default)]
-struct ProcessLogTextBuffer {
-    text: String,
-    visible_start: usize,
-}
-
 struct LogEditorPopup {
     title: String,
     text: String,
 }
 
-impl ProcessLogTextBuffer {
-    fn clear(&mut self) {
-        self.text.clear();
-        self.visible_start = 0;
-    }
-
-    fn append_line(&mut self, content: &str) {
-        if self.visible_start < self.text.len() {
-            self.text.push('\n');
-        }
-        let mut remaining = content;
-        while !remaining.is_empty() {
-            match remaining.find('\x1b') {
-                Some(0) if remaining.starts_with("\x1b[") => {
-                    let rest = &remaining[2..];
-                    if let Some(m_pos) = rest.find('m') {
-                        remaining = &rest[m_pos + 1..];
-                    } else {
-                        break;
-                    }
-                }
-                Some(0) => remaining = &remaining[1..],
-                Some(esc_pos) => {
-                    self.append_visible_text(&remaining[..esc_pos]);
-                    remaining = &remaining[esc_pos..];
-                }
-                None => {
-                    self.append_visible_text(remaining);
-                    break;
-                }
-            }
-        }
-    }
-
-    fn append_visible_text(&mut self, content: &str) {
-        if content.is_empty() {
-            return;
-        }
-        if content.len() >= PROCESS_LOG_EDITOR_MAX_BYTES {
-            let mut content_start = content.len() - PROCESS_LOG_EDITOR_MAX_BYTES;
-            while !content.is_char_boundary(content_start) {
-                content_start += 1;
-            }
-            self.clear();
-            self.text.push_str(&content[content_start..]);
-            return;
-        }
-        self.text.push_str(content);
-
-        if self.text.len() - self.visible_start > PROCESS_LOG_EDITOR_MAX_BYTES {
-            self.visible_start = self.text.len() - PROCESS_LOG_EDITOR_MAX_BYTES;
-            while !self.text.is_char_boundary(self.visible_start) {
-                self.visible_start += 1;
-            }
-        }
-        if self.visible_start >= PROCESS_LOG_EDITOR_COMPACT_AFTER_BYTES {
-            self.text.drain(..self.visible_start);
-            self.visible_start = 0;
-        }
-    }
-
-    fn visible_text(&self) -> &str {
-        &self.text[self.visible_start..]
-    }
-}
-
-impl egui::TextBuffer for ProcessLogTextBuffer {
-    fn is_mutable(&self) -> bool {
-        false
-    }
-
-    fn as_str(&self) -> &str {
-        self.visible_text()
-    }
-
-    fn insert_text(&mut self, _text: &str, _char_index: egui::text::CharIndex) -> usize {
-        0
-    }
-
-    fn delete_char_range(&mut self, _char_range: std::ops::Range<egui::text::CharIndex>) {}
-
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<Self>()
-    }
-}
-
-#[cfg(test)]
-mod process_log_text_buffer_tests {
-    use super::{ProcessLogTextBuffer, PROCESS_LOG_EDITOR_MAX_BYTES};
-
-    #[test]
-    fn appends_lines_in_place() {
-        let mut buffer = ProcessLogTextBuffer::default();
-        buffer.append_line("first");
-        buffer.append_line("second");
-
-        assert_eq!(buffer.visible_text(), "first\nsecond");
-    }
-
-    #[test]
-    fn oversized_utf8_line_keeps_a_bounded_valid_suffix() {
-        let mut buffer = ProcessLogTextBuffer::default();
-        let oversized = format!("é{}", "x".repeat(PROCESS_LOG_EDITOR_MAX_BYTES));
-        buffer.append_line(&oversized);
-
-        assert_eq!(buffer.visible_text().len(), PROCESS_LOG_EDITOR_MAX_BYTES);
-        assert!(buffer.visible_text().bytes().all(|byte| byte == b'x'));
-    }
-
-    #[test]
-    fn parses_ansi_sgr_sequences_before_display() {
-        let mut buffer = ProcessLogTextBuffer::default();
-        buffer.append_line("\x1b[31mred\x1b[0m plain");
-
-        assert_eq!(buffer.visible_text(), "red plain");
-    }
-}
 use tokio::runtime::Runtime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -541,7 +419,6 @@ enum RightTab {
     Proxies,
     Daemon,
     Dbus,
-    Logs,
     Actions,
     Processes,
     Traffic,
@@ -1205,7 +1082,11 @@ impl IntInput {
         visuals.extreme_bg_color = bg_color;
         let resp = ui
             .horizontal(|ui| {
-                let resp = ui.add(egui::TextEdit::singleline(input).id_source(text_edit_id));
+                let width = SPAWN_ARGS_NUMBER_WIDTH.min(ui.available_width().max(0.0));
+                let resp = ui.add_sized(
+                    egui::vec2(width, ui.spacing().interact_size.y),
+                    egui::TextEdit::singleline(input).id_source(text_edit_id),
+                );
                 resp
             })
             .inner;
@@ -1309,7 +1190,8 @@ struct App {
     selected_process_logs: Option<(ContainerName, u32)>,
     process_log_editor_target: Option<(ContainerName, u32)>,
     process_log_editor_next_seq: Option<u64>,
-    process_log_editor_text: ProcessLogTextBuffer,
+    process_log_rows: VecDeque<String>,
+    process_log_rows_bytes: usize,
     selected_persisted_log_file: Option<PathBuf>,
     persisted_logs_snapshot: PersistedLogsSnapshot,
     last_persisted_logs_refresh: Instant,
@@ -1582,10 +1464,6 @@ fn refresh_run_command_preview(run_command: &mut RunCommandDraft) {
 }
 
 impl App {
-    fn should_refresh_persisted_logs(&self) -> bool {
-        self.right_tab == RightTab::Logs
-    }
-
     fn request_persisted_logs_refresh(&mut self) {
         let _ = self
             .persisted_logs_tx
@@ -1595,7 +1473,7 @@ impl App {
                     .selected_process_logs
                     .as_ref()
                     .and_then(|(_, pid)| (!self.selected_process_is_pty()).then_some(*pid)),
-                logs_tab_visible: self.right_tab == RightTab::Logs,
+                logs_tab_visible: false,
                 process_logs_visible: false,
             });
         self.last_persisted_logs_refresh = Instant::now();
@@ -1967,7 +1845,8 @@ impl App {
             selected_process_logs: None,
             process_log_editor_target: None,
             process_log_editor_next_seq: None,
-            process_log_editor_text: ProcessLogTextBuffer::default(),
+            process_log_rows: VecDeque::new(),
+            process_log_rows_bytes: 0,
             selected_persisted_log_file: None,
             persisted_logs_snapshot: PersistedLogsSnapshot::default(),
             last_persisted_logs_refresh: Instant::now() - Duration::from_secs(60),
@@ -2002,7 +1881,6 @@ impl App {
             RightTab::Proxies => "Proxies",
             RightTab::Daemon => "Daemon",
             RightTab::Dbus => "Dbus",
-            RightTab::Logs => "Logs",
             RightTab::Actions => "Actions",
             RightTab::Processes => "Processes",
             RightTab::Traffic => "Traffic",
@@ -2095,6 +1973,96 @@ impl App {
             );
         }
         ui.small("This mode does not modify persisted configuration, runtime state, or commands sent to containers.");
+
+        ui.add_space(18.0);
+        section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Namespaces");
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if Self::refresh_button(ui, "Refresh namespace view").clicked() {
+                            self.supervisor
+                                .send(SupervisorCommand::RefreshNamespaces);
+                        }
+                    },
+                );
+            });
+            ui.add_space(3.0);
+            ui.small("Namespace IDs for the UI and the selected container.");
+
+            if let Some(warning) = &self.snapshot.namespace_warning {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    Color32::from_rgb(220, 170, 70),
+                    RichText::new(warning).small(),
+                );
+            }
+
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                render_namespace_indicator_row(
+                    ui,
+                    "UI",
+                    Some(std::process::id() as i32),
+                    Some(&self.snapshot.ui_ns),
+                    Color32::from_rgb(100, 150, 240),
+                );
+            });
+
+            if let Some(profile_name) = &self.selected_profile {
+                if let Some(profile_snapshot) = self.snapshot.profiles.get(profile_name) {
+                    let up_pid = profile_snapshot
+                        .ns_alive
+                        .as_ref()
+                        .and_then(|ns| ns.up_pid)
+                        .map(|pid| pid as i32);
+                    let child_pid = profile_snapshot
+                        .ns_alive
+                        .as_ref()
+                        .and_then(|ns| ns.child_pid)
+                        .map(|pid| pid as i32);
+
+                    if let Some(pid) = up_pid {
+                        ui.add_space(6.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            render_namespace_indicator_row(
+                                ui,
+                                "up",
+                                Some(pid),
+                                profile_snapshot.up_ns.as_ref(),
+                                Color32::from_rgb(120, 200, 140),
+                            );
+                        });
+                    }
+                    if let Some(pid) = child_pid {
+                        ui.add_space(6.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            render_namespace_indicator_row(
+                                ui,
+                                "keeper",
+                                Some(pid),
+                                profile_snapshot.keeper_ns.as_ref(),
+                                Color32::from_rgb(220, 180, 90),
+                            );
+                        });
+                    }
+                    if up_pid.is_none() && child_pid.is_none() {
+                        ui.add_space(8.0);
+                        ui.colored_label(
+                            Color32::GRAY,
+                            "Selected profile has no live pid yet",
+                        );
+                    }
+                }
+            } else {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    Color32::GRAY,
+                    "Select a profile to compare its namespace state",
+                );
+            }
+        });
     }
 
     fn is_valid_path(path: &str) -> bool {
@@ -2380,7 +2348,7 @@ impl App {
         // The proxy selector updates the running serve process immediately.
         // Preserve that newer route when saving unrelated HotConfig edits.
         if let Some(route) = self.live_route_for_profile(&profile_name) {
-            self.hotconfig_editor_value.route = route;
+            self.hotconfig_editor_value.default_route = route;
             self.hotconfig_editor_json = serde_json::to_string_pretty(&self.hotconfig_editor_value)
                 .unwrap_or_else(|_| "{}".to_string());
         }
@@ -2566,6 +2534,15 @@ impl App {
     }
 
     fn render_optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<String>) -> bool {
+        Self::render_optional_text_with_width(ui, label, value, ui.available_width())
+    }
+
+    fn render_optional_text_with_width(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &mut Option<String>,
+        width: f32,
+    ) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             let mut enabled = value.is_some();
@@ -2579,8 +2556,12 @@ impl App {
                 }
             }
             if let Some(text) = value.as_mut() {
+                let width = width.min(ui.available_width().max(0.0));
                 if ui
-                    .add(egui::TextEdit::singleline(text).desired_width(ui.available_width()))
+                    .add_sized(
+                        egui::vec2(width, ui.spacing().interact_size.y),
+                        egui::TextEdit::singleline(text),
+                    )
                     .changed()
                 {
                     changed = true;
@@ -3785,7 +3766,14 @@ impl App {
                         .size(11.0),
                 );
                 if ui
-                    .add(egui::TextEdit::singleline(arg).desired_width(ui.available_width() - 44.0))
+                    .add_sized(
+                        egui::vec2(
+                            (ui.available_width() - 24.0)
+                                .clamp(0.0, SPAWN_ARGS_TEXT_WIDTH),
+                            ui.spacing().interact_size.y,
+                        ),
+                        egui::TextEdit::singleline(arg),
+                    )
                     .changed()
                 {
                     changed = true;
@@ -3909,36 +3897,37 @@ impl App {
                 .unwrap_or(false);
 
             ui.add_space(6.0);
-            egui::Grid::new((id_prefix, "spawn-options-grid"))
-                .num_columns(2)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    if Self::render_optional_u32(
-                        ui,
-                        int_input,
-                        "uid",
-                        &mut args.uid,
-                        uid_gid_value_changed,
-                    ) {
-                        changed = true;
-                    }
-                    ui.end_row();
-                    if Self::render_optional_u32(
-                        ui,
-                        int_input,
-                        "gid",
-                        &mut args.gid,
-                        uid_gid_value_changed,
-                    ) {
-                        changed = true;
-                    }
-                    ui.end_row();
-                    if Self::render_optional_text(ui, "exec", &mut args.exec) {
-                        changed = true;
-                    }
-                    ui.end_row();
-                });
+            ui.weak("Identity");
+            if Self::render_optional_u32(
+                ui,
+                int_input,
+                "uid",
+                &mut args.uid,
+                uid_gid_value_changed,
+            ) {
+                changed = true;
+            }
+            if Self::render_optional_u32(
+                ui,
+                int_input,
+                "gid",
+                &mut args.gid,
+                uid_gid_value_changed,
+            ) {
+                changed = true;
+            }
+            if Self::render_optional_text_with_width(
+                ui,
+                "exec",
+                &mut args.exec,
+                SPAWN_ARGS_TEXT_WIDTH,
+            ) {
+                changed = true;
+            }
 
+            ui.add_space(6.0);
+            ui.separator();
+            ui.weak("Execution context");
             let mut cwd_text = args
                 .cwd
                 .as_ref()
@@ -3956,9 +3945,20 @@ impl App {
                         args.cwd = None;
                     }
                 }
-                if enabled && ui.text_edit_singleline(&mut cwd_text).changed() {
-                    args.cwd = Some(std::path::PathBuf::from(cwd_text.clone()));
-                    changed = true;
+                if enabled {
+                    if ui
+                        .add_sized(
+                            egui::vec2(
+                                SPAWN_ARGS_TEXT_WIDTH.min(ui.available_width().max(0.0)),
+                                ui.spacing().interact_size.y,
+                            ),
+                            egui::TextEdit::singleline(&mut cwd_text)
+                        )
+                        .changed()
+                    {
+                        args.cwd = Some(std::path::PathBuf::from(cwd_text.clone()));
+                        changed = true;
+                    }
                 }
             });
 
@@ -3971,10 +3971,13 @@ impl App {
             ui.horizontal(|ui| {
                 ui.weak("gids");
                 if ui
-                    .add(
+                    .add_sized(
+                        egui::vec2(
+                            SPAWN_ARGS_TEXT_WIDTH.min(ui.available_width().max(0.0)),
+                            ui.spacing().interact_size.y,
+                        ),
                         egui::TextEdit::singleline(&mut gids_csv)
-                            .hint_text("comma-separated, e.g. 10,104")
-                            .desired_width(180.0),
+                            .hint_text("comma-separated, e.g. 10,104"),
                     )
                     .changed()
                 {
@@ -4706,19 +4709,6 @@ impl eframe::App for App {
         {
             self.selected_persisted_log_file = None;
         }
-        if self.right_tab == RightTab::Logs && self.selected_persisted_log_file.is_none() {
-            self.selected_persisted_log_file = self
-                .persisted_logs_snapshot
-                .files
-                .first()
-                .map(|file| file.path.clone());
-        }
-        if self.should_refresh_persisted_logs()
-            && self.last_persisted_logs_refresh.elapsed() >= Duration::from_secs(2)
-        {
-            self.request_persisted_logs_refresh();
-        }
-
         // Update snapshot from supervisor (single source of truth)
         let mut drained_snapshots = 0usize;
         while let Some(snapshot) = self.supervisor.try_recv_snapshot() {
@@ -4734,7 +4724,8 @@ impl eframe::App for App {
 
             let current_seq = self.process_log_editor_next_seq.unwrap_or_default();
             if update.reset {
-                self.process_log_editor_text.clear();
+                self.process_log_rows.clear();
+                self.process_log_rows_bytes = 0;
             }
             let first_new = if update.reset {
                 0
@@ -4742,7 +4733,21 @@ impl eframe::App for App {
                 current_seq.saturating_sub(update.start_seq) as usize
             };
             for entry in update.logs.into_iter().skip(first_new) {
-                self.process_log_editor_text.append_line(&entry.content);
+                let content = entry.content.trim_end_matches(['\r', '\n']);
+                let mut line_start = content.len().saturating_sub(PROCESS_LOG_VIEWER_MAX_BYTES);
+                while !content.is_char_boundary(line_start) {
+                    line_start += 1;
+                }
+                let line = content[line_start..].to_string();
+                self.process_log_rows_bytes += line.len();
+                self.process_log_rows.push_back(line);
+                while self.process_log_rows_bytes > PROCESS_LOG_VIEWER_MAX_BYTES {
+                    let Some(removed) = self.process_log_rows.pop_front() else {
+                        break;
+                    };
+                    self.process_log_rows_bytes =
+                        self.process_log_rows_bytes.saturating_sub(removed.len());
+                }
             }
             self.process_log_editor_next_seq = Some(update.next_seq);
         }
@@ -4907,102 +4912,6 @@ impl eframe::App for App {
                     }
                 }
 
-                ui.add_space(6.0);
-
-                egui::Frame::NONE.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.heading("Namespaces");
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                            ui.add_space(5.);
-                                        if Self::refresh_button(ui, "Refresh namespace view")
-                                            .clicked()
-                                        {
-                                            self.supervisor
-                                                .send(SupervisorCommand::RefreshNamespaces);
-                            }
-                                    },
-                                );
-                    });
-
-                    ui.add_space(4.0);
-
-                    if let Some(warning) = &self.snapshot.namespace_warning {
-                        ui.label(
-                            egui::RichText::new(warning)
-                                .small()
-                                .color(Color32::from_rgb(220, 170, 70)),
-                        );
-                        ui.add_space(4.0);
-                    }
-
-                    render_namespace_indicator_row(
-                        ui,
-                        "UI",
-                        Some(std::process::id() as i32),
-                        Some(&self.snapshot.ui_ns),
-                        Color32::from_rgb(100, 150, 240),
-                    );
-
-                    if let Some(profile_name) = &self.selected_profile {
-                                if let Some(profile_snapshot) =
-                                    self.snapshot.profiles.get(profile_name)
-                                {
-                            let up_pid = profile_snapshot
-                                .ns_alive
-                                .as_ref()
-                                .and_then(|ns| ns.up_pid)
-                                .map(|p| p as i32);
-                            let child_pid = profile_snapshot
-                                .ns_alive
-                                .as_ref()
-                                .and_then(|ns| ns.child_pid)
-                                .map(|p| p as i32);
-
-                            if let Some(pid) = up_pid {
-                                ui.add_space(4.0);
-                                render_namespace_indicator_row(
-                                    ui,
-                                    "up",
-                                    Some(pid),
-                                    profile_snapshot.up_ns.as_ref(),
-                                    Color32::from_rgb(120, 200, 140),
-                                );
-                            }
-                            if let Some(pid) = child_pid {
-                                ui.add_space(4.0);
-                                render_namespace_indicator_row(
-                                    ui,
-                                    "keeper",
-                                    Some(pid),
-                                    profile_snapshot.keeper_ns.as_ref(),
-                                    Color32::from_rgb(220, 180, 90),
-                                );
-                            }
-                            if up_pid.is_none() && child_pid.is_none() {
-                                ui.label(
-                                            egui::RichText::new(
-                                                "Selected profile has no live pid yet",
-                                            )
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
-                            }
-                        }
-                    } else {
-                        ui.label(
-                                    egui::RichText::new(
-                                        "Select a profile to compare its namespace state",
-                                    )
-                                .small()
-                                .color(Color32::GRAY),
-                        );
-                    }
-                });
-
-                // minimal dev-only frame info intentionally omitted here
             });
             });
 
@@ -5054,12 +4963,6 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.right_tab = RightTab::Dbus;
-                    }
-                    if ui
-                        .selectable_label(self.right_tab == RightTab::Logs, "Logs")
-                        .clicked()
-                    {
-                        self.right_tab = RightTab::Logs;
                     }
                     if ui
                         .selectable_label(self.right_tab == RightTab::Actions, "Actions")
@@ -5171,7 +5074,6 @@ impl eframe::App for App {
                         RightTab::Proxies => self.render_proxies_tab(ui),
                         RightTab::Daemon => self.render_daemon_tab(ui),
                         RightTab::Dbus => self.render_dbus_tab(ui),
-                        RightTab::Logs => self.render_logs_tab(ui),
                         RightTab::Actions => self.render_actions_tab(ui),
                         RightTab::Processes => self.render_processes_tab(ui),
                         RightTab::Traffic => self.render_traffic_tab(ui),
@@ -6436,9 +6338,12 @@ impl App {
                 );
             });
         open_editor.then(|| {
-            let mut text = ProcessLogTextBuffer::default();
+            let mut text = String::new();
             for entry in entries {
-                text.append_line(&format!(
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!(
                     "{} {} [{}] {}",
                     match entry.entry.src {
                         LogSource::Serve => "serve",
@@ -6452,10 +6357,10 @@ impl App {
                     entry.entry.log.message,
                 ));
                 for field in &entry.entry.log.fields {
-                    text.append_line(&format!("{}={}", field.name, field.value));
+                    text.push_str(&format!("\n{}={}", field.name, field.value));
                 }
             }
-            text.visible_text().to_string()
+            text
         })
     }
 
@@ -7840,7 +7745,8 @@ impl App {
         if self.process_log_editor_target.as_ref() != Some(&target) {
             self.process_log_editor_target = Some(target);
             self.process_log_editor_next_seq = None;
-            self.process_log_editor_text.clear();
+            self.process_log_rows.clear();
+            self.process_log_rows_bytes = 0;
             self.request_process_logs(&profile, slot_pid);
         }
         ui.add_space(8.0);
@@ -7864,24 +7770,24 @@ impl App {
         });
 
         egui::Frame::NONE
-            .fill(Color32::from_gray(15))
+            .fill(LOG_EDITOR_BACKGROUND)
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.set_min_size(egui::vec2(ui.available_width(), 400.0));
-                let editor_width = ui.available_width();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(editor_width, 388.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_height(388.0);
-                        let mut editor = CodeEditor::default()
-                            .id_source(format!("raw_logs_editor_{}_{}", profile, slot_pid))
-                            .with_rows(1)
-                            .with_theme(ColorTheme::GRUVBOX)
-                            .with_numlines(false)
-                            .with_ui_fontsize(ui)
-                            .stick_to_bottom(true);
-                        let _ = editor.show(ui, &mut self.process_log_editor_text, &Syntax::new("text"));
+                if self.process_log_rows.is_empty() {
+                    ui.colored_label(Color32::from_gray(110), "no output yet");
+                    return;
+                }
+                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                egui_log_viewer::LogViewer::show_rows(
+                    ui,
+                    ("process_raw_logs", &profile, slot_pid),
+                    &self.process_log_rows,
+                    row_h,
+                    388.0,
+                    |line| line.clone(),
+                    |ui, _row_index, line, _selected| {
+                        ui.label(egui_sgr::ansi_to_layout_job(line, log_ansi_theme()));
                     },
                 );
             });
@@ -8281,11 +8187,42 @@ impl App {
                     .add_enabled(diag_connected, egui::Button::new("Route"))
                     .clicked()
                 {
+                    let key = match &metric.key.target {
+                        nsproxy_common::routing::WireAddress::SocketAddress(address) => {
+                            nsproxy_common::routing::RoutingKey::Addr(
+                                nsproxy_common::routing::TargetKey::for_final_destination(*address),
+                            )
+                        }
+                        nsproxy_common::routing::WireAddress::DomainAddress(host, port) => {
+                            nsproxy_common::routing::RoutingKey::host(host, Some(*port))
+                        }
+                    };
+                    let decision = match selected_route {
+                        nsproxy_common::stats::ObservedRoute::NoProxy => {
+                            match &metric.key.target {
+                                nsproxy_common::routing::WireAddress::SocketAddress(address) => {
+                                    nsproxy_common::routing::RoutingResovled::NoProxy(*address)
+                                }
+                                nsproxy_common::routing::WireAddress::DomainAddress(host, port) => {
+                                    nsproxy_common::routing::RoutingResovled::NoProxyDomain {
+                                        host: host.clone(),
+                                        port: *port,
+                                    }
+                                }
+                            }
+                        }
+                        nsproxy_common::stats::ObservedRoute::Proxy(proxy_id) => {
+                            nsproxy_common::routing::RoutingResovled::ProxyResovled {
+                                target: metric.key.target.clone(),
+                                id: proxy_id.clone(),
+                            }
+                        }
+                    };
                     supervisor.send(SupervisorCommand::Ctrl {
                         profile: profile_name.to_string(),
                         cmd: diag::ControlCommand::SetHostRoute {
-                            host: host.clone(),
-                            target: selected_route.clone(),
+                            key,
+                            decision,
                         },
                     });
                 }
@@ -9050,22 +8987,12 @@ impl App {
                 });
         };
 
-        if !profile.active_conn_ids.is_empty() {
-            ui.label(egui::RichText::new("Active").strong());
+        if !profile.recent_conn_ids.is_empty() {
+            ui.label(egui::RichText::new("Recent connections").strong());
             render_conn_table(
                 ui,
-                format!("conns_active_{}", profile_name),
-                &profile.active_conn_ids,
-            );
-            ui.add_space(4.0);
-        }
-
-        if !profile.finished_conn_ids.is_empty() {
-            ui.label(egui::RichText::new("Recently Finished").strong());
-            render_conn_table(
-                ui,
-                format!("conns_finished_{}", profile_name),
-                &profile.finished_conn_ids,
+                format!("conns_recent_{}", profile_name),
+                &profile.recent_conn_ids,
             );
         }
 
@@ -9658,7 +9585,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default();
                             if let Some(route) = self.live_route_for_profile(&src) {
-                                hot.route = route;
+                                hot.default_route = route;
                             }
                             self.manage_wizard.template.hot_init = Some(hot.clone());
                             self.manage_wizard.hot = hot;
@@ -9911,7 +9838,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         );
         ui.add_space(8.0);
 
-        let current_route = self.manage_wizard.hot.route.clone();
+        let current_route = self.manage_wizard.hot.default_route.clone();
         let mut new_route = current_route.clone();
 
         ui.strong("Proxy groups");
@@ -9963,7 +9890,7 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         }
 
         if new_route != current_route {
-            self.manage_wizard.hot.route = new_route;
+            self.manage_wizard.hot.default_route = new_route;
             self.manage_wizard.template.hot_init = Some(self.manage_wizard.hot.clone());
             self.manage_wizard.hot_json =
                 serde_json::to_string_pretty(&self.manage_wizard.hot).unwrap_or_default();
@@ -10118,8 +10045,8 @@ Pivot-enabled containers have URL opening handled right within the container, wh
                                     self.manage_wizard.hot.resolv_conf_dns =
                                         imported.resolv_conf_dns;
                                 }
-                                if !matches!(imported.route, nsproxy_core::HotRoute::None) {
-                                    self.manage_wizard.hot.route = imported.route;
+                                if !matches!(imported.default_route, nsproxy_core::HotRoute::None) {
+                                    self.manage_wizard.hot.default_route = imported.default_route;
                                 }
                                 self.manage_wizard.hot_json =
                                     serde_json::to_string_pretty(&self.manage_wizard.hot)
@@ -13164,7 +13091,10 @@ fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
 }
 
 fn run_manual_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "nsproxy - dashboard",
         native_options,

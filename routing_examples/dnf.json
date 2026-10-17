@@ -1,0 +1,100 @@
+{
+  "default_route": "NoProxy",
+  "route_map": [
+    [
+      {
+        "Host": [
+          "packages.redhat.com.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "packages.redhat.com.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ],
+    [
+      {
+        "Host": [
+          "repo.librewolf.net.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "repo.librewolf.net.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ],
+    [
+      {
+        "Host": [
+          "dl.google.com.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "dl.google.com.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ],
+    [
+      {
+        "Host": [
+          "downloads.cursor.com.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "downloads.cursor.com.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ],
+    [
+      {
+        "Host": [
+          "mirrors.rpmfusion.org.",
+          443
+        ]
+      },
+      {
+        "ProxyResovled": {
+          "target": {
+            "DomainAddress": [
+              "mirrors.rpmfusion.org.",
+              443
+            ]
+          },
+          "id": "bdcbc740ed49dfa6b15e9758cf5cc164e2d812fcab9e054b98809eb6ed63240d"
+        }
+      }
+    ]
+  ]
+}

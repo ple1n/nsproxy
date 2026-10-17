@@ -256,11 +256,9 @@ pub struct ContainerState {
     pub host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
     #[serde(skip)]
     pub recent_host_routes: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
-    /// Render-ready newest-first indexes for the connection tables.
+    /// Render-ready newest-first index of all retained connections.
     #[serde(skip)]
-    pub active_conn_ids: Vec<diag::ConnId>,
-    #[serde(skip)]
-    pub finished_conn_ids: Vec<diag::ConnId>,
+    pub recent_conn_ids: Vec<diag::ConnId>,
     /// Raw PTY bytes received since the previous snapshot, keyed by slot PID.
     #[serde(skip)]
     pub pty_streams: HashMap<u32, Vec<u8>>,
@@ -1506,7 +1504,7 @@ impl Supervisor {
             return;
         };
 
-        hotconfig.route = match (
+        hotconfig.default_route = match (
             &routing.selected_proxy,
             &routing.selected_group,
             routing.no_proxy,
@@ -3863,15 +3861,8 @@ impl Supervisor {
                     } else {
                         Arc::new(Vec::new())
                     },
-                    active_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
-                        diag.map(|d| connection_ids(&d.conns_state, false))
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    },
-                    finished_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
-                        diag.map(|d| connection_ids(&d.conns_state, true))
-                            .unwrap_or_default()
+                    recent_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
+                        diag.map(|d| connection_ids(&d.conns_state)).unwrap_or_default()
                     } else {
                         Vec::new()
                     },
@@ -4993,13 +4984,51 @@ fn daemon_key(profile: &ContainerName, args: &ShellArgs) -> String {
     format!("{}:{:x}", profile, hasher.finish())
 }
 
-fn connection_ids(state: &diag::ConnsState, finished: bool) -> Vec<diag::ConnId> {
+fn connection_ids(state: &diag::ConnsState) -> Vec<diag::ConnId> {
     state
         .conns
         .iter()
         .rev()
-        .filter_map(|(id, entry)| (entry.finished_at.is_some() == finished).then_some(*id))
+        .map(|(id, _)| *id)
         .collect()
+}
+
+#[cfg(test)]
+mod traffic_connection_tests {
+    use super::connection_ids;
+
+    #[test]
+    fn recent_connections_include_accepted_and_finished_entries_newest_first() {
+        let mut state = diag::ConnsState::default();
+        let destination = "127.0.0.1:443".parse().unwrap();
+        for (id, finished_at) in [(1, None), (2, Some(diag::Timestamp(2)))] {
+            state.conns.insert(
+                diag::ConnId(id),
+                std::sync::Arc::new(diag::ConnEntry {
+                    dst: nsproxy_common::routing::WireAddress::SocketAddress(destination),
+                    route: None,
+                    phase: if finished_at.is_some() {
+                        diag::ConnPhase::Finished
+                    } else {
+                        diag::ConnPhase::Accepted
+                    },
+                    history: Vec::new(),
+                    history_truncated: false,
+                    accepted_at: diag::Timestamp(1),
+                    connected_at: None,
+                    finished_at,
+                    error: None,
+                    bytes_up: None,
+                    bytes_down: None,
+                }),
+            );
+        }
+
+        assert_eq!(
+            connection_ids(&state),
+            vec![diag::ConnId(2), diag::ConnId(1)]
+        );
+    }
 }
 
 fn sort_host_route_metrics(metrics: &mut Vec<nsproxy_common::stats::HostRouteMetric>) {

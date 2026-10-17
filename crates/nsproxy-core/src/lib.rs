@@ -4,7 +4,7 @@
 #![feature(ip_as_octets)]
 #![feature(setgroups)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{File, create_dir_all};
 use std::io::Write;
@@ -65,6 +65,7 @@ pub mod hot_reload;
 pub mod internal_dns;
 pub mod personal;
 pub mod prelude;
+pub mod route_map;
 pub mod sandbox;
 pub mod shell;
 pub mod state_blueprint;
@@ -198,20 +199,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old_config.diag_conn_persist_secs, 300);
-        assert!(old_config.host_routes.is_empty());
+        assert!(old_config.route_map.is_empty());
     }
 
     #[test]
-    fn hotconfig_persists_host_wide_route_overrides() {
+    fn hotconfig_persists_host_route_map() {
         let mut config = HotConfig::default();
-        config.host_routes.push(HostRouteRule {
-            host: nsproxy_common::stats::HostRouteHost::domain("Example.COM."),
-            target: nsproxy_common::stats::ObservedRoute::NoProxy,
-        });
+        config.route_map.insert(
+            nsproxy_common::routing::RoutingKey::host("Example.COM.", Some(443)),
+            nsproxy_common::routing::RoutingResovled::NoProxyDomain {
+                host: "example.com.".to_string(),
+                port: 443,
+            },
+        );
 
         let encoded = serde_json::to_string(&config).unwrap();
+        assert!(encoded.contains(r#""example.com.""#));
         let decoded: HotConfig = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.host_routes, config.host_routes);
+        assert_eq!(decoded.route_map, config.route_map);
+    }
+
+    #[test]
+    fn hotconfig_rejects_route_keys_that_collide_after_domain_normalization() {
+        let mut json = serde_json::to_value(HotConfig::default()).unwrap();
+        json["route_map"] = serde_json::json!([
+            [
+                { "Host": ["Example.COM", 443] },
+                { "NoProxyDomain": { "host": "example.com", "port": 443 } }
+            ],
+            [
+                { "Host": ["example.com.", 443] },
+                { "NoProxyDomain": { "host": "example.com.", "port": 443 } }
+            ]
+        ]);
+
+        assert!(serde_json::from_value::<HotConfig>(json).is_err());
+    }
+
+    #[test]
+    fn route_cli_parses_apply_create_and_export() {
+        use clap::Parser;
+
+        let apply = Cli::try_parse_from([
+            "sp",
+            "route",
+            "routes.json",
+            "--apply-to",
+            "plein",
+            "--replace",
+        ])
+        .unwrap();
+        assert!(matches!(
+            apply.cmd,
+            MainCommand::Route {
+                args: RouteArgs {
+                    apply_to: Some(ref profile),
+                    replace: true,
+                    ..
+                },
+                ..
+            } if profile == "plein"
+        ));
+
+        let create = Cli::try_parse_from([
+            "sp",
+            "route",
+            "routes.json",
+            "--make-container",
+            "route-test",
+            "sh",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.cmd,
+            MainCommand::Route {
+                args: RouteArgs {
+                    make_container: Some(ref profile),
+                    ..
+                },
+                ..
+            } if profile == "route-test"
+        ));
+
+        let export = Cli::try_parse_from([
+            "sp",
+            "route",
+            "export",
+            "plein",
+            "routes.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            export.cmd,
+            MainCommand::Route {
+                cmd: Some(RouteCommand::Export { ref container, .. }),
+                ..
+            } if container == "plein"
+        ));
     }
 
     #[test]
@@ -257,46 +341,32 @@ mod tests {
     }
 
     #[test]
-    fn routing_prefs_serialize_symbols_and_routes() {
-        let prefs = RoutingPrefs {
-            symbols: vec![
-                RoutingSymbol {
-                    name: "direct".to_string(),
-                    comment: Some("Direct connection".to_string()),
-                },
-                RoutingSymbol {
-                    name: "alternate".to_string(),
-                    comment: Some("Alternate route".to_string()),
-                },
-            ],
-            routes: vec![
-                RoutingPrefRule {
-                    destination: None,
-                    symbol: "direct".to_string(),
-                },
-                RoutingPrefRule {
-                    destination: Some(RoutingDestination::DomainAddress(
-                        "huggingface.co".to_string(),
-                        443,
-                    )),
-                    symbol: "alternate".to_string(),
-                },
-            ],
+    fn route_prefs_serialize_default_and_concrete_route_map() {
+        let mut route_map = BTreeMap::new();
+        route_map.insert(
+            nsproxy_common::routing::RoutingKey::host("huggingface.co", Some(443)),
+            nsproxy_common::routing::RoutingResovled::NoProxyDomain {
+                host: "huggingface.co.".to_string(),
+                port: 443,
+            },
+        );
+        let prefs = RoutePrefs {
+            default_route: HotRoute::NoProxy,
+            route_map,
         };
         let encoded = serde_json::to_string(&prefs).unwrap();
-        assert_eq!(
-            encoded,
-            r#"{"symbols":[{"name":"direct","comment":"Direct connection"},{"name":"alternate","comment":"Alternate route"}],"routes":[{"symbol":"direct"},{"destination":{"DomainAddress":["huggingface.co",443]},"symbol":"alternate"}]}"#
-        );
-        let decoded: RoutingPrefs = serde_json::from_str(&encoded).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["default_route"], "NoProxy");
+        assert!(value["route_map"].is_array());
+        let decoded: RoutePrefs = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, prefs);
     }
 
     #[test]
-    fn routing_prefs_default_to_empty_symbol_and_route_lists() {
-        let prefs = RoutingPrefs::default();
-        assert!(prefs.symbols.is_empty());
-        assert!(prefs.routes.is_empty());
+    fn route_prefs_default_contains_both_hotconfig_fields() {
+        let prefs = RoutePrefs::default();
+        assert_eq!(prefs.default_route, HotRoute::None);
+        assert!(prefs.route_map.is_empty());
     }
 
     /// Verify that the no_dns_capture sentinel ("0.0.0.0/32") matches no real IP.
@@ -404,8 +474,8 @@ mod tests {
                 locals: HashMap::new(),
                 dns_capture: Default::default(),
                 resolv_conf_dns: default_resolv_conf_dns(),
-                route: HotRoute::None,
-                host_routes: Vec::new(),
+                default_route: HotRoute::None,
+                route_map: BTreeMap::new(),
                 mounts: Vec::new(),
                 daemons: Vec::new(),
                 applications: Vec::new(),
@@ -1126,56 +1196,15 @@ pub enum HotRoute {
 
 impl HotRoute {}
 
-/// A named variable used by routing preference rules.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct RoutingSymbol {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-/// A final destination matched by a workflow route rule.
-///
-/// Unlike an ingress IP, this identifies the resolved destination endpoint,
-/// including its port.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum RoutingDestination {
-    SocketAddress(SocketAddr),
-    DomainAddress(String, u16),
-}
-
-impl From<socks5_impl::protocol::WireAddress> for RoutingDestination {
-    fn from(address: socks5_impl::protocol::WireAddress) -> Self {
-        match address {
-            socks5_impl::protocol::WireAddress::SocketAddress(address) => Self::SocketAddress(address),
-            socks5_impl::protocol::WireAddress::DomainAddress(host, port) => {
-                Self::DomainAddress(host, port)
-            }
-        }
-    }
-}
-
-/// A routing rule targeting a symbol by name. `destination: None` is the default route.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct RoutingPrefRule {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<RoutingDestination>,
-    pub symbol: String,
-}
-
-/// Reusable higher-order routing preferences over named symbols.
+/// Transferable subset of `HotConfig` that controls routing.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-pub struct RoutingPrefs {
-    #[serde(default)]
-    pub symbols: Vec<RoutingSymbol>,
-    #[serde(default)]
-    pub routes: Vec<RoutingPrefRule>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct HostRouteRule {
-    pub host: nsproxy_common::stats::HostRouteHost,
-    pub target: nsproxy_common::stats::ObservedRoute,
+pub struct RoutePrefs {
+    pub default_route: HotRoute,
+    #[serde(with = "route_map_serde")]
+    pub route_map: BTreeMap<
+        nsproxy_common::routing::RoutingKey,
+        nsproxy_common::routing::RoutingResovled,
+    >,
 }
 
 /// An application that can be launched on demand from a profile's Actions UI.
@@ -1221,10 +1250,14 @@ pub struct HotConfig {
     pub resolv_conf_dns: String,
     /// Persisted live routing selection for the running serve process.
     #[serde(default)]
-    pub route: HotRoute,
-    /// Per-host routing overrides applied before the profile-wide route.
-    #[serde(default)]
-    pub host_routes: Vec<HostRouteRule>,
+    pub default_route: HotRoute,
+    /// Per-host routing decisions applied before the profile-wide route.
+    /// Host keys and domain targets use lowercase fully-qualified DNS names.
+    #[serde(default, with = "route_map_serde")]
+    pub route_map: BTreeMap<
+        nsproxy_common::routing::RoutingKey,
+        nsproxy_common::routing::RoutingResovled,
+    >,
     /// Mnt but with full parameters
     #[serde(default)]
     pub mounts: Vec<ProfileMount>,
@@ -1254,14 +1287,62 @@ impl Default for HotConfig {
             locals: HashMap::new(),
             dns_capture: HashSet::new(),
             resolv_conf_dns: String::new(),
-            route: HotRoute::default(),
-            host_routes: Vec::new(),
+            default_route: HotRoute::default(),
+            route_map: BTreeMap::new(),
             mounts: Vec::new(),
             daemons: Vec::new(),
             applications: Vec::new(),
             veth: Vec::new(),
             diag_conn_persist_secs: default_diag_conn_persist_secs(),
         }
+    }
+}
+
+mod route_map_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S>(
+        route_map: &BTreeMap<
+            nsproxy_common::routing::RoutingKey,
+            nsproxy_common::routing::RoutingResovled,
+        >,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut route_map = route_map.clone();
+        nsproxy_common::routing::normalize_route_map_domains(&mut route_map)
+            .map_err(serde::ser::Error::custom)?;
+        route_map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<
+        BTreeMap<
+            nsproxy_common::routing::RoutingKey,
+            nsproxy_common::routing::RoutingResovled,
+        >,
+        D::Error,
+    >
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<(
+            nsproxy_common::routing::RoutingKey,
+            nsproxy_common::routing::RoutingResovled,
+        )>::deserialize(deserializer)?;
+        let mut route_map = BTreeMap::new();
+        for (key, decision) in entries {
+            if route_map.insert(key, decision).is_some() {
+                return Err(D::Error::custom("duplicate routing key"));
+            }
+        }
+        nsproxy_common::routing::normalize_route_map_domains(&mut route_map)
+            .map_err(D::Error::custom)?;
+        Ok(route_map)
     }
 }
 
@@ -1441,6 +1522,8 @@ impl HotConfig {
 
     /// Normalize and persist this configuration as one atomic file replacement.
     pub fn process_and_save(&mut self, path: &Path) -> Result<()> {
+        nsproxy_common::routing::normalize_route_map_domains(&mut self.route_map)
+            .map_err(anyhow::Error::msg)?;
         self.process();
         let json = serde_json::to_vec_pretty(self)?;
         write_file_atomic(path, &json)
@@ -1650,7 +1733,10 @@ impl HotConfig {
 
     /// Serialize and persist this config to `path`.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_vec_pretty(self)?;
+        let mut normalized = self.clone();
+        nsproxy_common::routing::normalize_route_map_domains(&mut normalized.route_map)
+            .map_err(anyhow::Error::msg)?;
+        let json = serde_json::to_vec_pretty(&normalized)?;
         write_file_atomic(path, &json)
     }
 }
@@ -2787,6 +2873,64 @@ pub enum MainCommand {
         #[command(flatten)]
         sargs: ShellArgs,
     },
+    /// Apply, create with, or export concrete route preferences.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        override_usage = "sp route <ROUTE_PREFS_FILE> --make-container <NAME> [OPTIONS] [ENTER_ARGS]...\n       \
+sp route <ROUTE_PREFS_FILE> --apply-to <CONTAINER> [--replace]\n       \
+sp route export <CONTAINER> <DESTINATION>"
+    )]
+    Route {
+        #[command(subcommand)]
+        cmd: Option<RouteCommand>,
+        #[command(flatten)]
+        args: RouteArgs,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RouteCommand {
+    /// Export a container's concrete route preferences.
+    Export {
+        /// Source container
+        container: String,
+        /// Destination file, or a directory to write `<CONTAINER>.json` into
+        destination: PathBuf,
+        /// Overwrite an existing destination file
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[command(group(
+    clap::ArgGroup::new("route_target")
+        .args(["make_container", "apply_to"])
+        .required(true)
+))]
+pub struct RouteArgs {
+    /// Standalone route preferences JSON file
+    #[arg(value_name = "ROUTE_PREFS_FILE", required = true)]
+    pub file: Option<PathBuf>,
+    /// Create a new container with this route map and enter it
+    #[arg(long, value_name = "NAME")]
+    pub make_container: Option<String>,
+    /// Apply this route map to an existing container
+    #[arg(long, value_name = "CONTAINER", conflicts_with = "EnterArgs")]
+    pub apply_to: Option<String>,
+    /// Create the container from this profile template instead of the default Overlay template
+    #[arg(long, conflicts_with = "apply_to")]
+    pub template: Option<PathBuf>,
+    /// Tear down and remove the container after the entered command exits
+    #[arg(long, conflicts_with = "apply_to")]
+    pub destroy: bool,
+    /// Replace the container's route map instead of merging into it
+    #[arg(long, conflicts_with = "make_container")]
+    pub replace: bool,
+    /// `sp enter` arguments for the new container, including the command
+    #[command(flatten)]
+    pub enter: Option<EnterArgs>,
 }
 
 pub const DEFAULT_HISTORY_LISTEN: &str = "0.0.0.0:17890";
