@@ -1639,9 +1639,13 @@ fn main() -> anyhow::Result<()> {
                 loop {
                     let (conn, peer) = server.accept().await?;
                     info!(%proxy_addr, %peer, "accept SOCKS5 client");
-                    tokio::spawn(async {
+                    tokio::spawn(async move {
                         if let Err(err) = handle_socks5_connection(conn).await {
-                            warn!("socks5 connection error: {}", err);
+                            if is_expected_socks5_probe_close(&err) {
+                                info!(%peer, error = %err, "normal SOCKS5 probe disconnect");
+                            } else {
+                                warn!(%peer, error = %err, "SOCKS5 connection error");
+                            }
                         }
                     });
                 }
@@ -5008,6 +5012,17 @@ where
     }
 
     Ok(())
+}
+
+fn is_expected_socks5_probe_close(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::Unsupported
+            )
+        })
+    })
 }
 
 fn socks5_connect_error_reply(error: &std::io::Error) -> socks5_impl::protocol::Reply {

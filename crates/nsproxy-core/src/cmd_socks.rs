@@ -19,6 +19,18 @@ struct SocksResponse {
     address: WireAddress,
 }
 
+#[derive(Clone, Copy)]
+enum SummaryMark {
+    Check,
+    Cross,
+    Skipped,
+}
+
+struct SummaryItem {
+    label: String,
+    mark: SummaryMark,
+}
+
 pub async fn spawn_test_servers() -> Result<SocketAddr> {
     let tcp_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -97,53 +109,122 @@ pub async fn check(
         .map(|target| parse_endpoint(target).with_context(|| format!("invalid UDP echo target '{target}'")))
         .transpose()?;
 
-    println!("SOCKS5 proxy: {proxy}");
     info!(%proxy, "start SOCKS5 check");
+    let mut summary = Vec::new();
     let mut failures = Vec::new();
-    for (method, method_auth) in [(0x00, auth.as_ref()), (0x02, auth.as_ref()), (0x80, None)] {
-        if let Err(error) = probe_auth_method(&proxy, method, method_auth, operation_timeout).await {
-            let message = format!("authentication method {method:#04x}: {error:#}");
-            eprintln!("FAIL {message}");
-            failures.push(message);
+    for (method, method_auth, label) in [
+        (0x00, auth.as_ref(), "No-auth negotiation"),
+        (0x02, auth.as_ref(), "Username/password"),
+        (0x80, None, "Private method 0x80"),
+    ] {
+        match probe_auth_method(&proxy, method, method_auth, operation_timeout).await {
+            Ok(selected) => {
+                let detail = match (method, selected, auth.is_some()) {
+                    (0x02, true, false) => " (credentials not supplied)",
+                    (0x80, true, _) => " selected",
+                    (0x80, false, _) => " rejected",
+                    _ => "",
+                };
+                summary.push(SummaryItem {
+                    label: format!("{label}{detail}"),
+                    mark: if selected || method == 0x80 {
+                        SummaryMark::Check
+                    } else {
+                        SummaryMark::Cross
+                    },
+                });
+            }
+            Err(error) => {
+                let message = format!("authentication method {method:#04x}: {error:#}");
+                failures.push(message);
+                summary.push(SummaryItem {
+                    label: label.to_string(),
+                    mark: SummaryMark::Cross,
+                });
+            }
         }
     }
 
-    for target in connect_targets {
+    for target in &connect_targets {
         match command(&proxy, Command::Connect, target.clone(), auth.as_ref(), operation_timeout).await {
-            Ok((_, response)) => {
-                print_reply("CONNECT", &target, &response);
+            Ok((mut stream, response)) => {
                 if response.reply != Reply::Succeeded {
                     failures.push(format!("CONNECT to {target} failed: {}", response.reply));
+                    summary.push(SummaryItem {
+                        label: format!("CONNECT + TCP echo {target} ({})", response.reply),
+                        mark: SummaryMark::Cross,
+                    });
+                } else if let Err(error) = probe_tcp_echo(&mut stream, operation_timeout).await {
+                    let message = format!("TCP echo through {target}: {error:#}");
+                    failures.push(message);
+                    summary.push(SummaryItem {
+                        label: format!("CONNECT + TCP echo {target}"),
+                        mark: SummaryMark::Cross,
+                    });
+                } else {
+                    summary.push(SummaryItem {
+                        label: format!("CONNECT + TCP echo {target}"),
+                        mark: SummaryMark::Check,
+                    });
                 }
             }
             Err(error) => {
-                let message = format!("CONNECT to {target}: {error:#}");
-                eprintln!("FAIL {message}");
-                failures.push(message);
+                failures.push(format!("CONNECT to {target}: {error:#}"));
+                summary.push(SummaryItem {
+                    label: format!("CONNECT + TCP echo {target}"),
+                    mark: SummaryMark::Cross,
+                });
             }
         }
+    }
+    if connect_targets.is_empty() {
+        summary.push(SummaryItem {
+            label: "CONNECT + TCP echo (no --connect target)".to_string(),
+            mark: SummaryMark::Skipped,
+        });
     }
 
     if bind {
         if let Err(error) = probe_bind(&proxy, auth.as_ref(), operation_timeout).await {
-            let message = format!("BIND: {error:#}");
-            eprintln!("FAIL {message}");
-            failures.push(message);
+            failures.push(format!("BIND: {error:#}"));
+            summary.push(SummaryItem {
+                label: "BIND (two replies + TCP relay)".to_string(),
+                mark: SummaryMark::Cross,
+            });
+        } else {
+            summary.push(SummaryItem {
+                label: "BIND (two replies + TCP relay)".to_string(),
+                mark: SummaryMark::Check,
+            });
         }
     } else {
-        println!("SKIP BIND (pass --bind to exercise it)");
+        summary.push(SummaryItem {
+            label: "BIND (pass --bind to test)".to_string(),
+            mark: SummaryMark::Skipped,
+        });
     }
 
     if let Some(target) = udp_echo_target {
         if let Err(error) = probe_udp(&proxy, target.clone(), auth.as_ref(), operation_timeout).await {
-            let message = format!("UDP ASSOCIATE to {target}: {error:#}");
-            eprintln!("FAIL {message}");
-            failures.push(message);
+            failures.push(format!("UDP ASSOCIATE to {target}: {error:#}"));
+            summary.push(SummaryItem {
+                label: format!("UDP ASSOCIATE + echo {target}"),
+                mark: SummaryMark::Cross,
+            });
+        } else {
+            summary.push(SummaryItem {
+                label: format!("UDP ASSOCIATE + echo {target}"),
+                mark: SummaryMark::Check,
+            });
         }
     } else {
-        println!("SKIP UDP ASSOCIATE (pass --udp-echo-target HOST:PORT)");
+        summary.push(SummaryItem {
+            label: "UDP ASSOCIATE (pass --udp-echo-target to test)".to_string(),
+            mark: SummaryMark::Skipped,
+        });
     }
 
+    print_summary(&proxy, &summary);
     if failures.is_empty() {
         Ok(())
     } else {
@@ -151,12 +232,39 @@ pub async fn check(
     }
 }
 
+fn print_summary(proxy: &WireAddress, items: &[SummaryItem]) {
+    println!("SOCKS5 summary: {proxy}");
+    for item in items {
+        let mark = match item.mark {
+            SummaryMark::Check => "✓",
+            SummaryMark::Cross => "✗",
+            SummaryMark::Skipped => "—",
+        };
+        println!("  {:<54} {mark}", item.label);
+    }
+}
+
+async fn probe_tcp_echo(stream: &mut TcpStream, operation_timeout: Duration) -> Result<()> {
+    let payload = b"sp-socks5-tcp-probe";
+    timeout(operation_timeout, async {
+        stream.write_all(payload).await?;
+        let mut response = vec![0; payload.len()];
+        stream.read_exact(&mut response).await?;
+        ensure!(response == payload, "TCP echo payload mismatch");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("TCP echo timed out")??;
+    info!(bytes = payload.len(), "TCP echo through proxy");
+    Ok(())
+}
+
 async fn probe_auth_method(
     proxy: &WireAddress,
     method: u8,
     auth: Option<&UserKey>,
     operation_timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     let result = timeout(operation_timeout, async {
         let mut stream = connect_proxy(proxy).await?;
         info!(version = 5, method = format!("{method:#04x}"), "send SOCKS5 greeting");
@@ -172,15 +280,14 @@ async fn probe_auth_method(
 
     let (mut stream, selected) = result;
     match selected {
-        0xff => println!("UNSUPPORTED authentication method {method:#04x}"),
+        0xff => return Ok(false),
         selected if selected != method => bail!(
             "proxy selected unoffered authentication method {selected:#04x} when only {method:#04x} was offered"
         ),
-        0x00 => println!("PASS authentication method: no authentication"),
+        0x00 => {}
         0x02 => {
             let Some(auth) = auth else {
-                println!("SUPPORTED authentication method: username/password (credentials not supplied)");
-                return Ok(());
+                return Ok(true);
             };
             timeout(operation_timeout, async {
                 info!(username_bytes = auth.username.len(), password_bytes = auth.password.len(), "send RFC 1929 credentials");
@@ -196,11 +303,10 @@ async fn probe_auth_method(
             })
             .await
             .context("username/password authentication timed out")??;
-            println!("PASS authentication method: username/password credentials accepted");
         }
-        selected => bail!("proxy selected unsupported authentication method {selected:#04x}"),
+        _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn command(
@@ -267,7 +373,6 @@ async fn read_response(stream: &mut TcpStream) -> Result<SocksResponse> {
 async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeout: Duration) -> Result<()> {
     let request_address = WireAddress::try_from("0.0.0.0:0")?;
     let (mut control, first) = command(proxy, Command::Bind, request_address, auth, operation_timeout).await?;
-    print_reply("BIND (first reply)", proxy, &first);
     if first.reply != Reply::Succeeded {
         bail!("BIND was rejected: {}", first.reply);
     }
@@ -280,7 +385,6 @@ async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeo
     let second = timeout(operation_timeout, read_response(&mut control))
         .await
         .context("waiting for BIND second reply timed out")??;
-    print_reply("BIND (second reply)", &peer_addr.into(), &second);
     if second.reply != Reply::Succeeded {
         bail!("BIND peer was rejected: {}", second.reply);
     }
@@ -301,7 +405,6 @@ async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeo
     })
     .await
     .context("BIND data exchange timed out")??;
-    println!("PASS BIND bidirectional TCP relay");
     Ok(())
 }
 
@@ -324,7 +427,6 @@ async fn probe_udp(
     };
     let (mut control, response) =
         command(proxy, Command::UdpAssociate, requested_address, auth, operation_timeout).await?;
-    print_reply("UDP ASSOCIATE", proxy, &response);
     if response.reply != Reply::Succeeded {
         bail!("UDP ASSOCIATE was rejected: {}", response.reply);
     }
@@ -357,18 +459,9 @@ async fn probe_udp(
     ensure!(source == target, "UDP echo source mismatch: expected {target}, received {source}");
     ensure!(reply[payload_offset..] == payload[..], "UDP echo payload mismatch");
     info!(rsv = 0, frag = 0, atyp = ?source.get_type(), %source, bytes = reply.len() - payload_offset, "recv SOCKS5 UDP reply");
-    println!("PASS UDP ASSOCIATE relay and echo from {source}");
 
     drop(control);
     Ok(())
-}
-
-fn print_reply(operation: &str, target: &WireAddress, response: &SocksResponse) {
-    if response.reply == Reply::Succeeded {
-        println!("PASS {operation} to {target} (bound address {})", response.address);
-    } else {
-        println!("REJECTED {operation} to {target}: {}", response.reply);
-    }
 }
 
 async fn connect_proxy(proxy: &WireAddress) -> Result<TcpStream> {

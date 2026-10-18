@@ -2803,7 +2803,7 @@ pub enum SocksCommand {
     Check {
         /// Proxy address in HOST:PORT form
         proxy: String,
-        /// Explicit TCP destination to test with CONNECT; may be repeated
+        /// Explicit TCP echo destination to test CONNECT and data relay; may be repeated
         #[arg(long = "connect", value_name = "HOST:PORT")]
         connect_targets: Vec<String>,
         /// Explicit UDP echo destination to test with UDP ASSOCIATE
