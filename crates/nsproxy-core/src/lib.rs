@@ -58,6 +58,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 pub use tun2socks5;
 pub mod cmd_common;
+pub mod cmd_socks;
 pub mod cmd_udp;
 pub mod cmd_uplink;
 pub mod env;
@@ -200,6 +201,52 @@ mod tests {
             serde_json::from_str(r#"{"dns":{},"tun":{},"devs":{},"mnt":{},"locals":{}}"#).unwrap();
         assert_eq!(old_config.diag_conn_persist_secs, 300);
         assert!(old_config.route_map.is_empty());
+    }
+
+    #[test]
+    fn socks_commands_use_nested_check_and_serve_subcommands() {
+        let check = Cli::try_parse_from([
+            "sp",
+            "socks",
+            "check",
+            "proxy.example:1080",
+            "--connect",
+            "example.com:443",
+            "--bind",
+            "--udp-echo-target",
+            "127.0.0.1:7",
+            "--username",
+            "tester",
+            "--password",
+            "secret",
+        ])
+        .unwrap();
+        assert!(matches!(
+            check.cmd,
+            MainCommand::Socks {
+                cmd: SocksCommand::Check {
+                    proxy,
+                    connect_targets,
+                    udp_echo_target: Some(_),
+                    bind: true,
+                    username: Some(_),
+                    password: Some(_),
+                    ..
+                }
+            } if proxy == "proxy.example:1080" && connect_targets == ["example.com:443"]
+        ));
+
+        let serve = Cli::try_parse_from(["sp", "socks5", "serve", "1080", "--test-servers"]).unwrap();
+        assert!(matches!(
+            serve.cmd,
+            MainCommand::Socks5 {
+                cmd: Socks5Command::Serve {
+                    port: 1080,
+                    test_servers: true
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from(["sp", "socks5", "1080"]).is_err());
     }
 
     #[test]
@@ -2751,6 +2798,45 @@ impl std::str::FromStr for NsArg {
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+pub enum SocksCommand {
+    /// Probe a SOCKS5 proxy
+    Check {
+        /// Proxy address in HOST:PORT form
+        proxy: String,
+        /// Explicit TCP destination to test with CONNECT; may be repeated
+        #[arg(long = "connect", value_name = "HOST:PORT")]
+        connect_targets: Vec<String>,
+        /// Explicit UDP echo destination to test with UDP ASSOCIATE
+        #[arg(long, value_name = "HOST:PORT")]
+        udp_echo_target: Option<String>,
+        /// Exercise BIND and connect to the proxy's advertised listening address
+        #[arg(long)]
+        bind: bool,
+        /// Username for RFC 1929 username/password authentication
+        #[arg(long, requires = "password")]
+        username: Option<String>,
+        /// Password for RFC 1929 username/password authentication
+        #[arg(long, requires = "username")]
+        password: Option<String>,
+        /// Timeout for each network operation in seconds
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+pub enum Socks5Command {
+    /// Serve a SOCKS5 proxy server
+    Serve {
+        /// TCP port to listen on
+        port: u16,
+        /// Also start loopback TCP and UDP echo test servers on a shared ephemeral port
+        #[arg(long)]
+        test_servers: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
 pub enum MainCommand {
     #[command(alias = "e")]
     /// Find by process and enter an existing nsproxy namespace
@@ -2807,6 +2893,11 @@ pub enum MainCommand {
         #[arg(long, default_value_t = 3)]
         timeout_secs: u64,
     },
+    /// Probe SOCKS5 proxy behavior
+    Socks {
+        #[command(subcommand)]
+        cmd: SocksCommand,
+    },
     /// Generates an empty config file
     Gen { save_to: PathBuf },
     /// Record the current process namespaces as the basis namespace set.
@@ -2833,8 +2924,11 @@ pub enum MainCommand {
         #[arg(short = '9', requires = "kill")]
         force: bool,
     },
-    /// Serve a socks5 proxy server that could be used to escape a container
-    Socks5 { port: u32 },
+    /// Manage the SOCKS5 proxy server
+    Socks5 {
+        #[command(subcommand)]
+        cmd: Socks5Command,
+    },
     /// Fire a single HTTP request to a URL
     Curl {
         /// URL to request
