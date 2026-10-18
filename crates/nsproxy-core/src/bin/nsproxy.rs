@@ -2154,6 +2154,8 @@ fn main() -> anyhow::Result<()> {
             })?;
         }
         MainCommand::Udp {
+            ntp,
+            stun: _,
             target,
             socks5,
             timeout_secs,
@@ -2162,35 +2164,76 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
 
-            let result = rt.block_on(nsproxy_core::cmd_udp::probe_ntp(
-                &target,
-                socks5.as_deref(),
-                Duration::from_secs(timeout_secs),
-            ))?;
+            let timeout = Duration::from_secs(timeout_secs);
+            if ntp {
+                let target = target.as_deref().unwrap_or("time.cloudflare.com:123");
+                let result = rt.block_on(nsproxy_core::cmd_udp::probe_ntp(
+                    target,
+                    socks5.as_deref(),
+                    timeout,
+                ))?;
 
-            println!(
-                "NTP response from {}{} in {:.1} ms",
-                result.peer,
-                result
-                    .via_proxy
-                    .as_ref()
-                    .map(|proxy| format!(" via {proxy}"))
-                    .unwrap_or_default(),
-                result.elapsed.as_secs_f64() * 1000.0
-            );
-            match result.stratum {
-                0 => println!(
-                    "  UDP path is reachable; server declined the request (Kiss-o'-Death: {})",
-                    result.reference_id
-                ),
-                16 => println!("  UDP path is reachable; server reports unsynchronized time"),
-                stratum if result.leap_indicator == 3 => println!(
-                    "  UDP path is reachable; server reports unsynchronized time (stratum {stratum})"
-                ),
-                stratum => println!("  NTP stratum: {stratum}"),
-            }
-            if let Some(server_time) = result.server_time {
-                println!("  Server time: {}", server_time.to_rfc3339());
+                println!(
+                    "NTP response from {}{} in {:.1} ms",
+                    result.peer,
+                    result
+                        .via_proxy
+                        .as_ref()
+                        .map(|proxy| format!(" via {proxy}"))
+                        .unwrap_or_default(),
+                    result.elapsed.as_secs_f64() * 1000.0
+                );
+                match result.stratum {
+                    0 => println!(
+                        "  UDP path is reachable; server declined the request (Kiss-o'-Death: {})",
+                        result.reference_id
+                    ),
+                    16 => println!("  UDP path is reachable; server reports unsynchronized time"),
+                    stratum if result.leap_indicator == 3 => println!(
+                        "  UDP path is reachable; server reports unsynchronized time (stratum {stratum})"
+                    ),
+                    stratum => println!("  NTP stratum: {stratum}"),
+                }
+                if let Some(server_time) = result.server_time {
+                    println!("  Server time: {}", server_time.to_rfc3339());
+                }
+            } else {
+                let targets: Vec<&str> = target
+                    .as_deref()
+                    .map(|server| vec![server])
+                    .unwrap_or_else(|| nsproxy_core::cmd_udp::DEFAULT_STUN_SERVERS.to_vec());
+                let using_defaults = target.is_none();
+                let mut successful_probes = 0;
+
+                for server in targets {
+                    match rt.block_on(nsproxy_core::cmd_udp::probe_stun(
+                        server,
+                        socks5.as_deref(),
+                        timeout,
+                    )) {
+                        Ok(result) => {
+                            successful_probes += 1;
+                            println!(
+                                "STUN response from {}{} in {:.1} ms",
+                                result.server,
+                                result
+                                    .via_proxy
+                                    .as_ref()
+                                    .map(|proxy| format!(" via {proxy}"))
+                                    .unwrap_or_default(),
+                                result.elapsed.as_secs_f64() * 1000.0
+                            );
+                            println!("  Observed address: {}", result.mapped_address);
+                        }
+                        Err(error) if using_defaults => {
+                            eprintln!("STUN probe failed for {server}: {error:#}");
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if successful_probes == 0 {
+                    anyhow::bail!("all default STUN probes failed");
+                }
             }
         }
         MainCommand::Curl { url, proxy } => {

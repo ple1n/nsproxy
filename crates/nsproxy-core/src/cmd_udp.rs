@@ -16,6 +16,18 @@ use crate::uplink::proxy_adapters::{ProxyConnection, RemoteAdapter};
 
 const NTP_PACKET_LEN: usize = 48;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
+const STUN_HEADER_LEN: usize = 20;
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+const STUN_BINDING_REQUEST: u16 = 0x0001;
+const STUN_BINDING_SUCCESS: u16 = 0x0101;
+const STUN_MAPPED_ADDRESS: u16 = 0x0001;
+const STUN_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+
+pub const DEFAULT_STUN_SERVERS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
+];
 
 #[derive(Debug)]
 pub struct NtpProbeResult {
@@ -26,6 +38,14 @@ pub struct NtpProbeResult {
     pub stratum: u8,
     pub reference_id: String,
     pub server_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+pub struct StunProbeResult {
+    pub server: String,
+    pub via_proxy: Option<String>,
+    pub elapsed: Duration,
+    pub mapped_address: SocketAddr,
 }
 
 pub async fn probe_ntp(
@@ -111,6 +131,220 @@ pub async fn probe_ntp(
         &response[..response_len],
         &request,
     )
+}
+
+pub async fn probe_stun(
+    server: &str,
+    socks5: Option<&str>,
+    timeout_duration: Duration,
+) -> Result<StunProbeResult> {
+    ensure!(
+        !timeout_duration.is_zero(),
+        "timeout must be greater than zero"
+    );
+
+    let target_address = parse_target_address(server)?;
+    let (request, transaction_id) = make_stun_request();
+
+    if let Some(socks5) = socks5 {
+        let proxy = parse_socks5_proxy(socks5)?;
+        let connection = timeout(timeout_duration, RemoteAdapter::connect_udp(&proxy))
+            .await
+            .context("timed out connecting to SOCKS5 proxy")?
+            .context("failed to establish SOCKS5 UDP association")?;
+        let route = connection.info().to_owned();
+        let mut tunnel = match connection {
+            ProxyConnection::Udp(tunnel) => tunnel,
+            ProxyConnection::Tcp(_) => bail!("SOCKS5 proxy did not establish a UDP tunnel"),
+        };
+
+        let started = Instant::now();
+        let packet = timeout(timeout_duration, async {
+            tunnel
+                .send_to(&request, target_address)
+                .await
+                .context("failed to send STUN request through SOCKS5")?;
+            tunnel
+                .recv_from()
+                .await
+                .context("failed to receive STUN response through SOCKS5")
+        })
+        .await
+        .context("timed out waiting for STUN response through SOCKS5")??;
+
+        return finish_stun_probe(server, Some(route), started, &packet.data, &transaction_id);
+    }
+
+    let peer = resolve_target(&target_address)
+        .await
+        .with_context(|| format!("failed to resolve STUN server '{server}'"))?;
+    let bind_addr = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind local UDP socket for {peer}"))?;
+    socket
+        .connect(peer)
+        .await
+        .with_context(|| format!("failed to connect UDP socket to {peer}"))?;
+
+    let started = Instant::now();
+    let (response, response_len) = timeout(timeout_duration, async {
+        socket
+            .send(&request)
+            .await
+            .context("failed to send STUN request")?;
+        let mut response = [0; 512];
+        let response_len = socket
+            .recv(&mut response)
+            .await
+            .context("failed to receive STUN response")?;
+        Ok::<_, anyhow::Error>((response, response_len))
+    })
+    .await
+    .with_context(|| format!("timed out waiting for STUN response from {peer}"))??;
+
+    finish_stun_probe(
+        &peer.to_string(),
+        None,
+        started,
+        &response[..response_len],
+        &transaction_id,
+    )
+}
+
+fn make_stun_request() -> ([u8; STUN_HEADER_LEN], [u8; 12]) {
+    let transaction_id = rand::random::<[u8; 12]>();
+    let mut request = [0; STUN_HEADER_LEN];
+    request[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    request[8..20].copy_from_slice(&transaction_id);
+    (request, transaction_id)
+}
+
+fn finish_stun_probe(
+    server: &str,
+    via_proxy: Option<String>,
+    started: Instant,
+    response: &[u8],
+    transaction_id: &[u8; 12],
+) -> Result<StunProbeResult> {
+    let elapsed = started.elapsed();
+    let mapped_address = parse_stun_response(response, transaction_id)
+        .with_context(|| format!("invalid STUN response from {server}"))?;
+    Ok(StunProbeResult {
+        server: server.to_owned(),
+        via_proxy,
+        elapsed,
+        mapped_address,
+    })
+}
+
+fn parse_stun_response(response: &[u8], transaction_id: &[u8; 12]) -> Result<SocketAddr> {
+    ensure!(
+        response.len() >= STUN_HEADER_LEN,
+        "response is only {} bytes; expected at least {STUN_HEADER_LEN}",
+        response.len()
+    );
+    ensure!(
+        u16::from_be_bytes(response[0..2].try_into().unwrap()) == STUN_BINDING_SUCCESS,
+        "expected a STUN binding success response"
+    );
+    let message_len = usize::from(u16::from_be_bytes(response[2..4].try_into().unwrap()));
+    ensure!(
+        message_len % 4 == 0,
+        "invalid STUN message length {message_len}"
+    );
+    ensure!(
+        response.len() >= STUN_HEADER_LEN + message_len,
+        "truncated STUN response"
+    );
+    ensure!(
+        u32::from_be_bytes(response[4..8].try_into().unwrap()) == STUN_MAGIC_COOKIE,
+        "invalid STUN magic cookie"
+    );
+    ensure!(
+        &response[8..20] == transaction_id,
+        "STUN response does not match this request"
+    );
+
+    let mut offset = STUN_HEADER_LEN;
+    while offset < STUN_HEADER_LEN + message_len {
+        ensure!(
+            offset + 4 <= response.len(),
+            "truncated STUN attribute header"
+        );
+        let attribute_type = u16::from_be_bytes(response[offset..offset + 2].try_into().unwrap());
+        let attribute_len = usize::from(u16::from_be_bytes(
+            response[offset + 2..offset + 4].try_into().unwrap(),
+        ));
+        let value_start = offset + 4;
+        let value_end = value_start + attribute_len;
+        ensure!(
+            value_end <= STUN_HEADER_LEN + message_len,
+            "truncated STUN attribute value"
+        );
+        if matches!(
+            attribute_type,
+            STUN_XOR_MAPPED_ADDRESS | STUN_MAPPED_ADDRESS
+        ) {
+            return parse_stun_address(
+                attribute_type,
+                &response[value_start..value_end],
+                transaction_id,
+            );
+        }
+        offset = value_start + (attribute_len + 3) / 4 * 4;
+    }
+    bail!("STUN response did not include a mapped address")
+}
+
+fn parse_stun_address(
+    attribute_type: u16,
+    value: &[u8],
+    transaction_id: &[u8; 12],
+) -> Result<SocketAddr> {
+    ensure!(value.len() >= 4, "truncated STUN mapped address");
+    ensure!(value[0] == 0, "invalid STUN mapped address reserved byte");
+    let xor = attribute_type == STUN_XOR_MAPPED_ADDRESS;
+    let port = u16::from_be_bytes(value[2..4].try_into().unwrap())
+        ^ if xor {
+            (STUN_MAGIC_COOKIE >> 16) as u16
+        } else {
+            0
+        };
+    let address = match value[1] {
+        0x01 => {
+            ensure!(value.len() == 8, "invalid STUN IPv4 mapped address length");
+            let mut bytes: [u8; 4] = value[4..8].try_into().unwrap();
+            if xor {
+                for (byte, mask) in bytes.iter_mut().zip(STUN_MAGIC_COOKIE.to_be_bytes()) {
+                    *byte ^= mask;
+                }
+            }
+            std::net::IpAddr::V4(bytes.into())
+        }
+        0x02 => {
+            ensure!(value.len() == 20, "invalid STUN IPv6 mapped address length");
+            let mut bytes: [u8; 16] = value[4..20].try_into().unwrap();
+            if xor {
+                for (byte, mask) in bytes.iter_mut().zip(
+                    STUN_MAGIC_COOKIE
+                        .to_be_bytes()
+                        .into_iter()
+                        .chain(*transaction_id),
+                ) {
+                    *byte ^= mask;
+                }
+            }
+            std::net::IpAddr::V6(bytes.into())
+        }
+        family => bail!("unsupported STUN mapped address family {family}"),
+    };
+    Ok(SocketAddr::new(address, port))
 }
 
 fn finish_probe(
@@ -348,5 +582,85 @@ mod tests {
             parse_target_address("[2001:db8::1]:123").unwrap(),
             WireAddress::SocketAddress("[2001:db8::1]:123".parse().unwrap())
         );
+    }
+
+    fn make_stun_response(transaction_id: [u8; 12], mapped_address: SocketAddr) -> Vec<u8> {
+        let (family, address_bytes) = match mapped_address.ip() {
+            std::net::IpAddr::V4(ip) => (0x01, ip.octets().to_vec()),
+            std::net::IpAddr::V6(ip) => (0x02, ip.octets().to_vec()),
+        };
+        let mut response = vec![0; STUN_HEADER_LEN + 8 + address_bytes.len()];
+        response[0..2].copy_from_slice(&STUN_BINDING_SUCCESS.to_be_bytes());
+        response[2..4].copy_from_slice(&((8 + address_bytes.len()) as u16).to_be_bytes());
+        response[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        response[8..20].copy_from_slice(&transaction_id);
+        response[20..22].copy_from_slice(&STUN_XOR_MAPPED_ADDRESS.to_be_bytes());
+        response[22..24].copy_from_slice(&((4 + address_bytes.len()) as u16).to_be_bytes());
+        response[25] = family;
+        response[26..28].copy_from_slice(
+            &(mapped_address.port() ^ (STUN_MAGIC_COOKIE >> 16) as u16).to_be_bytes(),
+        );
+        for (index, byte) in address_bytes.into_iter().enumerate() {
+            let mask = if index < 4 {
+                STUN_MAGIC_COOKIE.to_be_bytes()[index]
+            } else {
+                transaction_id[index - 4]
+            };
+            response[28 + index] = byte ^ mask;
+        }
+        response
+    }
+
+    #[test]
+    fn parses_stun_xor_mapped_ipv4_and_ipv6_addresses() {
+        let transaction_id = [7; 12];
+        for address in [
+            "203.0.113.9:45678".parse().unwrap(),
+            "[2001:db8::1234]:45678".parse().unwrap(),
+        ] {
+            let response = make_stun_response(transaction_id, address);
+            assert_eq!(
+                parse_stun_response(&response, &transaction_id).unwrap(),
+                address
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_stun_response_for_another_transaction() {
+        let transaction_id = [7; 12];
+        let response = make_stun_response(transaction_id, "203.0.113.9:45678".parse().unwrap());
+
+        assert!(parse_stun_response(&response, &[8; 12]).is_err());
+    }
+
+    #[tokio::test]
+    async fn probes_a_local_stun_server() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = server.local_addr().unwrap().to_string();
+        let mapped_address = "203.0.113.9:45678".parse().unwrap();
+
+        tokio::spawn(async move {
+            let mut request = [0; 512];
+            let (len, peer) = server.recv_from(&mut request).await.unwrap();
+            assert_eq!(len, STUN_HEADER_LEN);
+            assert_eq!(
+                u16::from_be_bytes(request[0..2].try_into().unwrap()),
+                STUN_BINDING_REQUEST
+            );
+            assert_eq!(
+                u32::from_be_bytes(request[4..8].try_into().unwrap()),
+                STUN_MAGIC_COOKIE
+            );
+            let transaction_id = request[8..20].try_into().unwrap();
+            let response = make_stun_response(transaction_id, mapped_address);
+            server.send_to(&response, peer).await.unwrap();
+        });
+
+        let result = probe_stun(&target, None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result.mapped_address, mapped_address);
+        assert!(result.via_proxy.is_none());
     }
 }

@@ -2885,11 +2885,16 @@ pub enum MainCommand {
     #[command(alias = "n")]
     /// Netlink testing: print all IPv4 addresses
     Netlink,
-    /// Test UDP connectivity with an NTP request
+    /// Test UDP connectivity with STUN (default) or NTP
     Udp {
-        /// NTP server address (defaults to time.cloudflare.com:123)
-        #[arg(default_value = "time.cloudflare.com:123")]
-        target: String,
+        /// Test UDP connectivity with an NTP request
+        #[arg(long, conflicts_with = "stun")]
+        ntp: bool,
+        /// Test UDP connectivity with STUN (the default)
+        #[arg(long, conflicts_with = "ntp")]
+        stun: bool,
+        /// NTP server or STUN server address (defaults depend on the selected mode)
+        target: Option<String>,
         /// SOCKS5 proxy address, optionally with a socks5:// URL and credentials
         #[arg(long, value_name = "HOST:PORT|URL")]
         socks5: Option<String>,
