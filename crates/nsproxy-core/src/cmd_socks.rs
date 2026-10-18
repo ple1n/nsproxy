@@ -27,26 +27,26 @@ pub async fn spawn_test_servers() -> Result<SocketAddr> {
     let udp_socket = UdpSocket::bind(address)
         .await
         .context("binding localhost SOCKS5 UDP echo test server on the TCP test server port")?;
-    info!(transport = "tcp", operation = "bind/listen", %address, "SOCKS5 test server ready");
-    info!(transport = "udp", operation = "bind", %address, "SOCKS5 test server ready");
+    info!(%address, "bind/listen TCP test server");
+    info!(%address, "bind UDP test server");
 
     tokio::spawn(async move {
         loop {
             match tcp_listener.accept().await {
                 Ok((mut stream, peer)) => {
-                    info!(transport = "tcp", operation = "accept", %address, %peer, "SOCKS5 test server accepted connection");
+                    info!(%address, %peer, "accept TCP test connection");
                     tokio::spawn(async move {
                         let mut buffer = [0; 8192];
                         loop {
                             match stream.read(&mut buffer).await {
                                 Ok(0) => break,
                                 Ok(length) => {
-                                    info!(transport = "tcp", operation = "recv", %peer, bytes = length, "SOCKS5 TCP echo received data");
+                                    info!(%peer, bytes = length, "recv TCP test data");
                                     if let Err(error) = stream.write_all(&buffer[..length]).await {
                                         warn!("SOCKS5 TCP echo test server failed to reply: {error}");
                                         break;
                                     }
-                                    info!(transport = "tcp", operation = "write", %peer, bytes = length, "SOCKS5 TCP echo sent data");
+                                    info!(%peer, bytes = length, "write TCP echo data");
                                 }
                                 Err(error) => {
                                     warn!("SOCKS5 TCP echo test server failed to read: {error}");
@@ -65,9 +65,9 @@ pub async fn spawn_test_servers() -> Result<SocketAddr> {
         loop {
             match udp_socket.recv_from(&mut buffer).await {
                 Ok((length, peer)) => {
-                    info!(transport = "udp", operation = "recv_from", %address, %peer, bytes = length, "SOCKS5 UDP echo received datagram");
+                    info!(%address, %peer, bytes = length, "recv_from UDP test datagram");
                     match udp_socket.send_to(&buffer[..length], peer).await {
-                        Ok(sent) => info!(transport = "udp", operation = "send_to", %address, %peer, bytes = sent, "SOCKS5 UDP echo sent datagram"),
+                        Ok(sent) => info!(%address, %peer, bytes = sent, "send_to UDP echo peer"),
                         Err(error) => warn!("SOCKS5 UDP echo test server failed to reply to {peer}: {error}"),
                     }
                 }
@@ -98,7 +98,7 @@ pub async fn check(
         .transpose()?;
 
     println!("SOCKS5 proxy: {proxy}");
-    info!(operation = "start_probe", %proxy, "SOCKS5 feature probe started");
+    info!(%proxy, "start SOCKS5 check");
     let mut failures = Vec::new();
     for (method, method_auth) in [(0x00, auth.as_ref()), (0x02, auth.as_ref()), (0x80, None)] {
         if let Err(error) = probe_auth_method(&proxy, method, method_auth, operation_timeout).await {
@@ -159,12 +159,12 @@ async fn probe_auth_method(
 ) -> Result<()> {
     let result = timeout(operation_timeout, async {
         let mut stream = connect_proxy(proxy).await?;
-        info!(operation = "send_greeting", version = 5, method = format!("{method:#04x}"), "SOCKS5 probe sending method offer");
+        info!(version = 5, method = format!("{method:#04x}"), "send SOCKS5 greeting");
         stream.write_all(&[0x05, 0x01, method]).await?;
         let mut response = [0; 2];
         stream.read_exact(&mut response).await?;
         ensure!(response[0] == 0x05, "invalid SOCKS version in method response: {:#x}", response[0]);
-        info!(operation = "read_method_selection", version = response[0], method = format!("{:#04x}", response[1]), "SOCKS5 probe received method selection");
+        info!(version = response[0], method = format!("{:#04x}", response[1]), "read SOCKS5 method selection");
         Ok::<_, anyhow::Error>((stream, response[1]))
     })
     .await
@@ -183,7 +183,7 @@ async fn probe_auth_method(
                 return Ok(());
             };
             timeout(operation_timeout, async {
-                info!(operation = "send_rfc1929_auth", username_bytes = auth.username.len(), password_bytes = auth.password.len(), "SOCKS5 probe sending username/password credentials");
+                info!(username_bytes = auth.username.len(), password_bytes = auth.password.len(), "send RFC 1929 credentials");
                 stream.write_u8(0x01).await?;
                 write_socks_string(&mut stream, &auth.username).await?;
                 write_socks_string(&mut stream, &auth.password).await?;
@@ -191,7 +191,7 @@ async fn probe_auth_method(
                 stream.read_exact(&mut response).await?;
                 ensure!(response[0] == 0x01, "invalid RFC 1929 auth version: {:#x}", response[0]);
                 ensure!(response[1] == 0x00, "username/password authentication rejected");
-                info!(operation = "read_rfc1929_auth", version = response[0], status = response[1], "SOCKS5 probe received authentication status");
+                info!(version = response[0], status = response[1], "read RFC 1929 status");
                 Ok::<_, anyhow::Error>(())
             })
             .await
@@ -213,7 +213,7 @@ async fn command(
     timeout(operation_timeout, async {
         let mut stream = connect_proxy(proxy).await?;
         negotiate(&mut stream, auth).await?;
-        info!(operation = "send_request", ?command, atyp = ?target.get_type(), %target, "SOCKS5 probe sending command request");
+        info!(?command, atyp = ?target.get_type(), %target, "send SOCKS5 request");
         Request::new(command, target).write_to_async_stream(&mut stream).await?;
         let response = read_response(&mut stream).await?;
         Ok::<_, anyhow::Error>((stream, response))
@@ -224,17 +224,17 @@ async fn command(
 
 async fn negotiate(stream: &mut TcpStream, auth: Option<&UserKey>) -> Result<()> {
     if auth.is_some() {
-        info!(operation = "send_greeting", version = 5, methods = "no-auth,user-password", "SOCKS5 probe sending method offer");
+        info!(version = 5, methods = "no-auth,user-password", "send SOCKS5 greeting");
         stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
     } else {
-        info!(operation = "send_greeting", version = 5, methods = "no-auth", "SOCKS5 probe sending method offer");
+        info!(version = 5, methods = "no-auth", "send SOCKS5 greeting");
         stream.write_all(&[0x05, 0x01, 0x00]).await?;
     }
 
     let mut method = [0; 2];
     stream.read_exact(&mut method).await?;
     ensure!(method[0] == 0x05, "invalid SOCKS version in negotiation: {:#x}", method[0]);
-    info!(operation = "read_method_selection", version = method[0], method = format!("{:#04x}", method[1]), "SOCKS5 proxy selected authentication method");
+    info!(version = method[0], method = format!("{:#04x}", method[1]), "read SOCKS5 method selection");
 
     match method[1] {
         0x00 => Ok(()),
@@ -260,7 +260,7 @@ async fn read_response(stream: &mut TcpStream) -> Result<SocksResponse> {
     ensure!(header[2] == 0x00, "nonzero reserved byte in SOCKS5 reply: {:#x}", header[2]);
     let reply = Reply::try_from(header[1])?;
     let address = WireAddress::retrieve_from_async_stream(stream).await?;
-    info!(operation = "read_reply", version = header[0], ?reply, atyp = ?address.get_type(), %address, "SOCKS5 probe received command reply");
+    info!(version = header[0], ?reply, atyp = ?address.get_type(), %address, "read SOCKS5 reply");
     Ok(SocksResponse { reply, address })
 }
 
@@ -273,7 +273,7 @@ async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeo
     }
 
     let peer_addr = bind_connect_address(&first.address, proxy).await?;
-    info!(operation = "connect_bind_listener", %peer_addr, "SOCKS5 probe connecting to BIND relay");
+    info!(%peer_addr, "connect to BIND listener");
     let mut peer = timeout(operation_timeout, TcpStream::connect(peer_addr))
         .await
         .context("connecting to BIND relay timed out")??;
@@ -288,7 +288,7 @@ async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeo
     let request = b"sp-socks5-bind-probe";
     let response = b"sp-socks5-bind-response";
     timeout(operation_timeout, async {
-        info!(operation = "write_bind_data", bytes = request.len(), "SOCKS5 probe sending data through BIND");
+        info!(bytes = request.len(), "write BIND test data");
         control.write_all(request).await?;
         let mut received = vec![0; request.len()];
         peer.read_exact(&mut received).await?;
@@ -316,7 +316,7 @@ async fn probe_udp(
         _ => "0.0.0.0:0",
     };
     let socket = UdpSocket::bind(local_address).await?;
-    info!(operation = "bind_udp_client", local = %socket.local_addr()?, "SOCKS5 probe bound UDP client socket");
+    info!(local = %socket.local_addr()?, "bind UDP probe socket");
     let requested_address = if socket.local_addr()?.is_ipv4() {
         WireAddress::try_from("0.0.0.0:0")?
     } else {
@@ -331,17 +331,17 @@ async fn probe_udp(
 
     let relay_addr = bind_connect_address(&response.address, proxy).await?;
     socket.connect(relay_addr).await?;
-    info!(operation = "connect_udp_relay", %relay_addr, "SOCKS5 probe connected UDP socket to relay");
+    info!(%relay_addr, "connect UDP probe socket to relay");
     let payload = b"sp-socks5-udp-probe";
     let mut packet = Vec::with_capacity(3 + target.len() + payload.len());
     packet.extend_from_slice(&[0x00, 0x00, 0x00]);
     target.write_to_buf(&mut packet);
     packet.extend_from_slice(payload);
-    info!(operation = "send_udp_request", rsv = 0, frag = 0, atyp = ?target.get_type(), destination = %target, bytes = payload.len(), "SOCKS5 probe sending UDP datagram");
+    info!(rsv = 0, frag = 0, atyp = ?target.get_type(), destination = %target, bytes = payload.len(), "send SOCKS5 UDP request");
     let sent = timeout(operation_timeout, socket.send(&packet))
         .await
         .context("sending UDP probe timed out")??;
-    info!(operation = "send_udp_request", bytes = sent, "SOCKS5 probe sent UDP datagram");
+    info!(bytes = sent, "sent SOCKS5 UDP request");
 
     let mut reply = vec![0; 65_535];
     let size = timeout(operation_timeout, socket.recv(&mut reply))
@@ -356,7 +356,7 @@ async fn probe_udp(
     let payload_offset = 3 + cursor.position() as usize;
     ensure!(source == target, "UDP echo source mismatch: expected {target}, received {source}");
     ensure!(reply[payload_offset..] == payload[..], "UDP echo payload mismatch");
-    info!(operation = "receive_udp_reply", rsv = 0, frag = 0, atyp = ?source.get_type(), %source, bytes = reply.len() - payload_offset, "SOCKS5 probe received UDP echo reply");
+    info!(rsv = 0, frag = 0, atyp = ?source.get_type(), %source, bytes = reply.len() - payload_offset, "recv SOCKS5 UDP reply");
     println!("PASS UDP ASSOCIATE relay and echo from {source}");
 
     drop(control);
@@ -376,7 +376,7 @@ async fn connect_proxy(proxy: &WireAddress) -> Result<TcpStream> {
         .await?
         .next()
         .context("proxy address resolved to no IP addresses")?;
-    info!(operation = "connect", %addr, "SOCKS5 probe connecting to proxy");
+    info!(%addr, "connect to SOCKS5 proxy");
     TcpStream::connect(addr).await.context("connecting to SOCKS5 proxy failed")
 }
 

@@ -1622,7 +1622,7 @@ fn main() -> anyhow::Result<()> {
                 let addr = format!("0.0.0.0:{}", port);
                 let server = Server::bind(addr.parse()?, Arc::new(auth::NoAuth)).await?;
                 let proxy_addr = server.local_addr()?;
-                info!(operation = "bind/listen", %proxy_addr, "SOCKS5 proxy listener ready");
+                info!(%proxy_addr, "bind/listen SOCKS5 server");
                 if test_servers {
                     let test_server_addr = nsproxy_core::cmd_socks::spawn_test_servers().await?;
                     println!("SOCKS5 TCP/UDP echo test servers listening on {test_server_addr}");
@@ -1638,7 +1638,7 @@ fn main() -> anyhow::Result<()> {
                 warn!("starting socks server on {}", proxy_addr);
                 loop {
                     let (conn, peer) = server.accept().await?;
-                    info!(operation = "accept", %proxy_addr, %peer, "SOCKS5 proxy accepted TCP client");
+                    info!(%proxy_addr, %peer, "accept SOCKS5 client");
                     tokio::spawn(async {
                         if let Err(err) = handle_socks5_connection(conn).await {
                             warn!("socks5 connection error: {}", err);
@@ -4915,18 +4915,17 @@ where
     use tokio::net::TcpStream;
 
     let client_addr = conn.peer_addr()?;
-    info!(operation = "handshake", %client_addr, "SOCKS5 proxy reading client greeting");
+    info!(%client_addr, "read SOCKS5 greeting");
     let (conn, _auth_result) = conn.authenticate().await?;
-    info!(operation = "handshake_complete", %client_addr, method = "no-auth", "SOCKS5 proxy authentication complete");
+    info!(%client_addr, method = "no-auth", "SOCKS5 authentication complete");
 
     match conn.wait_request().await? {
         ClientConnection::UdpAssociate(associate, requested_client_addr) => {
             let client_tcp_addr = associate.peer_addr()?;
             info!(
-                operation = "bind_udp_relay",
                 %client_tcp_addr,
                 requested = %requested_client_addr,
-                "SOCKS5 UDP ASSOCIATE binding relay socket"
+                "bind UDP relay by SOCKS5 server"
             );
             let relay_bind_addr: SocketAddr = if client_tcp_addr.is_ipv4() {
                 "0.0.0.0:0".parse()?
@@ -4935,11 +4934,11 @@ where
             };
             let relay = tokio::net::UdpSocket::bind(relay_bind_addr).await?;
             let relay_addr = relay.local_addr()?;
-            info!(operation = "udp_relay_ready", %relay_addr, "SOCKS5 UDP relay bound");
+            info!(%relay_addr, "UDP relay bound");
             let mut conn = associate
                 .reply(Reply::Succeeded, WireAddress::from(relay_addr))
                 .await?;
-            info!(operation = "send_reply", reply = ?Reply::Succeeded, atyp = ?WireAddress::from(relay_addr).get_type(), %relay_addr, "SOCKS5 UDP ASSOCIATE reply sent");
+            info!(reply = ?Reply::Succeeded, atyp = ?WireAddress::from(relay_addr).get_type(), %relay_addr, "send UDP ASSOCIATE reply");
             select! {
                 result = relay_socks5_udp(&relay, client_tcp_addr, requested_client_addr) => result?,
                 result = conn.wait_until_closed() => result?,
@@ -4947,7 +4946,7 @@ where
         }
         ClientConnection::Bind(bind, expected_peer) => {
             let client_tcp_addr = bind.peer_addr()?;
-            info!(operation = "bind_tcp_listener", %client_tcp_addr, expected_peer = %expected_peer, "SOCKS5 BIND creating listener");
+            info!(%client_tcp_addr, expected_peer = %expected_peer, "bind BIND listener");
             let bind_addr: SocketAddr = if client_tcp_addr.is_ipv4() {
                 "0.0.0.0:0".parse()?
             } else {
@@ -4955,30 +4954,30 @@ where
             };
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
             let listener_addr = listener.local_addr()?;
-            info!(operation = "listen", %listener_addr, "SOCKS5 BIND listener ready");
+            info!(%listener_addr, "listen for BIND peer");
             let mut bind = bind
                 .reply(Reply::Succeeded, WireAddress::from(listener_addr))
                 .await?;
-            info!(operation = "send_first_reply", reply = ?Reply::Succeeded, %listener_addr, "SOCKS5 BIND first reply sent");
+            info!(reply = ?Reply::Succeeded, %listener_addr, "send first BIND reply");
             loop {
                 let (mut peer, peer_addr) = listener.accept().await?;
-                info!(operation = "accept_bind_peer", %peer_addr, "SOCKS5 BIND accepted TCP peer");
+                info!(%peer_addr, "accept BIND peer");
                 if !socks5_bind_peer_matches(&expected_peer, peer_addr).await? {
-                    info!(operation = "reject_bind_peer", %peer_addr, expected_peer = %expected_peer, "SOCKS5 BIND peer did not match request");
+                    info!(%peer_addr, expected_peer = %expected_peer, "reject BIND peer");
                     continue;
                 }
                 let mut conn = bind
                     .reply(Reply::Succeeded, WireAddress::from(peer_addr))
                     .await
                     .map_err(|(error, _)| error)?;
-                info!(operation = "send_second_reply", reply = ?Reply::Succeeded, %peer_addr, "SOCKS5 BIND second reply sent");
+                info!(reply = ?Reply::Succeeded, %peer_addr, "send second BIND reply");
                 let (client_to_peer, peer_to_client) = io::copy_bidirectional(&mut peer, &mut conn).await?;
-                info!(operation = "bind_relay_closed", client_to_peer, peer_to_client, "SOCKS5 BIND TCP relay finished");
+                info!(client_to_peer, peer_to_client, "BIND relay closed");
                 break;
             }
         }
         ClientConnection::Connect(connect, addr) => {
-            info!(operation = "connect", atyp = ?addr.get_type(), %addr, "SOCKS5 proxy connecting to requested destination");
+            info!(atyp = ?addr.get_type(), %addr, "connect by SOCKS5 proxy");
             let target = match &addr {
                 WireAddress::DomainAddress(domain, port) => {
                     TcpStream::connect((domain.as_str(), *port)).await
@@ -4992,10 +4991,10 @@ where
                     let mut conn = connect
                         .reply(Reply::Succeeded, WireAddress::from(bound_addr))
                         .await?;
-                    info!(operation = "send_reply", reply = ?Reply::Succeeded, %bound_addr, "SOCKS5 CONNECT succeeded");
+                    info!(reply = ?Reply::Succeeded, %bound_addr, "send CONNECT reply");
                     let (client_to_target, target_to_client) =
                         io::copy_bidirectional(&mut target_stream, &mut conn).await?;
-                    info!(operation = "connect_relay_closed", %addr, client_to_target, target_to_client, "SOCKS5 CONNECT TCP relay finished");
+                    info!(%addr, client_to_target, target_to_client, "CONNECT relay closed");
                 }
                 Err(err) => {
                     warn!(operation = "connect_failed", %addr, error = %err, "SOCKS5 proxy could not connect to destination");
@@ -5068,7 +5067,7 @@ async fn relay_socks5_udp(
                 continue;
             }
             client_udp_addr = Some(source);
-            info!(operation = "learn_udp_client", %source, "SOCKS5 UDP relay learned client endpoint");
+            info!(%source, "learn UDP client");
         }
 
         if Some(source) == client_udp_addr {
@@ -5098,22 +5097,21 @@ async fn relay_socks5_udp(
                 .send_to(&packet[payload_offset..length], destination_addr)
                 .await?;
             info!(
-                operation = "udp_send_to",
                 source = %source,
                 destination = %destination_addr,
                 atyp = ?destination.get_type(),
                 target = %destination,
                 frag = 0,
                 bytes = sent,
-                "SOCKS5 UDP relay forwarded datagram"
+                "send_to by proxy server"
             );
         } else if let Some(client_udp_addr) = client_udp_addr {
             let mut response = Vec::with_capacity(3 + WireAddress::from(source).len() + length);
             UdpHeader::new(0, WireAddress::from(source)).write_to_buf(&mut response);
             response.extend_from_slice(&packet[..length]);
-            info!(operation = "udp_recv_from", %source, bytes = length, "SOCKS5 UDP relay received target response");
+            info!(%source, bytes = length, "recv_from by proxy server");
             let sent = relay.send_to(&response, client_udp_addr).await?;
-            info!(operation = "udp_send_to_client", %client_udp_addr, bytes = sent, "SOCKS5 UDP relay returned response");
+            info!(%client_udp_addr, bytes = sent, "send_to client by proxy server");
         }
     }
 }
