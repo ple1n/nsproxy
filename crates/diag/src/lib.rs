@@ -178,7 +178,13 @@ pub enum DiagEvent {
         proxy_addr: std::net::SocketAddr,
         active_flows: usize,
         pkts_tx: u64,
+        pkts_rx_datagrams: u64,
         pkts_rx: u64,
+        pkts_rx_source_rejected: u64,
+        pkts_rx_parse_errors: u64,
+        pkts_rx_unmatched: u64,
+        pkts_rx_delivery_dropped: u64,
+        pkts_rx_queued: u64,
         bytes_tx: u64,
         bytes_rx: u64,
     },
@@ -216,7 +222,13 @@ pub struct SocksEndpointReport {
     pub status: SocksEndpointStatus,
     pub active_flows: usize,
     pub pkts_tx: u64,
+    pub pkts_rx_datagrams: u64,
     pub pkts_rx: u64,
+    pub pkts_rx_source_rejected: u64,
+    pub pkts_rx_parse_errors: u64,
+    pub pkts_rx_unmatched: u64,
+    pub pkts_rx_delivery_dropped: u64,
+    pub pkts_rx_queued: u64,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     pub updated_at: Timestamp,
@@ -1207,7 +1219,13 @@ impl DiagServer {
                     status: status.clone(),
                     active_flows: 0,
                     pkts_tx: 0,
+                    pkts_rx_datagrams: 0,
                     pkts_rx: 0,
+                    pkts_rx_source_rejected: 0,
+                    pkts_rx_parse_errors: 0,
+                    pkts_rx_unmatched: 0,
+                    pkts_rx_delivery_dropped: 0,
+                    pkts_rx_queued: 0,
                     bytes_tx: 0,
                     bytes_rx: 0,
                     updated_at: *ts,
@@ -1223,7 +1241,13 @@ impl DiagServer {
                 proxy_addr,
                 active_flows,
                 pkts_tx,
+                pkts_rx_datagrams,
                 pkts_rx,
+                pkts_rx_source_rejected,
+                pkts_rx_parse_errors,
+                pkts_rx_unmatched,
+                pkts_rx_delivery_dropped,
+                pkts_rx_queued,
                 bytes_tx,
                 bytes_rx,
             } => {
@@ -1233,7 +1257,13 @@ impl DiagServer {
                     status: SocksEndpointStatus::Connecting,
                     active_flows: *active_flows,
                     pkts_tx: *pkts_tx,
+                    pkts_rx_datagrams: *pkts_rx_datagrams,
                     pkts_rx: *pkts_rx,
+                    pkts_rx_source_rejected: *pkts_rx_source_rejected,
+                    pkts_rx_parse_errors: *pkts_rx_parse_errors,
+                    pkts_rx_unmatched: *pkts_rx_unmatched,
+                    pkts_rx_delivery_dropped: *pkts_rx_delivery_dropped,
+                    pkts_rx_queued: *pkts_rx_queued,
                     bytes_tx: *bytes_tx,
                     bytes_rx: *bytes_rx,
                     updated_at: *ts,
@@ -1242,7 +1272,13 @@ impl DiagServer {
                 report.proxy_addr = *proxy_addr;
                 report.active_flows = *active_flows;
                 report.pkts_tx = *pkts_tx;
+                report.pkts_rx_datagrams = *pkts_rx_datagrams;
                 report.pkts_rx = *pkts_rx;
+                report.pkts_rx_source_rejected = *pkts_rx_source_rejected;
+                report.pkts_rx_parse_errors = *pkts_rx_parse_errors;
+                report.pkts_rx_unmatched = *pkts_rx_unmatched;
+                report.pkts_rx_delivery_dropped = *pkts_rx_delivery_dropped;
+                report.pkts_rx_queued = *pkts_rx_queued;
                 report.bytes_tx = *bytes_tx;
                 report.bytes_rx = *bytes_rx;
                 report.updated_at = *ts;
@@ -1284,7 +1320,13 @@ async fn serve_client(
             proxy_addr: report.proxy_addr,
             active_flows: report.active_flows,
             pkts_tx: report.pkts_tx,
+            pkts_rx_datagrams: report.pkts_rx_datagrams,
             pkts_rx: report.pkts_rx,
+            pkts_rx_source_rejected: report.pkts_rx_source_rejected,
+            pkts_rx_parse_errors: report.pkts_rx_parse_errors,
+            pkts_rx_unmatched: report.pkts_rx_unmatched,
+            pkts_rx_delivery_dropped: report.pkts_rx_delivery_dropped,
+            pkts_rx_queued: report.pkts_rx_queued,
             bytes_tx: report.bytes_tx,
             bytes_rx: report.bytes_rx,
         };
@@ -2745,7 +2787,13 @@ mod tests {
             proxy_addr,
             active_flows: 3,
             pkts_tx: 10,
+            pkts_rx_datagrams: 11,
             pkts_rx: 8,
+            pkts_rx_source_rejected: 1,
+            pkts_rx_parse_errors: 1,
+            pkts_rx_unmatched: 0,
+            pkts_rx_delivery_dropped: 0,
+            pkts_rx_queued: 8,
             bytes_tx: 1024,
             bytes_rx: 800,
         };
@@ -2755,12 +2803,16 @@ mod tests {
             DiagEvent::SocksEndpointStats {
                 active_flows,
                 pkts_tx,
+                pkts_rx_datagrams,
                 pkts_rx,
+                pkts_rx_parse_errors,
                 ..
             } => {
                 assert_eq!(active_flows, 3);
                 assert_eq!(pkts_tx, 10);
+                assert_eq!(pkts_rx_datagrams, 11);
                 assert_eq!(pkts_rx, 8);
+                assert_eq!(pkts_rx_parse_errors, 1);
             }
             _ => panic!("wrong decoded stats event variant"),
         }
@@ -2787,7 +2839,13 @@ mod tests {
             proxy_addr,
             active_flows: 2,
             pkts_tx: 3,
+            pkts_rx_datagrams: 4,
             pkts_rx: 4,
+            pkts_rx_source_rejected: 0,
+            pkts_rx_parse_errors: 0,
+            pkts_rx_unmatched: 0,
+            pkts_rx_delivery_dropped: 0,
+            pkts_rx_queued: 4,
             bytes_tx: 5,
             bytes_rx: 6,
         });

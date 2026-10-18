@@ -8323,12 +8323,22 @@ impl App {
                         }
                         ui.separator();
                         ui.label(format!(
-                            "Flows: {} | ↑{} pkts ({:.1}KB) ↓{} pkts ({:.1}KB)",
+                            "Flows: {} | ↑{} pkts ({:.1}KB) ↓{} parsed ({:.1}KB), {} queued",
                             endpoint.active_flows,
                             endpoint.pkts_tx,
                             (endpoint.bytes_tx as f64) / 1024.0,
                             endpoint.pkts_rx,
                             (endpoint.bytes_rx as f64) / 1024.0,
+                            endpoint.pkts_rx_queued,
+                        ));
+                        ui.separator();
+                        ui.label(format!(
+                            "Relay RX: {} raw | rejected: source {}, parse {}, no flow {}, queue {}",
+                            endpoint.pkts_rx_datagrams,
+                            endpoint.pkts_rx_source_rejected,
+                            endpoint.pkts_rx_parse_errors,
+                            endpoint.pkts_rx_unmatched,
+                            endpoint.pkts_rx_delivery_dropped,
                         ));
                     }
                     diag::SocksEndpointStatus::Connecting => {
@@ -9294,11 +9304,23 @@ impl App {
 
                 ui.label("Traffic:");
                 ui.label(format!(
-                    "↑ {} pkts ({:.0} KB)   ↓ {} pkts ({:.0} KB)",
+                    "↑ {} pkts ({:.0} KB)   ↓ {} parsed ({:.0} KB), {} queued",
                     endpoint.pkts_tx,
                     endpoint.bytes_tx as f64 / 1024.0,
                     endpoint.pkts_rx,
                     endpoint.bytes_rx as f64 / 1024.0,
+                    endpoint.pkts_rx_queued,
+                ));
+                ui.end_row();
+
+                ui.label("Relay RX diagnostics:");
+                ui.label(format!(
+                    "{} raw; rejected: source {}, parse {}, no flow {}, queue {}",
+                    endpoint.pkts_rx_datagrams,
+                    endpoint.pkts_rx_source_rejected,
+                    endpoint.pkts_rx_parse_errors,
+                    endpoint.pkts_rx_unmatched,
+                    endpoint.pkts_rx_delivery_dropped,
                 ));
                 ui.end_row();
 
@@ -12528,7 +12550,13 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
             proxy_addr,
             active_flows,
             pkts_tx,
+            pkts_rx_datagrams,
             pkts_rx,
+            pkts_rx_source_rejected,
+            pkts_rx_parse_errors,
+            pkts_rx_unmatched,
+            pkts_rx_delivery_dropped,
+            pkts_rx_queued,
             bytes_tx,
             bytes_rx,
             ..
@@ -12539,13 +12567,19 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
             };
             ui.colored_label(Color32::from_rgb(140, 180, 240), op_str);
             ui.label(format!(
-                "@ {} | flows: {} | ↑{} pkts ({:.1}KB) ↓{} pkts ({:.1}KB)",
+                "@ {} | flows: {} | ↑{} pkts ({:.1}KB) ↓{} parsed ({:.1}KB), {} queued | raw {} / drops source:{} parse:{} no-flow:{} queue:{}",
                 proxy_addr,
                 active_flows,
                 pkts_tx,
                 (*bytes_tx as f64) / 1024.0,
                 pkts_rx,
                 (*bytes_rx as f64) / 1024.0,
+                pkts_rx_queued,
+                pkts_rx_datagrams,
+                pkts_rx_source_rejected,
+                pkts_rx_parse_errors,
+                pkts_rx_unmatched,
+                pkts_rx_delivery_dropped,
             ));
         }
         other => {

@@ -1364,7 +1364,7 @@ pub mod proxy_adapters {
     /// adapter only supplies the flow-specific queue expected by `UdpLike`.
     struct SharedSocks5UdpConn {
         associate: Arc<SharedUdpAssociate>,
-        inbound: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        inbound: tokio::sync::mpsc::Receiver<(WireAddress, Vec<u8>)>,
         info: String,
     }
 
@@ -1454,7 +1454,7 @@ pub mod proxy_adapters {
             })?;
             Ok(UdpPacket {
                 data,
-                dst_addr: WireAddress::SocketAddress(src),
+                dst_addr: src,
             })
         }
 
@@ -1907,6 +1907,7 @@ pub mod proxy_adapters {
             conn_id: diag::ConnId,
             local_addr: SocketAddr,
             peer_addr: SocketAddr,
+            target: WireAddress,
         ) -> anyhow::Result<ProxyConnection> {
             use tun2socks5::ProxyType;
 
@@ -1921,7 +1922,7 @@ pub mod proxy_adapters {
                 .await
                 .context("Timeout waiting for shared SOCKS5 UDP associate")??;
             let inbound = associate
-                .register_flow(conn_id, local_addr, peer_addr)
+                .register_flow(conn_id, local_addr, peer_addr, target)
                 .await;
             Ok(ProxyConnection::Udp(Box::new(SharedSocks5UdpConn {
                 associate,

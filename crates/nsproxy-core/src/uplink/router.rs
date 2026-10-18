@@ -1346,8 +1346,15 @@ impl Router {
                                     })
                                     .clone()
                             };
-                            RemoteAdapter::connect_shared_udp(p, associate, conn_id, local, peer)
-                                .await
+                            RemoteAdapter::connect_shared_udp(
+                                p,
+                                associate,
+                                conn_id,
+                                local,
+                                peer,
+                                target.clone(),
+                            )
+                            .await
                         }
                         _ => unreachable!(),
                     };

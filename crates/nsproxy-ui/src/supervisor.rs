@@ -2837,7 +2837,13 @@ impl Supervisor {
                                 status: status.clone(),
                                 active_flows: 0,
                                 pkts_tx: 0,
+                                pkts_rx_datagrams: 0,
                                 pkts_rx: 0,
+                                pkts_rx_source_rejected: 0,
+                                pkts_rx_parse_errors: 0,
+                                pkts_rx_unmatched: 0,
+                                pkts_rx_delivery_dropped: 0,
+                                pkts_rx_queued: 0,
                                 bytes_tx: 0,
                                 bytes_rx: 0,
                                 updated_at: ts,
@@ -2854,7 +2860,13 @@ impl Supervisor {
                         proxy_addr,
                         active_flows,
                         pkts_tx,
+                        pkts_rx_datagrams,
                         pkts_rx,
+                        pkts_rx_source_rejected,
+                        pkts_rx_parse_errors,
+                        pkts_rx_unmatched,
+                        pkts_rx_delivery_dropped,
+                        pkts_rx_queued,
                         bytes_tx,
                         bytes_rx,
                     } => {
@@ -2865,7 +2877,13 @@ impl Supervisor {
                                 status: diag::SocksEndpointStatus::Connecting,
                                 active_flows,
                                 pkts_tx,
+                                pkts_rx_datagrams,
                                 pkts_rx,
+                                pkts_rx_source_rejected,
+                                pkts_rx_parse_errors,
+                                pkts_rx_unmatched,
+                                pkts_rx_delivery_dropped,
+                                pkts_rx_queued,
                                 bytes_tx,
                                 bytes_rx,
                                 updated_at: ts,
@@ -2875,7 +2893,13 @@ impl Supervisor {
                         report.proxy_addr = proxy_addr;
                         report.active_flows = active_flows;
                         report.pkts_tx = pkts_tx;
+                        report.pkts_rx_datagrams = pkts_rx_datagrams;
                         report.pkts_rx = pkts_rx;
+                        report.pkts_rx_source_rejected = pkts_rx_source_rejected;
+                        report.pkts_rx_parse_errors = pkts_rx_parse_errors;
+                        report.pkts_rx_unmatched = pkts_rx_unmatched;
+                        report.pkts_rx_delivery_dropped = pkts_rx_delivery_dropped;
+                        report.pkts_rx_queued = pkts_rx_queued;
                         report.bytes_tx = bytes_tx;
                         report.bytes_rx = bytes_rx;
                         report.updated_at = ts;
