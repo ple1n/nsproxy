@@ -556,6 +556,8 @@ const MAX_CONN_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnEntry {
+    /// Transport protocol reported when the stream was accepted.
+    pub kind: StreamKind,
     /// Resolved destination address.
     pub dst: WireAddress,
     /// Most recent non-drop routing decision; a later Drop does not hide the useful route.
@@ -613,9 +615,10 @@ impl ConnsState {
     /// (in the supervisor) to keep a local reconstruction up-to-date.
     pub fn apply_event(&mut self, event: &DiagEvent) {
         match event {
-            DiagEvent::Accept { id, dst, ts, .. } => {
+            DiagEvent::Accept { id, dst, ts, kind, .. } => {
                 if let Ok(addr) = WireAddress::try_from(dst.as_str()) {
                     let mut entry = ConnEntry {
+                        kind: kind.clone(),
                         dst: addr,
                         route: None,
                         phase: ConnPhase::Accepted,
@@ -2294,6 +2297,32 @@ impl UpDaemonStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_protocol_survives_live_updates_and_snapshots() {
+        for kind in [StreamKind::Tcp, StreamKind::Udp] {
+            let id = ConnId(1);
+            let ts = Timestamp::now();
+            let mut state = ConnsState::default();
+            state.apply_event(&DiagEvent::Accept {
+                id,
+                ts,
+                kind: kind.clone(),
+                src: "127.0.0.1:50000".to_string(),
+                dst: "127.0.0.1:443".to_string(),
+            });
+            state.apply_event(&DiagEvent::Connected { id, ts });
+            assert_eq!(state.conns[&id].kind, kind);
+
+            let snapshot = DiagEvent::ConnsStateSnapshot { ts, state };
+            let encoded = bincode::serialize(&snapshot).unwrap();
+            let decoded: DiagEvent = bincode::deserialize(&encoded).unwrap();
+            let DiagEvent::ConnsStateSnapshot { state, .. } = decoded else {
+                panic!("expected connection snapshot");
+            };
+            assert_eq!(state.conns[&id].kind, kind);
+        }
+    }
 
     #[test]
     fn connection_history_keeps_useful_route_and_expires_finished_entries() {

@@ -5200,6 +5200,7 @@ mod traffic_connection_tests {
             state.conns.insert(
                 diag::ConnId(id),
                 std::sync::Arc::new(diag::ConnEntry {
+                    kind: diag::StreamKind::Tcp,
                     dst: nsproxy_common::routing::WireAddress::SocketAddress(destination),
                     route: None,
                     phase: if finished_at.is_some() {

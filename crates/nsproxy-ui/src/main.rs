@@ -8851,7 +8851,9 @@ impl App {
                                     return;
                                 };
                                 row.col(|ui| {
-                                    ui.colored_label(Color32::LIGHT_BLUE, format!("{}", id.0));
+                                    let (color, protocol) = conn_protocol_style(&entry.kind);
+                                    ui.colored_label(color, format!("{}", id.0))
+                                        .on_hover_text(protocol);
                                 });
                                 row.col(|ui| {
                                     ui.colored_label(
@@ -11552,6 +11554,27 @@ fn conn_phase_label(phase: diag::ConnPhase) -> &'static str {
         diag::ConnPhase::Failed => "failed",
         diag::ConnPhase::RouteExhausted => "retry limit reached",
         diag::ConnPhase::RouteRejected => "route rejected",
+    }
+}
+
+fn conn_protocol_style(kind: &diag::StreamKind) -> (Color32, &'static str) {
+    match kind {
+        diag::StreamKind::Tcp => (Color32::LIGHT_BLUE, "TCP"),
+        diag::StreamKind::Udp => (Color32::LIGHT_GREEN, "UDP"),
+    }
+}
+
+#[cfg(test)]
+mod connection_protocol_style_tests {
+    use super::*;
+
+    #[test]
+    fn tcp_and_udp_ids_have_distinct_colors_and_protocol_labels() {
+        let tcp = conn_protocol_style(&diag::StreamKind::Tcp);
+        let udp = conn_protocol_style(&diag::StreamKind::Udp);
+        assert_eq!(tcp, (Color32::LIGHT_BLUE, "TCP"));
+        assert_eq!(udp, (Color32::LIGHT_GREEN, "UDP"));
+        assert_ne!(tcp.0, udp.0);
     }
 }
 

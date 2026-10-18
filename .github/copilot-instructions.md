@@ -6,6 +6,8 @@ through a short path from the task's concept. Minimize lookup time complexity
 over tool calls: use the index to choose a high-value next edge, avoid broad
 directory scans, and stop traversing when the needed evidence is reached.
 
+Do not add co-author sign in commit.
+
 ## Core concept graph
 
 - **Runtime lifecycle** → [`agentic/sp-commands.md`](../agentic/sp-commands.md)
