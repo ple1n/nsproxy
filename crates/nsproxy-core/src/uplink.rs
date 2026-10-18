@@ -528,6 +528,7 @@ pub struct UplinkHub {
     pub stats: HashMap<ProxyID, ProxyStats>,
     /// Process-local TCP performance estimates keyed by host and exact route.
     pub host_route_stats: HashMap<HostRouteKey, HostRouteStats>,
+    host_route_stats_eviction_order: BTreeSet<(Timestamp, HostRouteKey)>,
     pub stats_clear: Timestamp,
     /// Map from proxy pseudonym (nym) to ProxyID for O(1) lookup
     pub nym_map: HashMap<ProxyNym, ProxyID>,
@@ -634,6 +635,7 @@ impl UplinkHub {
             clash: None,
             stats: HashMap::new(),
             host_route_stats: HashMap::new(),
+            host_route_stats_eviction_order: BTreeSet::new(),
             stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
             found_ips: ChronoData::default(),
@@ -657,20 +659,34 @@ impl UplinkHub {
         self.stats.get(id).cloned()
     }
 
-    fn host_route_stats_mut(&mut self, key: HostRouteKey) -> &mut HostRouteStats {
-        if !self.host_route_stats.contains_key(&key)
-            && self.host_route_stats.len() >= MAX_HOST_ROUTE_STATS
-        {
-            if let Some(oldest) = self
-                .host_route_stats
-                .iter()
-                .min_by_key(|(_, stats)| stats.last_observed)
-                .map(|(key, _)| key.clone())
-            {
+    fn update_host_route_stats<R>(
+        &mut self,
+        key: HostRouteKey,
+        update: impl FnOnce(&mut HostRouteStats) -> R,
+    ) -> R {
+        self.update_host_route_stats_with_capacity(key, MAX_HOST_ROUTE_STATS, update)
+    }
+
+    fn update_host_route_stats_with_capacity<R>(
+        &mut self,
+        key: HostRouteKey,
+        capacity: usize,
+        update: impl FnOnce(&mut HostRouteStats) -> R,
+    ) -> R {
+        if let Some(stats) = self.host_route_stats.get(&key) {
+            self.host_route_stats_eviction_order
+                .remove(&(stats.last_observed.unwrap_or_default(), key.clone()));
+        } else if self.host_route_stats.len() >= capacity {
+            if let Some((_, oldest)) = self.host_route_stats_eviction_order.pop_first() {
                 self.host_route_stats.remove(&oldest);
             }
         }
-        self.host_route_stats.entry(key).or_default()
+
+        let stats = self.host_route_stats.entry(key.clone()).or_default();
+        let result = update(stats);
+        self.host_route_stats_eviction_order
+            .insert((stats.last_observed.unwrap_or_default(), key));
+        result
     }
 
     pub fn record_host_route_attempt(
@@ -682,9 +698,10 @@ impl UplinkHub {
     ) -> HostRouteMetric {
         let key = HostRouteKey::new(target, route);
         let at = Timestamp::now();
-        let stats = self.host_route_stats_mut(key.clone());
-        stats.record_tcp_attempt(connect_latency, success, at);
-        stats.metric(key, at)
+        self.update_host_route_stats(key.clone(), |stats| {
+            stats.record_tcp_attempt(connect_latency, success, at);
+            stats.metric(key, at)
+        })
     }
 
     pub fn record_host_route_connection(
@@ -697,9 +714,10 @@ impl UplinkHub {
     ) -> HostRouteMetric {
         let key = HostRouteKey::new(target, route);
         let at = Timestamp::now();
-        let stats = self.host_route_stats_mut(key.clone());
-        stats.record_tcp_connection(connect_latency, upload_sample, download_sample, at);
-        stats.metric(key, at)
+        self.update_host_route_stats(key.clone(), |stats| {
+            stats.record_tcp_connection(connect_latency, upload_sample, download_sample, at);
+            stats.metric(key, at)
+        })
     }
 
     pub fn record_host_route_transfer_samples(
@@ -711,9 +729,10 @@ impl UplinkHub {
     ) -> HostRouteMetric {
         let key = HostRouteKey::new(target, route);
         let at = Timestamp::now();
-        let stats = self.host_route_stats_mut(key.clone());
-        stats.record_tcp_transfer_samples(upload_sample, download_sample, at);
-        stats.metric(key, at)
+        self.update_host_route_stats(key.clone(), |stats| {
+            stats.record_tcp_transfer_samples(upload_sample, download_sample, at);
+            stats.metric(key, at)
+        })
     }
 
     pub fn record_host_route_udp_transfer_samples(
@@ -725,9 +744,10 @@ impl UplinkHub {
     ) -> HostRouteMetric {
         let key = HostRouteKey::new(target, route);
         let at = Timestamp::now();
-        let stats = self.host_route_stats_mut(key.clone());
-        stats.record_udp_transfer_samples(upload_sample, download_sample, at);
-        stats.metric(key, at)
+        self.update_host_route_stats(key.clone(), |stats| {
+            stats.record_udp_transfer_samples(upload_sample, download_sample, at);
+            stats.metric(key, at)
+        })
     }
 
     pub fn host_route_metrics(&self, at: Timestamp) -> Vec<HostRouteMetric> {
@@ -743,6 +763,7 @@ impl UplinkHub {
     pub fn clear_stats(&mut self) {
         self.stats.clear();
         self.host_route_stats.clear();
+        self.host_route_stats_eviction_order.clear();
         self.stats_clear = Timestamp::now();
     }
 
@@ -798,6 +819,7 @@ impl UplinkHub {
             clash: None,
             stats: HashMap::new(),
             host_route_stats: HashMap::new(),
+            host_route_stats_eviction_order: BTreeSet::new(),
             stats_clear: Timestamp::default(),
             nym_map: HashMap::new(),
             found_ips: ChronoData::default(),
@@ -2339,6 +2361,40 @@ mod tests {
         assert_eq!(no_proxy.connect_latency_ms, Some(100.0));
         assert_eq!(no_proxy.download_bytes_per_sec, Some(1_000_000.0));
         assert_eq!(hub.host_route_metrics(Timestamp::now()).len(), 3);
+    }
+
+    #[test]
+    fn host_route_stats_evict_oldest_using_ordered_index() {
+        let key = |address: &str| {
+            HostRouteKey::new(
+                WireAddress::SocketAddress(address.parse().unwrap()),
+                ObservedRoute::NoProxy,
+            )
+        };
+        let (first, second, third) = (
+            key("192.0.2.1:443"),
+            key("192.0.2.2:443"),
+            key("192.0.2.3:443"),
+        );
+        let mut hub = UplinkHub::new();
+
+        hub.update_host_route_stats_with_capacity(first.clone(), 2, |stats| {
+            stats.last_observed = Some(Timestamp(10));
+        });
+        hub.update_host_route_stats_with_capacity(second.clone(), 2, |stats| {
+            stats.last_observed = Some(Timestamp(20));
+        });
+        hub.update_host_route_stats_with_capacity(first.clone(), 2, |stats| {
+            stats.last_observed = Some(Timestamp(30));
+        });
+        hub.update_host_route_stats_with_capacity(third.clone(), 2, |stats| {
+            stats.last_observed = Some(Timestamp(40));
+        });
+
+        assert!(hub.host_route_stats.contains_key(&first));
+        assert!(!hub.host_route_stats.contains_key(&second));
+        assert!(hub.host_route_stats.contains_key(&third));
+        assert_eq!(hub.host_route_stats_eviction_order.len(), 2);
     }
 
     #[test]
