@@ -5,8 +5,8 @@ pub use socks5_impl::protocol::WireAddress;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
-use std::net::SocketAddr;
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Context available during routing decision
@@ -124,7 +124,9 @@ pub fn route_map_match<'a>(
             route_map
                 .get(&RoutingKey::Addr(TargetKey::for_final_destination(address)))
                 .or_else(|| {
-                    route_map.get(&RoutingKey::Addr(TargetKey::for_any_port(context.target_ip)))
+                    route_map.get(&RoutingKey::Addr(TargetKey::for_any_port(
+                        context.target_ip,
+                    )))
                 })
         }
         VDNSRES::Opine(
@@ -132,13 +134,11 @@ pub fn route_map_match<'a>(
             | RoutingDecision::NoProxy(address)
             | RoutingDecision::NATByTUN(address),
         ) => route_map
-            .get(&RoutingKey::Addr(TargetKey::for_final_destination(*address)))
-            .or_else(|| {
-                route_map.get(&RoutingKey::Addr(TargetKey::for_any_port(address.ip())))
-            }),
-        VDNSRES::Opine(RoutingDecision::File(_) | RoutingDecision::Drop(_)) | VDNSRES::ERR => {
-            None
-        }
+            .get(&RoutingKey::Addr(TargetKey::for_final_destination(
+                *address,
+            )))
+            .or_else(|| route_map.get(&RoutingKey::Addr(TargetKey::for_any_port(address.ip())))),
+        VDNSRES::Opine(RoutingDecision::File(_) | RoutingDecision::Drop(_)) | VDNSRES::ERR => None,
     }
 }
 
@@ -177,7 +177,10 @@ pub enum RoutingResovled {
     },
     Drop(DropReason),
     /// No-proxy connection to a domain that must be resolved by the serve process.
-    NoProxyDomain { host: String, port: u16 },
+    NoProxyDomain {
+        host: String,
+        port: u16,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -216,7 +219,6 @@ impl<'de> Deserialize<'de> for ProxyID {
         arr.copy_from_slice(&bytes);
         Ok(ProxyID(arr))
     }
-
 }
 
 #[cfg(test)]
@@ -231,7 +233,10 @@ mod route_map_tests {
             "192.0.2.8:443".parse().unwrap(),
         ));
         let mut routes = BTreeMap::new();
-        routes.insert(host, RoutingResovled::NoProxy("192.0.2.8:80".parse().unwrap()));
+        routes.insert(
+            host,
+            RoutingResovled::NoProxy("192.0.2.8:80".parse().unwrap()),
+        );
         routes.insert(
             exact_host,
             RoutingResovled::NoProxy("192.0.2.8:443".parse().unwrap()),

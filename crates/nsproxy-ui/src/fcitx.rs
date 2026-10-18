@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use nsproxy_core::state_paths;
 use std::process::Stdio;
 use tokio::process::Command;
-use zbus::{Proxy, connection::Builder};
+use zbus::{connection::Builder, Proxy};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputMethodGroup {
@@ -46,7 +46,9 @@ pub enum FcitxAction {
 fn bus_address(profile: &str) -> String {
     format!(
         "unix:path={}",
-        state_paths::profile_dir(profile).join("bus/session.sock").display()
+        state_paths::profile_dir(profile)
+            .join("bus/session.sock")
+            .display()
     )
 }
 

@@ -1437,8 +1437,7 @@ fn stop_wal_processes_for_root(
     action: &str,
 ) -> anyhow::Result<()> {
     let process_log = selected_root.join("nsproxy-process-log.jsonl");
-    let records: Vec<serde_json::Value> =
-        nsproxy_core::state_file::read_wal(&process_log)?;
+    let records: Vec<serde_json::Value> = nsproxy_core::state_file::read_wal(&process_log)?;
     let mut active = Vec::new();
     for record in &records {
         let Some(pid) = record.get("pid").and_then(serde_json::Value::as_u64) else {
@@ -1466,9 +1465,7 @@ fn stop_wal_processes_for_root(
     if !active.is_empty() {
         let pids = active.iter().map(|(pid, _)| pid).collect::<Vec<_>>();
         eprintln!("Active nsproxy processes recorded in the state WAL: {pids:?}");
-        if !confirm_process_action(&format!(
-            "Send SIGTERM to these processes before {action}?"
-        ))? {
+        if !confirm_process_action(&format!("Send SIGTERM to these processes before {action}?"))? {
             anyhow::bail!("{action} cancelled; stop the listed processes and retry");
         }
         for (pid, start_ticks) in &active {
@@ -4975,7 +4972,8 @@ where
                     .await
                     .map_err(|(error, _)| error)?;
                 info!(reply = ?Reply::Succeeded, %peer_addr, "send second BIND reply");
-                let (client_to_peer, peer_to_client) = io::copy_bidirectional(&mut peer, &mut conn).await?;
+                let (client_to_peer, peer_to_client) =
+                    io::copy_bidirectional(&mut peer, &mut conn).await?;
                 info!(client_to_peer, peer_to_client, "BIND relay closed");
                 break;
             }
@@ -5042,7 +5040,8 @@ async fn socks5_bind_peer_matches(
 ) -> anyhow::Result<bool> {
     use socks5_impl::protocol::WireAddress;
     match expected {
-        WireAddress::SocketAddress(expected) => Ok((expected.ip().is_unspecified() || expected.ip() == peer.ip())
+        WireAddress::SocketAddress(expected) => Ok((expected.ip().is_unspecified()
+            || expected.ip() == peer.ip())
             && (expected.port() == 0 || expected.port() == peer.port())),
         WireAddress::DomainAddress(host, port) => {
             if *port != 0 && *port != peer.port() {
@@ -5077,7 +5076,8 @@ async fn relay_socks5_udp(
         if client_udp_addr.is_none() {
             if source.ip() != client_tcp_addr.ip()
                 || requested_client_ip.is_some_and(|ip| ip != source.ip())
-                || (requested_client_addr.port() != 0 && requested_client_addr.port() != source.port())
+                || (requested_client_addr.port() != 0
+                    && requested_client_addr.port() != source.port())
             {
                 continue;
             }
@@ -5233,12 +5233,18 @@ mod socks5_server_tests {
         let mut method = [0; 2];
         stream.read_exact(&mut method).await.unwrap();
         assert_eq!(method, [0x05, 0x00]);
-        Request::new(Command::Connect, WireAddress::SocketAddress(refused_address))
-            .write_to_async_stream(&mut stream)
-            .await
-            .unwrap();
+        Request::new(
+            Command::Connect,
+            WireAddress::SocketAddress(refused_address),
+        )
+        .write_to_async_stream(&mut stream)
+        .await
+        .unwrap();
         assert_eq!(
-            Response::retrieve_from_async_stream(&mut stream).await.unwrap().reply,
+            Response::retrieve_from_async_stream(&mut stream)
+                .await
+                .unwrap()
+                .reply,
             Reply::ConnectionRefused
         );
 

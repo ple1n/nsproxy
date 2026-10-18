@@ -91,10 +91,7 @@ impl HostRouteKey {
         if let WireAddress::DomainAddress(host, _) = &mut target {
             *host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         }
-        Self {
-            target,
-            route,
-        }
+        Self { target, route }
     }
 }
 
@@ -404,8 +401,7 @@ impl HostRouteStats {
             last_observed: self.last_observed,
             connect_latency_ms: self.connect_latency_ms(at),
             connect_success_rate: self.connect_success_rate(at),
-            upload_bytes_per_sec: upload_rate_summary
-                .map(|summary| summary.average_bytes_per_sec),
+            upload_bytes_per_sec: upload_rate_summary.map(|summary| summary.average_bytes_per_sec),
             download_bytes_per_sec: download_rate_summary
                 .map(|summary| summary.average_bytes_per_sec),
             upload_rate_summary,
@@ -813,10 +809,7 @@ mod tests {
     fn transfer_rate_produces_a_lower_bound_for_short_high_volume_transfers() {
         let mut tracker = TransferRateTracker::default();
         for index in 0..10_000 {
-            tracker.record(
-                1_300,
-                Duration::from_micros(index * 1_300_000 / 9_999),
-            );
+            tracker.record(1_300, Duration::from_micros(index * 1_300_000 / 9_999));
         }
 
         let sample = tracker
@@ -872,9 +865,7 @@ mod tests {
         for index in 0..10 {
             burst.record(100, Duration::from_millis(index));
         }
-        let burst_sample = burst
-            .sample(Timestamp(0), Duration::from_secs(1))
-            .unwrap();
+        let burst_sample = burst.sample(Timestamp(0), Duration::from_secs(1)).unwrap();
         assert_eq!(burst_sample.bytes, 1_000);
         assert_eq!(burst_sample.event_count, 10);
         assert_eq!(burst_sample.duration_micros, MICROS_PER_SEC);

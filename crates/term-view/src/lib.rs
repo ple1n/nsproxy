@@ -1,7 +1,7 @@
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell;
-use alacritty_terminal::term::{self, Term, test::TermSize};
+use alacritty_terminal::term::{self, test::TermSize, Term};
 use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use egui::epaint::{Galley, RectShape};
@@ -341,7 +341,11 @@ impl<'a> TermView<'a> {
     }
 
     pub fn request_focus_if(self, request: bool) -> Self {
-        if request { self.request_focus() } else { self }
+        if request {
+            self.request_focus()
+        } else {
+            self
+        }
     }
 
     pub fn set_size(mut self, size: Vec2) -> Self {

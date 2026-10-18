@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use tracing::warn;
 
 pub trait SimpleCRDT: Serialize + DeserializeOwned + Sized {
@@ -194,7 +194,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
-    use super::{append_wal_record, read, read_wal, try_update, update, SimpleCRDT};
+    use super::{SimpleCRDT, append_wal_record, read, read_wal, try_update, update};
 
     #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
     struct TestState {

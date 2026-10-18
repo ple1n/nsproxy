@@ -30,6 +30,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
+use tun2socks5::udp_associate::SharedUdpAssociate;
 
 use crate::{
     HotConfig,
@@ -132,6 +133,8 @@ pub struct Router {
     /// Explicit name mappings etc
     conf: Arc<watch::Receiver<HotConfig>>,
     host_connections: HostConnectionControl,
+    /// One SOCKS5 UDP ASSOCIATE per proxy endpoint, shared by all UDP flows.
+    socks_udp_associates: Arc<Mutex<HashMap<SocketAddr, Arc<SharedUdpAssociate>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -230,6 +233,7 @@ impl Router {
             file_server_tx,
             conf,
             host_connections: HostConnectionControl::default(),
+            socks_udp_associates: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1127,6 +1131,7 @@ impl Router {
         let diag = self.diag.clone();
         let conf = self.conf.clone();
         let host_connections = self.host_connections.clone();
+        let socks_udp_associates = self.socks_udp_associates.clone();
         let (kill_tx, mut kill_rx) = watch::channel(false);
 
         tokio::spawn(async move {
@@ -1139,6 +1144,7 @@ impl Router {
                     conn_id,
                     conf,
                     host_connections.clone(),
+                    socks_udp_associates,
                     kill_tx,
                 ) => {
                     if let Err(e) = result {
@@ -1175,6 +1181,7 @@ impl Router {
         conn_id: ConnId,
         conf: Arc<watch::Receiver<HotConfig>>,
         host_connections: HostConnectionControl,
+        socks_udp_associates: Arc<Mutex<HashMap<SocketAddr, Arc<SharedUdpAssociate>>>>,
         kill_tx: watch::Sender<bool>,
     ) -> Result<()> {
         let peer = udp.peer_addr();
@@ -1323,7 +1330,25 @@ impl Router {
                         UplinkProxy::Trojan(p) => {
                             TrojanAdapter::connect_udp(p, target.clone(), p.server_addr.ip()).await
                         }
-                        UplinkProxy::Remote(p) => RemoteAdapter::connect_udp(p).await,
+                        UplinkProxy::Remote(p) => {
+                            let associate = {
+                                let mut associates = socks_udp_associates.lock().map_err(|e| {
+                                    anyhow::anyhow!("SOCKS UDP associate cache poisoned: {e}")
+                                })?;
+                                associates
+                                    .entry(p.addr)
+                                    .or_insert_with(|| {
+                                        SharedUdpAssociate::new(
+                                            p.addr,
+                                            p.credentials.clone(),
+                                            diag.clone(),
+                                        )
+                                    })
+                                    .clone()
+                            };
+                            RemoteAdapter::connect_shared_udp(p, associate, conn_id, local, peer)
+                                .await
+                        }
                         _ => unreachable!(),
                     };
 

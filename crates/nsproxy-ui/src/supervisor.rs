@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -29,8 +29,8 @@ use nsproxy_core::cmd_common::read_ns_alive;
 use nsproxy_core::sandbox::{read_sandbox_status, SandboxStatus};
 use nsproxy_core::shell::ShellArgs;
 use nsproxy_core::{
-    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, HotVeth, MainCommand,
-    TemplateConfig, DEFAULT_HISTORY_LISTEN, DEFAULT_HISTORY_MAX_BYTES,
+    cli_to_inheritable_fd, to_cstr, Cli, HotConfig, HotRoute, HotVeth, MainCommand, TemplateConfig,
+    DEFAULT_HISTORY_LISTEN, DEFAULT_HISTORY_MAX_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -252,6 +252,8 @@ pub struct ContainerState {
     /// Used by the Traffic tab Connections sub-view.
     #[serde(skip)]
     pub conns_state: diag::ConnsState,
+    #[serde(skip)]
+    pub socks_endpoint: Option<diag::SocksEndpointReport>,
     /// Serve-computed per-target, per-route TCP performance estimates.
     #[serde(skip)]
     pub host_route_stats: Arc<Vec<nsproxy_common::stats::HostRouteMetric>>,
@@ -553,7 +555,7 @@ impl PtyWakeState {
 type SharedPtyViewportId = Arc<Mutex<Option<egui::ViewportId>>>;
 
 fn control_socket_filename() -> String {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     let timestamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -568,9 +570,7 @@ fn control_socket_filename() -> String {
 fn control_socket_runtime_dir() -> Result<PathBuf> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }))
-        });
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
     let metadata = std::fs::symlink_metadata(&runtime_dir)
         .with_context(|| format!("inspect UI runtime directory {}", runtime_dir.display()))?;
     anyhow::ensure!(
@@ -592,7 +592,10 @@ fn bind_control_socket_at(path: &Path) -> std::io::Result<std::os::unix::net::Un
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                format!("refusing to replace non-socket control path {}", path.display()),
+                format!(
+                    "refusing to replace non-socket control path {}",
+                    path.display()
+                ),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -630,8 +633,9 @@ fn bind_control_socket_in_state_root_or_runtime(
             );
             Ok((listener, runtime_path))
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("bind UI control socket {}", state_path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("bind UI control socket {}", state_path.display()))
+        }
     }
 }
 
@@ -647,12 +651,11 @@ pub struct SupervisorHandle {
 
 impl SupervisorHandle {
     pub fn new(ectx: egui::Context) -> Result<(Self, SupervisorTask)> {
-        let (control_listener, control_sock_path) =
-            bind_control_socket_in_state_root_or_runtime(
-                &state_paths::persist_root(),
-                &control_socket_filename(),
-                control_socket_runtime_dir,
-            )?;
+        let (control_listener, control_sock_path) = bind_control_socket_in_state_root_or_runtime(
+            &state_paths::persist_root(),
+            &control_socket_filename(),
+            control_socket_runtime_dir,
+        )?;
         control_listener.set_nonblocking(true)?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -947,6 +950,7 @@ struct DiagState {
     /// Updated via `ConnsState::apply_event` on every live event and overwritten
     /// on `ConnsStateSnapshot` (from `QueryConnsState`).
     conns_state: diag::ConnsState,
+    socks_endpoint_state: Option<diag::SocksEndpointReport>,
 }
 
 const MAX_TRAFFIC_HOST_ROUTE_METRICS: usize = 512;
@@ -971,11 +975,17 @@ enum PendingRootDaemonOp {
         result_tx: flume::Sender<ClashGroupImportCompletion>,
     },
     InitializeBasisNamespace,
-    SaveHotconfig { profile: ContainerName },
-    SaveProfile { profile: ContainerName },
+    SaveHotconfig {
+        profile: ContainerName,
+    },
+    SaveProfile {
+        profile: ContainerName,
+    },
     SaveConstants,
     LoadConstants,
-    CreateProfile { name: ContainerName },
+    CreateProfile {
+        name: ContainerName,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1011,6 +1021,7 @@ impl Default for DiagState {
             host_route_snapshot_at: diag::Timestamp::default(),
             diag_event_log: VecDeque::new(),
             conns_state: diag::ConnsState::default(),
+            socks_endpoint_state: None,
         }
     }
 }
@@ -1144,6 +1155,8 @@ fn diag_event_name(event: &DiagEvent) -> &'static str {
         DiagEvent::RecentLogs(_) => "RecentLogs",
         DiagEvent::RecentDiagEvents(_) => "RecentDiagEvents",
         DiagEvent::ConnsStateSnapshot { .. } => "ConnsStateSnapshot",
+        DiagEvent::SocksEndpointStateChanged { .. } => "SocksEndpointStateChanged",
+        DiagEvent::SocksEndpointStats { .. } => "SocksEndpointStats",
     }
 }
 
@@ -1755,20 +1768,21 @@ impl Supervisor {
         }
     }
 
-    fn spawn_veth(
-        &mut self,
-        profile: &ContainerName,
-        spec: HotVeth,
-        reason: &str,
-    ) {
+    fn spawn_veth(&mut self, profile: &ContainerName, spec: HotVeth, reason: &str) {
         let cli = Cli {
             conf: None,
             root: Some(state_paths::persist_root()),
             no_wrap_check: false,
             control_socket: None,
             cmd: MainCommand::Veth {
-                src: spec.src.parse().unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
-                dst: spec.dst.parse().unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
+                src: spec
+                    .src
+                    .parse()
+                    .unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
+                dst: spec
+                    .dst
+                    .parse()
+                    .unwrap_or_else(|_| nsproxy_core::NsArg::Container(profile.clone())),
                 veth_name: spec.veth_name,
                 src_ip4: spec.src_ip4,
                 dst_ip4: spec.dst_ip4,
@@ -2810,6 +2824,62 @@ impl Supervisor {
                     }
                 }
                 match event {
+                    DiagEvent::SocksEndpointStateChanged {
+                        ts,
+                        op,
+                        proxy_addr,
+                        status,
+                    } => {
+                        let report = state.socks_endpoint_state.get_or_insert_with(|| {
+                            diag::SocksEndpointReport {
+                                op,
+                                proxy_addr,
+                                status: status.clone(),
+                                active_flows: 0,
+                                pkts_tx: 0,
+                                pkts_rx: 0,
+                                bytes_tx: 0,
+                                bytes_rx: 0,
+                                updated_at: ts,
+                            }
+                        });
+                        report.op = op;
+                        report.proxy_addr = proxy_addr;
+                        report.status = status;
+                        report.updated_at = ts;
+                    }
+                    DiagEvent::SocksEndpointStats {
+                        ts,
+                        op,
+                        proxy_addr,
+                        active_flows,
+                        pkts_tx,
+                        pkts_rx,
+                        bytes_tx,
+                        bytes_rx,
+                    } => {
+                        let report = state.socks_endpoint_state.get_or_insert_with(|| {
+                            diag::SocksEndpointReport {
+                                op,
+                                proxy_addr,
+                                status: diag::SocksEndpointStatus::Connecting,
+                                active_flows,
+                                pkts_tx,
+                                pkts_rx,
+                                bytes_tx,
+                                bytes_rx,
+                                updated_at: ts,
+                            }
+                        });
+                        report.op = op;
+                        report.proxy_addr = proxy_addr;
+                        report.active_flows = active_flows;
+                        report.pkts_tx = pkts_tx;
+                        report.pkts_rx = pkts_rx;
+                        report.bytes_tx = bytes_tx;
+                        report.bytes_rx = bytes_rx;
+                        report.updated_at = ts;
+                    }
                     DiagEvent::DnsState { state: dns, .. } => state.dns_state = Some(dns),
                     DiagEvent::RoutingState { state: routing, .. } => {
                         state.routing_state = Some(routing)
@@ -3172,13 +3242,11 @@ impl Supervisor {
             SupervisorEvent::RootDaemonConnectionUpdate { state, error } => {
                 self.root_daemon_connection.state = state;
                 self.root_daemon_connection.last_error = error.clone();
-                if state == ConnectionState::Connected
-                    && self.initialize_basis_namespace_pending
-                {
+                if state == ConnectionState::Connected && self.initialize_basis_namespace_pending {
                     self.initialize_basis_namespace_pending = false;
                     self.queue_root_daemon_op(
                         diag::RootDaemonOp::InitializeBasisNamespace,
-                            PendingRootDaemonOp::InitializeBasisNamespace,
+                        PendingRootDaemonOp::InitializeBasisNamespace,
                     );
                 }
                 if state != ConnectionState::Connected {
@@ -3186,7 +3254,7 @@ impl Supervisor {
                     self.fail_inflight_root_daemon_ops(detail);
                 }
             }
-                    SupervisorEvent::RootDaemonEvent { event } => {
+            SupervisorEvent::RootDaemonEvent { event } => {
                 let pending = self.pending_root_daemon_ops.remove(&event.op_id);
                 if let Some(PendingRootDaemonOp::ImportClashGroup {
                     group_id,
@@ -3197,7 +3265,9 @@ impl Supervisor {
                     let result = match &event.result {
                         diag::RootDaemonResult::Ok { message, .. } => Ok(message.clone()),
                         diag::RootDaemonResult::Error { message, .. } => Err(message.clone()),
-                        _ => Err("Unexpected root-daemon response to Clash group import".to_owned()),
+                        _ => {
+                            Err("Unexpected root-daemon response to Clash group import".to_owned())
+                        }
                     };
                     if let Err(error) = result_tx.send(ClashGroupImportCompletion {
                         group_id: group_id.clone(),
@@ -3243,19 +3313,16 @@ impl Supervisor {
                                 PendingRootDaemonOp::SaveHotconfig { profile } => {
                                     self.refresh_config_cache(profile);
                                     self.refresh_profile_status(profile);
-                                    if self.send_diag_cmd(
-                                        profile,
-                                        ControlCommand::ReloadHotConfig,
-                                    ) {
+                                    if self.send_diag_cmd(profile, ControlCommand::ReloadHotConfig)
+                                    {
                                         status_message.push_str("; runtime reload requested");
                                     } else {
                                         warn!(
                                             profile = profile.as_str(),
                                             "HotConfig saved, but runtime reload request could not be sent"
                                         );
-                                        status_message.push_str(
-                                            "; runtime reload request could not be sent",
-                                        );
+                                        status_message
+                                            .push_str("; runtime reload request could not be sent");
                                     }
                                 }
                                 PendingRootDaemonOp::SaveProfile { profile } => {
@@ -4067,7 +4134,8 @@ impl Supervisor {
                         Arc::new(Vec::new())
                     },
                     recent_conn_ids: if self.is_traffic_subscribed(profile.as_str()) {
-                        diag.map(|d| connection_ids(&d.conns_state)).unwrap_or_default()
+                        diag.map(|d| connection_ids(&d.conns_state))
+                            .unwrap_or_default()
                     } else {
                         Vec::new()
                     },
@@ -4098,6 +4166,7 @@ impl Supervisor {
                     } else {
                         diag::ConnsState::default()
                     },
+                    socks_endpoint: diag.and_then(|d| d.socks_endpoint_state.clone()),
                     veth_status: self
                         .veth_status
                         .get(profile)
@@ -5180,12 +5249,7 @@ fn daemon_key(profile: &ContainerName, args: &ShellArgs) -> String {
 }
 
 fn connection_ids(state: &diag::ConnsState) -> Vec<diag::ConnId> {
-    state
-        .conns
-        .iter()
-        .rev()
-        .map(|(id, _)| *id)
-        .collect()
+    state.conns.iter().rev().map(|(id, _)| *id).collect()
 }
 
 #[cfg(test)]
@@ -5253,12 +5317,11 @@ mod control_socket_tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let (listener, socket_path) = bind_control_socket_in_state_root_or_runtime(
-            &state_root,
-            "ui_test.sock",
-            || Ok(runtime_dir.clone()),
-        )
-        .unwrap();
+        let (listener, socket_path) =
+            bind_control_socket_in_state_root_or_runtime(&state_root, "ui_test.sock", || {
+                Ok(runtime_dir.clone())
+            })
+            .unwrap();
 
         assert_eq!(socket_path, runtime_dir.join("ui_test.sock"));
         std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
@@ -5302,8 +5365,12 @@ fn refresh_recent_host_routes_for_state(state: &mut DiagState) {
         stats::{HostRouteKey, HostRouteMetric, ObservedRoute},
     };
 
-    let mut by_key: HashMap<HostRouteKey, HostRouteMetric> =
-        state.host_route_stats.iter().cloned().map(|m| (m.key.clone(), m)).collect();
+    let mut by_key: HashMap<HostRouteKey, HostRouteMetric> = state
+        .host_route_stats
+        .iter()
+        .cloned()
+        .map(|m| (m.key.clone(), m))
+        .collect();
     for entry in state.conns_state.conns.values() {
         let Some(route) = &entry.route else {
             continue;
@@ -5403,6 +5470,8 @@ fn diag_event_is_traffic_only(event: &DiagEvent) -> bool {
             | DiagEvent::HostRouteStatsSnapshot { .. }
             | DiagEvent::HostRouteStatsUpdated { .. }
             | DiagEvent::ConnectionsExpired { .. }
+            | DiagEvent::SocksEndpointStateChanged { .. }
+            | DiagEvent::SocksEndpointStats { .. }
     )
 }
 
@@ -5426,11 +5495,7 @@ struct SpawnedCli {
 }
 
 /// Direct spawning by UI
-fn spawn_nsproxy_cli(
-    path: &Path,
-    cli: &Cli,
-    rust_backtrace: Option<bool>,
-) -> Result<SpawnedCli> {
+fn spawn_nsproxy_cli(path: &Path, cli: &Cli, rust_backtrace: Option<bool>) -> Result<SpawnedCli> {
     let fd_file = cli_to_inheritable_fd(cli)?;
     let fd = fd_file.as_raw_fd();
 

@@ -276,9 +276,7 @@ pub struct ProfileNamespaces {
 
 impl Inode for ProfileNamespaces {
     fn ino_eq(&self, other: &Self) -> bool {
-        self.mnt.ino_eq(&other.mnt)
-            && self.net.ino_eq(&other.net)
-            && self.pid.ino_eq(&other.pid)
+        self.mnt.ino_eq(&other.mnt) && self.net.ino_eq(&other.net) && self.pid.ino_eq(&other.pid)
     }
 }
 
@@ -310,10 +308,7 @@ impl NamespacesRegistry {
                 registry.basis_ns = Some(current.clone());
                 initialized = true;
             }
-            Ok(registry
-                .basis_ns
-                .clone()
-                .expect("basis namespace was set"))
+            Ok(registry.basis_ns.clone().expect("basis namespace was set"))
         })?;
 
         Ok(NamespaceRegistryInit {
@@ -562,11 +557,7 @@ impl NSFrom<PathBuf> for ExactNS {
 
 impl NSFrom<(PidPath, &str)> for ExactNS {
     fn from_source(source: (PidPath, &str)) -> Result<Self> {
-        let path = PathBuf::from(format!(
-            "/proc/{}/ns/{}",
-            source.0.to_str(),
-            source.1
-        ));
+        let path = PathBuf::from(format!("/proc/{}/ns/{}", source.0.to_str(), source.1));
         NSFrom::from_source(path)
     }
 }
@@ -784,10 +775,7 @@ fn test_f() {
 #[test]
 fn initialize_basis_replaces_incompatible_registry() {
     let previous_root = state_paths::persist_root();
-    let root = std::env::temp_dir().join(format!(
-        "nsproxy-common-namespace-registry-{}",
-        getpid()
-    ));
+    let root = std::env::temp_dir().join(format!("nsproxy-common-namespace-registry-{}", getpid()));
     let _ = std::fs::remove_dir_all(&root);
     state_paths::set_persist_root(&root);
 

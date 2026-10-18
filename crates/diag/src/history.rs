@@ -297,12 +297,15 @@ impl History {
                 .0
                 .saturating_sub(age_seconds.saturating_mul(1_000_000)),
         );
-        let available_from = Timestamp(
-            self.activities_evicted_through.map_or(
-                self.activities_started_at.0,
-                |evicted| evicted.0.saturating_add(1).max(self.activities_started_at.0),
-            ),
-        );
+        let available_from = Timestamp(self.activities_evicted_through.map_or(
+            self.activities_started_at.0,
+            |evicted| {
+                evicted
+                    .0
+                    .saturating_add(1)
+                    .max(self.activities_started_at.0)
+            },
+        ));
         let history_partial = cutoff < available_from;
 
         let mut connections = BTreeMap::<ConnId, ConnectionActivity>::new();
@@ -402,7 +405,9 @@ fn event_timestamp(event: &DiagEvent) -> Timestamp {
         | DiagEvent::DnsResolved { ts, .. }
         | DiagEvent::DnsQuery { ts, .. }
         | DiagEvent::Wait { ts, .. }
-        | DiagEvent::WaitEnded { ts, .. } => *ts,
+        | DiagEvent::WaitEnded { ts, .. }
+        | DiagEvent::SocksEndpointStateChanged { ts, .. }
+        | DiagEvent::SocksEndpointStats { ts, .. } => *ts,
         DiagEvent::Dispatched { .. } => Timestamp::now(),
         _ => Timestamp::now(),
     }
@@ -665,8 +670,7 @@ fn query_connections(
     let store = store
         .lock()
         .map_err(|_| "in-memory history is temporarily unavailable".to_owned())?;
-    let (connections, available_from, history_partial) =
-        store.connections(age_seconds, ip_filter);
+    let (connections, available_from, history_partial) = store.connections(age_seconds, ip_filter);
     Ok(ConnectionsResponse {
         connections,
         available_from,
@@ -706,19 +710,25 @@ fn history_status() -> Result<HistoryStatus, String> {
     let mut status = HistoryStatus {
         started_at: store.started_at,
         log_oldest_available: Timestamp(
-            store.logs_evicted_through.map_or(store.logs_started_at.0, |ts| {
-                ts.0.saturating_add(1).max(store.logs_started_at.0)
-            }),
+            store
+                .logs_evicted_through
+                .map_or(store.logs_started_at.0, |ts| {
+                    ts.0.saturating_add(1).max(store.logs_started_at.0)
+                }),
         ),
         mapping_oldest_available: Timestamp(
-            store.mappings_evicted_through.map_or(store.mappings_started_at.0, |ts| {
-                ts.0.saturating_add(1).max(store.mappings_started_at.0)
-            }),
+            store
+                .mappings_evicted_through
+                .map_or(store.mappings_started_at.0, |ts| {
+                    ts.0.saturating_add(1).max(store.mappings_started_at.0)
+                }),
         ),
         activity_oldest_available: Timestamp(
-            store.activities_evicted_through.map_or(store.activities_started_at.0, |ts| {
-                ts.0.saturating_add(1).max(store.activities_started_at.0)
-            }),
+            store
+                .activities_evicted_through
+                .map_or(store.activities_started_at.0, |ts| {
+                    ts.0.saturating_add(1).max(store.activities_started_at.0)
+                }),
         ),
         used_bytes: store.used_bytes,
         max_bytes: store.max_bytes,
@@ -1247,10 +1257,9 @@ mod tests {
         let before_start = Timestamp(history.started_at.0.saturating_sub(1));
 
         assert!(history.query_logs(before_start, before_start).is_err());
-        assert!(history.mapping_at(
-            "198.18.0.5".parse().unwrap(),
-            before_start
-        ).is_err());
+        assert!(history
+            .mapping_at("198.18.0.5".parse().unwrap(), before_start)
+            .is_err());
 
         let (_, available_from, partial) = history.connections(60, None);
         assert_eq!(available_from, history.activities_started_at);
@@ -1259,11 +1268,8 @@ mod tests {
 
     #[tokio::test]
     async fn route_requires_explicit_timestamp_range() {
-        let (status, body) = route_request(
-            "GET /v1/logs HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            None,
-        )
-        .await;
+        let (status, body) =
+            route_request("GET /v1/logs HTTP/1.1\r\nHost: localhost\r\n\r\n", None).await;
         assert_eq!(status, 400);
         assert!(String::from_utf8(body).unwrap().contains("from_us"));
     }
@@ -1299,7 +1305,9 @@ mod tests {
     async fn route_endpoint_returns_the_router_decision() {
         let handler: RouteQueryHandler = Arc::new(|query| {
             Box::pin(async move {
-                Ok(RoutingResovled::NoProxy(SocketAddr::new(query.dst, query.port)))
+                Ok(RoutingResovled::NoProxy(SocketAddr::new(
+                    query.dst, query.port,
+                )))
             }) as RouteQueryFuture
         });
         let request = "GET /v1/route?dst=192.0.2.8&src=192.0.2.1&port=123&protocol=udp HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -1337,7 +1345,9 @@ mod tests {
         let assets = [("index.html", index.as_slice())];
 
         assert_eq!(
-            static_asset(Some("/client-route"), &assets, true).unwrap().1,
+            static_asset(Some("/client-route"), &assets, true)
+                .unwrap()
+                .1,
             index
         );
     }

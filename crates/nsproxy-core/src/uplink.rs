@@ -1132,6 +1132,7 @@ pub mod proxy_adapters {
     use tokio::net::{TcpStream, UdpSocket};
     use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
+    use tun2socks5::udp_associate::SharedUdpAssociate;
 
     /// UDP packet for datagram operations
     #[derive(Debug, Clone)]
@@ -1357,6 +1358,16 @@ pub mod proxy_adapters {
         info: String,
     }
 
+    /// A per-flow view of the router-wide SOCKS5 UDP associate.
+    ///
+    /// The associate owns the TCP control connection and relay socket; this
+    /// adapter only supplies the flow-specific queue expected by `UdpLike`.
+    struct SharedSocks5UdpConn {
+        associate: Arc<SharedUdpAssociate>,
+        inbound: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        info: String,
+    }
+
     impl TcpLike for Socks5TcpConn {
         fn info(&self) -> &str {
             &self.info
@@ -1416,6 +1427,34 @@ pub mod proxy_adapters {
             Ok(UdpPacket {
                 data: buf,
                 dst_addr: src,
+            })
+        }
+
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UdpLike for SharedSocks5UdpConn {
+        async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize> {
+            self.associate
+                .send_datagram(dst, data)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(data.len())
+        }
+
+        async fn recv_from(&mut self) -> std::io::Result<UdpPacket> {
+            let (src, data) = self.inbound.recv().await.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "shared SOCKS5 UDP flow was deregistered",
+                )
+            })?;
+            Ok(UdpPacket {
+                data,
+                dst_addr: WireAddress::SocketAddress(src),
             })
         }
 
@@ -1861,6 +1900,36 @@ pub mod proxy_adapters {
     pub struct RemoteAdapter;
 
     impl RemoteAdapter {
+        /// Register one UDP flow on a shared SOCKS5 UDP associate.
+        pub async fn connect_shared_udp(
+            proxy: &ArgProxy,
+            associate: Arc<SharedUdpAssociate>,
+            conn_id: diag::ConnId,
+            local_addr: SocketAddr,
+            peer_addr: SocketAddr,
+        ) -> anyhow::Result<ProxyConnection> {
+            use tun2socks5::ProxyType;
+
+            if proxy.proxy_type != ProxyType::Socks5 {
+                anyhow::bail!(
+                    "proxy type {:?} does not support shared UDP",
+                    proxy.proxy_type
+                );
+            }
+
+            tokio::time::timeout(CONNECT_TIMEOUT, associate.wait_until_active())
+                .await
+                .context("Timeout waiting for shared SOCKS5 UDP associate")??;
+            let inbound = associate
+                .register_flow(conn_id, local_addr, peer_addr)
+                .await;
+            Ok(ProxyConnection::Udp(Box::new(SharedSocks5UdpConn {
+                associate,
+                inbound,
+                info: format!("socks5+udp://{}", proxy.addr),
+            })))
+        }
+
         /// Create a SOCKS5 connection
         pub async fn connect_tcp(
             proxy: &ArgProxy,

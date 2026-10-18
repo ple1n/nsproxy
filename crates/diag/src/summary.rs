@@ -255,7 +255,9 @@ impl DiagAccumulator {
             | DiagEvent::Log(_)
             | DiagEvent::RecentLogs(_)
             | DiagEvent::RecentDiagEvents(_)
-            | DiagEvent::ConnsStateSnapshot { .. } => {}
+            | DiagEvent::ConnsStateSnapshot { .. }
+            | DiagEvent::SocksEndpointStateChanged { .. }
+            | DiagEvent::SocksEndpointStats { .. } => {}
         }
     }
 }

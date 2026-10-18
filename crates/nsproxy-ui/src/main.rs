@@ -107,7 +107,8 @@ mod supervisor;
 use alacritty_window::{run_term_window_process, ExternalTermWindowClient};
 use profile_loader::ProfileInfo;
 use supervisor::{
-    ContainerName, EditorStatus, LogSource, RenderedLogEntry, SupervisorCommand, SupervisorHandle,
+    ContainerName, ContainerState, EditorStatus, LogSource, RenderedLogEntry, SupervisorCommand,
+    SupervisorHandle,
 };
 use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
@@ -691,6 +692,7 @@ impl Default for ManageWizard {
 enum TrafficSubview {
     #[default]
     Connections,
+    Listeners,
     Logs,
 }
 
@@ -8296,12 +8298,60 @@ impl App {
                 ui.label("Routing: no route selected");
             }
         }
+        if let Some(endpoint) = &profile.socks_endpoint {
+            ui.horizontal(|ui| {
+                let op_str = match endpoint.op {
+                    diag::SocksOpKind::UdpAssociate => "SOCKS UDP Associate",
+                    diag::SocksOpKind::Bind => "SOCKS BIND",
+                };
+                ui.strong(format!("{}:", op_str));
+                match &endpoint.status {
+                    diag::SocksEndpointStatus::Active {
+                        raw_bnd,
+                        effective_bnd,
+                        relay_local_addr,
+                    } => {
+                        ui.colored_label(Color32::GREEN, "Active");
+                        ui.label(format!("Proxy: {}", endpoint.proxy_addr));
+                        ui.separator();
+                        ui.label(format!("BND: {}", raw_bnd));
+                        ui.separator();
+                        ui.label(format!("Effective: {}", effective_bnd));
+                        if let Some(local) = relay_local_addr {
+                            ui.separator();
+                            ui.label(format!("Local: {}", local));
+                        }
+                        ui.separator();
+                        ui.label(format!(
+                            "Flows: {} | ↑{} pkts ({:.1}KB) ↓{} pkts ({:.1}KB)",
+                            endpoint.active_flows,
+                            endpoint.pkts_tx,
+                            (endpoint.bytes_tx as f64) / 1024.0,
+                            endpoint.pkts_rx,
+                            (endpoint.bytes_rx as f64) / 1024.0,
+                        ));
+                    }
+                    diag::SocksEndpointStatus::Connecting => {
+                        ui.colored_label(Color32::YELLOW, "Connecting...");
+                        ui.label(format!("Proxy: {}", endpoint.proxy_addr));
+                    }
+                    diag::SocksEndpointStatus::Reconnecting { reason } => {
+                        ui.colored_label(Color32::from_rgb(255, 140, 0), "Reconnecting");
+                        ui.label(format!("Proxy: {} ({})", endpoint.proxy_addr, reason));
+                    }
+                    diag::SocksEndpointStatus::Closed { reason } => {
+                        ui.colored_label(Color32::from_gray(140), "Closed");
+                        ui.label(format!("Proxy: {} ({})", endpoint.proxy_addr, reason));
+                    }
+                }
+            });
+        }
 
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
 
-        // Sub-view toggle: Connections | Logs
+        // Sub-view toggle: Connections | Listeners | Logs
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(
@@ -8313,6 +8363,15 @@ impl App {
                 self.traffic_subview = TrafficSubview::Connections;
             }
             if ui
+                .selectable_label(
+                    self.traffic_subview == TrafficSubview::Listeners,
+                    "Listeners",
+                )
+                .clicked()
+            {
+                self.traffic_subview = TrafficSubview::Listeners;
+            }
+            if ui
                 .selectable_label(self.traffic_subview == TrafficSubview::Logs, "Logs")
                 .clicked()
             {
@@ -8320,6 +8379,12 @@ impl App {
             }
         });
         ui.add_space(4.0);
+
+        // ── Listeners sub-view (UDP ASSOCIATE / BIND) ─────────────────────────
+        if self.traffic_subview == TrafficSubview::Listeners {
+            Self::render_listeners_view(ui, &profile_name, profile);
+            return;
+        }
 
         // ── Logs sub-view (ported from nsp-diag viewer.rs) ───────────────────
         if self.traffic_subview == TrafficSubview::Logs {
@@ -8810,6 +8875,15 @@ impl App {
         let proxies = &self.proxies;
         let hide_secret = self.hide_secret;
         let cover_text = self.cover_text.as_str();
+
+        // ── Listeners section in Connections sub-view ─────────────────────────
+        egui::CollapsingHeader::new("Listeners (SOCKS UDP Associate / BIND)")
+            .default_open(true)
+            .show(ui, |ui| {
+                Self::render_listeners_summary_card(ui, &profile_name, profile);
+            });
+        ui.add_space(6.0);
+
         if conns.conns.is_empty() {
             ui.colored_label(Color32::from_gray(110), "no tracked connections");
         }
@@ -9141,6 +9215,182 @@ impl App {
                     });
                 });
         });
+    }
+
+    fn render_listeners_summary_card(
+        ui: &mut egui::Ui,
+        profile_name: &str,
+        profile: &ContainerState,
+    ) {
+        let Some(endpoint) = &profile.socks_endpoint else {
+            ui.colored_label(
+                Color32::from_gray(140),
+                "No SOCKS UDP Associate or BIND listener is active yet.",
+            );
+            return;
+        };
+
+        let op_name = match endpoint.op {
+            diag::SocksOpKind::UdpAssociate => "SOCKS UDP Associate",
+            diag::SocksOpKind::Bind => "SOCKS BIND",
+        };
+        let (status_label, status_color) = match &endpoint.status {
+            diag::SocksEndpointStatus::Active { .. } => ("● Active".to_string(), Color32::GREEN),
+            diag::SocksEndpointStatus::Connecting => ("● Connecting".to_string(), Color32::YELLOW),
+            diag::SocksEndpointStatus::Reconnecting { reason } => (
+                format!("● Reconnecting ({reason})"),
+                Color32::from_rgb(255, 140, 0),
+            ),
+            diag::SocksEndpointStatus::Closed { reason } => {
+                (format!("● Closed ({reason})"), Color32::from_gray(140))
+            }
+        };
+
+        ui.horizontal(|ui| {
+            ui.strong(format!("{op_name}:"));
+            ui.colored_label(status_color, status_label);
+        });
+
+        egui::Grid::new(("listeners_summary", profile_name))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Proxy Server:");
+                ui.label(endpoint.proxy_addr.to_string());
+                ui.end_row();
+
+                if let diag::SocksEndpointStatus::Active {
+                    raw_bnd,
+                    effective_bnd,
+                    relay_local_addr,
+                } = &endpoint.status
+                {
+                    ui.label("Reported BND (from proxy response):");
+                    ui.label(raw_bnd.to_string());
+                    ui.end_row();
+
+                    ui.label("Effective Relay Destination:");
+                    let response = ui.label(effective_bnd.to_string());
+                    if raw_bnd.to_string().starts_with("0.0.0.0")
+                        || raw_bnd.to_string().starts_with("[::]")
+                    {
+                        response.on_hover_text(
+                            "SOCKS5 proxies may report a wildcard BND address. \
+                             RFC 1928 resolves it to the proxy server address while \
+                             preserving the reported port.",
+                        );
+                    }
+                    ui.end_row();
+
+                    if let Some(local_addr) = relay_local_addr {
+                        ui.label("Local Relay Socket:");
+                        ui.label(local_addr.to_string());
+                        ui.end_row();
+                    }
+                }
+
+                ui.label("Active Mapped Flows:");
+                ui.label(endpoint.active_flows.to_string());
+                ui.end_row();
+
+                ui.label("Traffic:");
+                ui.label(format!(
+                    "↑ {} pkts ({:.0} KB)   ↓ {} pkts ({:.0} KB)",
+                    endpoint.pkts_tx,
+                    endpoint.bytes_tx as f64 / 1024.0,
+                    endpoint.pkts_rx,
+                    endpoint.bytes_rx as f64 / 1024.0,
+                ));
+                ui.end_row();
+
+                ui.label("Last Event:");
+                ui.label(format_conn_timestamp(endpoint.updated_at));
+                ui.end_row();
+            });
+    }
+
+    fn render_listeners_view(ui: &mut egui::Ui, profile_name: &str, profile: &ContainerState) {
+        ui.heading("Listeners & Relays (SOCKS UDP Associate / BIND)");
+        ui.label(
+            "Persistent external proxy listeners and multiplexed SOCKS5 UDP associations \
+             (RFC 1928) allocated for this container.",
+        );
+        Self::render_listeners_summary_card(ui, profile_name, profile);
+
+        ui.separator();
+        ui.strong("Active Container UDP Flows Mapped to Relay");
+
+        let active_udp_flows: Vec<_> = profile
+            .conns_state
+            .conns
+            .iter()
+            .filter(|(_, entry)| entry.kind == diag::StreamKind::Udp && entry.finished_at.is_none())
+            .collect();
+
+        if active_udp_flows.is_empty() {
+            ui.colored_label(
+                Color32::from_gray(140),
+                "No active UDP flows are currently sending or receiving through this association.",
+            );
+            return;
+        }
+
+        let row_height = 20.0;
+        TableBuilder::new(ui)
+            .id_salt(("listeners_flows", profile_name))
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::auto().at_least(60.0))
+            .column(Column::auto().at_least(110.0))
+            .column(Column::remainder().at_least(180.0))
+            .column(Column::auto().at_least(130.0))
+            .column(Column::auto().at_least(100.0))
+            .header(row_height, |mut header| {
+                header.col(|ui| {
+                    ui.strong("ID");
+                });
+                header.col(|ui| {
+                    ui.strong("State");
+                });
+                header.col(|ui| {
+                    ui.strong("Remote Peer");
+                });
+                header.col(|ui| {
+                    ui.strong("Traffic");
+                });
+                header.col(|ui| {
+                    ui.strong("Duration");
+                });
+            })
+            .body(|mut body| {
+                body.rows(row_height, active_udp_flows.len(), |mut row| {
+                    let (id, entry) = active_udp_flows[row.index()];
+                    row.col(|ui| {
+                        ui.label(id.0.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.colored_label(
+                            conn_phase_color(entry.phase),
+                            conn_phase_label(entry.phase),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(entry.dst.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(format!(
+                            "{:.0} / {:.0} bytes",
+                            entry.bytes_up.unwrap_or(0.0),
+                            entry.bytes_down.unwrap_or(0.0),
+                        ));
+                    });
+                    row.col(|ui| {
+                        let duration = diag::Timestamp::now().elapsed_since(entry.accepted_at);
+                        ui.label(diag::summary::format_duration_us(
+                            duration.as_secs_f64() * 1_000_000.0,
+                        ));
+                    });
+                });
+            });
     }
 
     // ── Manage tab ────────────────────────────────────────────────────────────
@@ -12233,6 +12483,71 @@ fn render_diag_event_row(ui: &mut egui::Ui, event: &diag::DiagEvent) {
                 }
             });
         }
+        diag::DiagEvent::SocksEndpointStateChanged {
+            op,
+            proxy_addr,
+            status,
+            ..
+        } => {
+            let op_str = match op {
+                diag::SocksOpKind::UdpAssociate => "SOCKS-UDP",
+                diag::SocksOpKind::Bind => "SOCKS-BIND",
+            };
+            match status {
+                diag::SocksEndpointStatus::Active {
+                    raw_bnd,
+                    effective_bnd,
+                    relay_local_addr,
+                } => {
+                    ui.colored_label(Color32::LIGHT_GREEN, op_str);
+                    let mut text = format!(
+                        "Active @ {} | BND: {} → Effective: {}",
+                        proxy_addr, raw_bnd, effective_bnd
+                    );
+                    if let Some(local) = relay_local_addr {
+                        text.push_str(&format!(" | Local: {}", local));
+                    }
+                    ui.label(text);
+                }
+                diag::SocksEndpointStatus::Connecting => {
+                    ui.colored_label(Color32::YELLOW, op_str);
+                    ui.label(format!("Connecting to proxy {}...", proxy_addr));
+                }
+                diag::SocksEndpointStatus::Reconnecting { reason } => {
+                    ui.colored_label(Color32::from_rgb(255, 140, 0), op_str);
+                    ui.label(format!("Reconnecting @ {}: {}", proxy_addr, reason));
+                }
+                diag::SocksEndpointStatus::Closed { reason } => {
+                    ui.colored_label(Color32::from_gray(140), op_str);
+                    ui.label(format!("Closed @ {}: {}", proxy_addr, reason));
+                }
+            }
+        }
+        diag::DiagEvent::SocksEndpointStats {
+            op,
+            proxy_addr,
+            active_flows,
+            pkts_tx,
+            pkts_rx,
+            bytes_tx,
+            bytes_rx,
+            ..
+        } => {
+            let op_str = match op {
+                diag::SocksOpKind::UdpAssociate => "SOCKS-UDP-STATS",
+                diag::SocksOpKind::Bind => "SOCKS-BIND-STATS",
+            };
+            ui.colored_label(Color32::from_rgb(140, 180, 240), op_str);
+            ui.label(format!(
+                "@ {} | flows: {} | ↑{} pkts ({:.1}KB) ↓{} pkts ({:.1}KB)",
+                proxy_addr,
+                active_flows,
+                pkts_tx,
+                (*bytes_tx as f64) / 1024.0,
+                pkts_rx,
+                (*bytes_rx as f64) / 1024.0,
+            ));
+        }
         other => {
             ui.colored_label(Color32::from_gray(120), diag_event_kind_label(other));
         }
@@ -12264,6 +12579,8 @@ fn diag_event_kind_label(ev: &diag::DiagEvent) -> &'static str {
         diag::DiagEvent::RecentLogs(_) => "RecentLogs",
         diag::DiagEvent::RecentDiagEvents(_) => "RecentDiagEvents",
         diag::DiagEvent::ConnsStateSnapshot { .. } => "ConnsStateSnapshot",
+        diag::DiagEvent::SocksEndpointStateChanged { .. } => "SocksEndpointStateChanged",
+        diag::DiagEvent::SocksEndpointStats { .. } => "SocksEndpointStats",
     }
 }
 

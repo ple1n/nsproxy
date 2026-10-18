@@ -236,7 +236,8 @@ mod tests {
             } if proxy == "proxy.example:1080" && connect_targets == ["example.com:443"]
         ));
 
-        let serve = Cli::try_parse_from(["sp", "socks5", "serve", "1080", "--test-servers"]).unwrap();
+        let serve =
+            Cli::try_parse_from(["sp", "socks5", "serve", "1080", "--test-servers"]).unwrap();
         assert!(matches!(
             serve.cmd,
             MainCommand::Socks5 {
@@ -743,7 +744,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "nsp3-hotconfig-uninitialized-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let mut hot = HotConfig::default();
         hot.dns

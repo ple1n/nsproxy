@@ -29,8 +29,9 @@ use anyhow::{bail, Result};
 pub use nsproxy_common::stats::Timestamp;
 use nsproxy_common::{
     routing::{ProxyID, RoutingResovled},
+    state_paths,
     stats::{HostRouteHost, HostRouteMetric, ObservedRoute},
-    state_paths, ExactNS, NSFrom, PidPath, UniqueFile,
+    ExactNS, NSFrom, PidPath, UniqueFile,
 };
 use serde::{Deserialize, Serialize};
 use socks5_impl::protocol::WireAddress;
@@ -42,9 +43,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
+pub mod history;
 pub mod personal;
 pub mod summary;
-pub mod history;
 
 // ── Wire protocol types ──────────────────────────────────────────────
 
@@ -163,6 +164,62 @@ pub enum DiagEvent {
     },
     /// Connection intentionally closed by a user action.
     Killed { id: ConnId, ts: Timestamp },
+    /// SOCKS5 UDP ASSOCIATE or BIND endpoint status change.
+    SocksEndpointStateChanged {
+        ts: Timestamp,
+        op: SocksOpKind,
+        proxy_addr: std::net::SocketAddr,
+        status: SocksEndpointStatus,
+    },
+    /// Periodic or event-driven stats for the SOCKS endpoint.
+    SocksEndpointStats {
+        ts: Timestamp,
+        op: SocksOpKind,
+        proxy_addr: std::net::SocketAddr,
+        active_flows: usize,
+        pkts_tx: u64,
+        pkts_rx: u64,
+        bytes_tx: u64,
+        bytes_rx: u64,
+    },
+}
+
+/// Kind of SOCKS operation establishing an external listener or relay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SocksOpKind {
+    UdpAssociate,
+    Bind,
+}
+
+/// Lifecycle and address state for a SOCKS endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SocksEndpointStatus {
+    Connecting,
+    Active {
+        raw_bnd: WireAddress,
+        effective_bnd: std::net::SocketAddr,
+        relay_local_addr: Option<std::net::SocketAddr>,
+    },
+    Reconnecting {
+        reason: String,
+    },
+    Closed {
+        reason: String,
+    },
+}
+
+/// Snapshot report of a SOCKS endpoint's state and metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SocksEndpointReport {
+    pub op: SocksOpKind,
+    pub proxy_addr: std::net::SocketAddr,
+    pub status: SocksEndpointStatus,
+    pub active_flows: usize,
+    pub pkts_tx: u64,
+    pub pkts_rx: u64,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
+    pub updated_at: Timestamp,
 }
 
 /// A single tracing log record, usable across multiple transport protocols.
@@ -203,9 +260,7 @@ pub enum ControlCommand {
         proxy_id: nsproxy_common::routing::ProxyID,
     },
     /// Route all traffic through a named user-owned proxy group.
-    SetGroupRouting {
-        group_id: String,
-    },
+    SetGroupRouting { group_id: String },
     /// Route all traffic without a proxy, independently of the no-route state.
     SetNoProxyRouting,
     /// Request current DNS state snapshot.
@@ -615,7 +670,9 @@ impl ConnsState {
     /// (in the supervisor) to keep a local reconstruction up-to-date.
     pub fn apply_event(&mut self, event: &DiagEvent) {
         match event {
-            DiagEvent::Accept { id, dst, ts, kind, .. } => {
+            DiagEvent::Accept {
+                id, dst, ts, kind, ..
+            } => {
                 if let Ok(addr) = WireAddress::try_from(dst.as_str()) {
                     let mut entry = ConnEntry {
                         kind: kind.clone(),
@@ -642,9 +699,9 @@ impl ConnsState {
                         RoutingResovled::Drop(nsproxy_common::routing::DropReason::MaxRetry) => {
                             entry.phase = ConnPhase::RouteExhausted;
                         }
-                        RoutingResovled::Drop(
-                            nsproxy_common::routing::DropReason::Preprocess(_),
-                        ) => {
+                        RoutingResovled::Drop(nsproxy_common::routing::DropReason::Preprocess(
+                            _,
+                        )) => {
                             entry.phase = ConnPhase::RouteRejected;
                         }
                         _ => {
@@ -882,6 +939,9 @@ pub struct DiagServer {
     cmd_tx: mpsc::Sender<ControlCommand>,
     /// Rolling ring buffer of the most-recent [`DIAG_EVENT_RING_CAP`] emitted events.
     event_ring: Arc<Mutex<VecDeque<DiagEvent>>>,
+    /// Latest SOCKS endpoint report, replayed to clients that connect after
+    /// the lifecycle event was emitted.
+    socks_endpoint: Arc<Mutex<Option<SocksEndpointReport>>>,
     /// Channel to the [`ConnsActor`] that owns connection-tracking state.
     conns_tx: mpsc::Sender<ConnsCmd>,
     /// When `false`, all connection-tracking logic in [`Self::emit`] is skipped.
@@ -941,12 +1001,14 @@ impl DiagServer {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CAP);
         let event_ring: Arc<Mutex<VecDeque<DiagEvent>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(DIAG_EVENT_RING_CAP)));
+        let socks_endpoint = Arc::new(Mutex::new(None));
         let track_conns = Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS));
         let (conns_tx, mut expired_rx) = ConnsActor::spawn(conn_persist);
         let server = DiagServer {
             tx: tx.clone(),
             cmd_tx: cmd_tx.clone(),
             event_ring: event_ring.clone(),
+            socks_endpoint: socks_endpoint.clone(),
             conns_tx: conns_tx.clone(),
             track_conns: track_conns.clone(),
             conn_persist,
@@ -979,6 +1041,7 @@ impl DiagServer {
                             rx,
                             cmd_tx.clone(),
                             event_ring.clone(),
+                            socks_endpoint.clone(),
                             track_conns.clone(),
                             conns_tx.clone(),
                         ));
@@ -1001,6 +1064,7 @@ impl DiagServer {
     /// forwarded to the [`ConnsActor`] for live connection-tracking.
     pub fn emit(&self, event: DiagEvent) {
         history::record_diag_event(&event);
+        self.update_socks_endpoint(&event);
         // 1. Push to the rolling ring buffer.
         if !matches!(
             event,
@@ -1080,6 +1144,7 @@ impl DiagServer {
             tx,
             cmd_tx,
             event_ring: Arc::new(Mutex::new(VecDeque::new())),
+            socks_endpoint: Arc::new(Mutex::new(None)),
             conns_tx,
             track_conns: Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS)),
             conn_persist: DEFAULT_CONN_PERSIST,
@@ -1097,6 +1162,7 @@ impl DiagServer {
         let rx = self.tx.subscribe();
         let cmd_tx = self.cmd_tx.clone();
         let ring = self.event_ring.clone();
+        let socks_endpoint = self.socks_endpoint.clone();
         let track_conns = self.track_conns.clone();
         let conns_tx = self.conns_tx.clone();
         tokio::spawn(serve_client(
@@ -1104,6 +1170,7 @@ impl DiagServer {
             rx,
             cmd_tx,
             ring,
+            socks_endpoint,
             track_conns,
             conns_tx,
         ));
@@ -1122,6 +1189,67 @@ impl DiagServer {
     ) -> impl std::future::Future<Output = F::Output> {
         TASK_DIAG.scope(Some(self.tx.clone()), fut)
     }
+
+    fn update_socks_endpoint(&self, event: &DiagEvent) {
+        let Ok(mut current) = self.socks_endpoint.lock() else {
+            return;
+        };
+        match event {
+            DiagEvent::SocksEndpointStateChanged {
+                ts,
+                op,
+                proxy_addr,
+                status,
+            } => {
+                let report = current.get_or_insert_with(|| SocksEndpointReport {
+                    op: *op,
+                    proxy_addr: *proxy_addr,
+                    status: status.clone(),
+                    active_flows: 0,
+                    pkts_tx: 0,
+                    pkts_rx: 0,
+                    bytes_tx: 0,
+                    bytes_rx: 0,
+                    updated_at: *ts,
+                });
+                report.op = *op;
+                report.proxy_addr = *proxy_addr;
+                report.status = status.clone();
+                report.updated_at = *ts;
+            }
+            DiagEvent::SocksEndpointStats {
+                ts,
+                op,
+                proxy_addr,
+                active_flows,
+                pkts_tx,
+                pkts_rx,
+                bytes_tx,
+                bytes_rx,
+            } => {
+                let report = current.get_or_insert_with(|| SocksEndpointReport {
+                    op: *op,
+                    proxy_addr: *proxy_addr,
+                    status: SocksEndpointStatus::Connecting,
+                    active_flows: *active_flows,
+                    pkts_tx: *pkts_tx,
+                    pkts_rx: *pkts_rx,
+                    bytes_tx: *bytes_tx,
+                    bytes_rx: *bytes_rx,
+                    updated_at: *ts,
+                });
+                report.op = *op;
+                report.proxy_addr = *proxy_addr;
+                report.active_flows = *active_flows;
+                report.pkts_tx = *pkts_tx;
+                report.pkts_rx = *pkts_rx;
+                report.bytes_tx = *bytes_tx;
+                report.bytes_rx = *bytes_rx;
+                report.updated_at = *ts;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Serve a single connected EGUI client.
@@ -1133,10 +1261,41 @@ async fn serve_client(
     mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
     cmd_tx: mpsc::Sender<ControlCommand>,
     event_ring: Arc<Mutex<VecDeque<DiagEvent>>>,
+    socks_endpoint: Arc<Mutex<Option<SocksEndpointReport>>>,
     track_conns: Arc<AtomicBool>,
     conns_tx: mpsc::Sender<ConnsCmd>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
+
+    // Lifecycle events are broadcast-only, so a client that connects after
+    // startup would otherwise never learn that the endpoint exists. Replay
+    // the retained report before entering the live event loop.
+    let endpoint = socks_endpoint.lock().ok().and_then(|report| report.clone());
+    if let Some(report) = endpoint {
+        let state = DiagEvent::SocksEndpointStateChanged {
+            ts: report.updated_at,
+            op: report.op,
+            proxy_addr: report.proxy_addr,
+            status: report.status,
+        };
+        let stats = DiagEvent::SocksEndpointStats {
+            ts: report.updated_at,
+            op: report.op,
+            proxy_addr: report.proxy_addr,
+            active_flows: report.active_flows,
+            pkts_tx: report.pkts_tx,
+            pkts_rx: report.pkts_rx,
+            bytes_tx: report.bytes_tx,
+            bytes_rx: report.bytes_rx,
+        };
+        for event in [state, stats] {
+            if let Ok(frame) = encode_frame(&event) {
+                if write_half.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -1261,7 +1420,9 @@ pub async fn connect(sock_path: &Path) -> Result<DiagEventStream> {
 }
 
 /// Connect to a diagnostic socket and return the server's network namespace identity.
-pub async fn connect_with_identity(sock_path: &Path) -> Result<(DiagEventStream, ProtocolHandshake)> {
+pub async fn connect_with_identity(
+    sock_path: &Path,
+) -> Result<(DiagEventStream, ProtocolHandshake)> {
     let mut stream = UnixStream::connect(sock_path).await?;
     let handshake = handshake_client(&mut stream, ProtocolChannel::Diag).await?;
     Ok((DiagEventStream::from_stream(stream), handshake))
@@ -2352,9 +2513,7 @@ mod tests {
         state.apply_event(&DiagEvent::Route {
             id,
             ts,
-            route: RoutingResovled::Drop(
-                nsproxy_common::routing::DropReason::MaxRetry,
-            ),
+            route: RoutingResovled::Drop(nsproxy_common::routing::DropReason::MaxRetry),
         });
         assert_eq!(
             state.conns.get(&id).unwrap().phase,
@@ -2401,10 +2560,7 @@ mod tests {
             dst: "127.0.0.1:53".to_string(),
         });
 
-        state.apply_event(&DiagEvent::ConnectionsExpired {
-            ts,
-            ids: vec![id],
-        });
+        state.apply_event(&DiagEvent::ConnectionsExpired { ts, ids: vec![id] });
         assert!(!state.conns.contains_key(&id));
     }
 
@@ -2540,5 +2696,121 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(expired, vec![id]);
+    }
+
+    #[test]
+    fn socks_endpoint_events_round_trip_over_bincode() {
+        use std::net::SocketAddr;
+        let proxy_addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let effective_bnd: SocketAddr = "1.2.3.4:45240".parse().unwrap();
+        let relay_local: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+
+        let state_event = DiagEvent::SocksEndpointStateChanged {
+            ts: Timestamp::now(),
+            op: SocksOpKind::UdpAssociate,
+            proxy_addr,
+            status: SocksEndpointStatus::Active {
+                raw_bnd: WireAddress::SocketAddress(effective_bnd),
+                effective_bnd,
+                relay_local_addr: Some(relay_local),
+            },
+        };
+
+        let encoded = bincode::serialize(&state_event).unwrap();
+        let decoded: DiagEvent = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            DiagEvent::SocksEndpointStateChanged {
+                op,
+                proxy_addr: p,
+                status:
+                    SocksEndpointStatus::Active {
+                        raw_bnd,
+                        effective_bnd: eff,
+                        relay_local_addr,
+                    },
+                ..
+            } => {
+                assert_eq!(op, SocksOpKind::UdpAssociate);
+                assert_eq!(p, proxy_addr);
+                assert_eq!(eff, effective_bnd);
+                assert_eq!(relay_local_addr, Some(relay_local));
+                assert_eq!(raw_bnd, WireAddress::SocketAddress(effective_bnd));
+            }
+            _ => panic!("wrong decoded event variant"),
+        }
+
+        let stats_event = DiagEvent::SocksEndpointStats {
+            ts: Timestamp::now(),
+            op: SocksOpKind::UdpAssociate,
+            proxy_addr,
+            active_flows: 3,
+            pkts_tx: 10,
+            pkts_rx: 8,
+            bytes_tx: 1024,
+            bytes_rx: 800,
+        };
+        let encoded = bincode::serialize(&stats_event).unwrap();
+        let decoded: DiagEvent = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            DiagEvent::SocksEndpointStats {
+                active_flows,
+                pkts_tx,
+                pkts_rx,
+                ..
+            } => {
+                assert_eq!(active_flows, 3);
+                assert_eq!(pkts_tx, 10);
+                assert_eq!(pkts_rx, 8);
+            }
+            _ => panic!("wrong decoded stats event variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn late_clients_receive_current_socks_endpoint_report() {
+        let server = DiagServer::noop();
+        let ts = Timestamp::now();
+        let proxy_addr = "127.0.0.1:1080".parse().unwrap();
+        server.emit(DiagEvent::SocksEndpointStateChanged {
+            ts,
+            op: SocksOpKind::UdpAssociate,
+            proxy_addr,
+            status: SocksEndpointStatus::Active {
+                raw_bnd: WireAddress::SocketAddress("0.0.0.0:53000".parse().unwrap()),
+                effective_bnd: "127.0.0.1:53000".parse().unwrap(),
+                relay_local_addr: Some("0.0.0.0:41000".parse().unwrap()),
+            },
+        });
+        server.emit(DiagEvent::SocksEndpointStats {
+            ts,
+            op: SocksOpKind::UdpAssociate,
+            proxy_addr,
+            active_flows: 2,
+            pkts_tx: 3,
+            pkts_rx: 4,
+            bytes_tx: 5,
+            bytes_rx: 6,
+        });
+
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        server.add_reversed_client(server_stream);
+
+        let first: DiagEvent = read_frame(&mut client_stream).await.unwrap().unwrap();
+        let second: DiagEvent = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert!(matches!(
+            first,
+            DiagEvent::SocksEndpointStateChanged {
+                status: SocksEndpointStatus::Active { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            DiagEvent::SocksEndpointStats {
+                active_flows: 2,
+                bytes_rx: 6,
+                ..
+            }
+        ));
     }
 }

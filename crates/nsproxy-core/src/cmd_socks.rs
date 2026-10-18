@@ -2,11 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use socks5_impl::protocol::{
     AsyncStreamOperation, Command, Reply, Request, StreamOperation, UserKey, WireAddress,
 };
-use std::{
-    io::Cursor,
-    net::SocketAddr,
-    time::Duration,
-};
+use std::{io::Cursor, net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket, lookup_host},
@@ -55,7 +51,9 @@ pub async fn spawn_test_servers() -> Result<SocketAddr> {
                                 Ok(length) => {
                                     info!(%peer, bytes = length, "recv TCP test data");
                                     if let Err(error) = stream.write_all(&buffer[..length]).await {
-                                        warn!("SOCKS5 TCP echo test server failed to reply: {error}");
+                                        warn!(
+                                            "SOCKS5 TCP echo test server failed to reply: {error}"
+                                        );
                                         break;
                                     }
                                     info!(%peer, bytes = length, "write TCP echo data");
@@ -80,7 +78,9 @@ pub async fn spawn_test_servers() -> Result<SocketAddr> {
                     info!(%address, %peer, bytes = length, "recv_from UDP test datagram");
                     match udp_socket.send_to(&buffer[..length], peer).await {
                         Ok(sent) => info!(%address, %peer, bytes = sent, "send_to UDP echo peer"),
-                        Err(error) => warn!("SOCKS5 UDP echo test server failed to reply to {peer}: {error}"),
+                        Err(error) => {
+                            warn!("SOCKS5 UDP echo test server failed to reply to {peer}: {error}")
+                        }
                     }
                 }
                 Err(error) => warn!("SOCKS5 UDP echo test server receive failed: {error}"),
@@ -100,13 +100,19 @@ pub async fn check(
     operation_timeout: Duration,
 ) -> Result<()> {
     let proxy = parse_endpoint(proxy).context("invalid proxy address")?;
-    let auth = username.zip(password).map(|(user, pass)| UserKey::new(user, pass));
+    let auth = username
+        .zip(password)
+        .map(|(user, pass)| UserKey::new(user, pass));
     let connect_targets = connect_targets
         .iter()
-        .map(|target| parse_endpoint(target).with_context(|| format!("invalid CONNECT target '{target}'")))
+        .map(|target| {
+            parse_endpoint(target).with_context(|| format!("invalid CONNECT target '{target}'"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let udp_echo_target = udp_echo_target
-        .map(|target| parse_endpoint(target).with_context(|| format!("invalid UDP echo target '{target}'")))
+        .map(|target| {
+            parse_endpoint(target).with_context(|| format!("invalid UDP echo target '{target}'"))
+        })
         .transpose()?;
 
     info!(%proxy, "start SOCKS5 check");
@@ -146,7 +152,15 @@ pub async fn check(
     }
 
     for target in &connect_targets {
-        match command(&proxy, Command::Connect, target.clone(), auth.as_ref(), operation_timeout).await {
+        match command(
+            &proxy,
+            Command::Connect,
+            target.clone(),
+            auth.as_ref(),
+            operation_timeout,
+        )
+        .await
+        {
             Ok((mut stream, response)) => {
                 if response.reply != Reply::Succeeded {
                     failures.push(format!("CONNECT to {target} failed: {}", response.reply));
@@ -205,7 +219,9 @@ pub async fn check(
     }
 
     if let Some(target) = udp_echo_target {
-        if let Err(error) = probe_udp(&proxy, target.clone(), auth.as_ref(), operation_timeout).await {
+        if let Err(error) =
+            probe_udp(&proxy, target.clone(), auth.as_ref(), operation_timeout).await
+        {
             failures.push(format!("UDP ASSOCIATE to {target}: {error:#}"));
             summary.push(SummaryItem {
                 label: format!("UDP ASSOCIATE + echo {target}"),
@@ -228,7 +244,11 @@ pub async fn check(
     if failures.is_empty() {
         Ok(())
     } else {
-        bail!("{} SOCKS5 probe(s) failed: {}", failures.len(), failures.join("; "))
+        bail!(
+            "{} SOCKS5 probe(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )
     }
 }
 
@@ -267,12 +287,24 @@ async fn probe_auth_method(
 ) -> Result<bool> {
     let result = timeout(operation_timeout, async {
         let mut stream = connect_proxy(proxy).await?;
-        info!(version = 5, method = format!("{method:#04x}"), "send SOCKS5 greeting");
+        info!(
+            version = 5,
+            method = format!("{method:#04x}"),
+            "send SOCKS5 greeting"
+        );
         stream.write_all(&[0x05, 0x01, method]).await?;
         let mut response = [0; 2];
         stream.read_exact(&mut response).await?;
-        ensure!(response[0] == 0x05, "invalid SOCKS version in method response: {:#x}", response[0]);
-        info!(version = response[0], method = format!("{:#04x}", response[1]), "read SOCKS5 method selection");
+        ensure!(
+            response[0] == 0x05,
+            "invalid SOCKS version in method response: {:#x}",
+            response[0]
+        );
+        info!(
+            version = response[0],
+            method = format!("{:#04x}", response[1]),
+            "read SOCKS5 method selection"
+        );
         Ok::<_, anyhow::Error>((stream, response[1]))
     })
     .await
@@ -290,15 +322,30 @@ async fn probe_auth_method(
                 return Ok(true);
             };
             timeout(operation_timeout, async {
-                info!(username_bytes = auth.username.len(), password_bytes = auth.password.len(), "send RFC 1929 credentials");
+                info!(
+                    username_bytes = auth.username.len(),
+                    password_bytes = auth.password.len(),
+                    "send RFC 1929 credentials"
+                );
                 stream.write_u8(0x01).await?;
                 write_socks_string(&mut stream, &auth.username).await?;
                 write_socks_string(&mut stream, &auth.password).await?;
                 let mut response = [0; 2];
                 stream.read_exact(&mut response).await?;
-                ensure!(response[0] == 0x01, "invalid RFC 1929 auth version: {:#x}", response[0]);
-                ensure!(response[1] == 0x00, "username/password authentication rejected");
-                info!(version = response[0], status = response[1], "read RFC 1929 status");
+                ensure!(
+                    response[0] == 0x01,
+                    "invalid RFC 1929 auth version: {:#x}",
+                    response[0]
+                );
+                ensure!(
+                    response[1] == 0x00,
+                    "username/password authentication rejected"
+                );
+                info!(
+                    version = response[0],
+                    status = response[1],
+                    "read RFC 1929 status"
+                );
                 Ok::<_, anyhow::Error>(())
             })
             .await
@@ -320,7 +367,9 @@ async fn command(
         let mut stream = connect_proxy(proxy).await?;
         negotiate(&mut stream, auth).await?;
         info!(?command, atyp = ?target.get_type(), %target, "send SOCKS5 request");
-        Request::new(command, target).write_to_async_stream(&mut stream).await?;
+        Request::new(command, target)
+            .write_to_async_stream(&mut stream)
+            .await?;
         let response = read_response(&mut stream).await?;
         Ok::<_, anyhow::Error>((stream, response))
     })
@@ -330,7 +379,11 @@ async fn command(
 
 async fn negotiate(stream: &mut TcpStream, auth: Option<&UserKey>) -> Result<()> {
     if auth.is_some() {
-        info!(version = 5, methods = "no-auth,user-password", "send SOCKS5 greeting");
+        info!(
+            version = 5,
+            methods = "no-auth,user-password",
+            "send SOCKS5 greeting"
+        );
         stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
     } else {
         info!(version = 5, methods = "no-auth", "send SOCKS5 greeting");
@@ -339,8 +392,16 @@ async fn negotiate(stream: &mut TcpStream, auth: Option<&UserKey>) -> Result<()>
 
     let mut method = [0; 2];
     stream.read_exact(&mut method).await?;
-    ensure!(method[0] == 0x05, "invalid SOCKS version in negotiation: {:#x}", method[0]);
-    info!(version = method[0], method = format!("{:#04x}", method[1]), "read SOCKS5 method selection");
+    ensure!(
+        method[0] == 0x05,
+        "invalid SOCKS version in negotiation: {:#x}",
+        method[0]
+    );
+    info!(
+        version = method[0],
+        method = format!("{:#04x}", method[1]),
+        "read SOCKS5 method selection"
+    );
 
     match method[1] {
         0x00 => Ok(()),
@@ -351,7 +412,10 @@ async fn negotiate(stream: &mut TcpStream, auth: Option<&UserKey>) -> Result<()>
             write_socks_string(stream, &auth.password).await?;
             let mut result = [0; 2];
             stream.read_exact(&mut result).await?;
-            ensure!(result[0] == 0x01 && result[1] == 0x00, "username/password authentication failed");
+            ensure!(
+                result[0] == 0x01 && result[1] == 0x00,
+                "username/password authentication failed"
+            );
             Ok(())
         }
         0xff => bail!("proxy has no acceptable authentication method"),
@@ -362,17 +426,36 @@ async fn negotiate(stream: &mut TcpStream, auth: Option<&UserKey>) -> Result<()>
 async fn read_response(stream: &mut TcpStream) -> Result<SocksResponse> {
     let mut header = [0; 3];
     stream.read_exact(&mut header).await?;
-    ensure!(header[0] == 0x05, "invalid SOCKS version in reply: {:#x}", header[0]);
-    ensure!(header[2] == 0x00, "nonzero reserved byte in SOCKS5 reply: {:#x}", header[2]);
+    ensure!(
+        header[0] == 0x05,
+        "invalid SOCKS version in reply: {:#x}",
+        header[0]
+    );
+    ensure!(
+        header[2] == 0x00,
+        "nonzero reserved byte in SOCKS5 reply: {:#x}",
+        header[2]
+    );
     let reply = Reply::try_from(header[1])?;
     let address = WireAddress::retrieve_from_async_stream(stream).await?;
     info!(version = header[0], ?reply, atyp = ?address.get_type(), %address, "read SOCKS5 reply");
     Ok(SocksResponse { reply, address })
 }
 
-async fn probe_bind(proxy: &WireAddress, auth: Option<&UserKey>, operation_timeout: Duration) -> Result<()> {
+async fn probe_bind(
+    proxy: &WireAddress,
+    auth: Option<&UserKey>,
+    operation_timeout: Duration,
+) -> Result<()> {
     let request_address = WireAddress::try_from("0.0.0.0:0")?;
-    let (mut control, first) = command(proxy, Command::Bind, request_address, auth, operation_timeout).await?;
+    let (mut control, first) = command(
+        proxy,
+        Command::Bind,
+        request_address,
+        auth,
+        operation_timeout,
+    )
+    .await?;
     if first.reply != Reply::Succeeded {
         bail!("BIND was rejected: {}", first.reply);
     }
@@ -425,8 +508,14 @@ async fn probe_udp(
     } else {
         WireAddress::try_from("[::]:0")?
     };
-    let (mut control, response) =
-        command(proxy, Command::UdpAssociate, requested_address, auth, operation_timeout).await?;
+    let (mut control, response) = command(
+        proxy,
+        Command::UdpAssociate,
+        requested_address,
+        auth,
+        operation_timeout,
+    )
+    .await?;
     if response.reply != Reply::Succeeded {
         bail!("UDP ASSOCIATE was rejected: {}", response.reply);
     }
@@ -451,13 +540,25 @@ async fn probe_udp(
         .context("waiting for UDP echo response timed out")??;
     reply.truncate(size);
     ensure!(reply.len() >= 3, "truncated SOCKS5 UDP response");
-    ensure!(reply[0..2] == [0x00, 0x00], "nonzero reserved bytes in UDP response");
-    ensure!(reply[2] == 0x00, "fragmented UDP response is not supported by this probe");
+    ensure!(
+        reply[0..2] == [0x00, 0x00],
+        "nonzero reserved bytes in UDP response"
+    );
+    ensure!(
+        reply[2] == 0x00,
+        "fragmented UDP response is not supported by this probe"
+    );
     let mut cursor = Cursor::new(&reply[3..]);
     let source = WireAddress::retrieve_from_stream(&mut cursor)?;
     let payload_offset = 3 + cursor.position() as usize;
-    ensure!(source == target, "UDP echo source mismatch: expected {target}, received {source}");
-    ensure!(reply[payload_offset..] == payload[..], "UDP echo payload mismatch");
+    ensure!(
+        source == target,
+        "UDP echo source mismatch: expected {target}, received {source}"
+    );
+    ensure!(
+        reply[payload_offset..] == payload[..],
+        "UDP echo payload mismatch"
+    );
     info!(rsv = 0, frag = 0, atyp = ?source.get_type(), %source, bytes = reply.len() - payload_offset, "recv SOCKS5 UDP reply");
 
     drop(control);
@@ -470,12 +571,16 @@ async fn connect_proxy(proxy: &WireAddress) -> Result<TcpStream> {
         .next()
         .context("proxy address resolved to no IP addresses")?;
     info!(%addr, "connect to SOCKS5 proxy");
-    TcpStream::connect(addr).await.context("connecting to SOCKS5 proxy failed")
+    TcpStream::connect(addr)
+        .await
+        .context("connecting to SOCKS5 proxy failed")
 }
 
 async fn bind_connect_address(address: &WireAddress, proxy: &WireAddress) -> Result<SocketAddr> {
     let mut addresses = lookup_host(address.to_string()).await?;
-    let mut addr = addresses.next().context("BIND/UDP relay address resolved to no IP addresses")?;
+    let mut addr = addresses
+        .next()
+        .context("BIND/UDP relay address resolved to no IP addresses")?;
     if addr.ip().is_unspecified() {
         let mut proxy_addresses = lookup_host(proxy.to_string()).await?;
         let proxy_addr = proxy_addresses
@@ -490,7 +595,10 @@ async fn bind_connect_address(address: &WireAddress, proxy: &WireAddress) -> Res
 
 async fn write_socks_string(stream: &mut TcpStream, value: &str) -> Result<()> {
     let bytes = value.as_bytes();
-    ensure!(bytes.len() <= u8::MAX as usize, "SOCKS5 username/password fields may not exceed 255 bytes");
+    ensure!(
+        bytes.len() <= u8::MAX as usize,
+        "SOCKS5 username/password fields may not exceed 255 bytes"
+    );
     stream.write_u8(bytes.len() as u8).await?;
     stream.write_all(bytes).await?;
     Ok(())
@@ -501,7 +609,10 @@ fn parse_endpoint(value: &str) -> Result<WireAddress> {
     ensure!(endpoint.port() != 0, "endpoint port must be nonzero");
     if let WireAddress::DomainAddress(host, _) = &endpoint {
         ensure!(!host.is_empty(), "endpoint hostname must not be empty");
-        ensure!(host.len() <= u8::MAX as usize, "SOCKS5 domain names may not exceed 255 bytes");
+        ensure!(
+            host.len() <= u8::MAX as usize,
+            "SOCKS5 domain names may not exceed 255 bytes"
+        );
     }
     Ok(endpoint)
 }
@@ -524,10 +635,13 @@ mod tests {
         let mut tcp_client = TcpStream::connect(address).await.unwrap();
         tcp_client.write_all(b"tcp test").await.unwrap();
         let mut tcp_response = [0; 8];
-        timeout(Duration::from_secs(1), tcp_client.read_exact(&mut tcp_response))
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            Duration::from_secs(1),
+            tcp_client.read_exact(&mut tcp_response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&tcp_response, b"tcp test");
 
         let udp_client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
@@ -572,7 +686,8 @@ mod tests {
                     if request.command == Command::UdpAssociate {
                         request_count.fetch_add(1, Ordering::SeqCst);
                     }
-                    let response = Response::new(Reply::CommandNotSupported, WireAddress::unspecified());
+                    let response =
+                        Response::new(Reply::CommandNotSupported, WireAddress::unspecified());
                     let _ = response.write_to_async_stream(&mut stream).await;
                 });
             }

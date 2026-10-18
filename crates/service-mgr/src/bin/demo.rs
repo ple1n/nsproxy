@@ -10,7 +10,7 @@ use service_mgr::{
     OutputCursor, Ownership, ServiceEvent, ServiceId, ServiceInfo, ServiceKind, ServiceManager,
     ServiceSpec, ServiceState,
 };
-use term_view::{PtyIpc, TermSession, TermView, flush_term_outputs, pump_pty_io};
+use term_view::{flush_term_outputs, pump_pty_io, PtyIpc, TermSession, TermView};
 
 const MAX_INCOMING_BYTES: usize = 256 * 1024;
 const MAX_LOG_LINES: usize = 100_000;
