@@ -39,12 +39,13 @@ sp sandbox <profile>
 
 ```fish
 sp down <profile>
+sp down -9 <profile>
 sp down --rm <profile>
 sp clean
 sp clean --veth
 ```
 
-`down` tears down the keeper and namespace bind mount. `--rm` also removes profile config/runtime directories. `clean --veth` performs the default veth cleanup; inspect state before using removal commands.
+`down` requests graceful shutdown from the up daemon, then sends SIGTERM to the keeper (escalating to SIGKILL after five seconds); the daemon terminates managed process groups with SIGKILL. `down -9` skips the graceful request and sends SIGKILL to the keeper immediately. `--rm` also removes profile config/runtime directories. `clean --veth` performs the default veth cleanup; inspect state before using removal commands.
 
 ### Trace hot configuration
 
@@ -104,7 +105,7 @@ For a mapping issue, check in this order: the JSON parses as `HotConfig`; `resol
 - `sp template [--reset] [--update] <PATH> [NAME]`: create a profile from a template. Name defaults to the template filename stem. `--reset` recreates an existing profile; `--update` updates its config without recreating directories.
 - `sp clone <NAME> <FROM>`: clone an existing profile into a new profile directory.
 - `sp up [OPTIONS] <PROFILE>`: create/persist the profile namespaces and keeper. Development protocol-test options are `--cmd <JSON>`, `--simulate-protocol-no-upgrade`, `--simulate-conn-close`, and `--simulate-slow-shutdown`; use them only for targeted tests.
-- `sp down [--rm] <PROFILE>`: tear down the profile; `--rm` also removes config/runtime directories.
+- `sp down [-9] [--rm] <PROFILE>`: tear down the profile; `-9` skips graceful shutdown and immediately SIGKILLs the keeper; `--rm` also removes config/runtime directories.
 - `sp serve --profile <PROFILE> [OPTIONS]`: attach TUN/router to an up profile. Options: `--tun-name`, `--simple <NYM>`, `-n/--no-default`, `-l/--log <PATH>`, `--no-dns-capture [true|false]`, and `--internal-dns-server [true|false]`.
 - `sp sandbox <PROFILE>`: enter the existing profile namespace and apply its Pivot-root sandbox/template mounts.
 - `sp dbus --profile <PROFILE>`: run the private D-Bus daemon for an up profile.

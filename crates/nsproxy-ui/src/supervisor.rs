@@ -2252,6 +2252,7 @@ impl Supervisor {
                     control_socket: None,
                     cmd: MainCommand::Down {
                         profile: profile.clone(),
+                        force: false,
                         rm: true,
                     },
                 };

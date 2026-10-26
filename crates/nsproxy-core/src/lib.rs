@@ -2991,6 +2991,9 @@ pub enum MainCommand {
     Down {
         /// Profile name
         profile: String,
+        /// Immediately send SIGKILL to the keeper instead of allowing graceful shutdown.
+        #[arg(short = '9', long)]
+        force: bool,
         /// Remove both the profile config and runtime mount directories after teardown.
         #[arg(long)]
         rm: bool,
@@ -3563,6 +3566,7 @@ mod cli_fd_tests {
             control_socket: None,
             cmd: MainCommand::Down {
                 profile: "p3".into(),
+                force: false,
                 rm: true,
             },
         });

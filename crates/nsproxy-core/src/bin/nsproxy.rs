@@ -2920,7 +2920,7 @@ fn main() -> anyhow::Result<()> {
                 Err(er) => report_clone3_err(&er)?,
             }
         }
-        MainCommand::Down { profile, rm } => {
+        MainCommand::Down { profile, rm, force } => {
             let ns_meta = state_paths::profile_ns_meta(&profile);
             let bind_mount = state_paths::profile_netns_bind(&profile);
             let profile_dir = state_paths::profile_dir(&profile);
@@ -2946,14 +2946,14 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        if ns_alive.up_pid.filter(|pid| pid_is_alive(*pid)).is_some() {
+                        if !force && ns_alive.up_pid.filter(|pid| pid_is_alive(*pid)).is_some() {
                             request_graceful_up_shutdown(&profile);
                         }
                         if let Some(pid) = ns_alive.child_pid {
                             let proc_path = PathBuf::from("/proc").join(pid.to_string());
                             if proc_path.exists() {
                                 warn!("killing keeper process pid={}", pid);
-                                if !kill_and_wait_for_exit(pid, Duration::from_secs(5)) {
+                                if !kill_and_wait_for_exit(pid, Duration::from_secs(5), force) {
                                     warn!("keeper pid {} did not exit within 5 seconds", pid);
                                 }
                             } else {
@@ -7559,27 +7559,27 @@ fn spawn_pty_process(
     }
 }
 
-fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
+fn kill_and_wait_for_exit(pid: u32, timeout: Duration, force: bool) -> bool {
     if pid == 0 {
         return false;
     }
 
     let target = Pid::from_raw(pid as i32);
     let deadline = Instant::now() + timeout;
+    let signal = if force {
+        nix::sys::signal::Signal::SIGKILL
+    } else {
+        nix::sys::signal::Signal::SIGTERM
+    };
+    if let Err(e) = nix::sys::signal::kill(target, signal) {
+        if e == nix::errno::Errno::ESRCH {
+            info!("pid {} is gone (no such process)", pid);
+            return true;
+        }
+        warn!("failed to send {:?} to pid {}: {}", signal, pid, e);
+    }
 
     while Instant::now() < deadline {
-        if let Err(e) = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL) {
-            match e {
-                nix::errno::Errno::ESRCH => {
-                    info!("pid {} is gone (no such process)", pid);
-                    return true;
-                }
-                _ => {
-                    warn!("failed to send SIGKILL to pid {}: {}", pid, e);
-                }
-            }
-        }
-
         match nix::sys::wait::waitpid(target, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
             Ok(nix::sys::wait::WaitStatus::StillAlive) => {
                 // still running
@@ -7632,6 +7632,13 @@ fn kill_and_wait_for_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    if !force {
+        if let Err(e) = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL) {
+            if e != nix::errno::Errno::ESRCH {
+                warn!("failed to escalate to SIGKILL for pid {}: {}", pid, e);
+            }
+        }
+    }
     false
 }
 
