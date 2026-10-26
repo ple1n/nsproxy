@@ -41,3 +41,9 @@ new profile and its serve process.
 Route-map lookup checks a hostname or destination IP, preferring the exact
 port before the any-port entry. A miss falls back to `default_route`. IP keys
 must identify final destinations, never virtual ingress addresses.
+
+Example command to adaptively proxy `dnf`
+
+```
+sp route ~/nsp3/routing_examples/dnf.json --make-container dnf fish
+```
