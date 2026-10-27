@@ -2073,10 +2073,6 @@ fn main() -> anyhow::Result<()> {
                 &short_path_unpriv, &selfprogdst_abs
             );
             symlink(&selfprogdst_abs, &short_path_unpriv);
-
-            sproxyf.set_file_name("nswrap");
-            let fd = dstdir.join(sproxyf.file_name().unwrap());
-            overwrite(&sproxyf, &fd)?;
         }
         MainCommand::Completions { fish } => {
             if fish {

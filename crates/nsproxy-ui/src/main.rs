@@ -4809,18 +4809,16 @@ impl eframe::App for App {
                             );
                         });
 
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
 
                         // Global configuration box at the top
                         let global_selected = self.selected_profile.is_none();
-                        let global_status_color = egui::Color32::from_rgb(100, 150, 240);
-                        if sidebar_box(ui, "all", "", global_selected, global_status_color)
-                            .clicked()
+                        if profile_sidebar_box(ui, "all", "", global_selected, None).clicked()
                         {
                             self.selected_profile = None;
                         }
 
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                         // Profiles
                         if self.snapshot.profiles.is_empty() {
                             ui.label(
@@ -4844,13 +4842,6 @@ impl eframe::App for App {
                                         s.detected_state == SandboxState::NoPivot
                                     });
 
-                                let status_color = if unpivoted_warning {
-                                    Color32::from_rgb(255, 185, 0)
-                                } else if running {
-                                    Color32::LIGHT_GREEN
-                                } else {
-                                    Color32::LIGHT_RED
-                                };
                                 let status_text = if unpivoted_warning {
                                     "unpivoted"
                                 } else {
@@ -4867,12 +4858,12 @@ impl eframe::App for App {
                                     }
                                 };
 
-                                let box_resp = sidebar_box(
+                                let box_resp = profile_sidebar_box(
                                     ui,
                                     &self.display_text(profile_name.as_str()),
                                     status_text,
                                     is_selected,
-                                    status_color,
+                                    Some(running),
                                 );
                                 if box_resp.clicked() {
                                     self.selected_profile = Some(profile_name.clone());
@@ -4882,7 +4873,7 @@ impl eframe::App for App {
                                         ),
                                     );
                                 }
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                             }
                         }
                     });
@@ -13065,7 +13056,60 @@ fn render_namespace_indicator_row(
     });
 }
 
-/// Helper to draw a large rectangular selectable box used in the left sidebar.
+/// Compact selectable profile card used in the container sidebar.
+fn profile_sidebar_box(
+    ui: &mut eframe::egui::Ui,
+    title: &str,
+    status: &str,
+    selected: bool,
+    running: Option<bool>,
+) -> eframe::egui::Response {
+    use eframe::egui::{Align2, FontId};
+
+    let (rect, response) = ui.allocate_exact_size(
+        eframe::egui::vec2(ui.available_width(), 40.0),
+        eframe::egui::Sense::click(),
+    );
+    let visuals = ui.visuals();
+    let status_fill = match running {
+        Some(true) => eframe::egui::Color32::from_rgba_unmultiplied(80, 190, 120, 18).blend(Color32::WHITE.gamma_multiply(0.05)),
+        Some(false) => eframe::egui::Color32::from_rgba_unmultiplied(190, 100, 100, 12).blend(Color32::WHITE.gamma_multiply(0.05)),
+        None => eframe::egui::Color32::TRANSPARENT,
+    };
+    ui.painter().rect_filled(rect, 6.0, status_fill);
+
+    if selected {
+        let fill = visuals.selection.bg_fill;
+        ui.painter().rect_filled(
+            rect,
+            6.0,
+            eframe::egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 48),
+        );
+    } else if response.hovered() {
+        let fill = visuals.widgets.hovered.bg_fill;
+        ui.painter().rect_filled(
+            rect,
+            6.0,
+            eframe::egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 30),
+        );
+    }
+
+    ui.painter().text(
+        rect.left_center() + eframe::egui::vec2(10.0, 0.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(15.0),
+        visuals.text_color(),
+    );
+
+    if status.is_empty() {
+        response
+    } else {
+        response.on_hover_text(status)
+    }
+}
+
+/// Helper to draw a large rectangular selectable box used in other sidebars.
 fn sidebar_box(
     ui: &mut eframe::egui::Ui,
     title: &str,
@@ -13394,6 +13438,9 @@ fn configure_ui_context(cc: &eframe::CreationContext<'_>) {
     setup_cjk_font(&cc.egui_ctx);
     // Set every text style to 16px for consistent sizing.
     cc.egui_ctx.style_mut_of(cc.egui_ctx.theme(), |style| {
+        if style.visuals.dark_mode {
+            style.visuals.override_text_color = Some(egui::Color32::WHITE.gamma_multiply(0.7));
+        }
         for ts in &[
             egui::TextStyle::Heading,
             egui::TextStyle::Body,

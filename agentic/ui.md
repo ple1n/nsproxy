@@ -8,7 +8,8 @@ Load this note for egui layout, widgets, profile editors, process/traffic views,
 
 Most rendering is in `crates/nsproxy-ui/src/main.rs`.
 
-- Sidebar: `egui::SidePanel::left`, `sidebar_box`, `sidebar_box_width`; its contents scroll within the panel's available height.
+- Sidebar: `egui::SidePanel::left`, `profile_sidebar_box`, `sidebar_box`, `sidebar_box_width`; its contents scroll within the panel's available height. Container profiles use compact, title-only cards with a faint running/stopped background tint; other sidebars retain the standard cards.
+- `configure_ui_context` sets the default dark-theme text color to opaque near-white for stronger contrast; explicitly colored text keeps its semantic color.
 - Main tabs: `render_proxies_tab`, `render_processes_tab`, `render_traffic_tab`, `render_diagnostics_tab`, `render_dns_tab`, `render_hotconfig_tab`, `render_profile_editor_tab`.
 - Meta tab: `render_meta_tab` contains UI-only presentation controls and the namespace comparison cards.
 - Proxy table/details: `render_proxies_table`, `render_proxy_row`, `render_proxy_detail_window`, `render_mini_sparkline`.
