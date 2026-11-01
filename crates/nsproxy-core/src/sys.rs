@@ -600,12 +600,12 @@ pub fn hide_old_root(mount: &Path) -> Result<()> {
 }
 
 pub fn mount_bind_root() -> Result<()> {
-    info!("mount root space");
+    info!("making root mount tree recursively slave");
     mount(
         None as Option<&Path>,
         &PathBuf::from("/"),
         None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        MsFlags::MS_REC | MsFlags::MS_SLAVE,
         None::<&str>,
     )?;
 

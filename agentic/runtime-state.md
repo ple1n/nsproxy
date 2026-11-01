@@ -23,6 +23,7 @@ Load this note for CLI commands, profile persistence, configuration, namespace e
 - `SandboxMode` and `TemplateConfig.sandbox_mode`: `crates/nsproxy-core/src/lib.rs`.
 - Pivot orchestration: `apply_pivot`, `build_skeleton`, `apply_mounts`, `apply_chmod`, `detect_sandbox_state`, `assert_mount_ns_isolated` in `crates/nsproxy-core/src/sandbox.rs`.
 - Mount primitives: `mount_bind_rw_explicit`, `mount_bind_ro_explicit`, `mount_tmpfs`, `pivot_root_into`, `mount_bind_root` in `crates/nsproxy-core/src/sys.rs`.
+- Fresh profile mount namespaces make the inherited mount tree recursively slave: host mount changes propagate inward where the parent mounts support propagation, while container mount changes do not propagate back. The host mount namespace is not made shared automatically. Existing profile namespaces must be recreated to acquire this relationship.
 - Profile-scoped staging path: `state_paths::pivot_root_dir`.
 
 ## Spawning in a namespace
