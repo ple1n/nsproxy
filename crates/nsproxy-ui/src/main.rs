@@ -1184,6 +1184,11 @@ struct App {
     traffic_subview: TrafficSubview,
     traffic_route_target: nsproxy_common::stats::ObservedRoute,
     traffic_route_target_index: usize,
+    direct_rule_host: String,
+    direct_rule_target: Option<nsproxy_common::routing::WireAddress>,
+    direct_rule_profile: Option<ContainerName>,
+    direct_rule_lookup_pending: bool,
+    direct_rule_status: Option<String>,
     traffic_route_targets: Vec<TrafficRouteTarget>,
     traffic_route_filter: String,
     traffic_route_filter_applied: String,
@@ -1509,6 +1514,80 @@ impl App {
             })
             .collect();
         self.traffic_route_filter_applied = self.traffic_route_filter.clone();
+    }
+
+    fn resolve_direct_rule_host(&mut self) {
+        self.direct_rule_target = None;
+        self.direct_rule_profile = self.selected_profile.clone();
+        let host = self
+            .direct_rule_host
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            self.direct_rule_status = None;
+            return;
+        }
+
+        let known_target = self
+            .selected_profile
+            .as_ref()
+            .and_then(|profile_name| self.snapshot.profiles.get(profile_name))
+            .and_then(|profile| {
+                profile
+                    .recent_host_routes
+                    .iter()
+                    .filter(|metric| match &metric.key.target {
+                        nsproxy_common::routing::WireAddress::SocketAddress(address) => {
+                            address.ip().to_string() == host
+                        }
+                        nsproxy_common::routing::WireAddress::DomainAddress(name, _) => {
+                            name.trim()
+                                .trim_end_matches('.')
+                                .eq_ignore_ascii_case(&host)
+                        }
+                    })
+                    .max_by_key(|metric| {
+                        metric
+                            .last_observed
+                            .unwrap_or(metric.observed_at)
+                            .0
+                    })
+                    .map(|metric| (metric.key.target.clone(), metric.key.route.clone()))
+            });
+
+        let Some((target, route)) = known_target else {
+            self.direct_rule_status =
+                Some("No matching host in recent traffic; enter a known host.".to_string());
+            return;
+        };
+
+        self.direct_rule_target = Some(target.clone());
+        if let Some(index) = self
+            .traffic_route_targets
+            .iter()
+            .position(|candidate| candidate.route == route)
+        {
+            self.traffic_route_target = route;
+            self.traffic_route_target_index = index;
+            self.direct_rule_status = Some(format!(
+                "Matched {}.",
+                match target {
+                    nsproxy_common::routing::WireAddress::SocketAddress(address) => {
+                        address.to_string()
+                    }
+                    nsproxy_common::routing::WireAddress::DomainAddress(host, port) => {
+                        format!("{host}:{port}")
+                    }
+                }
+            ));
+        } else {
+            self.traffic_route_target =
+                nsproxy_common::stats::ObservedRoute::NoProxy;
+            self.traffic_route_target_index = 0;
+            self.direct_rule_status =
+                Some("Known host found; choose an available route.".to_string());
+        }
     }
 
     pub fn new(ectx: egui::Context) -> Self {
@@ -1837,6 +1916,11 @@ impl App {
             traffic_subview: TrafficSubview::default(),
             traffic_route_target: nsproxy_common::stats::ObservedRoute::NoProxy,
             traffic_route_target_index: 0,
+            direct_rule_host: String::new(),
+            direct_rule_target: None,
+            direct_rule_profile: None,
+            direct_rule_lookup_pending: false,
+            direct_rule_status: None,
             traffic_route_targets,
             traffic_route_filter: String::new(),
             traffic_route_filter_applied: String::new(),
@@ -4688,6 +4772,22 @@ impl eframe::App for App {
         while let Some(snapshot) = self.supervisor.try_recv_snapshot() {
             drained_snapshots += 1;
             self.snapshot = snapshot;
+        }
+
+        if self.direct_rule_profile != self.selected_profile {
+            self.direct_rule_target = None;
+            self.direct_rule_profile = self.selected_profile.clone();
+            self.direct_rule_lookup_pending = !self.direct_rule_host.trim().is_empty();
+        }
+        if drained_snapshots > 0
+            && self.direct_rule_target.is_none()
+            && !self.direct_rule_host.trim().is_empty()
+        {
+            self.direct_rule_lookup_pending = true;
+        }
+        if self.direct_rule_lookup_pending {
+            self.direct_rule_lookup_pending = false;
+            self.resolve_direct_rule_host();
         }
 
         while let Some(update) = self.supervisor.try_recv_process_raw_log() {
@@ -8893,7 +8993,7 @@ impl App {
             egui::ScrollArea::horizontal()
                 .id_salt(id_salt.clone())
                 .show(ui, |ui| {
-                    TableBuilder::new(ui)
+                    let table_scroll = TableBuilder::new(ui)
                         .id_salt(format!("{}_tbl", id_salt))
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -8937,7 +9037,7 @@ impl App {
                                     );
                                 });
                                 row.col(|ui| {
-                                    let response = ui.label(conn_route_label(entry.route.as_ref()));
+                                    let response = ui.label(conn_route_label(entry));
                                     response.on_hover_ui(|ui| {
                                         ui.strong(format!(
                                             "Connection #{} — {}",
@@ -9001,6 +9101,12 @@ impl App {
                                 });
                             });
                         });
+                    stop_scroll_propagation_at_boundary(
+                        ui,
+                        table_scroll.inner_rect,
+                        table_scroll.state.offset.y,
+                        table_scroll.content_size.y,
+                    );
                 });
         };
 
@@ -9026,9 +9132,20 @@ impl App {
             let route_target = &mut self.traffic_route_target;
             let route_filter = &mut self.traffic_route_filter;
             let filtered_route_target_indices = &self.filtered_traffic_route_target_indices;
+            let diag_connected = profile.diag_connected;
             ui.weak("Showing up to 512 recent TCP and UDP target/routes, including routes before measurements are available.");
             ui.horizontal(|ui| {
-                ui.label("Click button to route to");
+                ui.label("Direct rule");
+                let host_edit = ui.add_sized(
+                    [180.0, row_height],
+                    egui::TextEdit::singleline(&mut self.direct_rule_host)
+                        .hint_text("Host from recent traffic"),
+                );
+                if host_edit.changed() {
+                    self.direct_rule_target = None;
+                    self.direct_rule_lookup_pending = true;
+                    self.direct_rule_status = Some("Looking up known host…".to_string());
+                }
                 egui::ComboBox::from_id_salt("traffic_host_route_target")
                     .selected_text(
                         route_targets
@@ -9036,7 +9153,7 @@ impl App {
                             .map(|target| target.key.as_str())
                             .unwrap_or("NoProxy"),
                     )
-                    .width(360.0)
+                    .width(190.0)
                     .height(360.0)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show_ui(ui, |ui| {
@@ -9098,14 +9215,71 @@ impl App {
                 if let Some(target) = route_targets.get(*route_target_index) {
                     *route_target = target.route.clone();
                 }
+                let can_apply_direct_rule = diag_connected
+                    && self.direct_rule_target.is_some()
+                    && self.direct_rule_profile == self.selected_profile;
+                if ui
+                    .add_enabled(can_apply_direct_rule, egui::Button::new("Set rule"))
+                    .clicked()
+                {
+                    if let (Some(profile_name), Some(target)) = (
+                        self.selected_profile.as_ref(),
+                        self.direct_rule_target.as_ref(),
+                    ) {
+                        use nsproxy_common::routing::{
+                            RoutingKey, RoutingResovled, TargetKey, WireAddress,
+                        };
+                        let (key, decision) = match (target, &*route_target) {
+                            (WireAddress::SocketAddress(address), route) => (
+                                RoutingKey::Addr(TargetKey::for_final_destination(*address)),
+                                match route {
+                                    nsproxy_common::stats::ObservedRoute::NoProxy => {
+                                        RoutingResovled::NoProxy(*address)
+                                    }
+                                    nsproxy_common::stats::ObservedRoute::Proxy(id) => {
+                                        RoutingResovled::ProxyResovled {
+                                            target: target.clone(),
+                                            id: id.clone(),
+                                        }
+                                    }
+                                },
+                            ),
+                            (WireAddress::DomainAddress(host, port), route) => (
+                                RoutingKey::host(host, Some(*port)),
+                                match route {
+                                    nsproxy_common::stats::ObservedRoute::NoProxy => {
+                                        RoutingResovled::NoProxyDomain {
+                                            host: host.clone(),
+                                            port: *port,
+                                        }
+                                    }
+                                    nsproxy_common::stats::ObservedRoute::Proxy(id) => {
+                                        RoutingResovled::ProxyResovled {
+                                            target: target.clone(),
+                                            id: id.clone(),
+                                        }
+                                    }
+                                },
+                            ),
+                        };
+                        self.supervisor.send(SupervisorCommand::Ctrl {
+                            profile: profile_name.to_string(),
+                            cmd: diag::ControlCommand::SetHostRoute { key, decision },
+                        });
+                        self.direct_rule_status = Some("Route rule sent to serve.".to_string());
+                    }
+                }
             });
+            if let Some(status) = &self.direct_rule_status {
+                ui.weak(status);
+            }
             if profile.recent_host_routes.is_empty() {
                 ui.weak("No recent host / route activity yet.");
                 return;
             }
             let selected_route = route_target.clone();
             let diag_connected = profile.diag_connected;
-            TableBuilder::new(ui)
+            let table_scroll = TableBuilder::new(ui)
                 .id_salt("host_route_performance")
                 .max_scroll_height(360.0)
                 .animate_scrolling(false)
@@ -9215,6 +9389,12 @@ impl App {
                         });
                     });
                 });
+            stop_scroll_propagation_at_boundary(
+                ui,
+                table_scroll.inner_rect,
+                table_scroll.state.offset.y,
+                table_scroll.content_size.y,
+            );
         });
     }
 
@@ -11839,6 +12019,56 @@ mod connection_protocol_style_tests {
         assert_eq!(udp, (Color32::LIGHT_GREEN, "UDP"));
         assert_ne!(tcp.0, udp.0);
     }
+
+    #[test]
+    fn dns_resolved_route_label_shows_domain_and_result() {
+        let destination = "192.0.2.1:53".parse().unwrap();
+        let entry = diag::ConnEntry {
+            kind: diag::StreamKind::Udp,
+            dst: nsproxy_common::routing::WireAddress::SocketAddress(destination),
+            route: None,
+            phase: diag::ConnPhase::DnsResolved,
+            history: vec![diag::ConnTransition {
+                ts: diag::Timestamp(1),
+                kind: diag::ConnTransitionKind::DnsResolved {
+                    domain: "example.com".to_string(),
+                    result: "192.0.2.1".to_string(),
+                },
+            }],
+            history_truncated: false,
+            accepted_at: diag::Timestamp(1),
+            connected_at: None,
+            finished_at: None,
+            error: None,
+            bytes_up: None,
+            bytes_down: None,
+        };
+
+        assert_eq!(
+            conn_route_label(&entry),
+            format!("example.com {} 192.0.2.1", regular::ARROW_RIGHT)
+        );
+    }
+}
+
+fn stop_scroll_propagation_at_boundary(
+    ui: &egui::Ui,
+    viewport: egui::Rect,
+    offset_y: f32,
+    content_height: f32,
+) {
+    let delta_y = ui.input(|input| input.smooth_scroll_delta().y);
+    let max_offset = (content_height - viewport.height()).max(0.0);
+    let boundary_tolerance = 0.5;
+    let at_boundary = (delta_y > 0.0 && offset_y <= boundary_tolerance)
+        || (delta_y < 0.0 && offset_y >= max_offset - boundary_tolerance);
+
+    if content_height > viewport.height() + boundary_tolerance
+        && ui.rect_contains_pointer(viewport)
+        && at_boundary
+    {
+        ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
+    }
 }
 
 fn conn_phase_color(phase: diag::ConnPhase) -> Color32 {
@@ -11854,10 +12084,20 @@ fn conn_phase_color(phase: diag::ConnPhase) -> Color32 {
     }
 }
 
-fn conn_route_label(route: Option<&nsproxy_common::routing::RoutingResovled>) -> String {
+fn conn_route_label(entry: &diag::ConnEntry) -> String {
     use nsproxy_common::routing::{DropReason, RoutingResovled};
 
-    match route {
+    if entry.phase == diag::ConnPhase::DnsResolved {
+        if let Some(diag::ConnTransition {
+            kind: diag::ConnTransitionKind::DnsResolved { domain, result },
+            ..
+        }) = entry.history.last()
+        {
+            return format!("{domain} {} {result}", regular::ARROW_RIGHT);
+        }
+    }
+
+    match entry.route.as_ref() {
         Some(RoutingResovled::NoProxy(address)) => {
             format!("NoProxy {} {address}", regular::ARROW_RIGHT)
         }

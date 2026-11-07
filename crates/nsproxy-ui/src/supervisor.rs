@@ -5279,7 +5279,67 @@ fn connection_ids(state: &diag::ConnsState) -> Vec<diag::ConnId> {
 
 #[cfg(test)]
 mod traffic_connection_tests {
-    use super::connection_ids;
+    use super::{connection_ids, preserve_host_route_order};
+
+    fn host_route_metric(
+        host: &str,
+        observed_at: u64,
+        connect_latency_ms: Option<f64>,
+    ) -> nsproxy_common::stats::HostRouteMetric {
+        use nsproxy_common::{
+            routing::WireAddress,
+            stats::{HostRouteKey, HostRouteMetric, ObservedRoute},
+        };
+
+        HostRouteMetric {
+            key: HostRouteKey::new(
+                WireAddress::DomainAddress(host.to_string(), 443),
+                ObservedRoute::NoProxy,
+            ),
+            observed_at: diag::Timestamp(observed_at),
+            last_observed: None,
+            connect_latency_ms,
+            connect_success_rate: None,
+            upload_bytes_per_sec: None,
+            download_bytes_per_sec: None,
+            upload_rate_summary: None,
+            download_rate_summary: None,
+            upload_sample: None,
+            download_sample: None,
+            udp_upload_bytes_per_sec: None,
+            udp_download_bytes_per_sec: None,
+            udp_upload_rate_summary: None,
+            udp_download_rate_summary: None,
+            udp_upload_sample: None,
+            udp_download_sample: None,
+        }
+    }
+
+    #[test]
+    fn updated_rows_keep_their_order_and_new_rows_append() {
+        let previous = vec![
+            host_route_metric("a.example", 1, None),
+            host_route_metric("b.example", 2, None),
+        ];
+        let ordered = preserve_host_route_order(
+            &previous,
+            vec![
+                host_route_metric("b.example", 20, Some(12.0)),
+                host_route_metric("c.example", 30, None),
+                host_route_metric("a.example", 40, None),
+            ],
+        );
+
+        let hosts: Vec<_> = ordered
+            .iter()
+            .map(|metric| match &metric.key.target {
+                nsproxy_common::routing::WireAddress::DomainAddress(host, _) => host.as_str(),
+                _ => panic!("expected domain target"),
+            })
+            .collect();
+        assert_eq!(hosts, vec!["a.example", "b.example", "c.example"]);
+        assert_eq!(ordered[1].connect_latency_ms, Some(12.0));
+    }
 
     #[test]
     fn recent_connections_include_accepted_and_finished_entries_newest_first() {
@@ -5384,6 +5444,33 @@ fn sort_host_route_metrics(metrics: &mut Vec<nsproxy_common::stats::HostRouteMet
     metrics.truncate(MAX_TRAFFIC_HOST_ROUTE_METRICS);
 }
 
+fn preserve_host_route_order(
+    previous: &[nsproxy_common::stats::HostRouteMetric],
+    metrics: Vec<nsproxy_common::stats::HostRouteMetric>,
+) -> Vec<nsproxy_common::stats::HostRouteMetric> {
+    use nsproxy_common::stats::{HostRouteKey, HostRouteMetric};
+
+    let mut current_by_key: HashMap<HostRouteKey, HostRouteMetric> = metrics
+        .into_iter()
+        .map(|metric| (metric.key.clone(), metric))
+        .collect();
+    let mut stable_metrics = Vec::with_capacity(current_by_key.len());
+    for previous in previous {
+        if let Some(metric) = current_by_key.remove(&previous.key) {
+            stable_metrics.push(metric);
+        }
+    }
+    let mut new_metrics: Vec<_> = current_by_key.into_values().collect();
+    new_metrics.sort_by(|left, right| {
+        right
+            .observed_at
+            .cmp(&left.observed_at)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    stable_metrics.extend(new_metrics);
+    stable_metrics
+}
+
 fn refresh_recent_host_routes_for_state(state: &mut DiagState) {
     use nsproxy_common::{
         routing::RoutingResovled,
@@ -5442,9 +5529,18 @@ fn refresh_recent_host_routes_for_state(state: &mut DiagState) {
         });
     }
     let mut metrics: Vec<_> = by_key.into_values().collect();
-    metrics.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+    metrics.sort_by(|left, right| {
+        right
+            .observed_at
+            .cmp(&left.observed_at)
+            .then_with(|| left.key.cmp(&right.key))
+    });
     metrics.truncate(MAX_TRAFFIC_HOST_ROUTE_METRICS);
-    state.recent_host_routes = Arc::new(metrics);
+
+    state.recent_host_routes = Arc::new(preserve_host_route_order(
+        &state.recent_host_routes,
+        metrics,
+    ));
 }
 
 fn build_diag_summary(state: &DiagState) -> Option<DiagSummary> {
