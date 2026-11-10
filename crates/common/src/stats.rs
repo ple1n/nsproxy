@@ -45,6 +45,8 @@ pub fn default_udp_expectation(protocol: ProxyProtocol) -> bool {
 pub enum ObservedRoute {
     NoProxy,
     Proxy(ProxyID),
+    #[serde(alias = "Lokinet")]
+    Socks6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

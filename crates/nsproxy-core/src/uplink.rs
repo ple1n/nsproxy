@@ -55,7 +55,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -75,7 +78,7 @@ use tracing::{info, warn};
 use tun2socks5::ArgProxy;
 use tun2socks5::dns::{VirtDNSAsync, VirtDNSHandle};
 
-use crate::{state_blueprint::PersistentState, state_paths};
+use crate::{Socks6Endpoint, state_blueprint::PersistentState, state_paths};
 
 pub mod backup;
 pub mod router;
@@ -85,6 +88,266 @@ const POOL_SIZE: usize = 65_535;
 const DNS_PORT: u16 = 53;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HOST_ROUTE_STATS: usize = 16_384;
+
+fn socks6_host(host: &str) -> &str {
+    host.strip_suffix('.').unwrap_or(host)
+}
+
+#[derive(Default)]
+pub struct Socks6Metrics {
+    active_tcp_streams: AtomicU64,
+    active_udp_flows: AtomicU64,
+    tcp_connects: AtomicU64,
+    udp_connects: AtomicU64,
+    connect_failures: AtomicU64,
+    udp_queue_drops: AtomicU64,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Copy)]
+enum Socks6FlowKind {
+    Tcp,
+    Udp,
+}
+
+pub struct Socks6FlowGuard {
+    metrics: Arc<Socks6Metrics>,
+    kind: Socks6FlowKind,
+}
+
+impl Drop for Socks6FlowGuard {
+    fn drop(&mut self) {
+        let active = match self.kind {
+            Socks6FlowKind::Tcp => &self.metrics.active_tcp_streams,
+            Socks6FlowKind::Udp => &self.metrics.active_udp_flows,
+        };
+        active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Socks6Metrics {
+    fn begin_flow(self: &Arc<Self>, kind: Socks6FlowKind) -> Socks6FlowGuard {
+        let active = match kind {
+            Socks6FlowKind::Tcp => &self.active_tcp_streams,
+            Socks6FlowKind::Udp => &self.active_udp_flows,
+        };
+        active.fetch_add(1, Ordering::Relaxed);
+        Socks6FlowGuard {
+            metrics: Arc::clone(self),
+            kind,
+        }
+    }
+
+    fn record_connect(&self, kind: Socks6FlowKind) {
+        let connects = match kind {
+            Socks6FlowKind::Tcp => &self.tcp_connects,
+            Socks6FlowKind::Udp => &self.udp_connects,
+        };
+        connects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_failure(&self, error: impl Into<String>) {
+        self.connect_failures.fetch_add(1, Ordering::Relaxed);
+        let error = error.into();
+        let error = error.chars().take(512).collect();
+        match self.last_error.lock() {
+            Ok(mut last_error) => *last_error = Some(error),
+            Err(error) => tracing::error!("SOCKS6 metrics error lock poisoned: {error}"),
+        }
+    }
+
+    pub fn record_queue_drop(&self) {
+        self.udp_queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_traffic(&self, bytes_up: u128, bytes_down: u128) {
+        self.bytes_up
+            .fetch_add(bytes_up.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.bytes_down
+            .fetch_add(bytes_down.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> diag::Socks6TransportMetrics {
+        diag::Socks6TransportMetrics {
+            active_tcp_streams: self.active_tcp_streams.load(Ordering::Relaxed),
+            active_udp_flows: self.active_udp_flows.load(Ordering::Relaxed),
+            tcp_connects: self.tcp_connects.load(Ordering::Relaxed),
+            udp_connects: self.udp_connects.load(Ordering::Relaxed),
+            connect_failures: self.connect_failures.load(Ordering::Relaxed),
+            udp_queue_drops: self.udp_queue_drops.load(Ordering::Relaxed),
+            bytes_up: self.bytes_up.load(Ordering::Relaxed),
+            bytes_down: self.bytes_down.load(Ordering::Relaxed),
+            last_error: self
+                .last_error
+                .lock()
+                .map(|error| error.clone())
+                .unwrap_or_else(|error| {
+                    tracing::error!("SOCKS6 metrics error lock poisoned: {error}");
+                    None
+                }),
+        }
+    }
+}
+
+pub struct Socks6Transport {
+    client: socks6::Client,
+    metrics: Arc<Socks6Metrics>,
+    identity_id: Option<String>,
+}
+
+impl Socks6Transport {
+    pub fn new(
+        endpoint: Socks6Endpoint,
+        identity_id: Option<String>,
+        metrics: Arc<Socks6Metrics>,
+    ) -> Result<Self> {
+        let client = match endpoint {
+            Socks6Endpoint::Tcp { address } => {
+                socks6::Client::from_connector(socks6::TcpConnector::new(
+                    address
+                        .parse::<SocketAddr>()
+                        .context("invalid SOCKS6 TCP socket address")?,
+                ))
+            }
+            Socks6Endpoint::Unix { path } => {
+                #[cfg(unix)]
+                {
+                    socks6::Client::from_connector(socks6::UnixConnector::new(path))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    anyhow::bail!("Unix-domain SOCKS6 endpoints are unavailable on this platform")
+                }
+            }
+        };
+        Ok(Self {
+            client,
+            metrics,
+            identity_id,
+        })
+    }
+
+    pub fn metrics(&self) -> Arc<Socks6Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    fn identity_selection(&self) -> socks6::IdentitySelection {
+        self.identity_id
+            .as_ref()
+            .map(|id| socks6::IdentitySelection::Offer(id.clone()))
+            .unwrap_or(socks6::IdentitySelection::Any)
+    }
+
+    pub async fn identity_session(&self) -> Result<socks6::IdentitySession> {
+        self.client
+            .identity_session()
+            .await
+            .context("failed to open SOCKS6 identity session")
+    }
+
+    pub async fn query_identities(&self) -> Result<Vec<socks6::IdentityOffer>> {
+        self.client
+            .query_identities()
+            .await
+            .context("failed to query SOCKS6 identity offers")
+    }
+
+    pub async fn service_details(&self) -> Result<(String, Vec<socks6::IdentityOffer>)> {
+        let session = self.identity_session().await?;
+        let server_name = session.capabilities().server_name.clone();
+        let identities = session.identities().to_vec();
+        session
+            .close()
+            .await
+            .context("failed to close SOCKS6 identity session")?;
+        Ok((server_name, identities))
+    }
+
+    pub async fn lease_identity(
+        &self,
+        identity_id: Option<String>,
+    ) -> Result<socks6::IdentityLease> {
+        self.client
+            .lease_identity(identity_id)
+            .await
+            .context("failed to lease SOCKS6 identity")
+    }
+
+    pub async fn release_identity(&self, lease: &socks6::IdentityLease) -> Result<()> {
+        self.client
+            .release_identity(lease)
+            .await
+            .context("failed to release SOCKS6 identity lease")
+    }
+
+    pub async fn open_stream(
+        &self,
+        target: socks6::Endpoint,
+        identity: socks6::IdentitySelection,
+    ) -> Result<socks6::StreamConnection> {
+        self.client
+            .connect_stream(target, identity)
+            .await
+            .context("failed to open SOCKS6 stream")
+    }
+
+    pub async fn accept_stream(
+        &self,
+        identity: socks6::IdentitySelection,
+        port: u16,
+    ) -> Result<socks6::StreamConnection> {
+        self.client
+            .accept_stream(identity, port)
+            .await
+            .context("failed to accept SOCKS6 stream")
+    }
+
+    pub async fn open_datagrams(
+        &self,
+        identity: socks6::IdentitySelection,
+    ) -> Result<socks6::DatagramChannelConnection> {
+        self.client
+            .open_datagrams(identity)
+            .await
+            .context("failed to open SOCKS6 datagram channel")
+    }
+
+    pub async fn status(&self) -> Result<socks6::ServiceStatus> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.client.query_status())
+            .await
+            .context("timed out querying SOCKS6 service status")?
+            .context("failed to query SOCKS6 service status")
+    }
+
+    pub async fn connect_tcp(
+        &self,
+        target: WireAddress,
+    ) -> Result<proxy_adapters::ProxyConnection> {
+        proxy_adapters::connect_socks6_tcp(
+            self.client.clone(),
+            Arc::clone(&self.metrics),
+            target,
+            self.identity_selection(),
+        )
+        .await
+    }
+
+    pub async fn connect_udp(
+        &self,
+        target: WireAddress,
+    ) -> Result<proxy_adapters::ProxyConnection> {
+        proxy_adapters::connect_socks6_udp(
+            self.client.clone(),
+            Arc::clone(&self.metrics),
+            target,
+            self.identity_selection(),
+        )
+        .await
+    }
+}
 
 fn ensure_rustls_crypto_provider() -> Result<()> {
     static TLS_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
@@ -371,7 +634,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Trait for a unified proxy stream interface
 /// All proxy types (Trojan, SOCKS5, HTTP, etc.) implement this
-pub trait ProxyStream: Send + Sync + 'static
+pub trait ProxyStream: Send + 'static
 where
     Self: AsyncRead + AsyncWrite + Unpin,
 {
@@ -472,6 +735,35 @@ pub fn simple_routing(id: ProxyID) -> RoutingFunction {
     })
 }
 
+pub fn socks6_routing() -> RoutingFunction {
+    Arc::new(|ctx: &RoutingContext, _hub: &UplinkHub| {
+        if ctx.attempt_num > 0 {
+            return RoutingResovled::Drop(DropReason::MaxRetry);
+        }
+
+        match &ctx.dns {
+            VDNSRES::NormalProxying => RoutingResovled::Socks6 {
+                target: WireAddress::SocketAddress(SocketAddr::new(ctx.target_ip, ctx.target_port)),
+            },
+            VDNSRES::Opine(RoutingDecision::HostOverProxy(host)) => RoutingResovled::Socks6 {
+                target: WireAddress::DomainAddress(host.clone(), ctx.target_port),
+            },
+            VDNSRES::Opine(RoutingDecision::SocketOverProxy(sock)) => RoutingResovled::Socks6 {
+                target: WireAddress::SocketAddress(*sock),
+            },
+            VDNSRES::Opine(RoutingDecision::NATByTUN(sock)) => RoutingResovled::NATByTUN(*sock),
+            VDNSRES::Opine(RoutingDecision::NoProxy(sock)) => RoutingResovled::NoProxy(*sock),
+            VDNSRES::Opine(RoutingDecision::File(_)) => RoutingResovled::Drop(
+                DropReason::Preprocess(Cow::Borrowed("file routes are not supported by SOCKS6")),
+            ),
+            VDNSRES::Opine(RoutingDecision::Drop(reason)) => RoutingResovled::Drop(reason.clone()),
+            VDNSRES::ERR => {
+                RoutingResovled::Drop(DropReason::Preprocess(Cow::Borrowed("vdns error")))
+            }
+        }
+    })
+}
+
 pub fn group_routing(group_id: clash::GroupId) -> RoutingFunction {
     Arc::new(move |ctx: &RoutingContext, hub: &UplinkHub| {
         let target = match &ctx.dns {
@@ -525,6 +817,9 @@ pub struct UplinkHub {
     routing_fn: RoutingFunction,
     /// User-owned Clash groups, imported proxy configs, and resolver caches.
     pub clash: Option<clash::ClashState>,
+    /// Optional SOCKS6 client transport used for explicitly routed destinations.
+    pub socks6: Option<Arc<Socks6Transport>>,
+    pub socks6_metrics: Arc<Socks6Metrics>,
     pub stats: HashMap<ProxyID, ProxyStats>,
     /// Process-local TCP performance estimates keyed by host and exact route.
     pub host_route_stats: HashMap<HostRouteKey, HostRouteStats>,
@@ -633,6 +928,8 @@ impl UplinkHub {
             proxies: HashMap::new(),
             routing_fn: no_routing(),
             clash: None,
+            socks6: None,
+            socks6_metrics: Arc::new(Socks6Metrics::default()),
             stats: HashMap::new(),
             host_route_stats: HashMap::new(),
             host_route_stats_eviction_order: BTreeSet::new(),
@@ -641,6 +938,17 @@ impl UplinkHub {
             found_ips: ChronoData::default(),
         }
     }
+
+    pub fn install_socks6(&mut self, config: &crate::Socks6Config) -> Result<()> {
+        config.validate()?;
+        self.socks6 = Some(Arc::new(Socks6Transport::new(
+            config.endpoint.clone(),
+            config.identity_id.clone(),
+            Arc::clone(&self.socks6_metrics),
+        )?));
+        Ok(())
+    }
+
     pub fn update_link_ttfb(&mut self, id: &ProxyID, latency: Duration) {
         self.stats
             .entry(id.clone())
@@ -817,6 +1125,8 @@ impl UplinkHub {
             proxies: HashMap::new(),
             routing_fn,
             clash: None,
+            socks6: None,
+            socks6_metrics: Arc::new(Socks6Metrics::default()),
             stats: HashMap::new(),
             host_route_stats: HashMap::new(),
             host_route_stats_eviction_order: BTreeSet::new(),
@@ -1143,7 +1453,7 @@ pub trait UdpHandler: Send + Sync + 'static {
 /// Kernel-style connection interface that supports both streaming and datagram operations
 pub mod proxy_adapters {
     use super::*;
-    use anyhow::Context as AnyhowContext;
+    use anyhow::{Context as AnyhowContext, bail};
     use bytes::{Buf, BufMut, BytesMut};
     use rustls::pki_types::ServerName;
     use socks5_impl::client;
@@ -1152,6 +1462,7 @@ pub mod proxy_adapters {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpStream, UdpSocket};
+    use tokio::{sync::mpsc, time};
     use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
     use tun2socks5::udp_associate::SharedUdpAssociate;
@@ -1164,7 +1475,7 @@ pub mod proxy_adapters {
     }
 
     /// Trait for TCP proxy streams (unified interface for Trojan, SOCKS5, unproxy, etc.)
-    pub trait TcpLike: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    pub trait TcpLike: AsyncRead + AsyncWrite + Send + Unpin {
         fn info(&self) -> &str;
     }
 
@@ -1212,6 +1523,254 @@ pub mod proxy_adapters {
                 ProxyConnection::Tcp(stream) => Some(stream.as_mut()),
                 _ => None,
             }
+        }
+    }
+
+    struct Socks6TcpConn {
+        inner: socks6::StreamConnection,
+        _flow: super::Socks6FlowGuard,
+        info: String,
+    }
+
+    impl TcpLike for Socks6TcpConn {
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    impl AsyncRead for Socks6TcpConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Socks6TcpConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    pub(super) async fn connect_socks6_tcp(
+        client: socks6::Client,
+        metrics: Arc<super::Socks6Metrics>,
+        target: WireAddress,
+        identity: socks6::IdentitySelection,
+    ) -> Result<ProxyConnection> {
+        let result: Result<ProxyConnection> = async {
+            let endpoint = socks6_endpoint(&target)?;
+            let target_description = endpoint.to_string();
+            let inner = time::timeout(
+                super::CONNECT_TIMEOUT,
+                client.connect_stream(endpoint, identity),
+            )
+            .await
+            .context("timed out connecting through the SOCKS6 service")?
+            .context("SOCKS6 service could not open the overlay stream")?;
+            metrics.record_connect(super::Socks6FlowKind::Tcp);
+            let flow = metrics.begin_flow(super::Socks6FlowKind::Tcp);
+            Ok(ProxyConnection::Tcp(Box::new(Socks6TcpConn {
+                inner,
+                _flow: flow,
+                info: format!("SOCKS6 stream {target_description}"),
+            })))
+        }
+        .await;
+        if let Err(error) = &result {
+            metrics.record_failure(error.to_string());
+        }
+        result
+    }
+
+    struct Socks6UdpConn {
+        association: socks6::DatagramChannelConnection,
+        target: WireAddress,
+        _flow: super::Socks6FlowGuard,
+        metrics: Arc<super::Socks6Metrics>,
+        info: String,
+    }
+
+    #[async_trait::async_trait]
+    impl UdpLike for Socks6UdpConn {
+        async fn send_to(&mut self, data: &[u8], dst: WireAddress) -> std::io::Result<usize> {
+            if dst != self.target {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS6 UDP flow destination changed",
+                ));
+            }
+            if data.is_empty() {
+                return Ok(0);
+            }
+            let len = data.len();
+            let endpoint = socks6_endpoint(&dst)?;
+            match self.association.send_to(endpoint, data.to_vec()).await {
+                Ok(()) => Ok(len),
+                Err(error) => {
+                    self.metrics.record_failure(error.to_string());
+                    Err(std::io::Error::other(error))
+                }
+            }
+        }
+
+        async fn recv_from(&mut self) -> std::io::Result<UdpPacket> {
+            let datagram = match self.association.recv_from().await {
+                Ok(datagram) => datagram,
+                Err(error) => {
+                    self.metrics.record_failure(error.to_string());
+                    return Err(std::io::Error::other(error));
+                }
+            };
+            let dst_addr = match wire_address_from_endpoint(datagram.endpoint) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    self.metrics.record_failure(error.to_string());
+                    return Err(error);
+                }
+            };
+            Ok(UdpPacket {
+                data: datagram.payload,
+                dst_addr,
+            })
+        }
+
+        fn info(&self) -> &str {
+            &self.info
+        }
+    }
+
+    fn socks6_endpoint(target: &WireAddress) -> std::io::Result<socks6::Endpoint> {
+        match target {
+            WireAddress::DomainAddress(host, port) => {
+                let host = super::socks6_host(host);
+                if host.is_empty() || *port == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "SOCKS6 requires a nonempty domain and nonzero port",
+                    ));
+                }
+                Ok(socks6::Endpoint::Domain(host.to_owned(), *port))
+            }
+            WireAddress::SocketAddress(address) if address.port() != 0 => {
+                Ok(socks6::Endpoint::Socket(*address))
+            }
+            WireAddress::SocketAddress(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SOCKS6 requires a nonzero destination port",
+            )),
+        }
+    }
+
+    fn wire_address_from_endpoint(endpoint: socks6::Endpoint) -> std::io::Result<WireAddress> {
+        match endpoint {
+            socks6::Endpoint::Socket(address) => Ok(WireAddress::SocketAddress(address)),
+            socks6::Endpoint::Domain(host, port) => Ok(WireAddress::DomainAddress(host, port)),
+            socks6::Endpoint::Ip(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SOCKS6 UDP response endpoint has no port",
+            )),
+            socks6::Endpoint::Service { namespace, .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported SOCKS6 service endpoint {namespace}"),
+            )),
+        }
+    }
+
+    pub(super) async fn connect_socks6_udp(
+        client: socks6::Client,
+        metrics: Arc<super::Socks6Metrics>,
+        target: WireAddress,
+        identity: socks6::IdentitySelection,
+    ) -> Result<ProxyConnection> {
+        let result: Result<ProxyConnection> = async {
+            let endpoint = socks6_endpoint(&target)?;
+            let target_description = endpoint.to_string();
+            let association =
+                time::timeout(super::CONNECT_TIMEOUT, client.open_datagrams(identity))
+                    .await
+                    .context("timed out opening a SOCKS6 datagram channel")?
+                    .context("SOCKS6 service could not open a datagram channel")?;
+            metrics.record_connect(super::Socks6FlowKind::Udp);
+            let flow = metrics.begin_flow(super::Socks6FlowKind::Udp);
+            Ok(ProxyConnection::Udp(Box::new(Socks6UdpConn {
+                association,
+                target,
+                _flow: flow,
+                metrics: Arc::clone(&metrics),
+                info: format!("SOCKS6 datagrams {target_description}"),
+            })))
+        }
+        .await;
+        if let Err(error) = &result {
+            metrics.record_failure(error.to_string());
+        }
+        result
+    }
+
+    #[cfg(test)]
+    mod socks6_endpoint_tests {
+        use super::*;
+
+        #[test]
+        fn domain_targets_become_domain_endpoints() {
+            assert_eq!(
+                socks6_endpoint(&WireAddress::DomainAddress(
+                    "service.example.".to_owned(),
+                    443
+                ))
+                .unwrap(),
+                socks6::Endpoint::Domain("service.example".to_owned(), 443)
+            );
+        }
+
+        #[test]
+        fn endpoints_accept_ip_and_reject_zero_port() {
+            assert_eq!(
+                socks6_endpoint(&WireAddress::SocketAddress(
+                    "192.0.2.1:443".parse().unwrap()
+                ))
+                .unwrap(),
+                socks6::Endpoint::Socket("192.0.2.1:443".parse().unwrap())
+            );
+            assert!(
+                socks6_endpoint(&WireAddress::DomainAddress("service.example".to_owned(), 0))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn udp_responses_preserve_socket_and_domain_endpoints() {
+            let socket = WireAddress::SocketAddress("192.0.2.1:443".parse().unwrap());
+            assert_eq!(
+                wire_address_from_endpoint(socks6::Endpoint::Socket(
+                    "192.0.2.1:443".parse().unwrap()
+                ))
+                .unwrap(),
+                socket
+            );
+            assert_eq!(
+                wire_address_from_endpoint(socks6::Endpoint::Domain("reply.loki".to_owned(), 1234))
+                    .unwrap(),
+                WireAddress::DomainAddress("reply.loki".to_owned(), 1234)
+            );
         }
     }
 
@@ -2209,6 +2768,67 @@ mod tests {
             no_routing()(&context, &hub),
             RoutingResovled::Drop(_)
         ));
+    }
+
+    #[test]
+    fn socks6_routing_preserves_domain_targets_and_direct_decisions() {
+        assert_eq!(socks6_host("service.example."), "service.example");
+        let mut context = RoutingContext {
+            target_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            target_port: 443,
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            protocol: RoutingProtocol::Tcp,
+            tried_proxies: Default::default(),
+            attempt_num: 0,
+            dns: VDNSRES::Opine(RoutingDecision::HostOverProxy(
+                "service.example".to_string(),
+            )),
+        };
+        let hub = UplinkHub::new();
+
+        assert_eq!(
+            socks6_routing()(&context, &hub),
+            RoutingResovled::Socks6 {
+                target: WireAddress::DomainAddress("service.example".to_string(), 443),
+            }
+        );
+
+        context.dns = VDNSRES::Opine(RoutingDecision::NoProxy(SocketAddr::new(
+            context.target_ip,
+            context.target_port,
+        )));
+        assert_eq!(
+            socks6_routing()(&context, &hub),
+            RoutingResovled::NoProxy(SocketAddr::new(context.target_ip, context.target_port))
+        );
+
+        context.attempt_num = 1;
+        assert_eq!(
+            socks6_routing()(&context, &hub),
+            RoutingResovled::Drop(DropReason::MaxRetry)
+        );
+    }
+
+    #[test]
+    fn socks6_metrics_track_active_flows_traffic_and_failures() {
+        let metrics = Arc::new(Socks6Metrics::default());
+        metrics.record_connect(Socks6FlowKind::Tcp);
+        let flow = metrics.begin_flow(Socks6FlowKind::Tcp);
+        metrics.record_traffic(100, 200);
+        metrics.record_failure("connection refused");
+        metrics.record_queue_drop();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.active_tcp_streams, 1);
+        assert_eq!(snapshot.tcp_connects, 1);
+        assert_eq!(snapshot.connect_failures, 1);
+        assert_eq!(snapshot.udp_queue_drops, 1);
+        assert_eq!(snapshot.bytes_up, 100);
+        assert_eq!(snapshot.bytes_down, 200);
+        assert_eq!(snapshot.last_error.as_deref(), Some("connection refused"));
+
+        drop(flow);
+        assert_eq!(metrics.snapshot().active_tcp_streams, 0);
     }
 
     #[test]

@@ -81,7 +81,7 @@ fn normalize_domain(domain: &str) -> String {
     normalized
 }
 
-/// Canonicalize host keys and domain targets to lowercase names with a trailing dot.
+/// Canonicalize DNS host keys and domain targets to lowercase names with a trailing dot.
 /// Returns an error if normalization causes distinct keys to collide.
 pub fn normalize_route_map_domains(
     route_map: &mut BTreeMap<RoutingKey, RoutingResovled>,
@@ -180,6 +180,11 @@ pub enum RoutingResovled {
     NoProxyDomain {
         host: String,
         port: u16,
+    },
+    /// Route through the configured SOCKS6 service.
+    #[serde(alias = "Lokinet")]
+    Socks6 {
+        target: WireAddress,
     },
 }
 
@@ -298,6 +303,12 @@ mod route_map_tests {
                 port: 443,
             },
         );
+        routes.insert(
+            RoutingKey::Host("Service.Loki".to_string(), Some(443)),
+            RoutingResovled::Socks6 {
+                target: WireAddress::DomainAddress("Service.Loki".to_string(), 443),
+            },
+        );
 
         normalize_route_map_domains(&mut routes).unwrap();
 
@@ -317,6 +328,12 @@ mod route_map_tests {
             RoutingResovled::NoProxyDomain {
                 host: "repo.example.".to_string(),
                 port: 443,
+            }
+        );
+        assert_eq!(
+            routes[&RoutingKey::Host("service.loki.".to_string(), Some(443))],
+            RoutingResovled::Socks6 {
+                target: WireAddress::DomainAddress("Service.Loki".to_string(), 443),
             }
         );
     }

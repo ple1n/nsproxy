@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{log_ring, ConnId, DiagEvent, LogEntry, StreamKind, Timestamp};
+use crate::{log_ring, ConnId, DiagEvent, LogEntry, Socks6Status, StreamKind, Timestamp};
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
@@ -38,6 +38,14 @@ pub struct VirtualIpMapping {
     pub valid_until: Option<Timestamp>,
 }
 
+fn query_socks6_status() -> Result<Option<Socks6Status>, String> {
+    let store = history()
+        .ok_or_else(|| "serve history is not initialized".to_owned())?
+        .lock()
+        .map_err(|_| "history store lock poisoned".to_owned())?;
+    Ok(store.socks6_status.clone())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionActivity {
     pub id: ConnId,
@@ -52,6 +60,18 @@ pub struct ConnectionActivity {
     pub bytes_down: Option<f32>,
     pub history_incomplete: bool,
     pub events: Vec<DiagEvent>,
+}
+
+pub(crate) fn record_socks6_status(status: &Socks6Status) {
+    if let Some(store) = history() {
+        match store.lock() {
+            Ok(mut store) => store.socks6_status = Some(status.clone()),
+            Err(_) => tracing::error!("history store lock poisoned while recording SOCKS6 status"),
+        }
+    }
+    if let Some(tx) = LIVE_EVENTS.get() {
+        let _ = tx.send(LiveEvent::Socks6Status(status.clone()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -71,6 +91,7 @@ pub type RouteQueryHandler = Arc<dyn Fn(RouteQuery) -> RouteQueryFuture + Send +
 enum LiveEvent {
     Log(LogEntry),
     Activity(DiagEvent),
+    Socks6Status(Socks6Status),
     Gap,
 }
 
@@ -136,6 +157,7 @@ struct History {
     mappings_evicted_through: Option<Timestamp>,
     mapping_history_incomplete_since: Option<Timestamp>,
     activities_evicted_through: Option<Timestamp>,
+    socks6_status: Option<Socks6Status>,
 }
 
 impl History {
@@ -153,6 +175,7 @@ impl History {
             mappings_evicted_through: None,
             mapping_history_incomplete_since: None,
             activities_evicted_through: None,
+            socks6_status: None,
         }
     }
 
@@ -970,6 +993,10 @@ async fn route_request(
     let params = parse_query(query);
     match path {
         "/v1/history" => match history_status() {
+            Ok(status) => json_response(200, &status),
+            Err(error) => json_error(503, &error),
+        },
+        "/v1/socks6" => match query_socks6_status() {
             Ok(status) => json_response(200, &status),
             Err(error) => json_error(503, &error),
         },

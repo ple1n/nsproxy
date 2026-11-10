@@ -6,6 +6,7 @@ set -euo pipefail
 
 RELEASE=0
 WEBUI=1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-web)
@@ -35,8 +36,9 @@ UI_PKG=nsproxy-ui
 UI_BIN=nsproxy-ui
 CLI_PKG=nsproxy-core
 CLI_BIN=nsproxy
+SUID_BIN=sproxy
 
-WEB_DIR="$(cd "$(dirname "$0")" && pwd)/crates/diag/web"
+WEB_DIR="$SCRIPT_DIR/crates/diag/web"
 if [ $WEBUI -eq 1 ]; then
   if [ ! -d "$WEB_DIR/node_modules" ]; then
     echo "Installing serve web UI dependencies"
@@ -54,18 +56,22 @@ build_cargo() {
   fi
 }
 
+build_core() {
+  build_cargo -p "$CLI_PKG" --bin "$CLI_BIN" --bin "$SUID_BIN" "$@"
+}
+
 if [ $RELEASE -eq 1 ]; then
-  echo "Building release: cargo build -p $CLI_PKG --bin $CLI_BIN --release"
-  build_cargo -p "$CLI_PKG" --bin "$CLI_BIN" --release
+  echo "Building release: cargo build -p $CLI_PKG --bin $CLI_BIN --bin $SUID_BIN --release"
+  build_core --release
   echo "Building release: cargo build -p $UI_PKG --bin $UI_BIN --release"
   build_cargo -p "$UI_PKG" --bin "$UI_BIN" --release
-  echo "Built: target/release/$CLI_BIN and target/release/$UI_BIN"
+  echo "Built: target/release/$CLI_BIN, $SUID_BIN and $UI_BIN"
 else
-  echo "Building debug: cargo build -p $CLI_PKG --bin $CLI_BIN"
-  build_cargo -p "$CLI_PKG" --bin "$CLI_BIN"
+  echo "Building debug: cargo build -p $CLI_PKG --bin $CLI_BIN --bin $SUID_BIN"
+  build_core
   echo "Building debug: cargo build -p $UI_PKG --bin $UI_BIN"
   build_cargo -p "$UI_PKG" --bin "$UI_BIN"
-  echo "Built: target/debug/$CLI_BIN and target/debug/$UI_BIN"
+  echo "Built: target/debug/$CLI_BIN, $SUID_BIN and $UI_BIN"
 fi
 
 # Helpful run hints

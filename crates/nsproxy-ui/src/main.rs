@@ -194,12 +194,18 @@ struct TrafficRouteTarget {
 }
 
 fn build_traffic_route_targets(proxies: &BTreeMap<ProxyID, ProxyItem>) -> Vec<TrafficRouteTarget> {
-    let mut targets = Vec::with_capacity(proxies.len() + 1);
+    let mut targets = Vec::with_capacity(proxies.len() + 2);
     targets.push(TrafficRouteTarget {
         route: nsproxy_common::stats::ObservedRoute::NoProxy,
         key: "NoProxy".to_string(),
         summary: "Direct connection".to_string(),
         filter_text: "noproxy direct connection".to_string(),
+    });
+    targets.push(TrafficRouteTarget {
+        route: nsproxy_common::stats::ObservedRoute::Socks6,
+        key: "SOCKS6".to_string(),
+        summary: "SOCKS6 service".to_string(),
+        filter_text: "socks6 service".to_string(),
     });
     for (proxy_id, proxy) in proxies {
         targets.push(TrafficRouteTarget {
@@ -2423,6 +2429,11 @@ impl App {
             self.hotconfig_editor_status = Some("Select a profile to save hotconfig.".to_string());
             return;
         };
+        if let Some(error) = &self.hotconfig_editor_error {
+            self.hotconfig_editor_status =
+                Some(format!("Fix HotConfig JSON errors before saving: {error}"));
+            return;
+        }
 
         // The proxy selector updates the running serve process immediately.
         // Preserve that newer route when saving unrelated HotConfig edits.
@@ -3540,6 +3551,9 @@ impl App {
         if Self::render_path_map(ui, "mnt", &mut hot.mnt, id_prefix) {
             changed = true;
         }
+        if Self::render_socks6_section(ui, id_prefix, hot) {
+            changed = true;
+        }
         section_frame(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("display backends");
@@ -3656,6 +3670,101 @@ impl App {
             });
         });
 
+        changed
+    }
+
+    fn render_socks6_section(ui: &mut egui::Ui, id_prefix: &str, hot: &mut HotConfig) -> bool {
+        let mut changed = false;
+        section_frame(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("SOCKS6 service");
+                ui.weak("Connect to a separately launched SOCKS6 provider.");
+            });
+            ui.small("The service is not started or supervised by nsproxy.");
+
+            let mut enabled = hot.socks6.is_some();
+            if ui.checkbox(&mut enabled, "Enable SOCKS6").changed() {
+                hot.socks6 = enabled.then(nsproxy_core::Socks6Config::default);
+                changed = true;
+            }
+
+            if let Some(config) = hot.socks6.as_mut() {
+                if ui.button("Restore SOCKS6 defaults").clicked() {
+                    *config = nsproxy_core::Socks6Config::default();
+                    changed = true;
+                }
+                let mut endpoint_kind = match &config.endpoint {
+                    nsproxy_core::Socks6Endpoint::Unix { .. } => "Unix socket",
+                    nsproxy_core::Socks6Endpoint::Tcp { .. } => "TCP address",
+                };
+                egui::ComboBox::from_id_salt((id_prefix, "socks6-transport"))
+                    .selected_text(endpoint_kind)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut endpoint_kind, "Unix socket", "Unix socket");
+                        ui.selectable_value(&mut endpoint_kind, "TCP address", "TCP address");
+                    });
+                if endpoint_kind == "Unix socket" {
+                    if !matches!(&config.endpoint, nsproxy_core::Socks6Endpoint::Unix { .. }) {
+                        config.endpoint = nsproxy_core::Socks6Endpoint::default();
+                        changed = true;
+                    }
+                    if let nsproxy_core::Socks6Endpoint::Unix { path } = &mut config.endpoint {
+                        if Self::render_path_field(
+                            ui,
+                            "SOCKS6 socket",
+                            path,
+                            (id_prefix, "socks6-socket"),
+                        ) {
+                            changed = true;
+                        }
+                        if !path.is_absolute() {
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                "SOCKS6 socket path must be absolute.",
+                            );
+                        } else if !path.exists() {
+                            ui.weak("The SOCKS6 socket is not present; start its provider before using this route.");
+                        }
+                        ui.small("Pivot profiles bind the socket directory read-only; reapply the sandbox after changing it.");
+                    }
+                } else {
+                    if !matches!(&config.endpoint, nsproxy_core::Socks6Endpoint::Tcp { .. }) {
+                        config.endpoint = nsproxy_core::Socks6Endpoint::Tcp {
+                            address: "127.0.0.1:1086".to_owned(),
+                        };
+                        changed = true;
+                    }
+                    if let nsproxy_core::Socks6Endpoint::Tcp { address } = &mut config.endpoint {
+                        ui.horizontal(|ui| {
+                            ui.label("SOCKS6 TCP endpoint");
+                            if ui.text_edit_singleline(address).changed() {
+                                changed = true;
+                            }
+                        });
+                        if address.parse::<std::net::SocketAddr>().is_err()
+                            || address
+                                .parse::<std::net::SocketAddr>()
+                                .is_ok_and(|address| address.port() == 0)
+                        {
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                "Enter a socket address with a nonzero port.",
+                            );
+                        }
+                        ui.small("The protocol does not authenticate or encrypt TCP connections; use only a trusted network.");
+                    }
+                }
+                let mut identity_id = config.identity_id.clone().unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Identity offer (optional)");
+                    if ui.text_edit_singleline(&mut identity_id).changed() {
+                        config.identity_id = (!identity_id.is_empty()).then_some(identity_id);
+                        changed = true;
+                    }
+                });
+                ui.small("Leave empty to let the SOCKS6 service select a compatible identity.");
+            }
+        });
         changed
     }
 
@@ -5598,6 +5707,8 @@ impl App {
                     if let Some(routing) = &profile.routing_state {
                         if routing.no_proxy {
                             ui.label(egui::RichText::new("NoProxy").color(Color32::LIGHT_GREEN));
+                        } else if routing.selected_socks6 {
+                            ui.label(egui::RichText::new("SOCKS6").color(Color32::LIGHT_GREEN));
                         } else if let Some(group_id) = &routing.selected_group {
                             ui.label(
                                 egui::RichText::new(format!("Group: {group_id}"))
@@ -5630,6 +5741,52 @@ impl App {
                         ui.label(egui::RichText::new("None").color(Color32::GRAY));
                     }
                 });
+                if let Some(status) = &profile.socks6_status {
+                    let (label, color) = match status.phase {
+                        diag::Socks6Phase::Disabled => ("Not configured", Color32::GRAY),
+                        diag::Socks6Phase::Connecting => ("Connecting", Color32::YELLOW),
+                        diag::Socks6Phase::Connected => ("Connected", Color32::LIGHT_GREEN),
+                        diag::Socks6Phase::Disconnected | diag::Socks6Phase::Failed => {
+                            ("Unavailable", Color32::LIGHT_RED)
+                        }
+                        diag::Socks6Phase::Stopped => ("Stopped", Color32::GRAY),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("SOCKS6:");
+                        ui.colored_label(color, label);
+                        if let Some(server_name) = &status.server_name {
+                            ui.weak(server_name);
+                        }
+                        if let Some(detail) = &status.detail {
+                            ui.label(egui::RichText::new(detail).color(Color32::GRAY));
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(format!("Active TCP: {}", status.metrics.active_tcp_streams));
+                        ui.weak(format!("Active UDP: {}", status.metrics.active_udp_flows));
+                        ui.weak(format!(
+                            "Connects: TCP {} / UDP {}",
+                            status.metrics.tcp_connects, status.metrics.udp_connects
+                        ));
+                        ui.weak(format!("Failures: {}", status.metrics.connect_failures));
+                        ui.weak(format!(
+                            "Traffic: ↑ {} / ↓ {}",
+                            format_bytes(status.metrics.bytes_up as u128),
+                            format_bytes(status.metrics.bytes_down as u128)
+                        ));
+                        if status.metrics.udp_queue_drops > 0 {
+                            ui.colored_label(
+                                Color32::YELLOW,
+                                format!("UDP callback drops: {}", status.metrics.udp_queue_drops),
+                            );
+                        }
+                        if let Some(error) = &status.metrics.last_error {
+                            ui.colored_label(Color32::LIGHT_RED, "Last error")
+                                .on_hover_text(error);
+                        }
+                        ui.weak(format!("Identity offers: {}", status.identities.len()));
+                    });
+                }
             }
         } else {
             ui.horizontal(|ui| {
@@ -8253,6 +8410,11 @@ impl App {
                                 id: proxy_id.clone(),
                             }
                         }
+                        nsproxy_common::stats::ObservedRoute::Socks6 => {
+                            nsproxy_common::routing::RoutingResovled::Socks6 {
+                                target: metric.key.target.clone(),
+                            }
+                        }
                     };
                     supervisor.send(SupervisorCommand::Ctrl {
                         profile: profile_name.to_string(),
@@ -9242,6 +9404,11 @@ impl App {
                                             id: id.clone(),
                                         }
                                     }
+                                    nsproxy_common::stats::ObservedRoute::Socks6 => {
+                                        RoutingResovled::Socks6 {
+                                            target: target.clone(),
+                                        }
+                                    }
                                 },
                             ),
                             (WireAddress::DomainAddress(host, port), route) => (
@@ -9257,6 +9424,11 @@ impl App {
                                         RoutingResovled::ProxyResovled {
                                             target: target.clone(),
                                             id: id.clone(),
+                                        }
+                                    }
+                                    nsproxy_common::stats::ObservedRoute::Socks6 => {
+                                        RoutingResovled::Socks6 {
+                                            target: target.clone(),
                                         }
                                     }
                                 },
@@ -10223,14 +10395,31 @@ Pivot-enabled containers have URL opening handled right within the container, wh
         ui.heading("Route Targets");
         ui.add_space(4.0);
         ui.label(
-            "Select which uplink proxy routes traffic from this container. \
-            The proxy must be reachable via a configured port listener.",
+            "Select the transport used for traffic from this container. \
+            SOCKS6 delegates stream and datagram traffic to the configured SOCKS6 service.",
         );
         ui.add_space(8.0);
 
         let current_route = self.manage_wizard.hot.default_route.clone();
         let mut new_route = current_route.clone();
 
+        ui.strong("Built-in transport");
+        let socks6_enabled = self.manage_wizard.hot.socks6.is_some();
+        if ui
+            .selectable_label(
+                matches!(&current_route, nsproxy_core::HotRoute::Socks6),
+                "SOCKS6",
+            )
+            .on_hover_text("Routes supported targets through the configured SOCKS6 service.")
+            .clicked()
+        {
+            new_route = nsproxy_core::HotRoute::Socks6;
+        }
+        if !socks6_enabled {
+            ui.weak("Configure and enable the SOCKS6 endpoint before selecting this route.");
+        }
+
+        ui.add_space(6.0);
         ui.strong("Proxy groups");
         for group_id in &self.user_groups {
             let is_selected = matches!(
@@ -12110,6 +12299,9 @@ fn conn_route_label(entry: &diag::ConnEntry) -> String {
         Some(RoutingResovled::ProxyResovled { target, id }) => {
             format!("Proxy {id} {} {target}", regular::ARROW_RIGHT)
         }
+        Some(RoutingResovled::Socks6 { target }) => {
+            format!("SOCKS6 {} {target}", regular::ARROW_RIGHT)
+        }
         Some(RoutingResovled::Drop(DropReason::MaxRetry)) => "Retry limit reached".to_string(),
         Some(RoutingResovled::Drop(DropReason::Preprocess(reason))) => {
             format!("Rejected: {reason}")
@@ -12144,6 +12336,9 @@ fn conn_transition_label(kind: &diag::ConnTransitionKind) -> String {
         }
         diag::ConnTransitionKind::Route(RoutingResovled::ProxyResovled { target, id }) => {
             format!("Proxy {id} {} {target}", regular::ARROW_RIGHT)
+        }
+        diag::ConnTransitionKind::Route(RoutingResovled::Socks6 { target }) => {
+            format!("SOCKS6 {} {target}", regular::ARROW_RIGHT)
         }
         diag::ConnTransitionKind::Connected => "Upstream connected".to_string(),
         diag::ConnTransitionKind::AttemptFailed { error } => {
@@ -12846,6 +13041,7 @@ fn diag_event_kind_label(ev: &diag::DiagEvent) -> &'static str {
         diag::DiagEvent::ConnsStateSnapshot { .. } => "ConnsStateSnapshot",
         diag::DiagEvent::SocksEndpointStateChanged { .. } => "SocksEndpointStateChanged",
         diag::DiagEvent::SocksEndpointStats { .. } => "SocksEndpointStats",
+        diag::DiagEvent::Socks6StatusChanged { .. } => "Socks6StatusChanged",
     }
 }
 

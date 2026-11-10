@@ -188,6 +188,8 @@ pub enum DiagEvent {
         bytes_tx: u64,
         bytes_rx: u64,
     },
+    /// Current status of the configured SOCKS6 service.
+    Socks6StatusChanged { status: Socks6Status },
 }
 
 /// Kind of SOCKS operation establishing an external listener or relay.
@@ -232,6 +234,71 @@ pub struct SocksEndpointReport {
     pub bytes_tx: u64,
     pub bytes_rx: u64,
     pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Socks6Phase {
+    Disabled,
+    Connecting,
+    Connected,
+    Disconnected,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Socks6TransportMetrics {
+    pub active_tcp_streams: u64,
+    pub active_udp_flows: u64,
+    pub tcp_connects: u64,
+    pub udp_connects: u64,
+    pub connect_failures: u64,
+    pub udp_queue_drops: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Socks6IdentityCapabilities {
+    pub send_streams: bool,
+    pub send_datagrams: bool,
+    pub receive_streams: bool,
+    pub receive_datagrams: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Socks6Identity {
+    pub id: String,
+    pub address: Option<String>,
+    pub capabilities: Socks6IdentityCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Socks6Status {
+    pub phase: Socks6Phase,
+    pub connected: bool,
+    pub updated_at: Timestamp,
+    pub detail: Option<String>,
+    pub server_name: Option<String>,
+    pub identities: Vec<Socks6Identity>,
+    #[serde(default)]
+    pub metrics: Socks6TransportMetrics,
+}
+
+impl Socks6Status {
+    pub fn new(phase: Socks6Phase, connected: bool, detail: Option<String>) -> Self {
+        Self {
+            phase,
+            connected,
+            updated_at: Timestamp::now(),
+            detail,
+            server_name: None,
+            identities: Vec::new(),
+            metrics: Socks6TransportMetrics::default(),
+        }
+    }
 }
 
 /// A single tracing log record, usable across multiple transport protocols.
@@ -421,6 +488,8 @@ pub struct RoutingState {
     pub selected_group: Option<String>,
     #[serde(default)]
     pub no_proxy: bool,
+    #[serde(default)]
+    pub selected_socks6: bool,
 }
 
 /// Logical protocol channel carried over the framed Unix stream.
@@ -954,6 +1023,8 @@ pub struct DiagServer {
     /// Latest SOCKS endpoint report, replayed to clients that connect after
     /// the lifecycle event was emitted.
     socks_endpoint: Arc<Mutex<Option<SocksEndpointReport>>>,
+    /// Latest SOCKS6 service status, replayed to clients that connect late.
+    socks6_status: Arc<Mutex<Option<Socks6Status>>>,
     /// Channel to the [`ConnsActor`] that owns connection-tracking state.
     conns_tx: mpsc::Sender<ConnsCmd>,
     /// When `false`, all connection-tracking logic in [`Self::emit`] is skipped.
@@ -1014,6 +1085,7 @@ impl DiagServer {
         let event_ring: Arc<Mutex<VecDeque<DiagEvent>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(DIAG_EVENT_RING_CAP)));
         let socks_endpoint = Arc::new(Mutex::new(None));
+        let socks6_status = Arc::new(Mutex::new(None));
         let track_conns = Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS));
         let (conns_tx, mut expired_rx) = ConnsActor::spawn(conn_persist);
         let server = DiagServer {
@@ -1021,6 +1093,7 @@ impl DiagServer {
             cmd_tx: cmd_tx.clone(),
             event_ring: event_ring.clone(),
             socks_endpoint: socks_endpoint.clone(),
+            socks6_status: socks6_status.clone(),
             conns_tx: conns_tx.clone(),
             track_conns: track_conns.clone(),
             conn_persist,
@@ -1054,6 +1127,7 @@ impl DiagServer {
                             cmd_tx.clone(),
                             event_ring.clone(),
                             socks_endpoint.clone(),
+                            socks6_status.clone(),
                             track_conns.clone(),
                             conns_tx.clone(),
                         ));
@@ -1077,6 +1151,10 @@ impl DiagServer {
     pub fn emit(&self, event: DiagEvent) {
         history::record_diag_event(&event);
         self.update_socks_endpoint(&event);
+        self.update_socks6_status(&event);
+        if let DiagEvent::Socks6StatusChanged { status } = &event {
+            history::record_socks6_status(status);
+        }
         // 1. Push to the rolling ring buffer.
         if !matches!(
             event,
@@ -1157,6 +1235,7 @@ impl DiagServer {
             cmd_tx,
             event_ring: Arc::new(Mutex::new(VecDeque::new())),
             socks_endpoint: Arc::new(Mutex::new(None)),
+            socks6_status: Arc::new(Mutex::new(None)),
             conns_tx,
             track_conns: Arc::new(AtomicBool::new(DEFAULT_TRACK_CONNS)),
             conn_persist: DEFAULT_CONN_PERSIST,
@@ -1175,6 +1254,7 @@ impl DiagServer {
         let cmd_tx = self.cmd_tx.clone();
         let ring = self.event_ring.clone();
         let socks_endpoint = self.socks_endpoint.clone();
+        let socks6_status = self.socks6_status.clone();
         let track_conns = self.track_conns.clone();
         let conns_tx = self.conns_tx.clone();
         tokio::spawn(serve_client(
@@ -1183,6 +1263,7 @@ impl DiagServer {
             cmd_tx,
             ring,
             socks_endpoint,
+            socks6_status,
             track_conns,
             conns_tx,
         ));
@@ -1286,6 +1367,16 @@ impl DiagServer {
             _ => {}
         }
     }
+
+    fn update_socks6_status(&self, event: &DiagEvent) {
+        let DiagEvent::Socks6StatusChanged { status } = event else {
+            return;
+        };
+        match self.socks6_status.lock() {
+            Ok(mut current) => *current = Some(status.clone()),
+            Err(_) => tracing::error!("SOCKS6 status lock poisoned while updating diagnostics"),
+        }
+    }
 }
 
 /// Serve a single connected EGUI client.
@@ -1298,6 +1389,7 @@ async fn serve_client(
     cmd_tx: mpsc::Sender<ControlCommand>,
     event_ring: Arc<Mutex<VecDeque<DiagEvent>>>,
     socks_endpoint: Arc<Mutex<Option<SocksEndpointReport>>>,
+    socks6_status: Arc<Mutex<Option<Socks6Status>>>,
     track_conns: Arc<AtomicBool>,
     conns_tx: mpsc::Sender<ConnsCmd>,
 ) {
@@ -1335,6 +1427,14 @@ async fn serve_client(
                 if write_half.write_all(&frame).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+    let socks6_status = socks6_status.lock().ok().and_then(|status| status.clone());
+    if let Some(status) = socks6_status {
+        if let Ok(frame) = encode_frame(&DiagEvent::Socks6StatusChanged { status }) {
+            if write_half.write_all(&frame).await.is_err() {
+                return;
             }
         }
     }
@@ -2869,6 +2969,24 @@ mod tests {
                 bytes_rx: 6,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_clients_receive_current_socks6_status() {
+        let server = DiagServer::noop();
+        let status = Socks6Status::new(Socks6Phase::Connected, true, None);
+        server.emit(DiagEvent::Socks6StatusChanged {
+            status: status.clone(),
+        });
+
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        server.add_reversed_client(server_stream);
+
+        let event: DiagEvent = read_frame(&mut client_stream).await.unwrap().unwrap();
+        assert!(matches!(
+            event,
+            DiagEvent::Socks6StatusChanged { status: actual } if actual == status
         ));
     }
 }

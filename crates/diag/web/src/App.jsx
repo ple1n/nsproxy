@@ -144,6 +144,7 @@ function ipTokens(text) {
 function App() {
   const [page, setPage] = useState("logs");
   const [history, setHistory] = useState(null);
+  const [socks6Status, setSocks6Status] = useState(null);
   const [streamState, setStreamState] = useState("connecting");
   const [activityVersion, setActivityVersion] = useState(0);
   const [selection, setSelection] = useState(null);
@@ -170,6 +171,14 @@ function App() {
   const queryRangeRef = useRef(null);
   const pendingLiveLogs = useRef([]);
   const liveFlushTimer = useRef(null);
+  const socks6Metrics = socks6Status?.metrics;
+  const socks6Tooltip = [
+    socks6Status?.detail,
+    socks6Metrics && `Active TCP ${socks6Metrics.active_tcp_streams} / UDP ${socks6Metrics.active_udp_flows}`,
+    socks6Metrics && `Connects TCP ${socks6Metrics.tcp_connects} / UDP ${socks6Metrics.udp_connects}; failures ${socks6Metrics.connect_failures}`,
+    socks6Metrics && `Traffic up ${formatBytes(socks6Metrics.bytes_up)} / down ${formatBytes(socks6Metrics.bytes_down)}; UDP callback drops ${socks6Metrics.udp_queue_drops}`,
+    socks6Metrics?.last_error && `Last error: ${socks6Metrics.last_error}`,
+  ].filter(Boolean).join("\n");
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -315,6 +324,8 @@ function App() {
           }
         } else if (event.type === "activity") {
           setActivityVersion((version) => version + 1);
+        } else if (event.type === "socks6_status") {
+          setSocks6Status(event.data);
         }
       } catch {
         setNotice("Received an unreadable live event.");
@@ -325,6 +336,18 @@ function App() {
       window.removeEventListener("popstate", handlePopState);
       events.close();
       clearTimeout(liveFlushTimer.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    requestJson("/v1/socks6")
+      .then((status) => {
+        if (alive) setSocks6Status(status);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
     };
   }, []);
 
@@ -395,7 +418,14 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <div className="breadcrumbs"><span>Workspace</span><b>/</b><strong>{page === "logs" ? "Log stream" : "Connections"}</strong></div>
-          <div className="topbar-right"><span className="secure-label">Profile network</span><span className="stream-pill"><i /> {streamState === "live" ? "Live" : "Reconnecting"}</span></div>
+          <div className="topbar-right">
+            <span className={`socks6-pill socks6-${socks6Status?.phase ?? "unknown"}`} title={socks6Tooltip}>
+              <i /> SOCKS6 {displayLabel(socks6Status?.phase ?? "unknown")}
+              {socks6Metrics && <em>{socks6Metrics.active_tcp_streams} TCP · {socks6Metrics.active_udp_flows} UDP</em>}
+            </span>
+            <span className="secure-label">Profile network</span>
+            <span className="stream-pill"><i /> {streamState === "live" ? "Live" : "Reconnecting"}</span>
+          </div>
         </header>
         <section className="page-content">
           {notice && <div className="notice"><span>!</span>{notice}<button onClick={() => setNotice("")}>×</button></div>}

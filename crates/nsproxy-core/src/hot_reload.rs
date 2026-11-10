@@ -44,21 +44,31 @@ fn routing_state_for_config(config: &HotConfig) -> diag::RoutingState {
             selected_proxy: None,
             selected_group: None,
             no_proxy: false,
+            selected_socks6: false,
         },
         HotRoute::NoProxy => diag::RoutingState {
             selected_proxy: None,
             selected_group: None,
             no_proxy: true,
+            selected_socks6: false,
         },
         HotRoute::SimpleProxy { proxy_id } => diag::RoutingState {
             selected_proxy: Some(proxy_id.clone()),
             selected_group: None,
             no_proxy: false,
+            selected_socks6: false,
         },
         HotRoute::Group { group_id } => diag::RoutingState {
             selected_proxy: None,
             selected_group: Some(group_id.clone()),
             no_proxy: false,
+            selected_socks6: false,
+        },
+        HotRoute::Socks6 => diag::RoutingState {
+            selected_proxy: None,
+            selected_group: None,
+            no_proxy: false,
+            selected_socks6: true,
         },
     }
 }
@@ -98,6 +108,13 @@ mod route_state_tests {
         assert!(state.selected_proxy.is_none());
         assert_eq!(state.selected_group.as_deref(), Some("fedora"));
         assert!(!state.no_proxy);
+
+        config.default_route = HotRoute::Socks6;
+        let state = routing_state_for_config(&config);
+        assert!(state.selected_proxy.is_none());
+        assert!(state.selected_group.is_none());
+        assert!(!state.no_proxy);
+        assert!(state.selected_socks6);
     }
 }
 

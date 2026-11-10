@@ -201,6 +201,136 @@ mod tests {
             serde_json::from_str(r#"{"dns":{},"tun":{},"devs":{},"mnt":{},"locals":{}}"#).unwrap();
         assert_eq!(old_config.diag_conn_persist_secs, 300);
         assert!(old_config.route_map.is_empty());
+        assert!(old_config.socks6.is_none());
+    }
+
+    #[test]
+    fn socks6_config_validates_endpoints_and_mounts_unix_socket_directory() {
+        let config = Socks6Config {
+            endpoint: Socks6Endpoint::Unix {
+                path: PathBuf::from("socks6.sock"),
+            },
+            identity_id: None,
+        };
+        assert!(config.validate().is_err());
+
+        let config = Socks6Config {
+            endpoint: Socks6Endpoint::Unix {
+                path: PathBuf::from("/run/socks6/socks6.sock"),
+            },
+            identity_id: None,
+        };
+        assert!(config.validate().is_ok());
+        let mount = config.socket_directory_mount().unwrap().unwrap();
+        assert_eq!(mount.source, PathBuf::from("/run/socks6"));
+        assert_eq!(mount.target, mount.source);
+        assert!(mount.read_only);
+        assert!(!mount.recursive);
+        assert!(!mount.skip_missing);
+
+        assert!(
+            Socks6Config {
+                endpoint: Socks6Endpoint::Unix {
+                    path: PathBuf::from("/run/proxy.socks6"),
+                },
+                identity_id: None,
+            }
+            .socket_directory_mount()
+            .is_err()
+        );
+        assert!(
+            Socks6Config {
+                endpoint: Socks6Endpoint::Tcp {
+                    address: "127.0.0.1:0".parse().unwrap(),
+                },
+                identity_id: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Socks6Config {
+                endpoint: Socks6Endpoint::Tcp {
+                    address: "127.0.0.1:1080".parse().unwrap(),
+                },
+                identity_id: None,
+            }
+            .socket_directory_mount()
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn socks6_config_defaults_to_a_generic_local_socket() {
+        let defaults = Socks6Config::default();
+        let Socks6Endpoint::Unix { path } = defaults.endpoint else {
+            panic!("default SOCKS6 endpoint should use a Unix socket");
+        };
+        assert!(path.is_absolute());
+        assert_eq!(path, PathBuf::from("/run/socks6/socks6.sock"));
+        let hot: HotConfig = serde_json::from_value(serde_json::json!({
+            "dns": {},
+            "tun": {},
+            "devs": {},
+            "mnt": {},
+            "locals": {},
+            "lokinet": {
+                "config_path": "/old/lokinet.ini",
+                "data_dir": "/old/lokinet-data"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            hot.socks6,
+            Some(Socks6Config {
+                endpoint: Socks6Endpoint::Unix {
+                    path: PathBuf::from("/run/lokinet-socks6/lokinet.socks6"),
+                },
+                identity_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_lokinet_toggle_migrates_to_socks6_and_can_be_saved() {
+        let path = std::env::temp_dir().join(format!(
+            "nsp3-hotconfig-lokinet-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.lock"));
+        let legacy = serde_json::json!({
+            "updated_at_ns": 10,
+            "dns": {"example.test": "192.0.2.1"},
+            "tun": {},
+            "devs": {},
+            "mnt": {},
+            "locals": {},
+            "lokinet": true
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let mut hot = state_file::read::<HotConfig>(&path).unwrap().unwrap();
+        let socks6 = hot.socks6.as_mut().unwrap();
+        assert_eq!(
+            socks6.endpoint,
+            Socks6Endpoint::Unix {
+                path: PathBuf::from("/run/lokinet-socks6/lokinet.socks6"),
+            }
+        );
+        socks6.endpoint = Socks6Endpoint::Unix {
+            path: PathBuf::from("/run/custom-socks6/custom.socks6"),
+        };
+        hot.process_and_save(&path).unwrap();
+
+        let saved = state_file::read::<HotConfig>(&path).unwrap().unwrap();
+        assert_eq!(saved.dns, hot.dns);
+        assert_eq!(saved.socks6, hot.socks6);
+        assert!(saved.updated_at_ns > 10);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
     }
 
     #[test]
@@ -581,6 +711,7 @@ mod tests {
             hot: PathBuf::from("@/hot.json"),
             hot_init: Some(HotConfig {
                 updated_at_ns: 0,
+                socks6: None,
                 dns: HashMap::new(),
                 x11: false,
                 wayland: false,
@@ -1359,6 +1490,9 @@ pub enum HotRoute {
     NoProxy,
     /// Route traffic through the healthiest and fastest available member of a user group.
     Group { group_id: String },
+    /// Route proxyable traffic through the configured SOCKS6 service.
+    #[serde(alias = "Lokinet")]
+    Socks6,
 }
 
 impl HotRoute {}
@@ -1384,6 +1518,150 @@ pub struct LaunchableApp {
     /// Process command and identity used for the managed launch.
     #[serde(default)]
     pub command: ShellArgs,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum Socks6Endpoint {
+    Unix { path: PathBuf },
+    Tcp { address: String },
+}
+
+impl Default for Socks6Endpoint {
+    fn default() -> Self {
+        Self::Unix {
+            path: PathBuf::from("/run/socks6/socks6.sock"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Socks6Config {
+    #[serde(default)]
+    pub endpoint: Socks6Endpoint,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+}
+
+impl Default for Socks6Config {
+    fn default() -> Self {
+        Self {
+            endpoint: Socks6Endpoint::default(),
+            identity_id: None,
+        }
+    }
+}
+
+impl Socks6Config {
+    pub fn validate(&self) -> Result<()> {
+        match &self.endpoint {
+            Socks6Endpoint::Unix { path } => ensure!(
+                path.is_absolute(),
+                "SOCKS6 Unix socket path must be absolute: {}",
+                path.display()
+            ),
+            Socks6Endpoint::Tcp { address } => {
+                let address = address
+                    .parse::<SocketAddr>()
+                    .map_err(|error| anyhow!("invalid SOCKS6 TCP socket address: {error}"))?;
+                ensure!(
+                    address.port() != 0,
+                    "SOCKS6 TCP endpoint must use a nonzero port"
+                );
+            }
+        }
+        if let Some(identity_id) = &self.identity_id {
+            ensure!(
+                !identity_id.is_empty(),
+                "SOCKS6 identity ID cannot be empty"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn socket_directory_mount(&self) -> Result<Option<ProfileMount>> {
+        self.validate()?;
+        let Socks6Endpoint::Unix { path } = &self.endpoint else {
+            return Ok(None);
+        };
+        let directory = path
+            .parent()
+            .ok_or_else(|| anyhow!("SOCKS6 proxy socket path must have a parent directory"))?;
+        ensure!(
+            ![
+                Path::new("/"),
+                Path::new("/run"),
+                Path::new("/var/run"),
+                Path::new("/tmp"),
+                Path::new("/home"),
+                Path::new("/root"),
+            ]
+            .contains(&directory),
+            "SOCKS6 socket must be inside a dedicated directory, not {}",
+            directory.display()
+        );
+        Ok(Some(ProfileMount {
+            source: directory.to_path_buf(),
+            target: directory.to_path_buf(),
+            read_only: true,
+            recursive: false,
+            skip_missing: false,
+        }))
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Socks6ConfigFields {
+    endpoint: Option<Socks6Endpoint>,
+    #[serde(alias = "socket_path")]
+    socket_path: Option<PathBuf>,
+    identity_id: Option<String>,
+    config_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Socks6ConfigSetting {
+    Config(Socks6ConfigFields),
+    LegacyEnabled(bool),
+}
+
+fn deserialize_socks6_config<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Socks6Config>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<Socks6ConfigSetting>::deserialize(deserializer)? {
+            None | Some(Socks6ConfigSetting::LegacyEnabled(false)) => None,
+            Some(Socks6ConfigSetting::Config(fields)) => {
+                let endpoint = fields
+                    .endpoint
+                    .or_else(|| fields.socket_path.map(|path| Socks6Endpoint::Unix { path }))
+                    .or_else(|| {
+                        (fields.config_path.is_some() || fields.data_dir.is_some()).then(|| {
+                            Socks6Endpoint::Unix {
+                                path: PathBuf::from("/run/lokinet-socks6/lokinet.socks6"),
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                Some(Socks6Config {
+                    endpoint,
+                    identity_id: fields.identity_id,
+                })
+            }
+            Some(Socks6ConfigSetting::LegacyEnabled(true)) => Some(Socks6Config {
+                endpoint: Socks6Endpoint::Unix {
+                    path: PathBuf::from("/run/lokinet-socks6/lokinet.socks6"),
+                },
+                identity_id: None,
+            }),
+        },
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1438,6 +1716,13 @@ pub struct HotConfig {
     /// Seconds to retain completed TCP/UDP diagnostics; zero disables finished-entry retention.
     #[serde(default = "default_diag_conn_persist_secs")]
     pub diag_conn_persist_secs: u32,
+    /// Optional separately launched SOCKS6 service configuration.
+    #[serde(
+        default,
+        alias = "lokinet",
+        deserialize_with = "deserialize_socks6_config"
+    )]
+    pub socks6: Option<Socks6Config>,
 }
 
 impl Default for HotConfig {
@@ -1460,6 +1745,7 @@ impl Default for HotConfig {
             applications: Vec::new(),
             veth: Vec::new(),
             diag_conn_persist_secs: default_diag_conn_persist_secs(),
+            socks6: None,
         }
     }
 }
@@ -1697,6 +1983,9 @@ impl HotConfig {
     pub fn process_and_save(&mut self, path: &Path) -> Result<()> {
         nsproxy_common::routing::normalize_route_map_domains(&mut self.route_map)
             .map_err(anyhow::Error::msg)?;
+        if let Some(socks6) = &self.socks6 {
+            socks6.validate()?;
+        }
         self.process();
         self.save(path)
     }

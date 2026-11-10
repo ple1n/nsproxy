@@ -29,6 +29,9 @@ exclude = [
     "crates/tun2socks5",
     "crates/tun_bench",
     "crates/warp",
+    "external/socks6",
+    "external/lokinet-socks6d",
+    "external/socks6-lab",
 ]
 resolver = "3"
 

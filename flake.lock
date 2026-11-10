@@ -1,0 +1,96 @@
+{
+  "nodes": {
+    "daemon": {
+      "flake": false,
+      "locked": {
+        "path": "./external/lokinet-socks6d",
+        "type": "path"
+      },
+      "original": {
+        "path": "./external/lokinet-socks6d",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "ipstack": {
+      "flake": false,
+      "locked": {
+        "allRefs": true,
+        "dirtyRev": "c3c12d1e086c4f99f57b04d8f099a7e81404adfc-dirty",
+        "dirtyShortRev": "c3c12d1-dirty",
+        "lastModified": 1794219364,
+        "narHash": "sha256-qJVEeHTGH6br9g9a0gmHfvzBwQIDt6e+wTfD2sDFjpg=",
+        "type": "git",
+        "url": "file:./crates/ipstack"
+      },
+      "original": {
+        "allRefs": true,
+        "type": "git",
+        "url": "file:./crates/ipstack"
+      }
+    },
+    "lokinet": {
+      "flake": false,
+      "locked": {
+        "allRefs": true,
+        "dirtyRev": "2a917223881ead0820791fd96bb307a4e63cbbc4-dirty",
+        "dirtyShortRev": "2a91722-dirty",
+        "lastModified": 1794280053,
+        "narHash": "sha256-7kAhRkco8kg5I/9zsFPvoFm4pf+I7EshtMNHjeXrto4=",
+        "submodules": true,
+        "type": "git",
+        "url": "file:./external/lokinet"
+      },
+      "original": {
+        "allRefs": true,
+        "submodules": true,
+        "type": "git",
+        "url": "file:./external/lokinet"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793876309,
+        "narHash": "sha256-Wojg9lIH/hDH91iDVH2/EPw8oDSpxjxhXONbU1yf4Zg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "f9a75f41be3a74eab55d3a7679d34ad6cc0da977",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "daemon": "daemon",
+        "ipstack": "ipstack",
+        "lokinet": "lokinet",
+        "nixpkgs": "nixpkgs",
+        "socks6": "socks6"
+      }
+    },
+    "socks6": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794274214,
+        "narHash": "sha256-qIquE7ee8QSLwd/++dU2Fm0Hwz+5Lqx3nsCghF/BuEY=",
+        "ref": "master",
+        "rev": "9a6e7fcff4021cbfdb13f6674e4d7d72a93abfc0",
+        "revCount": 14,
+        "type": "git",
+        "url": "file:./external/socks6"
+      },
+      "original": {
+        "rev": "9a6e7fcff4021cbfdb13f6674e4d7d72a93abfc0",
+        "type": "git",
+        "url": "file:./external/socks6"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

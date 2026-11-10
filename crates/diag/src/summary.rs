@@ -257,7 +257,8 @@ impl DiagAccumulator {
             | DiagEvent::RecentDiagEvents(_)
             | DiagEvent::ConnsStateSnapshot { .. }
             | DiagEvent::SocksEndpointStateChanged { .. }
-            | DiagEvent::SocksEndpointStats { .. } => {}
+            | DiagEvent::SocksEndpointStats { .. }
+            | DiagEvent::Socks6StatusChanged { .. } => {}
         }
     }
 }

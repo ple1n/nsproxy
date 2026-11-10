@@ -68,3 +68,10 @@
 	path = crates/egui_log_viewer
 	url = git@github.com:ple1n/egui_log_viewer.git
 	branch = main
+[submodule "external/lokinet"]
+	path = external/lokinet
+	url = git@github.com:ple1n/lokinet.git
+	branch = dev
+[submodule "external/socks6"]
+	path = external/socks6
+	url = https://github.com/ple1n/socks6.git

@@ -231,6 +231,7 @@ pub struct ContainerState {
     pub dns_state: Option<diag::DnsState>,
     pub diag_connected: bool,
     pub diag_summary: Option<DiagSummary>,
+    pub socks6_status: Option<diag::Socks6Status>,
     #[serde(skip)]
     pub traffic: TrafficSnapshot,
     pub proxy_stats: HashMap<ProxyID, ProxyStats>,
@@ -951,6 +952,7 @@ struct DiagState {
     /// on `ConnsStateSnapshot` (from `QueryConnsState`).
     conns_state: diag::ConnsState,
     socks_endpoint_state: Option<diag::SocksEndpointReport>,
+    socks6_status: Option<diag::Socks6Status>,
 }
 
 const MAX_TRAFFIC_HOST_ROUTE_METRICS: usize = 512;
@@ -1022,6 +1024,7 @@ impl Default for DiagState {
             diag_event_log: VecDeque::new(),
             conns_state: diag::ConnsState::default(),
             socks_endpoint_state: None,
+            socks6_status: None,
         }
     }
 }
@@ -1157,6 +1160,7 @@ fn diag_event_name(event: &DiagEvent) -> &'static str {
         DiagEvent::ConnsStateSnapshot { .. } => "ConnsStateSnapshot",
         DiagEvent::SocksEndpointStateChanged { .. } => "SocksEndpointStateChanged",
         DiagEvent::SocksEndpointStats { .. } => "SocksEndpointStats",
+        DiagEvent::Socks6StatusChanged { .. } => "Socks6StatusChanged",
     }
 }
 
@@ -2905,6 +2909,9 @@ impl Supervisor {
                         report.bytes_rx = bytes_rx;
                         report.updated_at = ts;
                     }
+                    DiagEvent::Socks6StatusChanged { status } => {
+                        state.socks6_status = Some(status);
+                    }
                     DiagEvent::DnsState { state: dns, .. } => state.dns_state = Some(dns),
                     DiagEvent::RoutingState { state: routing, .. } => {
                         state.routing_state = Some(routing)
@@ -4140,6 +4147,7 @@ impl Supervisor {
                     dns_state: diag.and_then(|d| d.dns_state.clone()),
                     diag_connected,
                     diag_summary: diag.and_then(build_diag_summary),
+                    socks6_status: diag.and_then(|d| d.socks6_status.clone()),
                     traffic: if self.is_traffic_subscribed(profile.as_str()) {
                         diag.map(build_traffic_snapshot).unwrap_or_default()
                     } else {
@@ -5489,6 +5497,7 @@ fn refresh_recent_host_routes_for_state(state: &mut DiagState) {
         };
         let observed_route = match route {
             RoutingResovled::ProxyResovled { id, .. } => ObservedRoute::Proxy(id.clone()),
+            RoutingResovled::Socks6 { .. } => ObservedRoute::Socks6,
             RoutingResovled::NATByTUN(_)
             | RoutingResovled::NoProxy(_)
             | RoutingResovled::NoProxyDomain { .. } => ObservedRoute::NoProxy,

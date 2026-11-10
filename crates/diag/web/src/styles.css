@@ -60,6 +60,15 @@ button { color: inherit; }
 .secure-label { font: 9px var(--mono); letter-spacing: .1em; color: #8792a0; }
 .stream-pill { display: flex; align-items: center; gap: 7px; border: 1px solid rgba(125,169,163,.18); border-radius: 20px; padding: 6px 9px; color: #91b3ad; font: 9px var(--mono); letter-spacing: .05em; }
 .stream-pill i { width: 5px; height: 5px; background: var(--cyan); border-radius: 50%; }
+.socks6-pill { display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 20px; padding: 6px 9px; color: #9ba2ab; font: 9px var(--mono); letter-spacing: .04em; }
+.socks6-pill em { color: var(--muted); font-style: normal; letter-spacing: 0; }
+.socks6-pill i { width: 5px; height: 5px; background: #8a96a9; border-radius: 50%; }
+.socks6-connected { color: #91b3ad; border-color: rgba(125,169,163,.18); }
+.socks6-connected i { background: var(--cyan); }
+.socks6-connecting { color: var(--warning); border-color: rgba(198,161,109,.2); }
+.socks6-connecting i { background: var(--warning); }
+.socks6-disconnected, .socks6-failed { color: var(--error); border-color: rgba(206,125,132,.2); }
+.socks6-disconnected i, .socks6-failed i { background: var(--error); }
 .page-content { max-width: 1600px; width: 100%; margin: 0 auto; padding: 33px 34px 30px; }
 .title-row { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 24px; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: #8994a2; font: 9px var(--mono); letter-spacing: .14em; }

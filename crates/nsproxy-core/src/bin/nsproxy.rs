@@ -3311,11 +3311,28 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("missing hot config {}", hot_path.display()))?;
                 hot.process_and_save(&hot_path)?;
                 hot.expand_with(&hot_vars);
-                if let Ok(mounts) = hot.merged_mounts() {
-                    if !mounts.is_empty() {
-                        nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
-                        status_mounts.extend(mounts);
+                let mut mounts = hot.merged_mounts()?;
+                if is_pivot_mode {
+                    if let Some(config) = &hot.socks6 {
+                        if let Some(mount) = config.socket_directory_mount()? {
+                            let source = hot_vars.expand_source(&mount.source);
+                            ensure!(
+                                source.is_dir(),
+                                "SOCKS6 socket directory is unavailable at {}; start the provider before sandboxing this profile",
+                                source.display()
+                            );
+                            if !mounts
+                                .iter()
+                                .any(|existing| existing.target == mount.target)
+                            {
+                                mounts.push(mount);
+                            }
+                        }
                     }
+                }
+                if !mounts.is_empty() {
+                    nsproxy_core::sandbox::apply_mounts(&hot_vars, &mounts)?;
+                    status_mounts.extend(mounts);
                 }
             }
 
@@ -3728,6 +3745,7 @@ fn apply_hot_route_to_uplink(uplink: &mut nsproxy_core::uplink::UplinkHub, hot: 
         HotRoute::Group { group_id } => nsproxy_core::uplink::group_routing(
             nsproxy_core::uplink::clash::GroupId::from(group_id.clone()),
         ),
+        HotRoute::Socks6 => nsproxy_core::uplink::socks6_routing(),
     };
     let route_map = hot.route_map.clone();
     uplink.set_routing(Arc::new(move |ctx, hub| {
@@ -3968,6 +3986,27 @@ mod hotconfig_routing_tests {
             RoutingResovled::NoProxy("203.0.113.7:443".parse().unwrap())
         );
     }
+
+    #[test]
+    fn hotconfig_socks6_default_route_preserves_host_targets() {
+        let hot = HotConfig {
+            default_route: HotRoute::Socks6,
+            ..HotConfig::default()
+        };
+        let mut uplink =
+            nsproxy_core::uplink::UplinkHub::with_routing(nsproxy_core::uplink::no_routing());
+        apply_hot_route_to_uplink(&mut uplink, &hot);
+
+        assert_eq!(
+            uplink.route(&context(
+                80,
+                VDNSRES::Opine(RoutingDecision::HostOverProxy("service.loki".to_string(),)),
+            )),
+            RoutingResovled::Socks6 {
+                target: WireAddress::DomainAddress("service.loki".to_string(), 80),
+            }
+        );
+    }
 }
 
 async fn serve_worker_runtime(
@@ -4126,6 +4165,150 @@ async fn serve_worker_runtime(
         Err(_) => warn!("serve child main task exiting because shutdown watcher closed"),
     }
     aok!()
+}
+
+fn emit_socks6_status(
+    diag_server: &diag::DiagServer,
+    phase: diag::Socks6Phase,
+    connected: bool,
+    detail: Option<String>,
+) -> diag::Socks6Status {
+    let status = diag::Socks6Status::new(phase, connected, detail);
+    diag_server.emit(diag::DiagEvent::Socks6StatusChanged {
+        status: status.clone(),
+    });
+    status
+}
+
+fn start_socks6_transport(
+    config: Option<&nsproxy_core::Socks6Config>,
+    metrics: Arc<nsproxy_core::uplink::Socks6Metrics>,
+    diag_server: &diag::DiagServer,
+) -> (
+    Option<Arc<nsproxy_core::uplink::Socks6Transport>>,
+    diag::Socks6Status,
+) {
+    let Some(config) = config else {
+        return (
+            None,
+            emit_socks6_status(diag_server, diag::Socks6Phase::Disabled, false, None),
+        );
+    };
+
+    if let Err(error) = config.validate() {
+        let detail = error.to_string();
+        warn!(%error, "invalid SOCKS6 service configuration");
+        return (
+            None,
+            emit_socks6_status(diag_server, diag::Socks6Phase::Failed, false, Some(detail)),
+        );
+    }
+
+    let transport = match nsproxy_core::uplink::Socks6Transport::new(
+        config.endpoint.clone(),
+        config.identity_id.clone(),
+        metrics,
+    ) {
+        Ok(transport) => Arc::new(transport),
+        Err(error) => {
+            let detail = error.to_string();
+            return (
+                None,
+                emit_socks6_status(diag_server, diag::Socks6Phase::Failed, false, Some(detail)),
+            );
+        }
+    };
+    let endpoint = match &config.endpoint {
+        nsproxy_core::Socks6Endpoint::Unix { path } => path.display().to_string(),
+        nsproxy_core::Socks6Endpoint::Tcp { address } => address.clone(),
+    };
+    let detail = Some(format!("Waiting for SOCKS6 service at {endpoint}"));
+    (
+        Some(transport),
+        emit_socks6_status(diag_server, diag::Socks6Phase::Connecting, false, detail),
+    )
+}
+
+async fn query_socks6_status(
+    transport: Option<&Arc<nsproxy_core::uplink::Socks6Transport>>,
+    ever_connected: &mut bool,
+) -> diag::Socks6Status {
+    let Some(transport) = transport else {
+        return diag::Socks6Status::new(diag::Socks6Phase::Disabled, false, None);
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), async {
+        let status = transport.status().await?;
+        if status.connected {
+            let (server_name, identities) = transport.service_details().await?;
+            Ok::<_, anyhow::Error>((status, Some(server_name), identities))
+        } else {
+            Ok((status, None, Vec::new()))
+        }
+    })
+    .await
+    {
+        Ok(Ok((status, server_name, identities))) if status.connected => {
+            *ever_connected = true;
+            let mut snapshot =
+                diag::Socks6Status::new(diag::Socks6Phase::Connected, true, status.detail);
+            snapshot.server_name = server_name;
+            snapshot.identities = identities
+                .into_iter()
+                .map(|identity| diag::Socks6Identity {
+                    id: identity.id,
+                    address: identity.address.map(|address| format!("{address:?}")),
+                    capabilities: diag::Socks6IdentityCapabilities {
+                        send_streams: identity.capabilities.send_streams,
+                        send_datagrams: identity.capabilities.send_datagrams,
+                        receive_streams: identity.capabilities.receive_streams,
+                        receive_datagrams: identity.capabilities.receive_datagrams,
+                    },
+                })
+                .collect();
+            snapshot
+        }
+        Ok(Ok((status, _, _))) => diag::Socks6Status::new(
+            if *ever_connected {
+                diag::Socks6Phase::Disconnected
+            } else {
+                diag::Socks6Phase::Connecting
+            },
+            false,
+            status.detail,
+        ),
+        Ok(Err(error)) => diag::Socks6Status::new(
+            diag::Socks6Phase::Disconnected,
+            false,
+            Some(error.to_string()),
+        ),
+        Err(_) => diag::Socks6Status::new(
+            diag::Socks6Phase::Disconnected,
+            false,
+            Some("timed out querying the SOCKS6 service".to_owned()),
+        ),
+    }
+}
+
+fn update_socks6_status(
+    diag_server: &diag::DiagServer,
+    current: &mut diag::Socks6Status,
+    mut status: diag::Socks6Status,
+    metrics: diag::Socks6TransportMetrics,
+) {
+    status.metrics = metrics;
+    if current.phase != status.phase
+        || current.connected != status.connected
+        || current.detail != status.detail
+        || current.server_name != status.server_name
+        || current.identities != status.identities
+        || current.metrics != status.metrics
+    {
+        diag_server.emit(diag::DiagEvent::Socks6StatusChanged {
+            status: status.clone(),
+        });
+        *current = status;
+    }
 }
 
 fn cmd_serve(
@@ -4447,6 +4630,18 @@ fn cmd_serve(
                     )?;
 
                     router.init_diag(&diag_path).await?;
+                    let socks6_diag = router.diag_handle();
+                    let mut socks6_config_current = initial_hot.socks6.clone();
+                    let socks6_metrics =
+                        Arc::clone(&router.uplink.read().await.socks6_metrics);
+                    let (mut socks6_transport, mut socks6_status) = start_socks6_transport(
+                        socks6_config_current.as_ref(),
+                        socks6_metrics,
+                        &socks6_diag,
+                    );
+                    router.uplink.write().await.socks6 = socks6_transport.clone();
+                    let mut socks6_ever_connected = socks6_status.connected;
+                    let socks6_uplink = router.uplink.clone();
                     let uplink = router.uplink.clone();
                     let dns_handle = Arc::new(sync::Mutex::new(router.dns_handle()));
                     let route_query_handler: diag::history::RouteQueryHandler =
@@ -4540,6 +4735,15 @@ fn cmd_serve(
                                             Ok(mut hub) => {
                                                 let current_hot = live_hot_cmd.read().await.clone();
                                                 apply_hot_route_to_uplink(&mut hub, &current_hot);
+                                                let (socks6, socks6_metrics) = {
+                                                    let current = uplink_cmd.read().await;
+                                                    (
+                                                        current.socks6.clone(),
+                                                        Arc::clone(&current.socks6_metrics),
+                                                    )
+                                                };
+                                                hub.socks6 = socks6;
+                                                hub.socks6_metrics = socks6_metrics;
                                                 let mut u = uplink_cmd.write().await;
                                                 *u = hub;
                                                 info!("uplink reloaded via diag cmd");
@@ -4659,15 +4863,16 @@ fn cmd_serve(
                                     }
                                     diag::ControlCommand::QueryRoutingState => {
                                         let current_hot = live_hot_cmd.read().await.clone();
-                                        let (selected_proxy, selected_group, no_proxy) = match &current_hot.default_route {
-                                            HotRoute::None => (None, None, false),
-                                            HotRoute::NoProxy => (None, None, true),
+                                        let (selected_proxy, selected_group, no_proxy, selected_socks6) = match &current_hot.default_route {
+                                            HotRoute::None => (None, None, false, false),
+                                            HotRoute::NoProxy => (None, None, true, false),
                                             HotRoute::SimpleProxy { proxy_id } => {
-                                                (Some(proxy_id.clone()), None, false)
+                                                (Some(proxy_id.clone()), None, false, false)
                                             }
                                             HotRoute::Group { group_id } => {
-                                                (None, Some(group_id.clone()), false)
+                                                (None, Some(group_id.clone()), false, false)
                                             }
+                                            HotRoute::Socks6 => (None, None, false, true),
                                         };
                                         diag_srv.emit(diag::DiagEvent::RoutingState {
                                             ts: diag::Timestamp::now(),
@@ -4675,6 +4880,7 @@ fn cmd_serve(
                                                 selected_proxy,
                                                 selected_group,
                                                 no_proxy,
+                                                selected_socks6,
                                             },
                                         });
                                     }
@@ -4905,7 +5111,78 @@ fn cmd_serve(
                     }),
                     ));
 
-                    router.run().await?;
+                    let mut socks6_config_watch = hot_tx.subscribe();
+                    let mut socks6_poll = tokio::time::interval(Duration::from_secs(1));
+                    socks6_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    socks6_poll.tick().await;
+                    let mut router_run = Box::pin(router.run());
+                    let router_result = loop {
+                        tokio::select! {
+                            result = &mut router_run => break result,
+                            _ = socks6_poll.tick(), if socks6_transport.is_some() => {
+                                let status =
+                                    query_socks6_status(socks6_transport.as_ref(), &mut socks6_ever_connected).await;
+                                let metrics = socks6_uplink
+                                    .read()
+                                    .await
+                                    .socks6_metrics
+                                    .snapshot();
+                                update_socks6_status(
+                                    &socks6_diag,
+                                    &mut socks6_status,
+                                    status,
+                                    metrics,
+                                );
+                            }
+                            changed = socks6_config_watch.changed() => {
+                                if changed.is_err() {
+                                    break Ok(());
+                                }
+                                let new_config = socks6_config_watch.borrow().socks6.clone();
+                                if new_config != socks6_config_current {
+                                    socks6_config_current = new_config;
+                                    let metrics = {
+                                        Arc::clone(&socks6_uplink.read().await.socks6_metrics)
+                                    };
+                                    let (new_transport, status) = start_socks6_transport(
+                                        socks6_config_current.as_ref(),
+                                        Arc::clone(&metrics),
+                                        &socks6_diag,
+                                    );
+                                    socks6_transport = new_transport;
+                                    socks6_ever_connected = status.connected;
+                                    socks6_uplink.write().await.socks6 = socks6_transport.clone();
+                                    let metrics = socks6_uplink
+                                        .read()
+                                        .await
+                                        .socks6_metrics
+                                        .snapshot();
+                                    update_socks6_status(
+                                        &socks6_diag,
+                                        &mut socks6_status,
+                                        status,
+                                        metrics,
+                                    );
+                                }
+                            }
+                        }
+                    };
+                    if socks6_transport.is_some() {
+                        let metrics = socks6_uplink
+                            .read()
+                            .await
+                            .socks6_metrics
+                            .snapshot();
+                        update_socks6_status(
+                            &socks6_diag,
+                            &mut socks6_status,
+                            diag::Socks6Status::new(diag::Socks6Phase::Stopped, false, None),
+                            metrics,
+                        );
+                    }
+                    socks6_uplink.write().await.socks6 = None;
+                    drop(socks6_transport);
+                    router_result?;
                     warn!("router exited");
                     let _ = vdns_sx.send(None).await;
 

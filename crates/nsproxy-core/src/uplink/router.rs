@@ -495,6 +495,103 @@ impl Router {
                     });
                     break;
                 }
+                RoutingResovled::Socks6 { target } => {
+                    let transport = uplink.read().await.socks6.clone();
+                    let Some(transport) = transport else {
+                        let error = "SOCKS6 route selected but no SOCKS6 service is configured";
+                        uplink.read().await.socks6_metrics.record_failure(error);
+                        diag.emit(DiagEvent::Finished {
+                            id: conn_id,
+                            ts: Timestamp::now(),
+                            error: Some(error.to_owned()),
+                            bytes_up: 0.0,
+                            bytes_down: 0.0,
+                        });
+                        break;
+                    };
+                    let connect_start = Instant::now();
+                    let conn = match transport.connect_tcp(target.clone()).await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            let connect_latency = connect_start.elapsed();
+                            let metric = uplink.write().await.record_host_route_attempt(
+                                stats_target.clone(),
+                                ObservedRoute::Socks6,
+                                connect_latency,
+                                false,
+                            );
+                            diag.emit(DiagEvent::HostRouteStatsUpdated {
+                                ts: metric.observed_at,
+                                stat: metric,
+                            });
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(error.to_string()),
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
+                            });
+                            break;
+                        }
+                    };
+                    let connect_latency = connect_start.elapsed();
+                    let mut conn = conn;
+                    let proxy_stream = match conn {
+                        crate::uplink::proxy_adapters::ProxyConnection::Tcp(ref mut stream) => {
+                            stream.as_mut()
+                        }
+                        crate::uplink::proxy_adapters::ProxyConnection::Udp(_) => {
+                            bail!("SOCKS6 service returned a datagram channel for a TCP stream")
+                        }
+                    };
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                    });
+                    let metric = uplink.write().await.record_host_route_attempt(
+                        stats_target.clone(),
+                        ObservedRoute::Socks6,
+                        connect_latency,
+                        true,
+                    );
+                    diag.emit(DiagEvent::HostRouteStatsUpdated {
+                        ts: metric.observed_at,
+                        stat: metric,
+                    });
+                    match Self::relay_tcp_with_cause(
+                        &mut tcp,
+                        proxy_stream,
+                        "tun->socks6",
+                        "socks6->tun",
+                        stats_target.clone(),
+                        ObservedRoute::Socks6,
+                        uplink.clone(),
+                        diag.clone(),
+                    )
+                    .await
+                    {
+                        Ok(relay) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: relay.bytes_up as f32,
+                                bytes_down: relay.bytes_down as f32,
+                            });
+                        }
+                        Err(error) => {
+                            transport.metrics().record_failure(error.to_string());
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(error.to_string()),
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
+                            });
+                        }
+                    }
+                    break;
+                }
                 RoutingResovled::ProxyResovled { target, id } => {
                     let proxy_clone = {
                         let hub = uplink.read().await;
@@ -783,6 +880,13 @@ impl Router {
             return;
         }
 
+        if matches!(route, ObservedRoute::Socks6) {
+            let metrics = Arc::clone(&uplink.read().await.socks6_metrics);
+            metrics.record_traffic(
+                upload_sample.map_or(0, |sample| sample.bytes),
+                download_sample.map_or(0, |sample| sample.bytes),
+            );
+        }
         let metric = uplink.write().await.record_host_route_udp_transfer_samples(
             stats_target.clone(),
             route.clone(),
@@ -803,6 +907,14 @@ impl Router {
         sample: TransferRateSample,
         upload: bool,
     ) {
+        if matches!(route, ObservedRoute::Socks6) {
+            let metrics = Arc::clone(&uplink.read().await.socks6_metrics);
+            if upload {
+                metrics.record_traffic(sample.bytes, 0);
+            } else {
+                metrics.record_traffic(0, sample.bytes);
+            }
+        }
         let (upload_sample, download_sample) = if upload {
             (Some(sample), None)
         } else {
@@ -1288,6 +1400,74 @@ impl Router {
                         bytes_up: 0.0,
                         bytes_down: 0.0,
                     });
+                    break;
+                }
+                RoutingResovled::Socks6 { target } => {
+                    let transport = uplink.read().await.socks6.clone();
+                    let Some(transport) = transport else {
+                        let error = "SOCKS6 route selected but no SOCKS6 service is configured";
+                        uplink.read().await.socks6_metrics.record_failure(error);
+                        diag.emit(DiagEvent::Finished {
+                            id: conn_id,
+                            ts: Timestamp::now(),
+                            error: Some(error.to_owned()),
+                            bytes_up: 0.0,
+                            bytes_down: 0.0,
+                        });
+                        break;
+                    };
+                    let mut conn = match transport.connect_udp(target.clone()).await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(error.to_string()),
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
+                            });
+                            break;
+                        }
+                    };
+                    let tunnel = match conn.as_udp_mut() {
+                        Some(tunnel) => tunnel,
+                        None => bail!("SOCKS6 service returned a TCP stream for a UDP flow"),
+                    };
+                    diag.emit(DiagEvent::Connected {
+                        id: conn_id,
+                        ts: Timestamp::now(),
+                    });
+                    match Self::relay_udp(
+                        tunnel,
+                        &mut udp,
+                        target,
+                        stats_target.clone(),
+                        ObservedRoute::Socks6,
+                        uplink.clone(),
+                        diag.clone(),
+                    )
+                    .await
+                    {
+                        Ok((bytes_up, bytes_down)) => {
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: None,
+                                bytes_up: bytes_up as f32,
+                                bytes_down: bytes_down as f32,
+                            });
+                        }
+                        Err(error) => {
+                            transport.metrics().record_failure(error.to_string());
+                            diag.emit(DiagEvent::Finished {
+                                id: conn_id,
+                                ts: Timestamp::now(),
+                                error: Some(error.to_string()),
+                                bytes_up: 0.0,
+                                bytes_down: 0.0,
+                            });
+                        }
+                    }
                     break;
                 }
                 RoutingResovled::ProxyResovled { target, id } => {
